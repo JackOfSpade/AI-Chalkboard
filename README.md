@@ -66,3 +66,40 @@ Add AI Chalkboard to `~/Library/Application Support/Claude/claude_desktop_config
 1. **Pixel-Perfect Alignment with Computer Use**: Screenshots captured by Claude Cowork match display physical pixel resolutions. Passing `x` and `y` directly from image analysis draws highlights at the exact pixel position.
 2. **Auto-Disappearing Annotations**: By passing `duration_seconds: 3`, Claude can highlight buttons or input fields briefly while explaining steps to the user without cluttering the screen.
 3. **Zero Input Disruption**: User can continue typing or clicking underneath while Claude draws highlights.
+
+---
+
+## Automated branch → main merging
+
+Every branch pushed to `origin` is merged into `main` automatically — once, and only
+once, the CI run for that branch's exact tip commit is green. The branch is then
+deleted. The gate is **fail-closed**: a red, in-progress, missing, or API-error CI
+result all skip the branch for that drain; nothing merges on ambiguity. The branch is
+picked up automatically on the next CI completion for its tip SHA (e.g. a retry, or a
+new push) — but because the gate is fail-closed, a tip SHA whose only CI run was
+**cancelled** (e.g. a manually cancelled run) is never retried automatically.
+`stranded-branch-check.yml` flags that within ~6h; the fix is to re-run CI for the
+branch or push a new commit.
+
+| File | Role |
+| --- | --- |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | The merge gate. Its run conclusion for a branch's tip SHA is what auto-merge reads. |
+| [`.github/workflows/auto-merge-claude.yml`](.github/workflows/auto-merge-claude.yml) | Drains every un-merged branch on each CI completion and re-verifies main's tip post-merge. |
+| [`.github/workflows/stranded-branch-check.yml`](.github/workflows/stranded-branch-check.yml) | Runs every 6 hours; flags a branch that is unmerged and whose CI run has been settled — or is still missing — for more than 6h (measured from the CI run itself, the same signal the merge gate reads, not the tip commit's date), or an open conflict PR. A branch whose CI is still queued/running is skipped, no matter how old its tip commit is. |
+| [`scripts/auto_merge_decision.sh`](scripts/auto_merge_decision.sh) | The fail-closed decision predicates (CI-green check, ancestry check, etc.). |
+| [`tests/test_auto_merge_logic.sh`](tests/test_auto_merge_logic.sh) | Unit tests for those predicates. |
+| [`.claude/session-start.sh`](.claude/session-start.sh) | SessionStart hook: resets a remote Claude session's assigned branch to `origin/main`. |
+
+**Operating notes**
+
+- There is no PR review step by design — a green CI run on a branch is sufficient to merge it.
+- If git cannot resolve a merge cleanly, the bot opens an `Auto-merge conflict: <branch>` PR instead of merging, so a human resolves it by hand.
+- The bot pushes the merge commit using `GITHUB_TOKEN`, so GitHub does **not** re-run CI on that commit. To cover this blind spot, the workflow's `postmerge` job re-verifies main's actual merged tip and opens a deduped issue if it's red.
+- `workflow_dispatch` on `auto-merge-claude.yml` is the manual drain escape hatch (e.g. after a transient API failure).
+- `ci.yml` is deliberately scoped to `branches: ['**']` (every branch, no tags), and its concurrency group is keyed on the commit SHA — so a re-run of an older commit can never cancel the current tip's run and strand the branch.
+
+**Requirements**
+
+- Repo Settings → Actions → General → Workflow permissions may be left at the read-only default — each workflow above requests the write scopes it needs via its own `permissions:` block.
+- Issues must stay enabled — `stranded-branch-check.yml` (and the `postmerge` job) alert by opening issues.
+- No branch protection is configured on this repo, so the bash gate in `scripts/auto_merge_decision.sh` is the only merge gate that exists.
