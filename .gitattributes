@@ -1,0 +1,19 @@
+# Auto-merge conflict avoidance for the branch -> main workflow
+# (.github/workflows/auto-merge-claude.yml).
+#
+# The built-in `union` merge driver keeps BOTH sides' added lines instead of
+# emitting conflict markers -- correct ONLY for append-only log files where
+# concurrent sessions each append new entries at the tail.
+#
+# This repo currently has NO append-only log file, so there are no active
+# `merge=union` entries below.
+#
+# Do NOT add `merge=union` for normal source files (Swift sources under
+# Sources/, Package.swift, README.md, etc.): they are edited IN PLACE, and
+# union would duplicate edited or whole-file content instead of resolving it
+# correctly. Genuine concurrent edits to those files are REAL conflicts,
+# which the workflow correctly routes to an "Auto-merge conflict: <branch>"
+# PR instead of merging.
+#
+# If a NEW append-only log file is ever added, register it here, e.g.:
+#   New_Append_Only_Log.md   merge=union

@@ -1,0 +1,325 @@
+name: Auto-merge branches to main
+
+# Merges ALL branches (any prefix — claude/*, jack/*, etc.) into main automatically — but ONLY once
+# their CI run is green. This keeps full hands-off automation while ensuring a red build never lands
+# on main.
+#
+# Why trigger on `workflow_run` (CI completed) instead of `push`:
+#   A push trigger merges immediately, before CI has even finished, so it cannot gate on CI at all.
+#   Triggering when the "CI" workflow completes means (a) every drain happens with a known CI verdict
+#   already in hand, and (b) when a branch's CI later turns green, that completion re-triggers this
+#   workflow and the branch gets picked up automatically. No polling, no stranded branches.
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+  workflow_dispatch: {}   # manual drain escape hatch
+
+concurrency:
+  group: auto-merge-main
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write   # read: the CI-gate check reads workflow runs via the Actions API.
+                        # write: the one-shot retry below calls `gh run rerun --failed`, which needs write.
+    outputs:
+      did_merge: ${{ steps.merge.outputs.did_merge }}
+      merged_sha: ${{ steps.merge.outputs.merged_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge all CI-green branches into main
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # NOTE: GitHub Actions runs `run:` steps as `bash -e {0}`, so errexit is ALREADY active
+          # here — this line adds `-u`/`pipefail` on top of it, it does not disable `-e`. Any bare
+          # command that fails aborts the whole drain, which is why every command in the loop below
+          # that may legitimately fail is explicitly guarded with `if`/`||`/`|| continue`.
+          set -uo pipefail
+          # shellcheck source=../../scripts/auto_merge_decision.sh
+          source scripts/auto_merge_decision.sh
+
+          # Drain EVERY un-merged branch (any prefix) below, not just the one whose CI run just
+          # completed. The concurrency group (auto-merge-main) keeps only ONE run pending, so rapid
+          # CI completions from several branches can drop a queued run entirely (GitHub keeps at
+          # most one pending run per group). Processing every branch here means whichever run does
+          # execute also picks up any stranded stragglers — a dropped queued run can never cause a
+          # branch's work to be lost.
+          if ! git fetch origin --prune; then
+            echo "::warning::git fetch failed; the next CI completion re-triggers and drains."
+            exit 0
+          fi
+
+          git checkout -B main origin/main
+
+          # Every remote branch is a candidate EXCEPT main itself (nothing to merge main into) and
+          # the origin/HEAD symbolic ref (not a real branch).
+          merged_branches=""
+          declare -a newly_merged_shas=()   # tip SHA of every branch genuinely merged (new content) this run
+          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ | grep -v -E '^origin/(main|HEAD)$' || true); do
+            br="${ref#origin/}"
+
+            # Already contained in main (e.g. a prior run merged it): just clean up.
+            if is_ancestor_of "$ref" main; then
+              merged_branches="$merged_branches $br"
+              continue
+            fi
+
+            # --- CI gate -----------------------------------------------------------
+            # Only merge a branch whose EXACT tip commit has a successful CI run. We query the
+            # latest "CI" workflow run for that precise SHA, so a commit pushed after CI passed (new
+            # tip, no green run yet) is skipped until its own CI completes green. Fail closed: any
+            # non-success (in-progress, failure, missing run, or API error) skips the branch —
+            # ci_conclusion_from_json / is_ci_green (scripts/auto_merge_decision.sh, sourced above)
+            # hold this fail-closed logic and are exercised by tests/test_auto_merge_logic.sh, not
+            # just actionlint/shellcheck syntax checks.
+            sha="$(git rev-parse "$ref" 2>/dev/null)" || { echo "::warning::could not resolve $ref to a SHA; skipping it this drain."; continue; }
+            # per_page=20 comfortably covers every run a single SHA could accumulate (this repo's
+            # ci.yml declares both `push` and `workflow_dispatch` triggers, so one SHA can have more
+            # than one run). Deliberately NOT filtered to event=push: a workflow_dispatch run of
+            # ci.yml runs the identical checks, so a green dispatch run is just as legitimate a signal
+            # as a green push run -- filtering it out would break the documented manual escape hatch.
+            # Combined with ci_conclusion_from_json/ci_run_id_from_json/ci_run_attempt_from_json
+            # selecting the newest run explicitly by max(.id) (see their header comments in
+            # scripts/auto_merge_decision.sh), correctness here no longer depends on API ordering at
+            # all.
+            runs_json="$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
+              2>/dev/null || echo "")"
+            ci_conclusion="$(ci_conclusion_from_json "$runs_json")"
+            if ! is_ci_green "$ci_conclusion"; then
+              # ONE-SHOT, CONTENT-FREE RETRY. Without this, a red-CI branch just sits parked
+              # indefinitely — no automated remediation at all, even for a transient/flaky CI
+              # failure. should_retry_failed_ci bounds this to exactly ONE attempt ever per run
+              # (GitHub's own run_attempt counter is the idempotency marker — a rerun that fails
+              # again reads attempt=2 and is never retried again); the rerun's own completion
+              # re-triggers this workflow via the existing workflow_run trigger, so no polling is
+              # needed here.
+              run_id="$(ci_run_id_from_json "$runs_json")"
+              run_attempt="$(ci_run_attempt_from_json "$runs_json")"
+              if should_retry_failed_ci "$ci_conclusion" "$run_attempt" && [ -n "$run_id" ]; then
+                echo "::notice::$br — CI for ${sha:0:7} failed on attempt 1; requesting a one-shot re-run (run $run_id) before treating it as stranded."
+                gh run rerun "$run_id" --failed 2>/dev/null \
+                  || echo "::warning::Could not request a re-run for $br (run $run_id) — falls through to the existing stranded-branch alert if it stays red."
+              fi
+              echo "::notice::Skipping $br — CI for ${sha:0:7} is '$ci_conclusion', not success. It merges once its CI run completes green."
+              continue
+            fi
+
+            # A branch with NO common ancestor (an orphan history) is not a content conflict: `git merge`
+            # exits 128 without ever setting MERGE_HEAD, so the abort/hard-stop path below cannot classify
+            # it, and the generic conflict branch would open an `Auto-merge conflict:` PR that GitHub can
+            # never merge without --allow-unrelated-histories -- a permanently stuck artifact that would
+            # also re-trip stranded-branch-check.yml on every sweep. Skip it with a distinct message; the
+            # 6-hourly stranded-branch sweep is the correct escalation path for a human to look at it.
+            if ! git merge-base "$ref" main >/dev/null 2>&1; then
+              echo "::warning::Skipping $br — it shares no common history with main (orphan branch). This is NOT a content conflict; it needs a human decision, and the stranded-branch sweep will flag it."
+              continue
+            fi
+
+            # Fast-forward if possible, else a merge commit.
+            if git merge --ff-only "$ref" || git merge --no-ff "$ref" -m "Auto-merge $br into main"; then
+              merged_branches="$merged_branches $br"
+              newly_merged_shas+=("$sha")   # genuinely new content landed this run
+            else
+              # merge --abort failing here is a hard stop, not a warning: a repo left mid-merge
+              # (MERGE_HEAD still present) would make every subsequent `git merge` in this loop
+              # report a false conflict against branches that are actually fine, cascading one real
+              # conflict into many bogus "Auto-merge conflict:" PRs. Stopping the whole drain now is
+              # strictly safer than continuing in a corrupted state — the next run starts clean.
+              git merge --abort || true
+              if git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+                echo "::error::merge abort failed for $br — repo still mid-merge (MERGE_HEAD present); stopping the drain now to avoid cascading false conflicts onto every later branch in this loop." >&2
+                exit 1
+              fi
+              echo "::warning::Unresolved conflict merging $br."
+              gh pr create --base main --head "$br" \
+                --title "Auto-merge conflict: $br" \
+                --body "The auto-merge workflow hit a conflict it could not auto-resolve. Resolve manually and merge, or close if superseded." \
+                || echo "PR already exists or could not be created."
+            fi
+          done
+
+          if [ -z "${merged_branches// }" ]; then
+            echo "No CI-green branches to merge."
+            exit 0
+          fi
+
+          if ! git push origin main; then
+            echo "::warning::push to main failed; branches left intact for the next run."
+            exit 0
+          fi
+
+          # STEP OUTPUT for the `postmerge` job (see its header comment below for the full
+          # rationale). Gate on newly_merged_shas, not merged_branches: newly_merged_shas is
+          # populated ONLY inside the `git merge --ff-only/--no-ff` success branch above (a
+          # genuinely NEW merge this run) — the earlier `is_ancestor_of "$ref" main` "already
+          # merged, just needs branch cleanup" path adds to merged_branches but deliberately never
+          # appends to newly_merged_shas. So this is exactly "did this run land new content on
+          # main", not "did this run touch merged_branches at all" (which would also fire on a
+          # cleanup-only re-run of an already-merged branch, wasting a macOS build on a tree that
+          # hasn't changed). Combined with the push-succeeded check just above, this also
+          # guarantees that the recorded `merged_sha` is a real, fetchable commit on `origin/main` —
+          # `postmerge` then checks it out by that exact SHA (not by branch name), so a later push to
+          # `main` cannot swap the tree out from under it.
+          if [ "${#newly_merged_shas[@]}" -gt 0 ]; then
+            echo "did_merge=true" >> "$GITHUB_OUTPUT"
+            echo "merged_sha=$(git rev-parse main)" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Delete each merged branch ONLY after re-confirming its current remote tip is fully
+          # contained in the new main, so a commit pushed during the merge window is never deleted
+          # unmerged — it's left for the next run.
+          for br in $merged_branches; do
+            git fetch origin "$br" >/dev/null 2>&1 || continue
+            br_sha="$(git rev-parse "origin/$br" 2>/dev/null)" || continue
+            if is_ancestor_of "$br_sha" main; then
+              # Compare-and-swap delete: --force-with-lease pins the exact SHA whose ancestry
+              # was just confirmed, so if a commit lands on the branch between that check and
+              # this push, the delete is REJECTED ("stale info") instead of silently discarding
+              # the new commit. The plain `--delete` this replaces had no such check — the
+              # ancestry test above was a TOCTOU window, not a guarantee.
+              git push origin --force-with-lease="refs/heads/$br:$br_sha" --delete "$br" \
+                || echo "::warning::delete of $br was rejected (it advanced after the ancestry check, or the push failed); leaving it for the next run."
+            else
+              echo "::warning::$br advanced during the merge; not deleting (next run merges it)."
+            fi
+          done
+
+  # ===================================================================================================
+  # POST-MERGE COVERAGE CHECK.
+  #
+  # THE GAP THIS CLOSES. The `merge` job above lands branches into main with `git merge --no-ff` /
+  # `--ff-only` and pushes with the workflow's own GITHUB_TOKEN. GitHub does NOT trigger new workflow
+  # runs from a GITHUB_TOKEN push (documented Actions behavior — it exists to prevent recursive
+  # workflow loops), so ci.yml's `push:` trigger never fires for the merge commit this job creates.
+  # main's actual merged tip — the tree every future branch's diff-base is taken against — therefore
+  # has ZERO CI signal of its own, even though every contributing branch was individually green. Two
+  # branches can each be green on their own and still break the app once combined (e.g. one changes a
+  # Swift symbol that another branch, touching an unrelated file, depends on).
+  #
+  # WHY A SEPARATE JOB ON macos-latest, NOT MORE STEPS ON THE `merge` JOB. The source of this workflow
+  # ran its equivalent check as trailing steps in the same (credential-free, cheap) job as the merge,
+  # because those checks were plain Python with no build step. That shortcut does not carry over here:
+  # this repo's post-merge check has to actually build the macOS app (`swift build`, `build_app.sh`),
+  # which requires a macos-latest runner — GitHub bills macOS minutes at 10x Linux minutes, and this
+  # repo is private (billed, not free). The `merge` job runs on every CI completion and merges nothing
+  # on most runs; putting the build check inline would force EVERY one of those runs onto a macOS
+  # runner. Splitting it into its own job, gated on `needs.merge.outputs.did_merge == 'true'`, means
+  # the macOS runner only spins up on runs that actually landed new content on main.
+  #
+  # FRESH CHECKOUT, NOT THE MERGE JOB'S WORKING TREE. Because `postmerge` runs on a different runner
+  # (macos-latest) than `merge` (ubuntu-latest), it cannot reuse the merge job's working tree and must
+  # check out fresh below — unlike the source, which could reuse its single job's in-place tree with no
+  # extra checkout. It pins the EXACT SHA the merge job pushed (`ref: needs.merge.outputs.merged_sha`),
+  # not the `main` branch name, because this repo has no branch protection: a human push to `main` in
+  # the gap between the bot's push and this job's checkout would otherwise make this job silently
+  # verify a different tree than the one the bot produced, either falsely clearing a broken merge or
+  # falsely blaming the bot for someone else's breakage.
+  #
+  # DELIBERATE NON-GOAL: no autonomous revert of main. This job's purpose is to make a broken merged
+  # tree IMPOSSIBLE TO MISS (a red run in the Actions tab, plus a GitHub issue), not to act on it —
+  # reverting a push that already landed is a materially higher-blast-radius action (main is what every
+  # future branch and every developer builds from) than the purely additive detection this job is
+  # scoped to. A human decides the remediation.
+  # ===================================================================================================
+  postmerge:
+    needs: merge
+    if: needs.merge.outputs.did_merge == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.merge.outputs.merged_sha }}
+
+      - name: Post-merge build + app check (run against main's ACTUAL merged tip)
+        id: postmerge
+        # `run_check` records a failure and keeps going instead of stopping at the first red check,
+        # so one run surfaces every broken class at once instead of only the first.
+        run: |
+          set -uo pipefail
+          fail=0
+          run_check() {
+            echo "--- $* ---"
+            if ! "$@"; then
+              fail=1
+              echo "::error::post-merge check failed: $*"
+            fi
+          }
+          run_check swift build
+          run_check swift build -c release
+          run_check bash build_app.sh
+          run_check test -x .build/release/AIChalkboard.app/Contents/MacOS/AIChalkboard
+          run_check bash tests/test_auto_merge_logic.sh
+          if [ "$fail" -eq 0 ]; then
+            echo "result=ok" >> "$GITHUB_OUTPUT"
+            echo "All post-merge checks passed against main's merged tip ($(git rev-parse HEAD))."
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+            echo "::error::One or more post-merge checks FAILED against main's merged tip ($(git rev-parse HEAD)) -- see the ::error:: lines above for which one(s). Every contributing branch's OWN CI was green; this is the combined-tree gap this job exists to catch."
+          fi
+
+      - name: Open/refresh finding issue (dedup) — post-merge check failed
+        if: always() && steps.postmerge.outputs.result == 'fail'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          {
+            echo "**RED MAIN** — the post-merge check (swift build, release build, app assembly, and the auto-merge decision-logic tests) failed against main's ACTUAL merged tip ($(git rev-parse HEAD)) after this workflow landed one or more branches. Each contributing branch's OWN CI was green individually — GitHub does not re-trigger ci.yml on this job's GITHUB_TOKEN push, so this is the first and only automated signal that the COMBINED tree is broken. See the failing run for which check(s) failed."
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > /tmp/postmerge_body.md
+
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json number,title \
+            --jq '[.[] | select(.title|startswith("⚠️ Post-merge coverage check:"))][0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body-file /tmp/postmerge_body.md
+            echo "Updated existing issue #$existing."
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "⚠️ Post-merge coverage check: main's merged tip is red" \
+              --body-file /tmp/postmerge_body.md
+          fi
+
+      - name: Close finding issue if resolved
+        if: always() && steps.postmerge.outputs.result == 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json number,title \
+            --jq '[.[] | select(.title|startswith("⚠️ Post-merge coverage check:"))][0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "Resolved — the post-merge check passed against main's current merged tip. Closing."
+            gh issue close "$existing" --repo "$GITHUB_REPOSITORY"
+          fi
+
+      - name: Fail the job if the post-merge check failed
+        # LAST STEP, DELIBERATELY: the checks themselves and the issue signalling above have already
+        # completed by this point, so failing here cannot skip any of it. See the job header comment
+        # above for why a red run (not only a GitHub issue) matters, and why an autonomous revert of
+        # main is explicitly NOT attempted.
+        if: steps.postmerge.outputs.result == 'fail'
+        run: |
+          echo "::error::Post-merge check failed against main's merged tip -- see the 'Post-merge build + app check' step above and the deduped GitHub issue for details."
+          exit 1

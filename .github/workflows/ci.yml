@@ -1,0 +1,181 @@
+name: CI
+
+# The overall run conclusion (success/failure) of THIS workflow IS the merge gate:
+# .github/workflows/auto-merge-claude.yml triggers on this workflow's completion
+# (workflow_run) and merges a branch's exact tip commit into main ONLY if the CI
+# run for that SHA concluded "success". Do NOT add `continue-on-error` to any step
+# in either job below — a step marked continue-on-error can fail silently while the
+# job (and therefore the run) still reports "success", which would let broken code
+# merge to main with zero red signal anywhere.
+#
+# `push:` below is filtered with `branches: ['**']`, which matches EVERY branch
+# (including ones with slashes, like `claude/foo`) and therefore preserves the
+# load-bearing property that every branch push produces a CI run the merge gate can
+# read, while excluding tag pushes (which nothing consumes — auto-merge-claude.yml
+# only ever iterates branch heads under refs/remotes/origin/*, so a tag's CI run was
+# previously just a wasted 10x-billed macOS build with no consumer).
+#
+# Do NOT narrow this further. auto-merge-claude.yml looks up the CI run for a
+# branch's exact tip SHA (repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs
+# ?head_sha=$sha) and fails CLOSED — no run found means the branch is skipped, every
+# single drain, forever. A commit that produces no CI run at all (because it didn't
+# match a branch filter, or only touched paths excluded by a paths-ignore filter) can
+# therefore NEVER merge — it would be stranded permanently, recoverable only by a
+# human pushing an unrelated matching change. If you ever need to skip expensive work
+# for e.g. docs-only changes, gate the JOB (or a step) with an `if:` condition instead
+# — the workflow run still exists and still concludes "success", so auto-merge still
+# sees a green gate for that SHA.
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+# Scoped to ${{ github.sha }}, not just ${{ github.ref }}, because
+# auto-merge-claude.yml's one-shot `gh run rerun` re-enters this concurrency group at
+# whatever the current wall-clock moment is. A ref-scoped group would let that re-run
+# of an OLDER sha cancel the in-progress run of the branch's CURRENT tip if a
+# developer pushes a fix at nearly the same time — leaving the tip's only run
+# "cancelled", which the merge gate rejects (is_ci_green) and which the one-shot
+# retry never repairs (should_retry_failed_ci only ever fires on an exact "failure"
+# conclusion, never "cancelled"). That strands the branch permanently until a human
+# intervenes. Scoping the group to the exact commit means runs for different SHAs can
+# never cancel each other, so this failure mode cannot occur.
+#
+# Accepted cost: two rapid pushes to the same branch now each get their own full CI
+# run — including a 10x-billed macOS build — instead of the older one being
+# cancelled. A wasted run is a strictly better outcome than a permanently stranded
+# branch.
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: shell-lint + actionlint + auto-merge logic tests
+    runs-on: ubuntu-latest
+    # ubuntu-latest, not macos-latest: this job needs no AppKit/Swift toolchain, and
+    # macOS runners bill at 10x on a private repo. Everything here that does not need
+    # to actually compile/run the app lives in this cheap job; only the `build` job
+    # below pays the macOS multiplier.
+    steps:
+      - uses: actions/checkout@v7
+
+      # BLOCKING GATE: actionlint statically checks every workflow file (and runs
+      # shellcheck on each embedded `run:` block). A *blocking* linter must be pinned
+      # so that a future actionlint release adding a new check cannot suddenly
+      # red-light every merge out of nowhere — bump this pin deliberately instead.
+      - name: Cache actionlint binary (pinned v1.7.12)
+        id: cache-actionlint
+        uses: actions/cache@v6
+        with:
+          path: actionlint
+          key: actionlint-v1.7.12-${{ runner.os }}
+      - name: Install actionlint (pinned v1.7.12)
+        if: steps.cache-actionlint.outputs.cache-hit != 'true'
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+      - name: actionlint (workflow YAML + embedded run-block bash via shellcheck)
+        run: ./actionlint -color
+
+      - name: shellcheck standalone scripts (warning+ blocks)
+        run: |
+          set -euo pipefail
+          # nullglob so a non-matching pattern disappears instead of being passed to
+          # the linter below as a literal, nonexistent path (bash's default when
+          # nothing matches a glob). Zero files found is treated as an ERROR, not a
+          # silent no-op -- a broken checkout or an accidentally-deleted directory
+          # should fail loudly here rather than let this step pass having checked
+          # nothing.
+          shopt -s nullglob
+          files=(scripts/*.sh tests/*.sh .claude/*.sh)
+          shopt -u nullglob
+          existing=()
+          for f in "${files[@]}"; do [ -f "$f" ] && existing+=("$f"); done
+          if [ "${#existing[@]}" -eq 0 ]; then
+            echo "::error::shellcheck found zero .sh files across scripts/, tests/, .claude/ — broken checkout or repo layout, not nothing to check."
+            exit 1
+          fi
+          # Floored at -S warning (unpinned, whatever ships on the runner): only
+          # warnings/errors block. The scripts pass clean today; this just stops a
+          # future shellcheck release's new *style/info*-level nit from wedging a
+          # blocking gate.
+          shellcheck -S warning "${existing[@]}"
+
+      - name: workflow_run trigger name stays in sync (auto-merge-claude.yml <-> ci.yml name:)
+        # actionlint does NOT catch this: auto-merge-claude.yml's on.workflow_run.workflows
+        # matches against a workflow's name: field, not its filename. Renaming this
+        # workflow's `name:` without updating that array would silently and permanently
+        # stop CI completions from re-triggering auto-merge, with zero red CI signal.
+        #
+        # The grep below is anchored to the indented `workflows:` YAML key specifically
+        # (leading whitespace, then `workflows:`, then the opening `[`) so that a `#`
+        # comment merely mentioning the word "workflows:" elsewhere in the file can
+        # neither satisfy this check (reading a stale comment instead of the real array
+        # and reporting OK on an actual desync) nor break it (a correct file must still
+        # match the real key line, not an unrelated comment). The trailing `|| true` on
+        # the grep is required, not decorative: under `set -e`, a `var="$(cmd)"`
+        # assignment whose command substitution exits non-zero (grep's exit status when
+        # it finds NO match) aborts the script right there, bare, before the `if [ -z
+        # "$line" ]` guard below ever runs — silently skipping this whole check with no
+        # ::error:: at all. `|| true` lets a no-match assign an empty string instead, so
+        # the guard is what reports the failure, loudly, as intended.
+        run: |
+          set -euo pipefail
+          ci_name="$(grep -m1 '^name:' .github/workflows/ci.yml | sed 's/^name:[[:space:]]*//')"
+          line="$(grep -m1 -E '^[[:space:]]+workflows:[[:space:]]*\[' .github/workflows/auto-merge-claude.yml || true)"
+          if [ -z "$line" ]; then
+            echo "::error::could not find the on.workflow_run.workflows array in .github/workflows/auto-merge-claude.yml -- the merge trigger may have been restructured; this check cannot verify it."
+            exit 1
+          fi
+          mapfile -t triggers < <(printf '%s' "$line" | grep -oP '(?<=\[)[^]]*(?=\])' | tr ',' '\n' | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
+          found=0
+          for t in "${triggers[@]}"; do [ "$t" = "$ci_name" ] && found=1 && break; done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::auto-merge-claude.yml's on.workflow_run.workflows is missing [$ci_name] (this file's name: field) -- CI completions will silently stop re-triggering auto-merge."
+            exit 1
+          fi
+          echo "OK: workflow_run trigger name matches ci.yml's name: field."
+
+      # The most CONSEQUENTIAL automation in this repo is the embedded bash that decides
+      # whether a branch's work reaches main (auto_merge_decision.sh, consumed by
+      # auto-merge-claude.yml). This is therefore a hard BLOCKING gate, not an advisory
+      # check: a failure here fails the CI run, which fails the merge gate above.
+      - name: auto-merge decision logic (CI-gate + delete-safety fixtures)
+        run: bash tests/test_auto_merge_logic.sh
+
+      - name: test_mcp_stdio.py syntax check
+        # Not run: it launches the built .app over stdio and drives it via JSON-RPC,
+        # which requires a real GUI/AppKit process and cannot execute headless in CI.
+        # Compiling it is enough to catch syntax errors before they'd break a human's
+        # local debugging session.
+        run: python3 -m py_compile test_mcp_stdio.py
+
+  build:
+    name: swift build (debug + release) + app bundle
+    runs-on: macos-latest
+    # macos-latest runners bill at 10x on a private repo, which is exactly why every
+    # check above that does NOT need AppKit/the Swift toolchain lives in the cheap
+    # ubuntu `checks` job instead. This job only does what genuinely requires macOS.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain version (recorded in the log)
+        run: swift --version
+
+      - name: swift build (debug)
+        run: swift build
+
+      - name: swift build (release)
+        run: swift build -c release
+
+      - name: Assemble .app bundle
+        run: bash build_app.sh
+
+      - name: Verify bundle contents
+        run: |
+          set -euo pipefail
+          test -x .build/release/AIChalkboard.app/Contents/MacOS/AIChalkboard
+          test -f .build/release/AIChalkboard.app/Contents/Info.plist
