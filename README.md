@@ -1,0 +1,68 @@
+# AI Chalkboard 🎨
+
+A lightweight, click-through, AI-only drawing overlay for macOS controlled via an in-process **Model Context Protocol (MCP)** server over `stdio`.
+
+Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Claude Code**) to draw highlights, focus boxes, arrows, and labels directly over UI elements during visual computer-use tasks, while **all human mouse and keyboard input passes straight through** to underlying apps.
+
+---
+
+## Key Features
+
+- **Click-Through Input Transparency**: Built with `window.ignoresMouseEvents = true`. The overlay window never consumes mouse clicks, drags, or keystrokes.
+- **Multi-Monitor Aware**: Automatically spawns transparent overlay windows across all connected displays and adjusts when display configurations change.
+- **Dual Coordinate Systems**:
+  - **Physical Pixel Space** (default): Matches screenshot tool dimensions (`x: 500, y: 300`).
+  - **Normalized Ratio Space** (`is_normalized: true`): Coordinates between `0.0` and `1.0` relative to screen dimensions (`x: 0.5, y: 0.5` targets center screen).
+- **Auto-Clear Duration**: Optional `duration_seconds` parameter on all drawing tools (e.g. `duration_seconds: 3.0`) causes drawing annotations to automatically disappear after N seconds to keep the screen uncluttered.
+- **Spatial Alignment Grid**: `draw_grid` tool renders a temporary pixel grid (e.g., 200px lines) to calibrate agent spatial awareness during screen recording tasks.
+- **macOS Dock Icon**: Set to `.regular` activation policy (`LSUIElement = false`). Displays in the macOS Dock so the user can easily right-click → Quit the application at any time. Also provides a menu bar status item ("Clear All Annotations", "Quit").
+
+---
+
+## MCP Tools Reference
+
+| Tool | Parameters | Description |
+| --- | --- | --- |
+| `get_screens` | `none` | Returns display IDs, physical pixel resolutions, backing scale factors, and point dimensions. |
+| `draw_circle` | `screen_id`, `x`, `y`, `radius`, `color?`, `label?`, `is_normalized?`, `duration_seconds?` | Draws a circle highlight badge. |
+| `draw_arrow` | `screen_id`, `x1`, `y1`, `x2`, `y2`, `color?`, `label?`, `is_normalized?`, `duration_seconds?` | Draws an arrow line from `(x1,y1)` to `(x2,y2)`. |
+| `draw_box` | `screen_id`, `x`, `y`, `width`, `height`, `color?`, `label?`, `is_normalized?`, `duration_seconds?` | Draws a rectangle highlight box. |
+| `draw_label` | `screen_id`, `x`, `y`, `text`, `color?`, `is_normalized?`, `duration_seconds?` | Draws a floating text badge with contrasting background. |
+| `draw_path` | `screen_id`, `points`, `color?`, `stroke_width?`, `is_closed?`, `label?`, `is_normalized?`, `duration_seconds?` | Draws a freehand path or organic sketch from an array of coordinates (ideal for freehand circles, loops, squiggles, checkmarks, custom callouts). |
+| `draw_grid` | `screen_id`, `step_px?`, `color?`, `duration_seconds?` | Draws an alignment grid overlay for spatial calibration. |
+| `clear` | `annotation_id?` | Clears a specific annotation by ID, or clears all annotations if omitted. |
+| `list_annotations` | `none` | Returns all currently active annotations across screens. |
+
+---
+
+## Build & Run Instructions
+
+```bash
+./build_app.sh
+```
+Executes release compilation and packages `.build/release/AIChalkboard.app`.
+
+---
+
+## Claude Desktop / Cowork Integration
+
+Add AI Chalkboard to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "ai-chalkboard": {
+      "command": "/Users/jack/Desktop/My Apps/AI-Chalkboard/.build/release/AIChalkboard.app/Contents/MacOS/AIChalkboard",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+---
+
+## Why This Setup is Ideal for Claude Cowork
+
+1. **Pixel-Perfect Alignment with Computer Use**: Screenshots captured by Claude Cowork match display physical pixel resolutions. Passing `x` and `y` directly from image analysis draws highlights at the exact pixel position.
+2. **Auto-Disappearing Annotations**: By passing `duration_seconds: 3`, Claude can highlight buttons or input fields briefly while explaining steps to the user without cluttering the screen.
+3. **Zero Input Disruption**: User can continue typing or clicking underneath while Claude draws highlights.
