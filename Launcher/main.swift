@@ -1,13 +1,6 @@
 import Foundation
 import AppKit
-
-/// Central place to determine which mode this process was launched in.
-/// Claude Desktop launches this binary as `AIChalkboard --mcp`; a normal
-/// GUI launch (Finder/Dock double-click) passes no arguments. AppDelegate
-/// reads this flag to decide the NSApplication activation policy.
-enum LaunchMode {
-    static let isMCPMode = CommandLine.arguments.contains("--mcp")
-}
+import AIChalkboardCore
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

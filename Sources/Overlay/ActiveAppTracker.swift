@@ -1,6 +1,18 @@
 import Foundation
 import AppKit
 
+/// Shared conservative syntax for an exact, complete bundle identifier.
+/// Three non-empty reverse-DNS components distinguish `com.apple.Safari` from
+/// vague prefixes such as `com.apple`, which must still undergo ambiguity checks.
+enum BundleIdentifierSyntax {
+    static func looksComplete(_ value: String) -> Bool {
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count >= 3
+            && parts.allSatisfy { !$0.isEmpty }
+            && value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+    }
+}
+
 /// A resolved application: a bundle identifier plus the human-readable name we
 /// found it under. Returned by `ActiveAppTracker.resolve(_:)` and embedded in
 /// `Annotation.appId` / `Annotation.appName`.
@@ -104,8 +116,9 @@ public final class ActiveAppTracker: NSObject {
     }
 
     /// The app an UNTAGGED `draw_*` call gets linked to: the most recent
-    /// frontmost application excluding AI Chalkboard itself AND excluding
-    /// Claude.
+    /// frontmost application excluding AI Chalkboard itself, Claude, and
+    /// prohibited/background-only processes and macOS session UI such as
+    /// `loginwindow`, none of which is a usable annotation destination.
     ///
     /// WHY THIS EXISTS -- the whole feature is broken without it:
     ///
@@ -215,6 +228,8 @@ public final class ActiveAppTracker: NSObject {
 
         let isSelf = isOwnApp(bundleId)
         let isClaude = isClaudeApp(bundleId)
+        let isProhibited = app?.activationPolicy == .prohibited
+        let isSystemSessionApp = Self.isSystemSessionApp(bundleId)
 
         lock.lock()
         let previousCurrentId = _currentAppId
@@ -223,7 +238,7 @@ public final class ActiveAppTracker: NSObject {
             _currentAppId = bundleId
             _currentAppName = name
         }
-        if !isSelf && !isClaude {
+        if !isSelf && !isClaude && !isProhibited && !isSystemSessionApp {
             _fallbackAppId = bundleId
             _fallbackAppName = name
         }
@@ -235,13 +250,23 @@ public final class ActiveAppTracker: NSObject {
         let didChange = (_currentAppId != previousCurrentId) || (_fallbackAppId != previousFallbackId)
         let currentForLog = _currentAppId ?? "<none>"
         let fallbackForLog = _fallbackAppId ?? "<none>"
-        let shouldLogExclusion = (isSelf || isClaude) && loggedExclusions.insert(bundleId).inserted
+        let shouldLogExclusion = (isSelf || isClaude || isProhibited || isSystemSessionApp)
+            && loggedExclusions.insert(bundleId).inserted
         lock.unlock()
 
         if shouldLogExclusion {
             // Log every excluded id ONCE so that "why did my drawing get tagged
             // to the wrong app" is answerable from the log alone.
-            let reason = isSelf ? "it is AI Chalkboard itself" : "it matched the Claude/Anthropic heuristic"
+            let reason: String
+            if isSelf {
+                reason = "it is AI Chalkboard itself"
+            } else if isClaude {
+                reason = "it matched the Claude/Anthropic heuristic"
+            } else if isSystemSessionApp {
+                reason = "it is macOS session UI, not an app the user can annotate"
+            } else {
+                reason = "its activation policy is prohibited, so it cannot be a usable annotation target"
+            }
             Logger.shared.log(
                 "ActiveAppTracker: EXCLUDING '\(bundleId)' (\(name)) from the untagged-draw fallback target because \(reason). Untagged draw_* calls will stay linked to the last app before it.",
                 level: "INFO"
@@ -291,6 +316,13 @@ public final class ActiveAppTracker: NSObject {
         return lower.contains("anthropic") || lower.contains("claude")
     }
 
+    /// Session/login UI can temporarily become frontmost while the screen is
+    /// locked. macOS reports loginwindow as activatable on some releases, so
+    /// activationPolicy alone cannot identify this unusable fallback target.
+    static func isSystemSessionApp(_ bundleId: String) -> Bool {
+        bundleId.caseInsensitiveCompare("com.apple.loginwindow") == .orderedSame
+    }
+
     // MARK: - Resolution
 
     /// Resolves a user-supplied string -- which may be a bundle identifier
@@ -299,7 +331,7 @@ public final class ActiveAppTracker: NSObject {
     ///
     /// Matching order, all case-insensitive:
     ///   1. exact bundle id                  -- unambiguous by definition
-    ///   2. exact display name               -- unambiguous by definition
+    ///   2. exact display name, if exactly one activatable bundle id matches
     ///   3. bundle-id PREFIX, but only if exactly ONE running app matches
     ///   4. display-name SUBSTRING, but only if exactly ONE running app matches
     /// Anything else is `.ambiguous` (several candidates) or `.notFound`.
@@ -330,7 +362,7 @@ public final class ActiveAppTracker: NSObject {
     /// legitimate answer, and both exist to stop a fuzzy pass "succeeding" with
     /// something the user could never have meant:
     ///
-    ///   * The name pass ignores apps with NO `localizedName`. For those,
+    ///   * Both name passes ignore apps with NO `localizedName`. For those,
     ///     `AppRef.name` is just the bundle id echoed back, and matching a
     ///     "display name" that is really a bundle id is how the dangerous vague
     ///     query survives uniqueness: `"com"` matched dozens of bundle ids
@@ -338,7 +370,7 @@ public final class ActiveAppTracker: NSObject {
     ///     `com.apple.PressAndHold`, a nameless `.prohibited` input agent -- and
     ///     was "resolved" to it. Bundle ids get exactly one pass, the prefix one.
     ///
-    ///   * Both fuzzy passes ignore `.prohibited` processes (XPC services and
+    ///   * Exact-name and both fuzzy passes ignore `.prohibited` processes (XPC services and
     ///     the like: `AutoFill (Google Chrome)`, `Open and Save Panel Service`).
     ///     Such a process CANNOT be activated, so it can never be the frontmost
     ///     app, so an annotation linked to it is unconditionally invisible --
@@ -371,8 +403,23 @@ public final class ActiveAppTracker: NSObject {
         if let hit = candidates.first(where: { $0.ref.bundleId.caseInsensitiveCompare(query) == .orderedSame }) {
             return .resolved(hit.ref)
         }
-        if let hit = candidates.first(where: { $0.ref.name.caseInsensitiveCompare(query) == .orderedSame }) {
-            return .resolved(hit.ref)
+        let exactNameHits = dedupedByBundleId(candidates.filter {
+            $0.canBeFrontmost
+                && $0.hasDisplayName
+                && $0.ref.name.caseInsensitiveCompare(query) == .orderedSame
+        })
+        if exactNameHits.count == 1 {
+            return .resolved(exactNameHits[0].ref)
+        }
+        if exactNameHits.count > 1 {
+            return ambiguousResolution(query: query, hits: exactNameHits)
+        }
+        // A fully qualified bundle identifier is more specific than a prefix
+        // match. If it is not running, preserve it verbatim so it can become
+        // visible when launched; do this before fuzzy passes whose helpers may
+        // share its prefix.
+        if BundleIdentifierSyntax.looksComplete(query) {
+            return .notFound
         }
 
         let lowered = query.lowercased()
@@ -400,16 +447,19 @@ public final class ActiveAppTracker: NSObject {
         for hit in nameHits where !ambiguous.contains(where: { $0.ref.bundleId.caseInsensitiveCompare(hit.ref.bundleId) == .orderedSame }) {
             ambiguous.append(hit)
         }
-        let ordered = ambiguous.filter { $0.isRegularApp }.map { $0.ref }
-            + ambiguous.filter { !$0.isRegularApp }.map { $0.ref }
-
-        if ordered.count > 1 {
-            Logger.shared.log("ActiveAppTracker: app query '\(query)' is AMBIGUOUS -- it matches \(ordered.count) running applications (\(ordered.map { $0.bundleId }.joined(separator: ", "))). Refusing to guess; the caller is told to be more specific.", level: "WARN")
-            return .ambiguous(ordered)
+        if ambiguous.count > 1 {
+            return ambiguousResolution(query: query, hits: ambiguous)
         }
 
         Logger.shared.log("ActiveAppTracker: could not resolve app '\(query)' against \(candidates.count) running applications.", level: "WARN")
         return .notFound
+    }
+
+    private func ambiguousResolution(query: String, hits: [Candidate]) -> AppResolution {
+        let ordered = hits.filter { $0.isRegularApp }.map { $0.ref }
+            + hits.filter { !$0.isRegularApp }.map { $0.ref }
+        Logger.shared.log("ActiveAppTracker: app query '\(query)' is AMBIGUOUS -- it matches \(ordered.count) running applications (\(ordered.map { $0.bundleId }.joined(separator: ", "))). Refusing to guess; the caller is told to be more specific.", level: "WARN")
+        return .ambiguous(ordered)
     }
 
     /// Collapses several `NSRunningApplication` entries that share one bundle id

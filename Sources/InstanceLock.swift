@@ -18,6 +18,12 @@ import Foundation
 public final class InstanceLock: @unchecked Sendable {
     public static let shared = InstanceLock()
 
+    /// Test-only path override. Production resolves the user's Application
+    /// Support path; isolated tests use a unique temporary file and therefore
+    /// never contend with or mutate the live app's lock.
+    private let lockURLOverride: URL?
+    private let logHandler: (String, String) -> Void
+
     /// Kept open for the lifetime of the process. Closing this descriptor
     /// (or letting it be deallocated) would release the flock, so it is
     /// intentionally never closed once acquired.
@@ -37,6 +43,11 @@ public final class InstanceLock: @unchecked Sendable {
     /// How many consecutive retry polls have found NO lock file at all.
     /// See `missingLockFilePollsBeforeRecreate`.
     private var consecutiveMissingLockFilePolls = 0
+
+    /// Last retry-only anomaly written to the log. Retry acquisition runs every
+    /// three seconds and Logger has no level filtering, so an unresolved error
+    /// is logged once per episode rather than once per poll.
+    private var lastRetryAnomaly: String?
 
     /// How long a secondary tolerates a missing lock file before recreating it
     /// and promoting itself, expressed in retry polls.
@@ -70,7 +81,31 @@ public final class InstanceLock: @unchecked Sendable {
         case lockFileMissing
     }
 
-    private init() {}
+    /// A primary lock check has more than two meaningful outcomes: a fail-open
+    /// primary with no descriptor must retain its UI, while only a proven owner
+    /// of the repaired path should make this process relinquish it.
+    public enum RevalidationResult: Equatable {
+        case retainPrimary
+        case relinquishToPathOwner
+    }
+
+    private init() {
+        lockURLOverride = nil
+        logHandler = { message, level in
+            Logger.shared.log(message, level: level)
+        }
+    }
+
+    init(lockURL: URL, logHandler: @escaping (String, String) -> Void = { _, _ in }) {
+        lockURLOverride = lockURL
+        self.logHandler = logHandler
+    }
+
+    deinit {
+        if lockFileDescriptor >= 0 {
+            close(lockFileDescriptor)
+        }
+    }
 
     /// Attempts to become the primary instance.
     ///
@@ -185,6 +220,7 @@ public final class InstanceLock: @unchecked Sendable {
         // and `performAcquire`.
         switch performAcquire(logContention: false, failOpen: false, verifyInode: true, createIfMissing: false) {
         case .primary:
+            clearRetryAnomaly()
             consecutiveMissingLockFilePolls = 0
             acquired = true
             return true
@@ -194,6 +230,7 @@ public final class InstanceLock: @unchecked Sendable {
             return false
 
         case .lockFileMissing:
+            clearRetryAnomaly()
             // No lock file at all. A LIVE primary repairs that within about one
             // poll (`revalidatePrimaryLock`), so a single sighting proves
             // nothing -- but an indefinite refusal would strand this process if
@@ -205,7 +242,7 @@ public final class InstanceLock: @unchecked Sendable {
             }
             consecutiveMissingLockFilePolls = 0
 
-            Logger.shared.log("InstanceLock: the lock file has been missing for \(Self.missingLockFilePollsBeforeRecreate) consecutive polls -- long enough that a live primary would have recreated it. Assuming no primary exists (deleted lock file plus an exited primary, or a wiped Application Support folder) and recreating it now, so this process is not left with no status item, no Dock icon and no window.", level: "INFO")
+            log("InstanceLock: the lock file has been missing for \(Self.missingLockFilePollsBeforeRecreate) consecutive polls -- long enough that a live primary would have recreated it. Assuming no primary exists (deleted lock file plus an exited primary, or a wiped Application Support folder) and recreating it now, so this process is not left with no status item, no Dock icon and no window.", level: "INFO")
 
             if performAcquire(logContention: false, failOpen: false, verifyInode: true, createIfMissing: true) == .primary {
                 acquired = true
@@ -244,59 +281,133 @@ public final class InstanceLock: @unchecked Sendable {
     /// only because locking failed open (`lockFileDescriptor < 0`): there is no
     /// lock to validate, and re-testing could only produce a false alarm.
     @discardableResult
-    public func revalidatePrimaryLock() -> Bool {
-        guard lockFileDescriptor >= 0 else { return false }
+    public func revalidatePrimaryLock() -> RevalidationResult {
+        // Initial acquisition deliberately fails open when locking itself is
+        // unavailable. No descriptor is not proof that somebody else owns the
+        // role, so the only safe result is to keep the sole user-facing UI.
+        guard lockFileDescriptor >= 0 else { return .retainPrimary }
 
-        guard let lockURL = resolveLockURL(failureWording: "cannot revalidate the primary lock this tick") else {
-            return true
+        guard let lockURL = resolveLockURL(failureWording: "cannot revalidate the primary lock this tick", logFailures: false) else {
+            logRetryAnomalyOnce(
+                key: "primary-resolve-lock-url",
+                message: "InstanceLock: could not resolve or create the primary lock path. Retaining the primary role and suppressing repeats until the condition changes."
+            )
+            return .retainPrimary
         }
 
         var fdInfo = stat()
-        var pathInfo = stat()
-        let fdOK = fstat(lockFileDescriptor, &fdInfo) == 0
-        let pathOK = stat(lockURL.path, &pathInfo) == 0
-
-        if fdOK && pathOK && fdInfo.st_dev == pathInfo.st_dev && fdInfo.st_ino == pathInfo.st_ino {
-            return true // The overwhelmingly common case: nothing to do, nothing logged.
+        guard fstat(lockFileDescriptor, &fdInfo) == 0 else {
+            let err = errno
+            logRetryAnomalyOnce(
+                key: "primary-fstat-\(err)",
+                message: "InstanceLock: could not inspect the primary lock descriptor (errno \(err) \(String(cString: strerror(err)))). Retaining the primary role because this does not prove another process owns it; will retry next tick."
+            )
+            return .retainPrimary
         }
 
-        Logger.shared.log("InstanceLock: the primary lock file at \(lockURL.path) is no longer the file this process locked (deleted or replaced). Recreating it so secondary instances can still see that a primary exists -- otherwise their next poll would lock a fresh inode and install a SECOND status-bar item.", level: "WARN")
+        var pathInfo = stat()
+        let pathOK = stat(lockURL.path, &pathInfo) == 0
+        let pathErr = pathOK ? 0 : errno
+
+        if pathOK && fdInfo.st_dev == pathInfo.st_dev && fdInfo.st_ino == pathInfo.st_ino {
+            clearRetryAnomaly()
+            return .retainPrimary
+        }
+
+        guard pathOK || pathErr == ENOENT else {
+            logRetryAnomalyOnce(
+                key: "primary-stat-\(pathErr)",
+                message: "InstanceLock: could not inspect the primary lock path at \(lockURL.path) (errno \(pathErr) \(String(cString: strerror(pathErr)))). Retaining the primary role because this does not prove replacement; will retry next tick."
+            )
+            return .retainPrimary
+        }
 
         let newFd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
         guard newFd >= 0 else {
             let err = errno
-            Logger.shared.log("InstanceLock: could not recreate the lock file at \(lockURL.path) (errno \(err) \(String(cString: strerror(err)))). Staying primary and keeping the old descriptor; will retry on the next tick.", level: "WARN")
-            return true
+            logRetryAnomalyOnce(
+                key: "primary-repair-open-\(err)",
+                message: "InstanceLock: could not recreate \(lockURL.path) (errno \(err) \(String(cString: strerror(err)))). Retaining the existing primary role; will retry next tick."
+            )
+            return .retainPrimary
         }
 
         guard flock(newFd, LOCK_EX | LOCK_NB) == 0 else {
             let err = errno
+            let replacementIsPathVisible = descriptor(newFd, matchesPath: lockURL.path)
             close(newFd)
-            // Another instance got to the recreated file first (it recreated it
-            // itself before this repair ran). Keep the old descriptor and stay
-            // primary -- this process owns the status item and must not drop it
-            // -- and retry: the other side declines to promote on a file it did
-            // not find, closes its probe fd, and this repair wins a later tick.
-            Logger.shared.log("InstanceLock: recreated lock file at \(lockURL.path) is already locked by another process (errno \(err)). Keeping the existing descriptor and this process's primary role; retrying on the next tick.", level: "WARN")
-            return true
+
+            if err == EWOULDBLOCK && replacementIsPathVisible {
+                log("InstanceLock: another process holds the path-visible replacement at \(lockURL.path). Relinquishing this process's orphaned lock and primary role so there cannot be two permanent status-bar owners.", level: "WARN")
+                close(lockFileDescriptor)
+                lockFileDescriptor = -1
+                acquired = false
+                clearRetryAnomaly()
+                return .relinquishToPathOwner
+            }
+
+            logRetryAnomalyOnce(
+                key: "primary-repair-flock-\(err)-visible-\(replacementIsPathVisible)",
+                message: "InstanceLock: could not lock the replacement at \(lockURL.path) (errno \(err) \(String(cString: strerror(err))), path-visible=\(replacementIsPathVisible)). Retaining the existing primary role because this is not proof of a competing path owner; will retry next tick."
+            )
+            return .retainPrimary
         }
 
-        // Release the lock on the orphaned inode only after the replacement is
-        // held, so there is never an instant in which this process holds no
-        // lock at all.
+        // The path can be replaced between open() and flock(). Never exchange
+        // one orphaned descriptor for another that secondaries cannot discover.
+        guard descriptor(newFd, matchesPath: lockURL.path) else {
+            close(newFd)
+            logRetryAnomalyOnce(
+                key: "primary-repair-inode-race",
+                message: "InstanceLock: locked a replacement descriptor, but it no longer matches \(lockURL.path). Retaining the existing primary role and retrying next tick."
+            )
+            return .retainPrimary
+        }
+
+        // Release the orphan only after its discoverable replacement is held.
         close(lockFileDescriptor)
         lockFileDescriptor = newFd
-        Logger.shared.log("InstanceLock: primary lock repaired -- now holding \(lockURL.path) (fd \(newFd)).", level: "INFO")
-        return true
+        clearRetryAnomaly()
+        log("InstanceLock: primary lock repaired -- now holding \(lockURL.path) (fd \(newFd)).", level: "INFO")
+        return .retainPrimary
+    }
+
+    private func descriptor(_ fd: Int32, matchesPath path: String) -> Bool {
+        var fdInfo = stat()
+        var pathInfo = stat()
+        return fstat(fd, &fdInfo) == 0
+            && stat(path, &pathInfo) == 0
+            && fdInfo.st_dev == pathInfo.st_dev
+            && fdInfo.st_ino == pathInfo.st_ino
+    }
+
+    private func logRetryAnomalyOnce(key: String, message: String) {
+        guard lastRetryAnomaly != key else { return }
+        lastRetryAnomaly = key
+        log(message, level: "WARN")
+    }
+
+    private func clearRetryAnomaly() {
+        lastRetryAnomaly = nil
+    }
+
+    private func log(_ message: String, level: String) {
+        logHandler(message, level)
     }
 
     /// Resolves the lock file's URL, creating its directory if needed.
     /// `nil` (with a WARN naming `failureWording`) when that is not possible.
-    private func resolveLockURL(failureWording: String) -> URL? {
+    private func resolveLockURL(failureWording: String, logFailures: Bool = true) -> URL? {
+        if let lockURLOverride {
+            return lockURLOverride
+        }
+
         let fileManager = FileManager.default
 
         guard let supportDir = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            Logger.shared.log("InstanceLock: could not resolve Application Support directory; \(failureWording).", level: "WARN")
+            if logFailures {
+                log("InstanceLock: could not resolve Application Support directory; \(failureWording).", level: "WARN")
+            }
             return nil
         }
 
@@ -305,7 +416,9 @@ public final class InstanceLock: @unchecked Sendable {
         do {
             try fileManager.createDirectory(at: appDir, withIntermediateDirectories: true)
         } catch {
-            Logger.shared.log("InstanceLock: failed to create lock directory at \(appDir.path): \(error.localizedDescription); \(failureWording).", level: "WARN")
+            if logFailures {
+                log("InstanceLock: failed to create lock directory at \(appDir.path): \(error.localizedDescription); \(failureWording).", level: "WARN")
+            }
             return nil
         }
 
@@ -342,7 +455,13 @@ public final class InstanceLock: @unchecked Sendable {
             ? "failing open (treating this process as primary)"
             : "failing closed (staying secondary and continuing to poll; another instance is already primary)"
 
-        guard let lockURL = resolveLockURL(failureWording: failureWording) else {
+        guard let lockURL = resolveLockURL(failureWording: failureWording, logFailures: logContention) else {
+            if !logContention {
+                logRetryAnomalyOnce(
+                    key: "retry-resolve-lock-url",
+                    message: "InstanceLock: retry could not resolve or create the lock path; staying secondary. Repeats are suppressed until the outcome changes."
+                )
+            }
             return failureOutcome
         }
 
@@ -355,13 +474,18 @@ public final class InstanceLock: @unchecked Sendable {
             if !createIfMissing && err == ENOENT {
                 // Expected on the retry path when the lock file has been
                 // deleted. NOT evidence that the primary died -- see
-                // `createIfMissing` above. Logged at DEBUG because a primary
-                // that is repairing (or a user who deleted the file and left it
-                // deleted) would otherwise emit this every 3s forever.
-                Logger.shared.log("InstanceLock: lock file at \(lockURL.path) does not exist. Not creating it from the retry path: a missing file cannot prove the primary is gone, and locking a fresh inode would install a second status-bar item beside a live primary. Staying secondary; the primary recreates the file within a few seconds.", level: "DEBUG")
+                // `createIfMissing` above. Do not log this recurring retry
+                // condition: Logger intentionally has no level filtering.
                 return .lockFileMissing
             }
-            Logger.shared.log("InstanceLock: failed to open lock file at \(lockURL.path) (errno \(err) \(String(cString: strerror(err)))); \(failureWording).", level: "WARN")
+            if logContention {
+                log("InstanceLock: failed to open lock file at \(lockURL.path) (errno \(err) \(String(cString: strerror(err)))); \(failureWording).", level: "WARN")
+            } else {
+                logRetryAnomalyOnce(
+                    key: "retry-open-\(err)",
+                    message: "InstanceLock: retry could not open \(lockURL.path) (errno \(err) \(String(cString: strerror(err)))); staying secondary. Repeats are suppressed until the outcome changes."
+                )
+            }
             return failureOutcome
         }
 
@@ -399,7 +523,14 @@ public final class InstanceLock: @unchecked Sendable {
                     // `retryAcquire()` must go through the whole probe again
                     // rather than short-circuiting on a held descriptor.
                     close(fd)
-                    Logger.shared.log("InstanceLock: won an flock at \(lockURL.path) but the locked descriptor is NOT the file at that path any more (fstat ok=\(fdOK) dev/ino \(fdInfo.st_dev)/\(fdInfo.st_ino) vs stat ok=\(pathOK) dev/ino \(pathInfo.st_dev)/\(pathInfo.st_ino)) -- the lock file was deleted or replaced, so this win proves nothing about the incumbent primary, which may still be alive and owning the status item. Declining the promotion (a second status-bar item would be permanent) and continuing to poll.", level: "WARN")
+                    if logContention {
+                        log("InstanceLock: won an flock at \(lockURL.path) but the locked descriptor is NOT the file at that path any more (fstat ok=\(fdOK) dev/ino \(fdInfo.st_dev)/\(fdInfo.st_ino) vs stat ok=\(pathOK) dev/ino \(pathInfo.st_dev)/\(pathInfo.st_ino)) -- the lock file was deleted or replaced, so this win proves nothing about the incumbent primary, which may still be alive and owning the status item. Declining the promotion and continuing to poll.", level: "WARN")
+                    } else {
+                        logRetryAnomalyOnce(
+                            key: "retry-inode-mismatch",
+                            message: "InstanceLock: a retry locked a descriptor that no longer matches \(lockURL.path). Declining promotion; repeats are suppressed until the outcome changes."
+                        )
+                    }
                     return .secondary
                 }
             }
@@ -407,7 +538,7 @@ public final class InstanceLock: @unchecked Sendable {
             // Primary instance. Hold the descriptor open for the process
             // lifetime -- see comment on lockFileDescriptor above.
             lockFileDescriptor = fd
-            Logger.shared.log("InstanceLock: acquired primary instance lock at \(lockURL.path) (fd \(fd)).", level: "INFO")
+            log("InstanceLock: acquired primary instance lock at \(lockURL.path) (fd \(fd)).", level: "INFO")
             return .primary
         }
 
@@ -425,7 +556,9 @@ public final class InstanceLock: @unchecked Sendable {
             // leak an fd until the process hit its descriptor limit.
             close(fd)
             if logContention {
-                Logger.shared.log("InstanceLock: lock at \(lockURL.path) already held by another process; this process is secondary.", level: "INFO")
+                log("InstanceLock: lock at \(lockURL.path) already held by another process; this process is secondary.", level: "INFO")
+            } else {
+                clearRetryAnomaly()
             }
             return .secondary
         } else {
@@ -452,7 +585,14 @@ public final class InstanceLock: @unchecked Sendable {
             //     status-bar item -- and the poll gets thousands of attempts a
             //     day to trip over a transient EMFILE/EINTR/ENOLCK.
             close(fd)
-            Logger.shared.log("InstanceLock: flock() failed at \(lockURL.path) with unexpected errno \(err) (\(String(cString: strerror(err)))); \(failureWording).", level: "WARN")
+            if logContention {
+                log("InstanceLock: flock() failed at \(lockURL.path) with unexpected errno \(err) (\(String(cString: strerror(err)))); \(failureWording).", level: "WARN")
+            } else {
+                logRetryAnomalyOnce(
+                    key: "retry-flock-\(err)",
+                    message: "InstanceLock: retry flock() failed at \(lockURL.path) with unexpected errno \(err) (\(String(cString: strerror(err)))); staying secondary. Repeats are suppressed until the outcome changes."
+                )
+            }
             return failureOutcome
         }
     }

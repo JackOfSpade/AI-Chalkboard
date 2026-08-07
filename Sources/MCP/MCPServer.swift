@@ -84,7 +84,7 @@ public final class MCPServer: @unchecked Sendable {
         // so we hop to the main queue rather than calling it directly here.
         // Routing through NSApp.terminate(nil) (instead of a bare exit(0))
         // keeps this symmetric with the SIGTERM/SIGINT/SIGHUP shutdown path
-        // in main.swift, and ensures AppDelegate.applicationWillTerminate's
+        // in the launcher entry point, and ensures AppDelegate.applicationWillTerminate's
         // clean-shutdown log line still fires.
         DispatchQueue.main.async {
             // LIFECYCLE shutdown, NOT a user quit. Claude Desktop gives each of
@@ -177,7 +177,7 @@ public final class MCPServer: @unchecked Sendable {
         let tools: [[String: Any]] = [
             [
                 "name": "get_screens",
-                "description": "Returns all connected macOS displays, physical pixel resolutions, backing scale factors, and point dimensions, plus the current capture_visible state (whether annotations show up in screenshots/recordings). Use this first to pick screen_id and determine coordinate bounds.",
+                "description": "Returns all connected macOS displays, physical pixel resolutions, backing scale factors, and point dimensions, plus the current capture_visible request state. backingScaleFactor follows the active macOS display mode: a Retina panel can legitimately report 1 when configured at native unscaled resolution, and 2 in a HiDPI scaled mode. capture_visible controls AI Chalkboard's renderer and legacy NSWindow sharing preference; the program taking a screenshot may still independently include or exclude overlay windows. Use this first to pick screen_id and determine coordinate bounds.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [:]
@@ -291,6 +291,7 @@ public final class MCPServer: @unchecked Sendable {
                         "screen_id": ["type": "string", "description": "Screen ID or index from get_screens."],
                         "step_px": ["type": "number", "description": "Grid line interval in physical pixels. Default 200."],
                         "color": ["type": "string", "description": "Grid line color. Default '#00E0FF'."],
+                        "label": ["type": "string", "description": "Optional label text used to identify the grid in list_annotations."],
                         "app": ["type": "string", "description": "Optional app (bundle id or display name) to restrict the grid to. Omit for the default: a GLOBAL grid visible over every app."],
                         "duration_seconds": ["type": "number", "description": "Duration in seconds before grid clears. Default 5.0."]
                     ]
@@ -325,11 +326,11 @@ public final class MCPServer: @unchecked Sendable {
             ],
             [
                 "name": "set_capture_visible",
-                "description": "Controls whether overlay annotations appear in screencapture, screen recordings, and screenshots you take. Default false: the overlay is invisible to all capture, so screenshots always show the user's real, unmodified UI. Set true to verify your own drawing placement, then set it back to false -- while true, your next screenshot will contain your previous annotations and you risk mistaking them for real interface elements. IMPORTANT: turning this ON also makes the overlay render EVERY annotation, including ones linked to an app that is not frontmost, precisely so you can verify placement -- your window is frontmost when you screenshot, so an app-linked annotation would otherwise be filtered out and your capture would come back blank. Turning it back off restores normal per-app visibility. Applies to every AI Chalkboard instance immediately; no restart needed.",
+                "description": "Sets AI Chalkboard's capture-debug mode while keeping the existing API name. false (default) requests NSWindowSharingType.none and uses normal per-app rendering; true requests .readOnly and makes the overlay render EVERY annotation, including annotations linked to an app that is not frontmost, so supported full-display capture paths can verify placement. This is an eligibility/request flag, not a guarantee: modern capture tools such as ScreenCaptureKit or computer-use can independently include or exclude apps and windows. Restore false after debugging to restore normal filtering. Applies to every AI Chalkboard instance immediately; no restart needed.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
-                        "visible": ["type": "boolean", "description": "true = annotations included in screen captures (NSWindowSharingType.readOnly). false = excluded (.none), the default."]
+                        "visible": ["type": "boolean", "description": "true = request capture eligibility (.readOnly) and render all annotations. false = request legacy exclusion (.none) and restore normal app filtering. The capturing program's own filters still decide final inclusion."]
                     ],
                     "required": ["visible"]
                 ]
@@ -354,7 +355,7 @@ public final class MCPServer: @unchecked Sendable {
             // ride along. Reporting that state here is what lets a caller who
             // turned capture on for a placement check notice it is still on and
             // put it back, instead of silently leaving every subsequent
-            // screen recording polluted with annotations.
+            // compatible capture path eligible to include annotations.
             guard let screenData = try? JSONEncoder().encode(screens),
                   let screenArray = (try? JSONSerialization.jsonObject(with: screenData)) as? [Any] else {
                 sendErrorResult(id: id, text: "Failed to encode screen list.")
@@ -365,8 +366,8 @@ public final class MCPServer: @unchecked Sendable {
                 "screens": screenArray,
                 "captureVisible": captureVisible,
                 "captureNote": captureVisible
-                    ? "Overlay windows are currently sharingType=.readOnly: your screenshots and the user's screen recordings DO include annotations. Call set_capture_visible with visible=false to restore the default."
-                    : "Overlay windows are sharingType=.none (default): annotations are excluded from screencapture, screen recordings and your screenshots, so what you capture is the user's real UI. Call set_capture_visible with visible=true if you need to verify your own drawing placement."
+                    ? "Capture-debug mode is ON: overlay windows request sharingType=.readOnly and render every annotation. A capture tool may still omit these windows through its own app/window filter. Call set_capture_visible(false) to restore normal filtering."
+                    : "Capture-debug mode is OFF (default): overlay windows request legacy sharingType=.none and render only annotations visible for the active app. This is not a security guarantee; modern capture tools control their own inclusion filters."
             ]
             if let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
                let jsonString = String(data: data, encoding: .utf8) {
@@ -585,6 +586,7 @@ public final class MCPServer: @unchecked Sendable {
             let screenId = OverlayWindowController.shared.resolveScreenId(args["screen_id"] as? String)
             let stepPx = getDouble(args["step_px"]) ?? 200.0
             let color = args["color"] as? String ?? "#00E0FF"
+            let label = args["label"] as? String
             let duration = getDouble(args["duration_seconds"]) ?? 5.0
 
             // GRID DEFAULTS TO GLOBAL (appId = nil) -- the one draw tool that
@@ -606,7 +608,7 @@ public final class MCPServer: @unchecked Sendable {
                 screenId: screenId,
                 kind: .grid(stepPx: stepPx),
                 colorHex: color,
-                label: nil,
+                label: label,
                 appId: appId,
                 appName: appName
             )
@@ -658,10 +660,10 @@ public final class MCPServer: @unchecked Sendable {
                 //     app.
                 // In short: clear must undo what the SAME channel drew.
                 //
-                // The `?? currentAppId` tail covers "no fallback known yet"
-                // (Claude was frontmost since launch and nothing else has been
-                // activated), which is also the case where untagged draws went
-                // GLOBAL -- and globals are removed either way.
+                // With no fallback known yet, untagged draws were GLOBAL.
+                // Keep the target nil so `clearVisible(forApp:)` removes only
+                // globals; falling back to currentAppId here would target
+                // Claude's annotations instead.
                 let tracker = ActiveAppTracker.shared
                 let activeId: String?
                 let activeName: String?
@@ -669,8 +671,8 @@ public final class MCPServer: @unchecked Sendable {
                     activeId = fallbackId
                     activeName = tracker.fallbackAppName
                 } else {
-                    activeId = tracker.currentAppId
-                    activeName = tracker.currentAppName
+                    activeId = nil
+                    activeName = nil
                 }
                 let removed = AnnotationStore.shared.clearVisible(forApp: activeId)
                 let target = activeName ?? activeId ?? "<no frontmost app detected>"
@@ -694,8 +696,8 @@ public final class MCPServer: @unchecked Sendable {
             // so this single call applies the change here as well.
             InstanceBroadcast.shared.postSetCaptureVisible(visible)
             let explanation = visible
-                ? "Annotations WILL now appear in screencapture, screen recordings and your own screenshots. Remember to set this back to false when you are done: leaving it on means your next screenshot contains your previous drawings, which you may misread as real UI."
-                : "Annotations are now hidden from all screen capture (the default). Your screenshots show the user's real, unmodified UI."
+                ? "AI Chalkboard now requests capture eligibility and renders every annotation for placement checks. The capture program can still omit overlay windows through its own filters. Restore false when finished."
+                : "AI Chalkboard now requests legacy capture exclusion and has restored normal per-app rendering. Modern capture programs may independently include or exclude these windows, so this is not a privacy guarantee."
             sendTextResult(id: id, text: "capture_visible = \(visible) (sharingType = \(visible ? "NSWindowSharingType.readOnly" : "NSWindowSharingType.none")), applied to all AI Chalkboard instances. \(explanation)")
 
         default:
@@ -723,6 +725,7 @@ public final class MCPServer: @unchecked Sendable {
     private func buildAnnotationListJSON() -> String {
         let annotations = AnnotationStore.shared.getAll()
         let activeId = ActiveAppTracker.shared.currentAppId
+        let captureVisible = OverlayWindowController.shared.isCaptureVisible
         let encoder = JSONEncoder()
 
         var entries: [[String: Any]] = []
@@ -740,8 +743,9 @@ public final class MCPServer: @unchecked Sendable {
             object["appName"] = jsonValue(
                 annotation.appName ?? ActiveAppTracker.shared.displayName(forBundleId: annotation.appId)
             )
+            object["type"] = annotation.kind.typeName
             object["scope"] = annotation.appId == nil ? "global" : "app-linked"
-            object["isVisibleNow"] = (annotation.appId == nil || annotation.appId == activeId)
+            object["isVisibleNow"] = captureVisible || annotation.appId == nil || annotation.appId == activeId
             entries.append(object)
         }
 
@@ -750,10 +754,10 @@ public final class MCPServer: @unchecked Sendable {
                 "bundleId": jsonValue(activeId),
                 "name": jsonValue(ActiveAppTracker.shared.currentAppName)
             ] as [String: Any],
-            "captureVisible": OverlayWindowController.shared.isCaptureVisible,
+            "captureVisible": captureVisible,
             "count": entries.count,
             "annotations": entries,
-            "note": "An annotation is drawn only when scope='global' or its appId equals activeApp.bundleId. isVisibleNow reflects that for the frontmost app at the moment of this call."
+            "note": "With captureVisible=false, an annotation is drawn only when scope='global' or its appId equals activeApp.bundleId. With captureVisible=true, every annotation is drawn for capture-debug placement checks. External capture filters still decide whether the overlay is included. isVisibleNow reflects the current rendering mode."
         ]
 
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
@@ -876,7 +880,7 @@ public final class MCPServer: @unchecked Sendable {
         case .notFound:
             if looksLikeBundleIdentifier(raw) {
                 appId = raw
-                appName = raw
+                appName = nil
                 log("resolveTargetApp: '\(raw)' matched no running application but is bundle-id shaped; accepting it verbatim. The annotation will appear once that app is launched and brought to the front.")
                 return nil
             }
@@ -885,10 +889,10 @@ public final class MCPServer: @unchecked Sendable {
         }
     }
 
-    /// Heuristic: reverse-DNS shaped, i.e. has a dot and no whitespace.
-    /// "com.apple.Terminal" yes, "DaVinci Resolve" no.
+    /// Uses the same conservative complete-ID rule as ActiveAppTracker, so a
+    /// vague prefix cannot be rejected there but accepted here.
     private func looksLikeBundleIdentifier(_ value: String) -> Bool {
-        return value.contains(".") && value.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+        return BundleIdentifierSyntax.looksComplete(value)
     }
 
     /// Human-readable trailer appended to every draw_* success message, so the

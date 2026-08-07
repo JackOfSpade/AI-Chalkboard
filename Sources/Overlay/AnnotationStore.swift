@@ -29,7 +29,9 @@ public final class AnnotationStore: @unchecked Sendable {
     
     public var onStoreChanged: (() -> Void)?
 
-    private init() {}
+    /// Internal so tests and in-process simulations can own isolated stores;
+    /// production continues to use `shared`.
+    init() {}
 
     public func add(_ annotation: Annotation, durationSeconds: Double? = nil) {
         lock.lock()
@@ -56,11 +58,14 @@ public final class AnnotationStore: @unchecked Sendable {
         return removed
     }
 
-    public func clearAll() {
+    @discardableResult
+    public func clearAll() -> Int {
         lock.lock()
+        let removed = annotations.count
         annotations.removeAll()
         lock.unlock()
         notifyChange()
+        return removed
     }
 
     /// Removes exactly the annotations that are currently VISIBLE over
@@ -97,8 +102,9 @@ public final class AnnotationStore: @unchecked Sendable {
     /// Its one caller is `OverlayView.draw(_:)` while capture visibility is ON:
     /// that debug mode must render everything, because the app whose
     /// annotations are being verified is by definition NOT the frontmost one at
-    /// the moment Claude takes the screenshot, and filtering would hand back an
-    /// empty capture. Normal painting uses `getForScreen(_:visibleForApp:)`.
+    /// the moment Claude takes the screenshot. Filtering here would prevent the
+    /// overlay from drawing them even on compatible capture paths. Normal
+    /// painting uses `getForScreen(_:visibleForApp:)`.
     public func getForScreen(_ screenId: String) -> [Annotation] {
         lock.lock()
         defer { lock.unlock() }

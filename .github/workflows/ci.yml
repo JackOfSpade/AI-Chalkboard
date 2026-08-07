@@ -146,12 +146,18 @@ jobs:
       - name: auto-merge decision logic (CI-gate + delete-safety fixtures)
         run: bash tests/test_auto_merge_logic.sh
 
-      - name: test_mcp_stdio.py syntax check
-        # Not run: it launches the built .app over stdio and drives it via JSON-RPC,
-        # which requires a real GUI/AppKit process and cannot execute headless in CI.
-        # Compiling it is enough to catch syntax errors before they'd break a human's
-        # local debugging session.
-        run: python3 -m py_compile test_mcp_stdio.py
+      - name: MCP stdio harness syntax + framing/timeout tests
+        # The full integration script launches AppKit and still requires an Aqua GUI
+        # session, but its protocol framing and deadline behavior are pure Python and
+        # must be exercised here rather than merely syntax-checked.
+        run: |
+          python3 -m py_compile test_mcp_stdio.py tests/test_mcp_stdio_harness.py
+          python3 -m unittest tests/test_mcp_stdio_harness.py
+
+      - name: Swift test target path casing
+        # The repository's established directory is lowercase `tests/`. This catches
+        # a manifest/new-file case mismatch that case-insensitive macOS volumes hide.
+        run: test -d tests/AIChalkboardCoreTests
 
   build:
     name: swift build (debug + release) + app bundle
@@ -165,6 +171,9 @@ jobs:
       - name: Toolchain version (recorded in the log)
         run: swift --version
 
+      - name: swift test
+        run: swift test
+
       - name: swift build (debug)
         run: swift build
 
@@ -177,5 +186,11 @@ jobs:
       - name: Verify bundle contents
         run: |
           set -euo pipefail
-          test -x .build/release/AIChalkboard.app/Contents/MacOS/AIChalkboard
-          test -f .build/release/AIChalkboard.app/Contents/Info.plist
+          app=.build/release/AIChalkboard.app
+          plist="$app/Contents/Info.plist"
+          test -x "$app/Contents/MacOS/AIChalkboard"
+          test -f "$plist"
+          plutil -lint "$plist"
+          test "$(plutil -extract NSHighResolutionCapable raw -o - "$plist")" = true
+          test "$(plutil -extract NSHighResolutionMagnifyAllowed raw -o - "$plist")" = false
+          codesign --verify --deep --strict --verbose=2 "$app"

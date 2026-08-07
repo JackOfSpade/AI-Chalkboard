@@ -323,7 +323,7 @@ public final class Logger: @unchecked Sendable {
     // call sites where the process may terminate (abort(), a re-raised
     // signal, etc.) before an async closure enqueued by log() would ever
     // get a chance to run -- e.g. NSSetUncaughtExceptionHandler in
-    // main.swift, whose handler runs immediately before the runtime calls
+    // the launcher entry point, whose handler runs immediately before the runtime calls
     // abort(). Without this, the one log line explaining a crash could be
     // lost from the file (it would still reach stderr, since that part of
     // log()'s formatting is already synchronous).

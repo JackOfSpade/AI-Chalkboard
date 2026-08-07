@@ -36,16 +36,15 @@ extension Notification.Name {
     /// "Every AI Chalkboard process: set your overlay windows' sharingType."
     ///
     /// Needs the same fan-out as clear, and for the same reason: EVERY instance
-    /// creates its own per-screen overlay windows, so a capture-visibility flip
-    /// applied in one process would leave the other process's annotations still
-    /// invisible to (or still polluting) screen recordings. Half-applied is the
-    /// worst outcome -- the user turns the toggle on, screenshots, and sees an
-    /// arbitrary subset of the drawings.
+    /// creates its own per-screen overlay windows, so a capture-debug request
+    /// applied in one process would leave the other process using a different
+    /// sharing preference and render filter. Half-applied would make placement
+    /// checks show an arbitrary subset on capture paths that include overlays.
     static let chalkboardSetCaptureVisible = Notification.Name("com.aichalkboard.overlay.setCaptureVisible")
 }
 
-/// The QUIT broadcast's `object`, used to scope a quit to instances launched
-/// the same way as the poster.
+/// The QUIT broadcast's `object`, used only to scope Dock/Cmd-Q quits to
+/// instances launched the same way as the poster.
 ///
 /// WHY THE QUIT IS SCOPED AND THE CLEAR IS NOT:
 ///
@@ -55,11 +54,9 @@ extension Notification.Name {
 /// that hand-launched window posted an unscoped quit and killed BOTH MCP
 /// servers mid-session. The user closed a window they opened by hand; they did
 /// not ask to terminate the agent's servers. Conversely, quitting from an MCP
-/// instance's status menu still has to take its SIBLING MCP instance with it --
-/// that is the split-brain InstanceBroadcast exists to prevent -- so the quit
-/// cannot simply become process-local either. Matching launch modes is the line
-/// that separates "the other half of the thing I am quitting" from "somebody
-/// else's session".
+/// instance's status menu is an explicit "Quit AI Chalkboard" command, so it
+/// intentionally reaches every coexisting instance. The status menu is the
+/// cross-mode control surface; only Dock/Cmd-Q is scoped to its launch mode.
 ///
 /// CLEAR stays unscoped deliberately: clearing across modes is harmless (it
 /// destroys only transient on-screen drawings) and desirable (whichever
@@ -81,6 +78,48 @@ private enum BroadcastKey {
     static let appId = "appId"
     static let appName = "appName"
     static let visible = "visible"
+}
+
+/// Canonical encoding and application of a clear broadcast. Keeping payload
+/// parsing here makes the sender and every receiver share one definition and
+/// lets tests simulate multiple process-local stores without touching the
+/// session-global DistributedNotificationCenter.
+struct ClearBroadcastRequest {
+    let scope: ClearScope
+    let appId: String?
+    let appName: String?
+
+    init(scope: ClearScope, appId: String?, appName: String?) {
+        self.scope = scope
+        self.appId = appId
+        self.appName = appName
+    }
+
+    init(notification: Notification) {
+        let rawScope = notification.userInfo?[BroadcastKey.scope] as? String
+        // Legacy/malformed payloads meant "clear all" before scopes existed;
+        // preserve that fail-safe compatibility contract.
+        scope = ClearScope(rawValue: rawScope ?? "") ?? .all
+        appId = notification.userInfo?[BroadcastKey.appId] as? String
+        appName = notification.userInfo?[BroadcastKey.appName] as? String
+    }
+
+    var userInfo: [String: String] {
+        var result = [BroadcastKey.scope: scope.rawValue]
+        if let appId { result[BroadcastKey.appId] = appId }
+        if let appName { result[BroadcastKey.appName] = appName }
+        return result
+    }
+
+    @discardableResult
+    func apply(to store: AnnotationStore) -> Int {
+        switch scope {
+        case .all:
+            return store.clearAll()
+        case .active:
+            return store.clearVisible(forApp: appId)
+        }
+    }
 }
 
 /// Cross-process fan-out for the two menu-bar actions ("Clear All Annotations"
@@ -218,7 +257,7 @@ public final class InstanceBroadcast: NSObject {
         // hazard -- another reason this lives on a singleton.)
         //
         // Delivery requires a running main run loop. That is satisfied here:
-        // `app.run()` in main.swift runs it, and MCPServer reads stdin on a
+        // `app.run()` in the launcher entry point runs it, and MCPServer reads stdin on a
         // background queue (`DispatchQueue.global()`), so the main run loop is
         // never blocked by the protocol read. A process that registered and
         // then blocked the main thread without running a run loop would
@@ -259,15 +298,13 @@ public final class InstanceBroadcast: NSObject {
     /// should remove; `appName` rides along purely so the receiver's log line is
     /// readable. Both are omitted for `.all`.
     public func postClear(scope: ClearScope, appId: String?, appName: String?) {
-        var userInfo: [String: String] = [BroadcastKey.scope: scope.rawValue]
-        if let appId = appId { userInfo[BroadcastKey.appId] = appId }
-        if let appName = appName { userInfo[BroadcastKey.appName] = appName }
+        let request = ClearBroadcastRequest(scope: scope, appId: appId, appName: appName)
 
         Logger.shared.log("InstanceBroadcast: posting CLEAR broadcast (scope=\(scope.rawValue), app=\(appName ?? appId ?? "n/a")) to all AI Chalkboard instances.", level: "INFO")
         DistributedNotificationCenter.default().postNotificationName(
             .chalkboardClearAll,
             object: nil,
-            userInfo: userInfo,
+            userInfo: request.userInfo,
             deliverImmediately: true
         )
     }
@@ -294,19 +331,17 @@ public final class InstanceBroadcast: NSObject {
 
     /// Posts "quit" to every instance, including this one.
     ///
-    /// Two callers, both user-initiated quits: the status-menu item, and
-    /// `AppDelegate.applicationShouldTerminate` (which covers Dock right-click
-    /// -> Quit and Cmd-Q -- paths that reach `NSApp.terminate` directly and
-    /// would otherwise quit this process alone). Lifecycle shutdowns (stdin
+    /// The status-menu item uses the unscoped default, because its explicit
+    /// "Quit AI Chalkboard" wording means all coexisting instances. Dock and
+    /// Cmd-Q pass `scopedToLaunchMode: true`, so a hand-launched GUI copy does
+    /// not terminate Claude Desktop's MCP servers. Lifecycle shutdowns (stdin
     /// EOF, signals, obeying someone else's quit broadcast) must NOT call this.
-    public func postQuitAll() {
-        let scope = QuitScope.current
-        Logger.shared.log("InstanceBroadcast: posting QUIT broadcast (scope=\(scope)) to AI Chalkboard instances launched in the same mode (user-initiated quit).", level: "INFO")
+    public func postQuitAll(scopedToLaunchMode: Bool = false) {
+        let scope = scopedToLaunchMode ? QuitScope.current : nil
+        Logger.shared.log("InstanceBroadcast: posting QUIT broadcast (scope=\(scope ?? "<all instances>")) to \(scopedToLaunchMode ? "AI Chalkboard instances launched in the same mode" : "all coexisting AI Chalkboard instances") (user-initiated quit).", level: "INFO")
 
-        // `object:` carries this process's launch mode, so a hand-launched GUI
-        // copy's Cmd-Q cannot kill Claude Desktop's `--mcp` servers. See
-        // `QuitScope` for the full rationale. Receivers observe with a nil
-        // (wildcard) object and compare in the handler.
+        // `object:` carries the launch mode only for Dock/Cmd-Q. A nil object
+        // is deliberately an all-instance status-menu quit.
         DistributedNotificationCenter.default().postNotificationName(
             .chalkboardQuitAll,
             object: scope,
@@ -359,30 +394,23 @@ public final class InstanceBroadcast: NSObject {
     // MARK: - Receiving (every instance: primary AND secondary)
 
     @objc private func handleClearAllBroadcast(_ notification: Notification) {
-        // Absent or unrecognised scope => `.all`, which is what this
-        // notification unconditionally meant before scoping existed. Falling
-        // back to `.active` instead would make a malformed payload silently
-        // clear less than the sender asked for.
-        let rawScope = notification.userInfo?[BroadcastKey.scope] as? String
-        let scope = ClearScope(rawValue: rawScope ?? "") ?? .all
+        let request = ClearBroadcastRequest(notification: notification)
 
         // Safe from any thread: AnnotationStore's mutations are NSLock-guarded
         // and its change notification hops to the main queue itself. (In
         // practice distributed notifications are delivered on the main thread.)
-        switch scope {
+        switch request.scope {
         case .all:
-            AnnotationStore.shared.clearAll()
-            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=all. Cleared this process's entire AnnotationStore and repainting its overlays.", level: "INFO")
+            let removed = request.apply(to: AnnotationStore.shared)
+            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=all. Removed \(removed) annotation(s) from this process's store and repainting its overlays.", level: "INFO")
 
         case .active:
             // The poster resolved the target app; this process must NOT
             // re-derive it (see postClear's doc comment). A missing appId means
             // the poster could not determine a frontmost app, in which case
             // only the global annotations are removed.
-            let appId = notification.userInfo?[BroadcastKey.appId] as? String
-            let appName = notification.userInfo?[BroadcastKey.appName] as? String
-            let removed = AnnotationStore.shared.clearVisible(forApp: appId)
-            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=active app=\(appName ?? appId ?? "<none: global annotations only>"). Removed \(removed) annotation(s) from this process's store; annotations linked to other apps were left untouched.", level: "INFO")
+            let removed = request.apply(to: AnnotationStore.shared)
+            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=active app=\(request.appName ?? request.appId ?? "<none: global annotations only>"). Removed \(removed) annotation(s) from this process's store; annotations linked to other apps were left untouched.", level: "INFO")
         }
 
         // `clearAll()` already triggers `onStoreChanged` -> `refreshViews()`.
@@ -427,18 +455,13 @@ public final class InstanceBroadcast: NSObject {
         onMain { [weak self] in
             guard let self = self else { return }
 
-            // SCOPE FILTER (see `QuitScope`): only obey a quit from an instance
-            // launched the same way as this one. A hand-launched GUI copy being
-            // Cmd-Q'd must not terminate Claude Desktop's `--mcp` servers, and
-            // vice versa.
+            // A non-nil scope is a Dock/Cmd-Q quit, which reaches only the
+            // same launch mode. A nil scope is the status-menu's deliberate
+            // all-instance quit (and is also compatible with older builds).
             //
-            // A nil object means a legacy, unscoped post from an older build:
-            // obey it, because that is exactly what it has always meant. (Newer
-            // builds always set it, so this only matters during a mixed-version
-            // upgrade.)
             let ownScope = QuitScope.current
             if let senderScope = senderScope, senderScope != ownScope {
-                Logger.shared.log("InstanceBroadcast: IGNORING QUIT broadcast from a '\(senderScope)' instance -- this process is '\(ownScope)'. A quit only reaches instances launched the same way, so quitting a hand-launched GUI copy cannot kill Claude Desktop's --mcp servers (or the reverse).", level: "INFO")
+                Logger.shared.log("InstanceBroadcast: IGNORING scoped QUIT broadcast from a '\(senderScope)' instance -- this process is '\(ownScope)'. Dock/Cmd-Q does not cross launch modes.", level: "INFO")
                 return
             }
 

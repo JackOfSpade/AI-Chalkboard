@@ -1,6 +1,17 @@
 import Foundation
 import AppKit
 
+/// Pixel-to-point conversion shared by renderer code and deterministic tests.
+/// MCP drawing dimensions are physical backing pixels; Core Graphics drawing
+/// APIs consume AppKit points, so lengths must be divided by the active backing
+/// scale just like positions are.
+enum OverlayDrawingMetrics {
+    static func points(forPhysicalPixels pixels: Double, backingScaleFactor: CGFloat) -> CGFloat {
+        let scale = backingScaleFactor > 0 ? backingScaleFactor : 1.0
+        return CGFloat(pixels) / scale
+    }
+}
+
 public final class OverlayView: NSView {
     public var screenId: String = ""
     public var scaleFactor: CGFloat = 2.0
@@ -39,16 +50,16 @@ public final class OverlayView: NSView {
         // deliberately exempt from the filter -- do not "simplify" this back to
         // a single unconditional call:
         //
-        // `set_capture_visible(true)` exists for exactly one purpose: Claude
-        // draws something, exposes the overlay to screen capture, screenshots
-        // the display and checks that the box landed where it meant. But Claude
+        // `set_capture_visible(true)` exists for placement debugging: Claude
+        // draws something, requests capture eligibility, screenshots the
+        // display through a compatible capture path, and checks placement. But Claude
         // Desktop is frontmost at the moment it screenshots, so `currentAppId`
         // is Claude, while the annotation it just drew was tagged with
         // `fallbackAppId` (the OTHER app -- see ActiveAppTracker). Filtering
-        // here would drop that annotation from the capture and hand back a
-        // BLANK overlay: byte-for-byte the symptom that `sharingType = .none`
-        // used to cause, reintroduced through a second mechanism, defeating the
-        // very tool built to tell those two causes apart.
+        // here would guarantee that annotation is absent even when the capture
+        // path includes the overlay. Rendering it keeps AI Chalkboard's own
+        // filtering from defeating the debug request; external capture filters
+        // remain outside the app's control.
         //
         // So while the debug toggle is on, render EVERYTHING on this screen
         // (this is the sole caller of the 1-arg `getForScreen`). The user has
@@ -187,7 +198,11 @@ public final class OverlayView: NSView {
 
             case .path(let rawPoints, let strokeWidth, let isClosed):
                 guard rawPoints.count >= 2 else { break }
-                let stroke = strokeWidth > 0 ? CGFloat(strokeWidth) : 3.5
+                let physicalStroke = strokeWidth > 0 ? strokeWidth : 3.5
+                let stroke = OverlayDrawingMetrics.points(
+                    forPhysicalPixels: physicalStroke,
+                    backingScaleFactor: scale
+                )
                 
                 var cgPoints: [CGPoint] = []
                 for pt in rawPoints {
@@ -276,4 +291,3 @@ public final class OverlayView: NSView {
         (text as NSString).draw(in: textRect, withAttributes: textAttributes)
     }
 }
-

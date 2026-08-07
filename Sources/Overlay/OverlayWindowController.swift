@@ -23,20 +23,16 @@ public final class OverlayWindowController: NSObject {
     //
     // WHY THE DEFAULT IS `false` (i.e. NSWindowSharingType.none):
     //
-    // With `.readOnly`, the annotations appear in screencapture, in screen
-    // recordings, and -- the important one -- in the screenshots Claude takes of
-    // the user's display. That last one creates a feedback loop: Claude asks for
-    // a screenshot to decide where to draw, sees its own previous circles and
-    // arrows composited on top of the app, and mistakes them for real UI. It
-    // then annotates its own annotations, drifting further from the actual
-    // interface with every round trip. `.none` keeps the overlay strictly a
-    // human-facing layer, so what Claude measures is always the unmodified app.
+    // `.readOnly` makes the windows eligible to legacy capture paths; `.none`
+    // requests exclusion. Modern capture APIs can apply their own app/window
+    // filters and Apple now treats `.none` as a legacy hint, so neither value can
+    // guarantee what an independent capture program composites. The default is
+    // still false to minimize feedback loops on capture paths that honor it.
     //
     // The toggle exists because the loop is exactly what you WANT when
     // debugging placement: flipping this on is the only way for Claude to
-    // verify that a box it drew landed where it intended. `get_screens` reports
-    // the current state so Claude can put it back to `false` and not leave the
-    // user's screen recordings polluted.
+    // verify that a box landed where intended on compatible full-display capture
+    // paths. `get_screens` reports the requested mode so it can be restored.
 
     /// Guards `_captureVisible` only. The flag is written from the main thread
     /// (menu / broadcast handler) and read from the MCP server's background read
@@ -45,7 +41,8 @@ public final class OverlayWindowController: NSObject {
     private let captureLock = NSLock()
     private var _captureVisible = false
 
-    /// Whether overlay windows are currently included in screen captures.
+    /// Requested capture-debug mode. This controls rendering and the legacy
+    /// NSWindow sharing preference, not an external capture tool's filters.
     public var isCaptureVisible: Bool {
         captureLock.lock(); defer { captureLock.unlock() }
         return _captureVisible
@@ -58,7 +55,7 @@ public final class OverlayWindowController: NSObject {
         return isCaptureVisible ? .readOnly : .none
     }
 
-    /// Turns capture visibility on/off across every overlay window.
+    /// Turns the capture-debug request on/off across every overlay window.
     ///
     /// APPROACH: assigns `sharingType` on the LIVE windows -- no teardown, no
     /// `rebuildOverlayWindows()`. This was verified empirically rather than
@@ -106,7 +103,7 @@ public final class OverlayWindowController: NSObject {
             self.refreshViews()
 
             Logger.shared.log(
-                "OverlayWindowController: capture visibility set to \(visible) (sharingType = \(visible ? ".readOnly" : ".none")) on \(self.windowsByScreenId.count) window reference(s), applied live without rebuilding. \(visible ? "Annotations WILL now appear in screencapture, screen recordings and Claude's screenshots." : "Annotations are hidden from all screen capture (the default).")",
+                "OverlayWindowController: capture-debug request set to \(visible) (sharingType = \(visible ? ".readOnly" : ".none")) on \(self.windowsByScreenId.count) window reference(s), applied live without rebuilding. External capture tools retain independent app/window filters, so final inclusion is not guaranteed.",
                 level: "INFO"
             )
         }
@@ -167,6 +164,12 @@ public final class OverlayWindowController: NSObject {
         let screens = NSScreen.screens
         for (idx, screen) in screens.enumerated() {
             let screenId = getScreenId(screen: screen, index: idx)
+            let frame = screen.frame
+            let scale = screen.backingScaleFactor
+            Logger.shared.log(
+                "OverlayWindowController: configuring screen id=\(screenId) name='\(screen.localizedName)' points=\(Int(frame.width))x\(Int(frame.height)) backingScaleFactor=\(scale) physicalPixels=\(Int(round(frame.width * scale)))x\(Int(round(frame.height * scale))).",
+                level: "INFO"
+            )
             let window = createOverlayWindow(for: screen, screenId: screenId)
             windowsByScreenId[screenId] = window
             
@@ -213,9 +216,9 @@ public final class OverlayWindowController: NSObject {
         window.backgroundColor = .clear
         window.hasShadow = false
 
-        // Born with whatever the user last chose (default `.none` -- hidden from
-        // every screen capture; see the `desiredSharingType` doc comment for the
-        // feedback-loop rationale). Reading it from the stored value rather than
+        // Born with whatever the user last requested (default `.none`; see the
+        // `desiredSharingType` doc comment for the legacy-sharing caveat).
+        // Reading it from the stored value rather than
         // hard-coding `.none` is what makes the setting survive a
         // `rebuildOverlayWindows()` caused by a display being plugged in.
         window.sharingType = desiredSharingType

@@ -13,8 +13,10 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 - **Dual Coordinate Systems**:
   - **Physical Pixel Space** (default): Matches screenshot tool dimensions (`x: 500, y: 300`).
   - **Normalized Ratio Space** (`is_normalized: true`): Coordinates between `0.0` and `1.0` relative to screen dimensions (`x: 0.5, y: 0.5` targets center screen).
+  - `backingScaleFactor` reflects the active macOS display mode, not the panel's marketing label: a Retina panel can correctly report `1` at native unscaled resolution or `2` in a HiDPI scaled mode.
 - **Auto-Clear Duration**: Optional `duration_seconds` parameter on all drawing tools (e.g. `duration_seconds: 3.0`) causes drawing annotations to automatically disappear after N seconds to keep the screen uncluttered.
 - **Spatial Alignment Grid**: `draw_grid` tool renders a temporary pixel grid (e.g., 200px lines) to calibrate agent spatial awareness during screen recording tasks.
+- **Capture Debug Request**: `set_capture_visible(true)` asks compatible capture paths to include the overlay and renders all annotations for placement checks. Capture programs retain their own app/window filters, so inclusion is not guaranteed; `.none` is also not a privacy boundary on modern macOS.
 - **macOS Dock Icon**: Set to `.regular` activation policy (`LSUIElement = false`). Displays in the macOS Dock so the user can easily right-click → Quit the application at any time. Also provides a menu bar status item ("Clear All Annotations", "Quit").
 
 ---
@@ -24,14 +26,16 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 | Tool | Parameters | Description |
 | --- | --- | --- |
 | `get_screens` | `none` | Returns display IDs, physical pixel resolutions, backing scale factors, and point dimensions. |
-| `draw_circle` | `screen_id`, `x`, `y`, `radius`, `color?`, `label?`, `is_normalized?`, `duration_seconds?` | Draws a circle highlight badge. |
-| `draw_arrow` | `screen_id`, `x1`, `y1`, `x2`, `y2`, `color?`, `label?`, `is_normalized?`, `duration_seconds?` | Draws an arrow line from `(x1,y1)` to `(x2,y2)`. |
-| `draw_box` | `screen_id`, `x`, `y`, `width`, `height`, `color?`, `label?`, `is_normalized?`, `duration_seconds?` | Draws a rectangle highlight box. |
-| `draw_label` | `screen_id`, `x`, `y`, `text`, `color?`, `is_normalized?`, `duration_seconds?` | Draws a floating text badge with contrasting background. |
-| `draw_path` | `screen_id`, `points`, `color?`, `stroke_width?`, `is_closed?`, `label?`, `is_normalized?`, `duration_seconds?` | Draws a freehand path or organic sketch from an array of coordinates (ideal for freehand circles, loops, squiggles, checkmarks, custom callouts). |
-| `draw_grid` | `screen_id`, `step_px?`, `color?`, `duration_seconds?` | Draws an alignment grid overlay for spatial calibration. |
-| `clear` | `annotation_id?` | Clears a specific annotation by ID, or clears all annotations if omitted. |
+| `draw_circle` | `screen_id?`, `x`, `y`, `radius`, `color?`, `label?`, `app?`, `is_normalized?`, `duration_seconds?` | Draws a circle highlight badge. |
+| `draw_arrow` | `screen_id?`, `x1`, `y1`, `x2`, `y2`, `color?`, `label?`, `app?`, `is_normalized?`, `duration_seconds?` | Draws an arrow line from `(x1,y1)` to `(x2,y2)`. |
+| `draw_box` | `screen_id?`, `x`, `y`, `width`, `height`, `color?`, `label?`, `app?`, `is_normalized?`, `duration_seconds?` | Draws a rectangle highlight box. |
+| `draw_label` | `screen_id?`, `x`, `y`, `text`, `color?`, `app?`, `is_normalized?`, `duration_seconds?` | Draws a floating text badge with contrasting background. |
+| `draw_path` | `screen_id?`, `points`, `color?`, `stroke_width?`, `is_closed?`, `label?`, `app?`, `is_normalized?`, `duration_seconds?` | Draws a freehand path or organic sketch from an array of coordinates (ideal for freehand circles, loops, squiggles, checkmarks, custom callouts). |
+| `draw_grid` | `screen_id?`, `step_px?`, `color?`, `label?`, `app?`, `duration_seconds?` | Draws an alignment grid overlay for spatial calibration. |
+| `clear` | `annotation_id?`, `scope?` | Clears one exact ID when supplied. Otherwise defaults to `scope="active"` (fallback-app annotations plus globals); use `scope="all"` to clear every app. |
 | `list_annotations` | `none` | Returns all currently active annotations across screens. |
+| `get_active_app` | `none` | Returns raw/current frontmost app state and the fallback app targeted by untagged drawing calls. |
+| `set_capture_visible` | `visible` | Requests capture-debug eligibility and toggles all-annotation debug rendering; external capture filters still decide inclusion. |
 
 ---
 
@@ -63,7 +67,7 @@ Add AI Chalkboard to `~/Library/Application Support/Claude/claude_desktop_config
 
 ## Why This Setup is Ideal for Claude Cowork
 
-1. **Pixel-Perfect Alignment with Computer Use**: Screenshots captured by Claude Cowork match display physical pixel resolutions. Passing `x` and `y` directly from image analysis draws highlights at the exact pixel position.
+1. **Physical-Pixel Coordinates**: When a screenshot represents the full display pixel grid, passing `x` and `y` directly from image analysis draws at the corresponding backing-pixel position. App/window-filtered computer-use captures may omit the overlay even when capture debug mode is enabled.
 2. **Auto-Disappearing Annotations**: By passing `duration_seconds: 3`, Claude can highlight buttons or input fields briefly while explaining steps to the user without cluttering the screen.
 3. **Zero Input Disruption**: User can continue typing or clicking underneath while Claude draws highlights.
 

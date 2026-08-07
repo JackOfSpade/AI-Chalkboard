@@ -8,7 +8,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     /// on every menu open to name whatever app is frontmost at that moment.
     private var clearActiveAppItem: NSMenuItem?
 
-    /// "Show in Screen Captures" -- retained so its checkmark can be synced with
+    /// "Capture Debug Mode" -- retained so its checkmark can be synced with
     /// the real `OverlayWindowController` state on every menu open (that state
     /// can also be changed by the MCP `set_capture_visible` tool or by a sibling
     /// instance's broadcast, neither of which goes through this menu).
@@ -189,8 +189,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     private func startPrimaryLockWatchdog() {
         guard primaryLockWatchdog == nil else { return }
 
-        let timer = Timer(timeInterval: Self.primaryElectionRetryInterval, repeats: true) { _ in
-            InstanceLock.shared.revalidatePrimaryLock()
+        let timer = Timer(timeInterval: Self.primaryElectionRetryInterval, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+            guard InstanceLock.shared.revalidatePrimaryLock() == .relinquishToPathOwner else { return }
+
+            // Another process repaired and locked the path before this orphaned
+            // primary could. It now owns the only trustworthy election result;
+            // remove our UI rather than leave two permanent status items.
+            timer.invalidate()
+            self.primaryLockWatchdog = nil
+            if let statusItem = self.statusItem {
+                NSStatusBar.system.removeStatusItem(statusItem)
+                self.statusItem = nil
+            }
+            Logger.shared.log("Demoted from PRIMARY instance: another process owns the repaired instance lock. Removed this process's status-bar item and resumed secondary election polling.", level: "WARN")
+            self.startPrimaryElectionRetry()
         }
         RunLoop.main.add(timer, forMode: .common)
         primaryLockWatchdog = timer
@@ -253,8 +269,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         // back around into a second post via this same method.
         isInternalTermination = true
 
-        Logger.shared.log("User-initiated quit (Dock menu, Cmd-Q or the status-bar menu item). Broadcasting QUIT so sibling AI Chalkboard instances terminate too, then terminating this process.", level: "INFO")
-        InstanceBroadcast.shared.postQuitAll()
+        Logger.shared.log("User-initiated Dock/Cmd-Q quit. Broadcasting a launch-mode-scoped QUIT, then terminating this process.", level: "INFO")
+        InstanceBroadcast.shared.postQuitAll(scopedToLaunchMode: true)
 
         // Safe to terminate right away: postNotificationName hands the message
         // to the session's distnoted daemon before it returns, so the fan-out
@@ -298,6 +314,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
             button.toolTip = "AI Chalkboard (MCP Overlay Agent)"
         }
         
+        statusItem?.menu = makeStatusMenu()
+    }
+
+    /// Builds the menu independently of installing an `NSStatusItem`. Keeping
+    /// construction separate makes target/action wiring deterministic and
+    /// testable without touching the live menu bar.
+    func makeStatusMenu() -> NSMenu {
         let menu = NSMenu()
 
         // Scoped clear FIRST and bound to Cmd-K (the shortcut the old "Clear All
@@ -317,7 +340,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
 
         menu.addItem(NSMenuItem.separator())
 
-        let capture = NSMenuItem(title: "Show in Screen Captures", action: #selector(toggleCaptureVisible), keyEquivalent: "")
+        let capture = NSMenuItem(title: "Capture Debug Mode", action: #selector(toggleCaptureVisible), keyEquivalent: "")
         menu.addItem(capture)
         captureVisibleItem = capture
 
@@ -334,7 +357,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         // capture state whenever it was changed via MCP or by a sibling process.
         menu.delegate = self
 
-        statusItem?.menu = menu
+        return menu
     }
 
     // MARK: - NSMenuDelegate
@@ -416,10 +439,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         InstanceBroadcast.shared.postClear(scope: .all, appId: nil, appName: nil)
     }
 
-    /// Toggles whether the overlay appears in screencapture / screen recordings
-    /// / Claude's screenshots. Broadcast, not local: every instance draws its
-    /// own overlay windows, so a local-only flip would expose one process's
-    /// annotations and not the other's.
+    /// Toggles AI Chalkboard's capture eligibility request and debug renderer.
+    /// Broadcast, not local: every instance draws its own overlay windows, so a
+    /// local-only flip would leave processes with inconsistent preferences.
     ///
     /// The checkmark is NOT set here -- `menuNeedsUpdate(_:)` reads the real
     /// state back from `OverlayWindowController` on the next menu open, so the

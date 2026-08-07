@@ -33,6 +33,10 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHighResolutionMagnifyAllowed</key>
+    <false/>
     <key>LSUIElement</key>
     <false/>
     <key>LSMinimumSystemVersion</key>
@@ -40,5 +44,11 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
 </dict>
 </plist>
 EOF
+
+# SwiftPM linker-signs the bare executable before it is placed in the bundle.
+# Sign the completed bundle again so the final code directory binds Info.plist
+# (including the bundle identifier and Retina capability) instead of leaving
+# those launch-critical settings outside the signature.
+codesign --force --deep --sign - "$APP_DIR"
 
 echo "App bundle created successfully at $(pwd)/$APP_DIR"

@@ -10,9 +10,19 @@ let package = Package(
         .executable(name: "AIChalkboard", targets: ["AIChalkboard"])
     ],
     targets: [
+        .target(
+            name: "AIChalkboardCore",
+            path: "Sources"
+        ),
         .executableTarget(
             name: "AIChalkboard",
-            path: "Sources"
+            dependencies: ["AIChalkboardCore"],
+            path: "Launcher"
+        ),
+        .testTarget(
+            name: "AIChalkboardCoreTests",
+            dependencies: ["AIChalkboardCore"],
+            path: "tests/AIChalkboardCoreTests"
         )
     ]
 )

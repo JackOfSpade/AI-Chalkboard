@@ -8,6 +8,21 @@ public enum AnnotationKind: Codable {
     case label(x: Double, y: Double, text: String)
     case grid(stepPx: Double)
     case path(points: [[Double]], strokeWidth: Double, isClosed: Bool)
+
+    /// Stable, flat discriminator for MCP clients. Swift's synthesized Codable
+    /// representation nests the case name under `kind` (for example
+    /// `{"kind":{"grid":...}}`), which is useful for round-tripping but
+    /// awkward for clients that only need to branch on the primitive type.
+    var typeName: String {
+        switch self {
+        case .circle: return "circle"
+        case .arrow: return "arrow"
+        case .box: return "box"
+        case .label: return "label"
+        case .grid: return "grid"
+        case .path: return "path"
+        }
+    }
 }
 
 public struct Annotation: Identifiable, Codable {
@@ -35,12 +50,9 @@ public struct Annotation: Identifiable, Codable {
     public let appId: String?
 
     /// Human-readable name of `appId` ("DaVinci Resolve") captured at creation
-    /// time, purely so `list_annotations` can tell the user *which* app an
-    /// annotation is waiting for without having to look the bundle id up again.
-    /// Resolution goes through `NSWorkspace.runningApplications`, so the name is
-    /// unavailable once the app quits -- caching it here keeps the diagnostic
-    /// output readable in exactly the case the user most needs it (the linked
-    /// app is not running, which is *why* nothing is showing up).
+    /// time. It is nil when a non-running app was targeted by bundle id because
+    /// `NSWorkspace.runningApplications` has no display name to resolve then.
+    /// Once captured it remains readable after that app quits.
     public let appName: String?
 
     public init(
