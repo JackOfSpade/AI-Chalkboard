@@ -28,7 +28,41 @@ public final class OverlayView: NSView {
         guard let context = NSGraphicsContext.current?.cgContext else { return }
         context.clear(dirtyRect)
         
-        let annotations = AnnotationStore.shared.getForScreen(screenId)
+        // Per-app filtering: only annotations that are global, or linked to the
+        // app that is frontmost RIGHT NOW, get painted. `ActiveAppTracker`
+        // repaints every overlay on each app activation, so switching from
+        // DaVinci Resolve to Terminal swaps one app's annotations out for the
+        // other's. Note this uses `currentAppId` (what is on screen) and NOT
+        // `fallbackAppId` (what an untagged draw call would target).
+        //
+        // EXCEPT while capture visibility is ON, which is a DEBUG MODE and is
+        // deliberately exempt from the filter -- do not "simplify" this back to
+        // a single unconditional call:
+        //
+        // `set_capture_visible(true)` exists for exactly one purpose: Claude
+        // draws something, exposes the overlay to screen capture, screenshots
+        // the display and checks that the box landed where it meant. But Claude
+        // Desktop is frontmost at the moment it screenshots, so `currentAppId`
+        // is Claude, while the annotation it just drew was tagged with
+        // `fallbackAppId` (the OTHER app -- see ActiveAppTracker). Filtering
+        // here would drop that annotation from the capture and hand back a
+        // BLANK overlay: byte-for-byte the symptom that `sharingType = .none`
+        // used to cause, reintroduced through a second mechanism, defeating the
+        // very tool built to tell those two causes apart.
+        //
+        // So while the debug toggle is on, render EVERYTHING on this screen
+        // (this is the sole caller of the 1-arg `getForScreen`). The user has
+        // explicitly asked to see the overlay as it really is; showing another
+        // app's annotations for the duration is the intended, reversible cost.
+        let annotations: [Annotation]
+        if OverlayWindowController.shared.isCaptureVisible {
+            annotations = AnnotationStore.shared.getForScreen(screenId)
+        } else {
+            annotations = AnnotationStore.shared.getForScreen(
+                screenId,
+                visibleForApp: ActiveAppTracker.shared.currentAppId
+            )
+        }
         let scale = scaleFactor > 0 ? scaleFactor : 1.0
         let viewHeight = bounds.height
 

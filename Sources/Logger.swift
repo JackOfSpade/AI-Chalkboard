@@ -1,92 +1,366 @@
 import Foundation
+// Foundation re-exports Darwin on Apple platforms, which is where open(2),
+// flock(2), fstat(2)/stat(2), and close(2) come from below.
 
 public final class Logger: @unchecked Sendable {
     public static let shared = Logger()
-    
+
     private var fileHandle: FileHandle?
     private let logFileURL: URL
     private let backupFileURL: URL
+    private let lockFileURL: URL
     private let queue = DispatchQueue(label: "com.aichalkboard.logger", qos: .utility)
     private let dateFormatter: DateFormatter
-    
+
     // Capped at 5 MB max per log file (total max disk space: 10 MB with 1 backup)
     private let maxFileSizeBytes: UInt64 = 5 * 1024 * 1024
-    
+
+    // BUG FIX (failed rotation retried forever): tracks when a rotation
+    // attempt last failed (e.g. permission denied, stale backup couldn't be
+    // removed) so rotateIfNeeded() can back off instead of re-running the
+    // failing rename + lock + handle-recycle dance on every single log()
+    // call from every process sharing this file. Only ever read/written
+    // from inside `queue` (see rotateIfNeeded/logSync), so no extra
+    // synchronization is needed despite this class being Sendable.
+    private var lastRotationFailure: Date?
+    private let rotationFailureCooldown: TimeInterval = 60
+
     private init() {
         let fileManager = FileManager.default
         let logsDir = fileManager.urls(for: .libraryDirectory, in: .userDomainMask).first!
             .appendingPathComponent("Logs")
             .appendingPathComponent("AIChalkboard")
-        
+
         try? fileManager.createDirectory(at: logsDir, withIntermediateDirectories: true)
-        
+
         logFileURL = logsDir.appendingPathComponent("ai_chalkboard.log")
         backupFileURL = logsDir.appendingPathComponent("ai_chalkboard.1.log")
-        
-        if !fileManager.fileExists(atPath: logFileURL.path) {
-            fileManager.createFile(atPath: logFileURL.path, contents: nil)
-        }
-        
-        fileHandle = try? FileHandle(forWritingTo: logFileURL)
-        fileHandle?.seekToEndOfFile()
-        
+        lockFileURL = logsDir.appendingPathComponent("ai_chalkboard.rotate.lock")
+
         dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
-        
+        // BUG FIX (timestamps vs. MCP host): this deliberately matches the MCP
+        // host's own log timestamps, which are UTC (e.g. "17:47:02.468Z"). The
+        // previous formatter only set `dateFormat`, so it defaulted to the
+        // system's local time zone; the logger would print "13:47:02.558" for
+        // the same instant the host printed "17:47:02.468Z" (a 4-hour offset in
+        // this deployment), forcing manual math to correlate the two logs when
+        // debugging. Forcing UTC (with a trailing "Z" in the format) means the
+        // two logs can be read side by side with matching timestamps. Locale is
+        // pinned to en_US_POSIX because a fixed-format DateFormatter must not be
+        // allowed to vary its digit/format conventions with the user's locale.
+        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS'Z'"
+        dateFormatter.timeZone = TimeZone(identifier: "UTC")
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+
+        fileHandle = Logger.openAppendHandle(at: logFileURL)
+
         log("==================================================")
         log("AI Chalkboard Logger Initialized (PID: \(ProcessInfo.processInfo.processIdentifier))")
         log("Log File: \(logFileURL.path)")
         log("Log Max Size Cap: 5 MB (Auto-rotating)")
         log("==================================================")
     }
-    
+
+    // Opens (creating if necessary) the log file with O_APPEND.
+    //
+    // BUG FIX (concurrent writers corrupt the log): Claude Desktop routinely
+    // runs multiple instances of this MCP server process at the same time
+    // (observed concurrently in production: two independent PID pairs all
+    // writing to this same log file). The previous implementation opened the
+    // file once via FileHandle(forWritingTo:) and called seekToEndOfFile() a
+    // single time at init. Each process then tracked its own file offset
+    // independently, so a later write from process B landed at B's
+    // last-known offset and physically overwrote bytes process A had already
+    // written (and vice versa) — real, observed corruption: an orphaned
+    // fragment of one process's init banner (" Log Max Size Cap: 5 MB
+    // (Auto-rotating)") landed mid-line inside another process's output, with
+    // no timestamp/PID prefix of its own because it was a partial overwrite.
+    // Opening with O_APPEND delegates "seek to end" to the kernel and makes it
+    // part of the same atomic operation as the write (per POSIX, each
+    // O_APPEND write atomically seeks to the current end-of-file first), so
+    // concurrent writers from separate processes each append at the file's
+    // true current end rather than at a stale, locally-cached offset.
+    private static func openAppendHandle(at url: URL) -> FileHandle? {
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        guard fd != -1 else {
+            // A logging failure must never take down the MCP server. Report to
+            // stderr only and continue with fileHandle == nil; log() already
+            // writes to stderr unconditionally, so output isn't fully lost.
+            let msg = "[Logger] Failed to open log file at \(url.path) (errno \(errno)). Logging to stderr only.\n"
+            if let data = msg.data(using: .utf8) {
+                FileHandle.standardError.write(data)
+            }
+            return nil
+        }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+    }
+
     public func log(_ message: String, level: String = "INFO") {
         let timestamp = dateFormatter.string(from: Date())
         let pid = ProcessInfo.processInfo.processIdentifier
         let line = "[\(timestamp)] [PID: \(pid)] [\(level)] \(message)\n"
-        
-        // Write to stderr
-        if let data = line.data(using: .utf8) {
-            FileHandle.standardError.write(data)
-        }
-        
-        // Write to log file asynchronously with size-cap rotation
+
+        // Write to stderr. NEVER write to stdout: this process is an MCP stdio
+        // server speaking JSON-RPC over stdout, and any stray byte there would
+        // corrupt the protocol stream.
+        guard let data = line.data(using: .utf8) else { return }
+        FileHandle.standardError.write(data)
+
+        // Write to log file asynchronously with size-cap rotation.
         queue.async { [weak self] in
             guard let self = self else { return }
+            self.reopenIfRotatedAwayFromUnderUs()
             self.rotateIfNeeded()
-            
-            if let handle = self.fileHandle, let data = line.data(using: .utf8) {
-                handle.write(data)
-                try? handle.synchronize()
+            self.writeToFile(data)
+        }
+    }
+
+    // Writes pre-encoded line data to the current file handle, degrading to
+    // stderr-only on any failure rather than crashing the MCP server. Using
+    // the throwing `write(contentsOf:)` API (not the legacy non-throwing
+    // `write(_:)`) matters here: the legacy API can raise an uncatchable
+    // Objective-C exception on failure (e.g. EPIPE), which would terminate
+    // this process outright.
+    private func writeToFile(_ data: Data) {
+        guard let handle = fileHandle else { return }
+        do {
+            try handle.write(contentsOf: data)
+            // BUG FIX (fsync on every line is ~8x slower and unnecessary):
+            // measured on this machine, 0.0028 ms/line without fsync vs
+            // 0.0219 ms/line with it, on a hot path that runs for every MCP
+            // protocol message. This is a diagnostic log, not a durability-
+            // critical store: losing the last few OS-buffered lines on a
+            // hard crash (kill -9, power loss, kernel panic) is acceptable,
+            // and the file is opened O_APPEND so the write(2) itself still
+            // reaches the OS immediately -- another process reading this
+            // file (tail -f, another instance's inode self-heal stat/fstat
+            // check) sees it right away with no fsync required. Do NOT add
+            // synchronize() back here; it belongs only on genuinely rare,
+            // high-value writes: the rotation banner (rotateIfNeeded) and
+            // the synchronous FATAL path (logSync).
+        } catch {
+            let msg = "[Logger] File write failed: \(error). Logging to stderr only for this line.\n"
+            if let errData = msg.data(using: .utf8) {
+                FileHandle.standardError.write(errData)
             }
         }
     }
-    
-    private func rotateIfNeeded() {
-        guard let handle = fileHandle else { return }
-        let currentSize = handle.offsetInFile
-        
-        if currentSize >= maxFileSizeBytes {
+
+    // Detects that another process rotated the log out from under this one,
+    // and self-heals by reopening against the path.
+    //
+    // BUG FIX (rotation across processes silently misroutes logs): POSIX file
+    // descriptors follow inodes, not paths. If process A rotates (renames the
+    // current log to the backup name, then creates a fresh file at the
+    // original path), process B's already-open descriptor still refers to the
+    // renamed inode — B would keep appending into what is now the backup file
+    // forever, and B's logs would silently vanish from the live log. We guard
+    // against this on the same code path that runs before every write: fstat
+    // our own descriptor and stat the current path, and if the inodes differ,
+    // someone else rotated, so close and reopen against the path to land back
+    // on the live file.
+    private func reopenIfRotatedAwayFromUnderUs() {
+        guard let handle = fileHandle else {
+            fileHandle = Logger.openAppendHandle(at: logFileURL)
+            return
+        }
+
+        var handleStat = stat()
+        var pathStat = stat()
+
+        guard fstat(handle.fileDescriptor, &handleStat) == 0 else { return }
+        guard stat(logFileURL.path, &pathStat) == 0 else {
+            // Path momentarily missing (e.g. another process mid-rename);
+            // leave the handle as-is and retry on the next log() call.
+            return
+        }
+
+        if handleStat.st_ino != pathStat.st_ino {
             try? handle.close()
-            
-            let fm = FileManager.default
+            fileHandle = Logger.openAppendHandle(at: logFileURL)
+        }
+    }
+
+    // Rotates the log file when it exceeds maxFileSizeBytes.
+    //
+    // BUG FIX (rotation measures the wrong thing): the previous implementation
+    // used `handle.offsetInFile` as a proxy for file size. That only ever
+    // reflected bytes THIS process itself had written since opening its
+    // handle, not the file's real size on disk — with multiple writer
+    // processes it undercounts wildly and the 5 MB cap never actually
+    // triggers. It's also meaningless now that O_APPEND is in play, since
+    // offsetInFile no longer tracks a locally-seeked position the way it did
+    // for seek-then-write. We instead stat the real path to get the true
+    // on-disk size, which reflects every process's writes.
+    //
+    // BUG FIX (rotation race across processes): rotation is a rename +
+    // recreate, which is not atomic across processes. Without coordination,
+    // two processes could both observe "over cap" at once and both attempt to
+    // rotate, racing each other's renames (e.g. one process's fresh file gets
+    // immediately clobbered by the other's rotation, or a backup is lost). We
+    // serialize rotation across processes with flock() on a dedicated lock
+    // file, then re-check the size after acquiring the lock, since another
+    // process may have already rotated while we were waiting for it.
+    private func rotateIfNeeded() {
+        guard fileHandle != nil else { return }
+        guard let currentSize = Logger.fileSize(atPath: logFileURL.path),
+              currentSize >= maxFileSizeBytes else { return }
+
+        // BUG FIX (permanent silent rotation failure spins forever): if a
+        // previous attempt failed (e.g. the log directory lost write
+        // permission, or a stale ai_chalkboard.1.log couldn't be removed),
+        // retrying on *every single subsequent log() call*, from every
+        // process sharing this file, would mean the failing rename, the
+        // lock acquisition, and the handle close/reopen all run on the hot
+        // path forever with nothing to show for it. Back off for a cooldown
+        // window instead of hammering a condition that won't resolve itself
+        // without outside intervention (e.g. a human fixing permissions).
+        if let lastFailure = lastRotationFailure,
+           Date().timeIntervalSince(lastFailure) < rotationFailureCooldown {
+            return
+        }
+
+        let lockFd = open(lockFileURL.path, O_WRONLY | O_CREAT, 0o644)
+        guard lockFd != -1 else {
+            // Can't coordinate rotation right now; skip rotating this round
+            // rather than risk racing another process. We'll reassess on the
+            // next log() call.
+            return
+        }
+        defer { close(lockFd) }
+
+        // BUG FIX (blocking flock stalls the whole serial queue forever): a
+        // plain LOCK_EX blocks the calling thread until the lock holder
+        // releases it. If the holder is suspended mid-rotation (SIGSTOP, a
+        // paused debugger, a frozen VM), this call never returns. log()
+        // itself doesn't block the caller (it writes stderr synchronously
+        // then queue.async's the file write), but `queue` is serial, so
+        // every subsequent log() from this process piles up behind this one
+        // stuck closure -- unbounded memory growth and on-disk logging
+        // silently stops. LOCK_NB makes the attempt non-blocking: on
+        // EWOULDBLOCK, another process is already rotating, so just skip
+        // this round (mirrors the "can't coordinate right now, skip this
+        // round" behavior above for the open() failure case). Either that
+        // process finishes rotating -- and our next call picks up the fresh
+        // file via the inode self-heal -- or it eventually releases the
+        // lock and a later line retries successfully.
+        guard flock(lockFd, LOCK_EX | LOCK_NB) == 0 else {
+            return
+        }
+        defer { flock(lockFd, LOCK_UN) }
+
+        // Re-check under the lock: another process may have already rotated
+        // while we were waiting to acquire it.
+        guard let sizeAfterLock = Logger.fileSize(atPath: logFileURL.path),
+              sizeAfterLock >= maxFileSizeBytes else {
+            // Someone else already rotated (or the file otherwise shrank);
+            // make sure our handle still points at the live file and bail.
+            reopenIfRotatedAwayFromUnderUs()
+            return
+        }
+
+        // BUG FIX (failed rename made rotation a permanent silent no-op):
+        // the previous code used `try?` for both removeItem and moveItem,
+        // discarding any error, and then *unconditionally* closed/reopened
+        // the handle and appended a "Log file rotated" banner regardless of
+        // whether the move actually happened. If the move fails (directory
+        // lost write permission, a stale backup exists and can't be
+        // removed, moveItem refuses to overwrite an existing destination,
+        // etc.) the oversized file was left untouched on disk, yet every
+        // process would still print a FALSE "rotated" banner and keep
+        // pointlessly recycling its handle -- on every single log line,
+        // forever -- while the file grew without bound, with no visible
+        // error. We now check each step explicitly and only perform the
+        // handle swap / banner write if the move genuinely succeeded.
+        let fm = FileManager.default
+        do {
             if fm.fileExists(atPath: backupFileURL.path) {
-                try? fm.removeItem(at: backupFileURL)
+                try fm.removeItem(at: backupFileURL)
             }
-            try? fm.moveItem(at: logFileURL, to: backupFileURL)
-            fm.createFile(atPath: logFileURL.path, contents: nil)
-            
-            fileHandle = try? FileHandle(forWritingTo: logFileURL)
-            fileHandle?.seekToEndOfFile()
-            
-            if let newHandle = fileHandle,
-               let rotationMsg = "[\(dateFormatter.string(from: Date()))] [PID: \(ProcessInfo.processInfo.processIdentifier)] [INFO] Log file rotated: 5 MB limit reached. Oldest logs moved to ai_chalkboard.1.log\n".data(using: .utf8) {
-                newHandle.write(rotationMsg)
+            try fm.moveItem(at: logFileURL, to: backupFileURL)
+        } catch {
+            lastRotationFailure = Date()
+            // Report directly to stderr, never via log(): we're running
+            // inside `queue` right now, and log() would queue.async back
+            // onto this same serial queue -- at best a pointless bounce,
+            // and the established rule in this file is that error paths
+            // inside the queue always write to stderr directly.
+            let msg = "[Logger] Rotation failed, leaving oversized log file in place; will retry in \(Int(rotationFailureCooldown))s. Path: \(logFileURL.path) Error: \(error)\n"
+            if let msgData = msg.data(using: .utf8) {
+                FileHandle.standardError.write(msgData)
+            }
+            // Degraded but alive, never dead: fileHandle is untouched and
+            // still open on the existing (oversized) file, so logging
+            // continues uninterrupted -- just without the size cap enforced
+            // until the underlying problem clears and a later attempt (at
+            // least rotationFailureCooldown seconds from now) succeeds.
+            return
+        }
+
+        // Close the handle on the now-renamed (backup) inode and reopen
+        // against the path, which recreates the fresh file via O_CREAT. This
+        // is the same self-heal used by reopenIfRotatedAwayFromUnderUs(), run
+        // here directly since we're the process that performed the rotation.
+        try? fileHandle?.close()
+        fileHandle = Logger.openAppendHandle(at: logFileURL)
+        lastRotationFailure = nil
+
+        if let newHandle = fileHandle {
+            let rotationMsg = "[\(dateFormatter.string(from: Date()))] [PID: \(ProcessInfo.processInfo.processIdentifier)] [INFO] Log file rotated: 5 MB limit reached. Oldest logs moved to ai_chalkboard.1.log\n"
+            if let msgData = rotationMsg.data(using: .utf8) {
+                try? newHandle.write(contentsOf: msgData)
+                // Unlike routine per-line writes (see writeToFile), a
+                // rotation is a rare, significant event worth the fsync
+                // cost to make sure the banner marking the new file's start
+                // is durable.
                 try? newHandle.synchronize()
             }
         }
     }
-    
+
+    // Synchronously logs `message` to stderr and to the log file, bypassing
+    // the normal `queue.async` path, then fsyncs. Intended for the rare
+    // call sites where the process may terminate (abort(), a re-raised
+    // signal, etc.) before an async closure enqueued by log() would ever
+    // get a chance to run -- e.g. NSSetUncaughtExceptionHandler in
+    // main.swift, whose handler runs immediately before the runtime calls
+    // abort(). Without this, the one log line explaining a crash could be
+    // lost from the file (it would still reach stderr, since that part of
+    // log()'s formatting is already synchronous).
+    //
+    // MUST NOT be called from a closure already running on `queue` (i.e.
+    // from within rotateIfNeeded/writeToFile/reopenIfRotatedAwayFromUnderUs,
+    // or a closure passed to queue.async by log()) -- queue.sync from
+    // inside the queue it targets deadlocks. All current call sites (the
+    // uncaught-exception handler) run on their own thread outside the
+    // logger's queue, so this is safe.
+    public func logSync(_ message: String, level: String = "FATAL") {
+        let timestamp = dateFormatter.string(from: Date())
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let line = "[\(timestamp)] [PID: \(pid)] [\(level)] \(message)\n"
+
+        guard let data = line.data(using: .utf8) else { return }
+        FileHandle.standardError.write(data)
+
+        queue.sync { [weak self] in
+            guard let self = self else { return }
+            self.reopenIfRotatedAwayFromUnderUs()
+            self.rotateIfNeeded()
+            self.writeToFile(data)
+            // Durability matters here specifically: the process is about to
+            // abort()/exit and this may be the only record of why. This is
+            // the other genuinely-rare, high-value write alongside the
+            // rotation banner that justifies paying for fsync.
+            try? self.fileHandle?.synchronize()
+        }
+    }
+
+    private static func fileSize(atPath path: String) -> UInt64? {
+        var s = stat()
+        guard stat(path, &s) == 0 else { return nil }
+        return UInt64(s.st_size)
+    }
+
     public var logFilePath: String {
         return logFileURL.path
     }

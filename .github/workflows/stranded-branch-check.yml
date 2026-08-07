@@ -40,6 +40,12 @@ jobs:
                                 # its CI run has been settled — or is still missing — for >6h without being
                                 # merged. See the per-branch CI-run lookup below for exactly how age is
                                 # measured; the tip commit's committer date is only a fallback (no run yet).
+          MAX_INFLIGHT_HOURS: '12'   # a normal CI run here finishes in minutes, so a run that is STILL
+                                      # not in a terminal state after 12h is wedged, not working — e.g. a
+                                      # GitHub Actions outage (the motivating real-world case: runs get
+                                      # stuck queued/in_progress and GitHub never marks them completed).
+                                      # Deliberately much larger than MAX_AGE_HOURS: an in-flight run is
+                                      # not stranded just for being slow, only for being wedged.
         run: |
           set -uo pipefail
           # Fetch ALL remote branches (checkout only brought main).
@@ -67,7 +73,20 @@ jobs:
             #   - no run for the tip SHA  -> CI hasn't produced a run (yet, or ever); fall back to the
             #                                tip-commit-date age as a coarse guard. This is the ONLY
             #                                place the committer date still drives the verdict.
-            #   - run queued/in_progress  -> in flight, not stranded, no matter how old the commit is.
+            #   - run queued/in_progress  -> in flight; not stranded while it is genuinely progressing.
+            #                                BUT a run that never reaches a terminal state must not be
+            #                                able to hide a branch forever — that is exactly what a
+            #                                GitHub Actions outage produces (runs wedge in
+            #                                queued/in_progress and GitHub never marks them completed),
+            #                                and it is the real-world case that motivates this branch.
+            #                                Two thresholds exist for this reason: MAX_AGE_HOURS (short)
+            #                                covers settled-or-missing runs, which resolve within minutes
+            #                                when everything is healthy; MAX_INFLIGHT_HOURS (long) is the
+            #                                outer bound past which a still-non-terminal run is presumed
+            #                                wedged rather than working. Age here is measured from the
+            #                                run's `created_at` (when it was queued), NOT `updated_at` —
+            #                                a wedged run's `updated_at` can keep ticking even though the
+            #                                run itself never finishes.
             #   - run completed           -> genuinely settled; age is measured from the run's
             #                                `updated_at` (when it reached its terminal state), and its
             #                                `conclusion` is the actionable fact (failure -> fix CI,
@@ -90,13 +109,13 @@ jobs:
             # conclusion=2026-01-01T00:00:00Z, updated_at=""). "|" is not IFS whitespace, so empty
             # fields are preserved positionally. No GitHub run status/conclusion value contains "|".
             row="$(printf '%s' "$runs_json" | jq -r '
-              if (.workflow_runs | type) != "array" then "||"
+              if (.workflow_runs | type) != "array" then "|||"
               else ((.workflow_runs | max_by(.id)) as $r |
-                if $r == null then "||"
-                else (($r.status // "") + "|" + ($r.conclusion // "") + "|" + ($r.updated_at // ""))
+                if $r == null then "|||"
+                else (($r.status // "") + "|" + ($r.conclusion // "") + "|" + ($r.updated_at // "") + "|" + ($r.created_at // ""))
                 end)
               end' 2>/dev/null || true)"
-            IFS='|' read -r run_status run_conclusion run_updated_at <<< "$row"
+            IFS='|' read -r run_status run_conclusion run_updated_at run_created_at <<< "$row"
 
             if [ -z "$run_status" ]; then
               # No CI run exists yet for the tip SHA — CI may simply not have started. Fall back to
@@ -107,9 +126,44 @@ jobs:
                 echo "- \`$br\` — unmerged; no CI run found for tip commit, which is ${age}h old (tip $(git rev-parse --short "$ref"))" >> /tmp/stranded.txt
               fi
             elif [ "$run_status" != "completed" ]; then
-              : # queued/in_progress — in flight, not stranded, no matter how old the commit is.
+              # Non-terminal (queued/in_progress/waiting/...). Not stranded while it's genuinely still
+              # progressing, but must not be allowed to hide the branch forever if it's wedged (e.g. a
+              # GitHub Actions outage) — see MAX_INFLIGHT_HOURS above. Age is from `created_at` (when
+              # queued), not `updated_at`, since a wedged run's `updated_at` may keep ticking.
+              #
+              # NB: `date -u -d ""` (GNU date) EXITS 0 and returns today's midnight UTC rather than
+              # failing — verified on real GNU date — so emptiness must be checked directly on the
+              # string, not inferred from date's exit status (same fix as the `updated_at` handling
+              # below).
+              if [ -n "$run_created_at" ]; then
+                created_epoch="$(date -u -d "$run_created_at" +%s 2>/dev/null)" || created_epoch=""
+              else
+                created_epoch=""
+              fi
+              if [ -z "$created_epoch" ]; then
+                echo "::warning::Could not parse CI run created_at ('$run_created_at') for \`$br\`; falling back to tip-commit-date age."
+                ct=$(git log -1 --format='%ct' "$ref")
+                age=$(( (now - ct) / 3600 ))
+                if [ "$age" -ge "$MAX_AGE_HOURS" ]; then
+                  echo "- \`$br\` — unmerged; tip commit is ${age}h old (CI run's created_at was unparseable; run status: $run_status) (tip $(git rev-parse --short "$ref"))" >> /tmp/stranded.txt
+                fi
+              else
+                age=$(( (now - created_epoch) / 3600 ))
+                if [ "$age" -ge "$MAX_INFLIGHT_HOURS" ]; then
+                  echo "- \`$br\` — unmerged; CI run has been stuck in '$run_status' for ${age}h (tip $(git rev-parse --short "$ref"))" >> /tmp/stranded.txt
+                fi
+                # else: genuinely in flight and still within the wedged-run grace period — not stranded.
+              fi
             else
-              updated_epoch="$(date -u -d "$run_updated_at" +%s 2>/dev/null)" || updated_epoch=""
+              # `date -u -d ""` (GNU date) EXITS 0 and returns today's midnight UTC rather than failing
+              # — verified on real GNU date — so we must check the string is non-empty ourselves BEFORE
+              # calling `date`, rather than trusting a non-empty $updated_epoch to mean the parse
+              # succeeded on real input.
+              if [ -n "$run_updated_at" ]; then
+                updated_epoch="$(date -u -d "$run_updated_at" +%s 2>/dev/null)" || updated_epoch=""
+              else
+                updated_epoch=""
+              fi
               if [ -z "$updated_epoch" ]; then
                 echo "::warning::Could not parse CI run updated_at ('$run_updated_at') for \`$br\`; falling back to tip-commit-date age."
                 ct=$(git log -1 --format='%ct' "$ref")
@@ -165,7 +219,7 @@ jobs:
             echo "::warning::Stranded branch / unmerged work detected — see the alert step / opened issue."
           else
             echo "problem=false" >> "$GITHUB_OUTPUT"
-            echo "OK: no stranded branches (CI settled or missing > ${MAX_AGE_HOURS}h), no open conflict PRs."
+            echo "OK: no stranded branches (CI settled or missing > ${MAX_AGE_HOURS}h; CI stuck in-flight > ${MAX_INFLIGHT_HOURS}h), no open conflict PRs."
           fi
 
       - name: Open alert issue (dedup) and fail the run
@@ -179,7 +233,7 @@ jobs:
             echo "A branch's work may be sitting unmerged with no automatic signal: auto-merge-claude.yml only merges a branch once its CI run is green, so a branch whose CI stays red is skipped by every drain indefinitely, and an unresolved \`Auto-merge conflict:\` PR sits open until someone notices it."
             echo
             if [ -s /tmp/stranded.txt ]; then
-              echo "**Stranded branches (unmerged, CI settled or missing > 6h):**"; echo; cat /tmp/stranded.txt; echo
+              echo "**Stranded branches (unmerged: CI settled or missing > 6h, or CI stuck in a non-terminal status > 12h):**"; echo; cat /tmp/stranded.txt; echo
             fi
             if [ -s /tmp/conflicts.txt ]; then
               echo "**Open auto-merge conflict PRs:**"; echo; cat /tmp/conflicts.txt; echo
@@ -189,7 +243,7 @@ jobs:
             elif [ "${PR_LIST_FAILED:-0}" = "1" ]; then
               echo "**Could not check for open 'Auto-merge conflict:' PRs** (\`gh pr list\` exited non-zero with no error output — this is a monitoring gap, not necessarily a stranded branch)"; echo
             fi
-            echo "**Resolve:** for a red/stuck branch, re-run CI for its tip (\`gh workflow run ci.yml --ref <branch>\`) or push a new commit to produce a fresh CI run — auto-merge drains it automatically once that run completes green (the gate is fail-closed, so it never merges on its own without a green run for the exact tip SHA). Otherwise, merge/close the conflict PR, or delete the branch if it is obsolete."
+            echo "**Resolve:** for a red/failed branch, re-run CI for its tip (\`gh workflow run ci.yml --ref <branch>\`) or push a new commit to produce a fresh CI run. For a branch whose CI run is stuck in a non-terminal status (queued/in_progress and not actually progressing — e.g. during a GitHub Actions outage), cancel the wedged run and re-run CI (\`gh run cancel <run-id>\` then \`gh workflow run ci.yml --ref <branch>\`), or just push a new commit to produce a fresh run. Either way, auto-merge drains the branch automatically once a run completes green (the gate is fail-closed, so it never merges on its own without a green run for the exact tip SHA). Otherwise, merge/close the conflict PR, or delete the branch if it is obsolete."
           } > /tmp/body.md
 
           # Dedup by title prefix (avoids a new issue every 6h while one incident is open).

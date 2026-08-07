@@ -85,7 +85,7 @@ branch or push a new commit.
 | --- | --- |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | The merge gate. Its run conclusion for a branch's tip SHA is what auto-merge reads. |
 | [`.github/workflows/auto-merge-claude.yml`](.github/workflows/auto-merge-claude.yml) | Drains every un-merged branch on each CI completion and re-verifies main's tip post-merge. |
-| [`.github/workflows/stranded-branch-check.yml`](.github/workflows/stranded-branch-check.yml) | Runs every 6 hours; flags a branch that is unmerged and whose CI run has been settled — or is still missing — for more than 6h (measured from the CI run itself, the same signal the merge gate reads, not the tip commit's date), or an open conflict PR. A branch whose CI is still queued/running is skipped, no matter how old its tip commit is. |
+| [`.github/workflows/stranded-branch-check.yml`](.github/workflows/stranded-branch-check.yml) | Runs every 6 hours; flags a branch that is unmerged and whose CI run has been settled — or is still missing — for more than 6h (measured from the CI run itself, the same signal the merge gate reads, not the tip commit's date), or an open conflict PR. A branch whose CI is genuinely still queued/running is skipped — but a run wedged in a non-terminal status for more than 12h (e.g. a GitHub Actions outage) is flagged too, so it can't hide a branch forever. |
 | [`scripts/auto_merge_decision.sh`](scripts/auto_merge_decision.sh) | The fail-closed decision predicates (CI-green check, ancestry check, etc.). |
 | [`tests/test_auto_merge_logic.sh`](tests/test_auto_merge_logic.sh) | Unit tests for those predicates. |
 | [`.claude/session-start.sh`](.claude/session-start.sh) | SessionStart hook: resets a remote Claude session's assigned branch to `origin/main`. |

@@ -18,13 +18,48 @@ public struct Annotation: Identifiable, Codable {
     public let label: String?
     public let createdAt: Date
 
-    public init(id: String = UUID().uuidString, screenId: String, kind: AnnotationKind, colorHex: String = "#FF0000", label: String? = nil) {
+    /// Bundle identifier of the application this annotation is LINKED to, e.g.
+    /// "com.blackmagic-design.DaVinciResolve".
+    ///
+    /// `nil` means GLOBAL: the annotation is drawn over every application, no
+    /// matter which one is frontmost. That is the escape hatch for calibration
+    /// aids (see `draw_grid`) and for anything the user wants pinned on screen
+    /// permanently.
+    ///
+    /// A non-nil value means the annotation is only rendered while that app is
+    /// the frontmost application -- switch to another app and it disappears,
+    /// switch back and it returns. It is NOT deleted while hidden; it stays in
+    /// the store until it expires, is cleared, or the process exits. The filter
+    /// lives in `AnnotationStore.getForScreen(_:visibleForApp:)`, which
+    /// `OverlayView.draw(_:)` calls with `ActiveAppTracker.shared.currentAppId`.
+    public let appId: String?
+
+    /// Human-readable name of `appId` ("DaVinci Resolve") captured at creation
+    /// time, purely so `list_annotations` can tell the user *which* app an
+    /// annotation is waiting for without having to look the bundle id up again.
+    /// Resolution goes through `NSWorkspace.runningApplications`, so the name is
+    /// unavailable once the app quits -- caching it here keeps the diagnostic
+    /// output readable in exactly the case the user most needs it (the linked
+    /// app is not running, which is *why* nothing is showing up).
+    public let appName: String?
+
+    public init(
+        id: String = UUID().uuidString,
+        screenId: String,
+        kind: AnnotationKind,
+        colorHex: String = "#FF0000",
+        label: String? = nil,
+        appId: String? = nil,
+        appName: String? = nil
+    ) {
         self.id = id
         self.screenId = screenId
         self.kind = kind
         self.colorHex = colorHex
         self.label = label
         self.createdAt = Date()
+        self.appId = appId
+        self.appName = appName
     }
 }
 

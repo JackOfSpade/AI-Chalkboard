@@ -1,0 +1,459 @@
+import Foundation
+
+/// Advisory single-instance guard used to prevent duplicate status-bar items.
+///
+/// Claude Desktop spawns TWO `AIChalkboard --mcp` processes for a single MCP
+/// server config entry. Both are legitimate, independent MCP stdio servers --
+/// Claude Desktop talks to each over its own stdin/stdout pipe -- so neither
+/// process can simply exit or skip protocol handling; doing so would make
+/// Claude Desktop see a dropped/failed connection, which is strictly worse
+/// than a cosmetic duplicate menu-bar icon.
+///
+/// This lock exists ONLY to elect exactly one of the two processes as
+/// "primary" so only ONE of them installs the status-bar item (a genuine
+/// OS-level singleton resource -- two of them look broken/duplicated to the
+/// user). It must never be used to gate `MCPServer.shared.start()` or
+/// `OverlayWindowController.shared.setup()`; those must run in every
+/// process regardless of who wins the lock.
+public final class InstanceLock: @unchecked Sendable {
+    public static let shared = InstanceLock()
+
+    /// Kept open for the lifetime of the process. Closing this descriptor
+    /// (or letting it be deallocated) would release the flock, so it is
+    /// intentionally never closed once acquired.
+    private var lockFileDescriptor: Int32 = -1
+
+    /// Cached outcome of the first `acquire()` call, so subsequent calls are
+    /// idempotent. `flock` locks are scoped to the *open file description*
+    /// (the kernel object `open()` creates), not to the process. A naive
+    /// second call would `open()` a brand-new descriptor on the same path
+    /// and then `flock()` it -- contending against the lock this very
+    /// process already holds via the first descriptor. That self-contention
+    /// reports EWOULDBLOCK, so an uncached `acquire()` would lie and say
+    /// "secondary" even though this process is (and remains) primary.
+    /// Caching the first result avoids ever re-opening/re-locking.
+    private var acquired: Bool?
+
+    /// How many consecutive retry polls have found NO lock file at all.
+    /// See `missingLockFilePollsBeforeRecreate`.
+    private var consecutiveMissingLockFilePolls = 0
+
+    /// How long a secondary tolerates a missing lock file before recreating it
+    /// and promoting itself, expressed in retry polls.
+    ///
+    /// This number is a race resolver, and it is why the value is not 1:
+    ///   * If a primary is ALIVE, `revalidatePrimaryLock()` recreates a deleted
+    ///     lock file on ITS timer -- the same 3s interval this poll runs at
+    ///     (`AppDelegate.primaryElectionRetryInterval` drives both). So a live
+    ///     primary makes the file reappear within about one poll. Waiting
+    ///     several polls means a secondary never mistakes that repair window for
+    ///     "the primary is gone".
+    ///   * If NO primary is alive (the lock file was deleted and then the
+    ///     primary exited, or the whole Application Support folder was wiped),
+    ///     nobody will ever recreate it, and refusing forever would strand this
+    ///     process exactly the way losing the election permanently used to:
+    ///     no status item, no Dock icon in MCP mode, no window.
+    /// Four polls is ~12s: several times the repair window, and a delay the
+    /// user reads as "it came back" rather than "it is broken".
+    private static let missingLockFilePollsBeforeRecreate = 4
+
+    /// What one `performAcquire` attempt concluded.
+    private enum AcquireOutcome {
+        /// This process holds the lock (or should behave as though it does).
+        case primary
+        /// Somebody else holds it, or an error said "do not promote".
+        case secondary
+        /// There is no lock file at the path AND this caller was not allowed to
+        /// create one. Distinct from `.secondary` because it says nothing about
+        /// whether a primary exists -- only the caller's policy can decide what
+        /// to do about it.
+        case lockFileMissing
+    }
+
+    private init() {}
+
+    /// Attempts to become the primary instance.
+    ///
+    /// Returns `true` if this process should behave as primary -- either
+    /// because it genuinely acquired the exclusive lock, or because
+    /// something went wrong creating/opening/locking the lock file. Failures
+    /// fail OPEN (return true): a broken lock file must never disable the
+    /// app's UI for every instance.
+    ///
+    /// THE FAIL-OPEN POLICY IS SPECIFIC TO THIS METHOD -- it applies to the
+    /// t=0 election only, where "nobody owns the UI" is the worst outcome.
+    /// `retryAcquire()` passes `failOpen: false` and fails CLOSED instead,
+    /// because by then an incumbent primary is known to exist and the worst
+    /// outcome is a permanent second status-bar item. Do not restate this
+    /// paragraph as "same policy as acquire()"; that is what it used to say and
+    /// it no longer holds.
+    ///
+    /// Idempotent: safe to call more than once; subsequent calls return the
+    /// cached outcome of the first call without touching the filesystem or
+    /// the lock again (see the `acquired` doc comment for why that matters).
+    ///
+    /// A process that LOSES this election is not condemned to stay secondary
+    /// forever -- see `retryAcquire()`.
+    @discardableResult
+    public func acquire() -> Bool {
+        if let acquired {
+            return acquired
+        }
+        // `createIfMissing` defaults to true here, so `.lockFileMissing` cannot
+        // occur: on a first run the lock file legitimately does not exist yet
+        // and somebody has to create it.
+        let outcome = (performAcquire() == .primary)
+        acquired = outcome
+        return outcome
+    }
+
+    /// Non-caching re-election attempt: "is the primary slot free *now*?"
+    ///
+    /// WHY THIS EXISTS -- do not delete it as redundant with `acquire()`.
+    /// `acquire()` caches its answer for the lifetime of the process, so a
+    /// process that lost the election at t=0 could never win it later. But the
+    /// primary can die by many paths other than the menu's Quit: it crashes,
+    /// Claude Desktop closes only its pipe (stdin EOF), someone runs `kill`,
+    /// a watchdog fires. The kernel ALWAYS releases its flock when it dies --
+    /// the lock genuinely becomes free -- and with a cached answer nothing
+    /// ever retried it.
+    ///
+    /// The surviving secondary would then have no user interface whatsoever:
+    /// `.accessory` activation policy in MCP mode (no Dock icon), no
+    /// status-bar item (it lost the election at t=0, and that answer was
+    /// cached), and no window at all since the floating Clear/Quit panel was
+    /// deleted as "redundant with the menu-bar item". Meanwhile its own
+    /// `AnnotationStore` may still be FULL, so stale annotations stay painted
+    /// across every screen with no way to clear them and no way to quit the
+    /// process. Before the floating panel was removed, that panel became the
+    /// frontmost clickable surface the instant the primary's vanished; this
+    /// re-election is what replaces that lost fallback.
+    ///
+    /// Semantics, deliberately different from `acquire()`:
+    /// * Never consults the cache -- the whole point is to re-test reality.
+    /// * Never records a NEGATIVE result. Losing a retry says nothing about
+    ///   the future, so the caller is expected to keep polling.
+    /// * A WINNING retry does update the cached value, because from that
+    ///   moment this process really is the primary and a later `acquire()`
+    ///   must not keep insisting otherwise. (Corrects the cache upward only;
+    ///   it can never poison it with a spurious "secondary".)
+    /// * FAILS CLOSED, unlike `acquire()`. Failing open is right at t=0 (if
+    ///   locking is broken, SOMEONE must own the UI) but wrong here: this
+    ///   process already knows another instance won the election and therefore
+    ///   already has a working menu, so an unexpected errno (EMFILE, ENOLCK,
+    ///   EINTR, a transient createDirectory failure) says nothing about the
+    ///   primary being gone. Returning true on those would latch
+    ///   `acquired = true`, invalidate the retry timer and install a SECOND
+    ///   status item next to the live one -- permanently, with no
+    ///   self-correction, and with ~28,800 chances a day per secondary to hit
+    ///   it. So: keep polling instead of self-promoting.
+    /// * VALIDATES THE INODE it locked (`verifyInode`), because winning an
+    ///   flock on a lock file that has been REPLACED proves nothing. See
+    ///   `performAcquire`.
+    /// * NEVER CREATES the lock file (`createIfMissing: false`) on an ordinary
+    ///   poll. Creating it is how a secondary used to manufacture a fresh inode
+    ///   and promote itself beside a live primary that still held the unlinked
+    ///   original -- measured: two permanent status-bar items, ~3s after the
+    ///   lock file was deleted. It escalates to creating only after the file has
+    ///   been missing for `missingLockFilePollsBeforeRecreate` polls, i.e.
+    ///   longer than a live primary's own repair takes.
+    /// * No descriptor leak: `performAcquire` closes the probe fd on every
+    ///   path that does not become the lock holder, so polling every few
+    ///   seconds for hours cannot exhaust the fd table.
+    ///
+    /// Main-thread only (driven by AppDelegate's re-election timer); the
+    /// state it touches is not synchronized.
+    @discardableResult
+    public func retryAcquire() -> Bool {
+        // Already holding the lock -- from the original `acquire()` or from an
+        // earlier winning retry. Return true WITHOUT touching the filesystem:
+        // re-`open()`ing the path here would create a second open file
+        // description and `flock()` it against the one this very process
+        // already holds, which reports EWOULDBLOCK and would make us
+        // self-demote. See the `acquired` doc comment.
+        if lockFileDescriptor >= 0 {
+            return true
+        }
+
+        // `logContention: false` keeps the routine "still secondary" line out
+        // of the log: this runs every few seconds for as long as the primary
+        // lives, and Logger has no level filtering (every line hits stderr and
+        // the rotating file). Genuine anomalies (fail-open paths) still log.
+        //
+        // `failOpen: false`, `verifyInode: true` and `createIfMissing: false`
+        // are what make repeated polling safe -- see this method's doc comment
+        // and `performAcquire`.
+        switch performAcquire(logContention: false, failOpen: false, verifyInode: true, createIfMissing: false) {
+        case .primary:
+            consecutiveMissingLockFilePolls = 0
+            acquired = true
+            return true
+
+        case .secondary:
+            consecutiveMissingLockFilePolls = 0
+            return false
+
+        case .lockFileMissing:
+            // No lock file at all. A LIVE primary repairs that within about one
+            // poll (`revalidatePrimaryLock`), so a single sighting proves
+            // nothing -- but an indefinite refusal would strand this process if
+            // the file was deleted and the primary then exited. Wait out the
+            // repair window, then create it and take the role.
+            consecutiveMissingLockFilePolls += 1
+            guard consecutiveMissingLockFilePolls >= Self.missingLockFilePollsBeforeRecreate else {
+                return false
+            }
+            consecutiveMissingLockFilePolls = 0
+
+            Logger.shared.log("InstanceLock: the lock file has been missing for \(Self.missingLockFilePollsBeforeRecreate) consecutive polls -- long enough that a live primary would have recreated it. Assuming no primary exists (deleted lock file plus an exited primary, or a wiped Application Support folder) and recreating it now, so this process is not left with no status item, no Dock icon and no window.", level: "INFO")
+
+            if performAcquire(logContention: false, failOpen: false, verifyInode: true, createIfMissing: true) == .primary {
+                acquired = true
+                return true
+            }
+            return false
+        }
+    }
+
+    /// Primary-only self-check, driven by the same 3s timer that secondaries use
+    /// for re-election: is the descriptor this process holds still the file that
+    /// lives at the lock path? If not, RE-CREATE and re-lock the file.
+    ///
+    /// WHY A PRIMARY HAS TO REPAIR ITS OWN LOCK -- this is the other half of the
+    /// "deleted lock file" fix, and neither half works alone:
+    ///
+    /// `flock` is held on an open file DESCRIPTION; the path is just how you
+    /// find one. Delete `instance.lock` (uninstaller, "clear app data", manual
+    /// troubleshooting) and the primary keeps a perfectly valid lock on an
+    /// inode that no longer has a name. Nothing on disk then connects the
+    /// primary to the lock path, so a secondary polling that path has NO way to
+    /// discover the primary -- whatever it does with that path, it is reasoning
+    /// about a different file. Only the primary can restore the link, so only
+    /// the primary can fix it.
+    ///
+    /// With `retryAcquire()` no longer creating the file, the two halves give:
+    ///   * file deleted, primary alive  -> secondary finds ENOENT and keeps
+    ///     polling; primary recreates the file within 3s; secondary then
+    ///     contends against it normally and stays secondary. No second menu.
+    ///   * file deleted, primary dies   -> the repaired file (or, if the
+    ///     primary died first, the original) is present and unlocked, so the
+    ///     secondary promotes as designed. Nothing is stranded.
+    ///
+    /// Cheap: two `stat` calls per tick, and it only does real work on the
+    /// (essentially never) mismatch path. No-ops in a process that is primary
+    /// only because locking failed open (`lockFileDescriptor < 0`): there is no
+    /// lock to validate, and re-testing could only produce a false alarm.
+    @discardableResult
+    public func revalidatePrimaryLock() -> Bool {
+        guard lockFileDescriptor >= 0 else { return false }
+
+        guard let lockURL = resolveLockURL(failureWording: "cannot revalidate the primary lock this tick") else {
+            return true
+        }
+
+        var fdInfo = stat()
+        var pathInfo = stat()
+        let fdOK = fstat(lockFileDescriptor, &fdInfo) == 0
+        let pathOK = stat(lockURL.path, &pathInfo) == 0
+
+        if fdOK && pathOK && fdInfo.st_dev == pathInfo.st_dev && fdInfo.st_ino == pathInfo.st_ino {
+            return true // The overwhelmingly common case: nothing to do, nothing logged.
+        }
+
+        Logger.shared.log("InstanceLock: the primary lock file at \(lockURL.path) is no longer the file this process locked (deleted or replaced). Recreating it so secondary instances can still see that a primary exists -- otherwise their next poll would lock a fresh inode and install a SECOND status-bar item.", level: "WARN")
+
+        let newFd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+        guard newFd >= 0 else {
+            let err = errno
+            Logger.shared.log("InstanceLock: could not recreate the lock file at \(lockURL.path) (errno \(err) \(String(cString: strerror(err)))). Staying primary and keeping the old descriptor; will retry on the next tick.", level: "WARN")
+            return true
+        }
+
+        guard flock(newFd, LOCK_EX | LOCK_NB) == 0 else {
+            let err = errno
+            close(newFd)
+            // Another instance got to the recreated file first (it recreated it
+            // itself before this repair ran). Keep the old descriptor and stay
+            // primary -- this process owns the status item and must not drop it
+            // -- and retry: the other side declines to promote on a file it did
+            // not find, closes its probe fd, and this repair wins a later tick.
+            Logger.shared.log("InstanceLock: recreated lock file at \(lockURL.path) is already locked by another process (errno \(err)). Keeping the existing descriptor and this process's primary role; retrying on the next tick.", level: "WARN")
+            return true
+        }
+
+        // Release the lock on the orphaned inode only after the replacement is
+        // held, so there is never an instant in which this process holds no
+        // lock at all.
+        close(lockFileDescriptor)
+        lockFileDescriptor = newFd
+        Logger.shared.log("InstanceLock: primary lock repaired -- now holding \(lockURL.path) (fd \(newFd)).", level: "INFO")
+        return true
+    }
+
+    /// Resolves the lock file's URL, creating its directory if needed.
+    /// `nil` (with a WARN naming `failureWording`) when that is not possible.
+    private func resolveLockURL(failureWording: String) -> URL? {
+        let fileManager = FileManager.default
+
+        guard let supportDir = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            Logger.shared.log("InstanceLock: could not resolve Application Support directory; \(failureWording).", level: "WARN")
+            return nil
+        }
+
+        let appDir = supportDir.appendingPathComponent("AIChalkboard", isDirectory: true)
+
+        do {
+            try fileManager.createDirectory(at: appDir, withIntermediateDirectories: true)
+        } catch {
+            Logger.shared.log("InstanceLock: failed to create lock directory at \(appDir.path): \(error.localizedDescription); \(failureWording).", level: "WARN")
+            return nil
+        }
+
+        return appDir.appendingPathComponent("instance.lock")
+    }
+
+    /// - Parameters:
+    ///   - logContention: whether a plain "someone else holds it" outcome is
+    ///     worth a log line (false for the every-3s poll).
+    ///   - failOpen: what an UNEXPECTED failure (no Application Support dir,
+    ///     createDirectory error, open() error, non-EWOULDBLOCK flock errno)
+    ///     should return. `true` for the t=0 election -- if locking is broken
+    ///     somebody has to own the UI. `false` for the retry poll -- another
+    ///     instance is known to be primary already, so an unrelated errno must
+    ///     not promote this process into a second menu-bar owner.
+    ///   - verifyInode: whether a WINNING flock must additionally prove that the
+    ///     descriptor it locked is still the file at `lockURL`.
+    ///   - createIfMissing: whether a missing lock file may be CREATED. True for
+    ///     the t=0 election (first run ever; somebody has to make it). FALSE for
+    ///     the retry poll: creating it there is precisely how a secondary used
+    ///     to manufacture a brand-new inode, lock it trivially and promote
+    ///     itself next to a live primary that still held the unlinked original.
+    ///     A missing file on the retry path means "the primary's lock is
+    ///     unreachable", not "the primary is gone" -- so report
+    ///     `.lockFileMissing` and let `revalidatePrimaryLock()` on the primary
+    ///     side restore the file. `retryAcquire()` escalates back to
+    ///     `createIfMissing: true` if the file stays missing for several polls,
+    ///     which is the only way to tell "a primary is repairing it" from
+    ///     "nobody is left to repair it"; see
+    ///     `missingLockFilePollsBeforeRecreate`.
+    private func performAcquire(logContention: Bool = true, failOpen: Bool = true, verifyInode: Bool = false, createIfMissing: Bool = true) -> AcquireOutcome {
+        let failureOutcome: AcquireOutcome = failOpen ? .primary : .secondary
+        let failureWording = failOpen
+            ? "failing open (treating this process as primary)"
+            : "failing closed (staying secondary and continuing to poll; another instance is already primary)"
+
+        guard let lockURL = resolveLockURL(failureWording: failureWording) else {
+            return failureOutcome
+        }
+
+        // Raw POSIX open() rather than FileHandle, since flock() needs the
+        // underlying file descriptor directly.
+        let fd = open(lockURL.path, createIfMissing ? (O_CREAT | O_RDWR) : O_RDWR, 0o644)
+        guard fd >= 0 else {
+            // Capture errno immediately: any Foundation call can clobber it.
+            let err = errno
+            if !createIfMissing && err == ENOENT {
+                // Expected on the retry path when the lock file has been
+                // deleted. NOT evidence that the primary died -- see
+                // `createIfMissing` above. Logged at DEBUG because a primary
+                // that is repairing (or a user who deleted the file and left it
+                // deleted) would otherwise emit this every 3s forever.
+                Logger.shared.log("InstanceLock: lock file at \(lockURL.path) does not exist. Not creating it from the retry path: a missing file cannot prove the primary is gone, and locking a fresh inode would install a second status-bar item beside a live primary. Staying secondary; the primary recreates the file within a few seconds.", level: "DEBUG")
+                return .lockFileMissing
+            }
+            Logger.shared.log("InstanceLock: failed to open lock file at \(lockURL.path) (errno \(err) \(String(cString: strerror(err)))); \(failureWording).", level: "WARN")
+            return failureOutcome
+        }
+
+        // Non-blocking exclusive advisory lock: returns immediately with
+        // EWOULDBLOCK if another live process already holds it, rather than
+        // hanging this process waiting for it.
+        let result = flock(fd, LOCK_EX | LOCK_NB)
+        if result == 0 {
+            // WINNING THE FLOCK IS NOT ENOUGH ON A RETRY. `flock` is held on an
+            // open file DESCRIPTION (the kernel object), but `open()` above
+            // resolves a PATH. If instance.lock is unlinked or replaced while
+            // the real primary is running -- an uninstaller, "clear app data",
+            // a user troubleshooting by deleting Application Support files --
+            // then this open() creates a BRAND NEW inode that nobody holds, the
+            // flock trivially succeeds, and this process would promote itself
+            // while the live primary still holds its lock on the now-unlinked
+            // inode and still owns the status item. Result: two menu-bar icons,
+            // forever, with no self-correction -- and the 3s re-election timer
+            // re-armed that race continuously.
+            //
+            // So compare the descriptor we just locked against the path it was
+            // supposed to be: same device AND same inode, or this lock is
+            // meaningless. Only the retry path needs it (at t=0 there is no
+            // incumbent to duplicate, and failing there would leave nobody with
+            // a menu).
+            if verifyInode {
+                var fdInfo = stat()
+                var pathInfo = stat()
+                let fdOK = fstat(fd, &fdInfo) == 0
+                let pathOK = stat(lockURL.path, &pathInfo) == 0
+
+                if !fdOK || !pathOK || fdInfo.st_dev != pathInfo.st_dev || fdInfo.st_ino != pathInfo.st_ino {
+                    // Deliberately leaves `lockFileDescriptor` at -1: this
+                    // process did NOT become the lock holder, so a later
+                    // `retryAcquire()` must go through the whole probe again
+                    // rather than short-circuiting on a held descriptor.
+                    close(fd)
+                    Logger.shared.log("InstanceLock: won an flock at \(lockURL.path) but the locked descriptor is NOT the file at that path any more (fstat ok=\(fdOK) dev/ino \(fdInfo.st_dev)/\(fdInfo.st_ino) vs stat ok=\(pathOK) dev/ino \(pathInfo.st_dev)/\(pathInfo.st_ino)) -- the lock file was deleted or replaced, so this win proves nothing about the incumbent primary, which may still be alive and owning the status item. Declining the promotion (a second status-bar item would be permanent) and continuing to poll.", level: "WARN")
+                    return .secondary
+                }
+            }
+
+            // Primary instance. Hold the descriptor open for the process
+            // lifetime -- see comment on lockFileDescriptor above.
+            lockFileDescriptor = fd
+            Logger.shared.log("InstanceLock: acquired primary instance lock at \(lockURL.path) (fd \(fd)).", level: "INFO")
+            return .primary
+        }
+
+        // Capture errno on the very next line, before any other call
+        // (including Logger/Foundation work) can clobber it -- `errno` is
+        // the real C global, not a Swift-managed value, so anything run
+        // between the failing flock() call and reading it here could
+        // silently overwrite it with an unrelated value.
+        let err = errno
+        if err == EWOULDBLOCK {
+            // EAGAIN == EWOULDBLOCK on Darwin. Genuine contention: another
+            // live process already holds the lock, so this one is secondary.
+            // Closing the probe descriptor is what makes repeated
+            // `retryAcquire()` polling safe: without it every retry would
+            // leak an fd until the process hit its descriptor limit.
+            close(fd)
+            if logContention {
+                Logger.shared.log("InstanceLock: lock at \(lockURL.path) already held by another process; this process is secondary.", level: "INFO")
+            }
+            return .secondary
+        } else {
+            // Any other errno (e.g. ENOLCK, EBADF, ...) means the locking
+            // mechanism itself failed for a reason unrelated to contention --
+            // NOT that another instance holds the lock.
+            //
+            // WHICH WAY TO FAIL DEPENDS ON THE CALLER, hence `failOpen`:
+            //
+            //   * t=0 election (`acquire()`, failOpen: true): fail OPEN.
+            //     Failing closed would tell the ONLY running instance that it
+            //     is secondary, so it would never install the status item. In
+            //     MCP mode the app runs with `.accessory` activation policy --
+            //     no Dock icon -- so the status-bar menu is the sole remaining
+            //     UI affordance to Clear/Quit; wrongly suppressing it would
+            //     leave that instance with no way to quit at all.
+            //
+            //   * retry poll (`retryAcquire()`, failOpen: false): fail CLOSED.
+            //     By then this process has already been told another instance
+            //     is primary and presumably has a working menu, so "locking
+            //     misbehaved for an unrelated reason" is no evidence at all
+            //     that the slot is free. Returning true here would latch
+            //     `acquired`, kill the timer and add a permanent second
+            //     status-bar item -- and the poll gets thousands of attempts a
+            //     day to trip over a transient EMFILE/EINTR/ENOLCK.
+            close(fd)
+            Logger.shared.log("InstanceLock: flock() failed at \(lockURL.path) with unexpected errno \(err) (\(String(cString: strerror(err)))); \(failureWording).", level: "WARN")
+            return failureOutcome
+        }
+    }
+}

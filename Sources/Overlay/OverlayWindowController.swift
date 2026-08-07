@@ -18,7 +18,108 @@ public final class OverlayWindowController: NSObject {
     
     private var windowsByScreenId: [String: NSWindow] = [:]
     private var viewsByScreenId: [String: OverlayView] = [:]
-    
+
+    // MARK: - Capture visibility
+    //
+    // WHY THE DEFAULT IS `false` (i.e. NSWindowSharingType.none):
+    //
+    // With `.readOnly`, the annotations appear in screencapture, in screen
+    // recordings, and -- the important one -- in the screenshots Claude takes of
+    // the user's display. That last one creates a feedback loop: Claude asks for
+    // a screenshot to decide where to draw, sees its own previous circles and
+    // arrows composited on top of the app, and mistakes them for real UI. It
+    // then annotates its own annotations, drifting further from the actual
+    // interface with every round trip. `.none` keeps the overlay strictly a
+    // human-facing layer, so what Claude measures is always the unmodified app.
+    //
+    // The toggle exists because the loop is exactly what you WANT when
+    // debugging placement: flipping this on is the only way for Claude to
+    // verify that a box it drew landed where it intended. `get_screens` reports
+    // the current state so Claude can put it back to `false` and not leave the
+    // user's screen recordings polluted.
+
+    /// Guards `_captureVisible` only. The flag is written from the main thread
+    /// (menu / broadcast handler) and read from the MCP server's background read
+    /// queue (`get_screens`), so it cannot be plain unsynchronized state like
+    /// the window dictionaries above.
+    private let captureLock = NSLock()
+    private var _captureVisible = false
+
+    /// Whether overlay windows are currently included in screen captures.
+    public var isCaptureVisible: Bool {
+        captureLock.lock(); defer { captureLock.unlock() }
+        return _captureVisible
+    }
+
+    /// The `sharingType` newly created windows must be born with, so that a
+    /// `rebuildOverlayWindows()` triggered by anything else (display connected,
+    /// resolution change) does not silently revert the user's choice.
+    private var desiredSharingType: NSWindow.SharingType {
+        return isCaptureVisible ? .readOnly : .none
+    }
+
+    /// Turns capture visibility on/off across every overlay window.
+    ///
+    /// APPROACH: assigns `sharingType` on the LIVE windows -- no teardown, no
+    /// `rebuildOverlayWindows()`. This was verified empirically rather than
+    /// assumed (see the probe in this change's notes): a window was created with
+    /// `.none`, ordered onto the window server, then flipped at runtime, and the
+    /// WINDOW SERVER'S OWN copy of the flag -- `kCGWindowSharingState` read back
+    /// via `CGWindowListCopyWindowInfo`, not just the Cocoa-side property --
+    /// tracked every flip within one run-loop turn (0 -> 1 -> 0 -> 1). So the
+    /// value is not latched at window-creation time and recreation is
+    /// unnecessary. Avoiding the rebuild matters: a rebuild closes and reopens
+    /// every overlay, which flickers and briefly drops the annotations off
+    /// screen, on what is meant to be an instant debugging toggle.
+    ///
+    /// The early return when the value is unchanged is load-bearing: this is
+    /// driven by a distributed notification that is also delivered back to the
+    /// process that posted it, so the no-op guard is what keeps the echo free.
+    public func setCaptureVisible(_ visible: Bool) {
+        captureLock.lock()
+        let changed = (_captureVisible != visible)
+        _captureVisible = visible
+        captureLock.unlock()
+
+        guard changed else { return }
+
+        onMain { [weak self] in
+            guard let self = self else { return }
+            let sharingType: NSWindow.SharingType = visible ? .readOnly : .none
+            // `windowsByScreenId` holds each window twice (display id + index
+            // alias), so some windows get assigned twice here. Assigning the
+            // same value twice is a no-op.
+            for window in self.windowsByScreenId.values {
+                window.sharingType = sharingType
+            }
+
+            // REQUIRED, not cosmetic: `OverlayView.draw(_:)` branches on
+            // `isCaptureVisible` to decide whether to apply the per-app filter
+            // (capture-visible mode renders every annotation so a placement
+            // check cannot come back blank -- see that method). Flipping the
+            // flag therefore changes what should be on screen even though no
+            // annotation was added or removed, and nothing else would repaint:
+            // the store did not mutate, so `onStoreChanged` never fires, and an
+            // app switch may not happen before the next screenshot. Without
+            // this the toggle would appear to do nothing until the user
+            // happened to alt-tab. `refreshViews()` only sets `needsDisplay`.
+            self.refreshViews()
+
+            Logger.shared.log(
+                "OverlayWindowController: capture visibility set to \(visible) (sharingType = \(visible ? ".readOnly" : ".none")) on \(self.windowsByScreenId.count) window reference(s), applied live without rebuilding. \(visible ? "Annotations WILL now appear in screencapture, screen recordings and Claude's screenshots." : "Annotations are hidden from all screen capture (the default).")",
+                level: "INFO"
+            )
+        }
+    }
+
+    private func onMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+
     override private init() {
         super.init()
     }
@@ -27,11 +128,14 @@ public final class OverlayWindowController: NSObject {
         DispatchQueue.main.async { [weak self] in
             self?.rebuildOverlayWindows()
             self?.observeScreenChanges()
-            ClearButtonWindowController.shared.setup()
-            
+
+            // NOTE: `onStoreChanged` is a SINGLE optional closure, not a list of
+            // observers, and this is the only place it is ever assigned. Anything
+            // else that assigns it would silently clobber the repaint below --
+            // which is the only thing that redraws the overlays after a mutation.
+            // Compose into this closure instead of reassigning the property.
             AnnotationStore.shared.onStoreChanged = { [weak self] in
                 self?.refreshViews()
-                ClearButtonWindowController.shared.updateVisibility()
             }
         }
     }
@@ -48,7 +152,6 @@ public final class OverlayWindowController: NSObject {
     @objc private func screenParametersChanged() {
         DispatchQueue.main.async { [weak self] in
             self?.rebuildOverlayWindows()
-            ClearButtonWindowController.shared.createWindow()
         }
     }
     
@@ -85,13 +188,105 @@ public final class OverlayWindowController: NSObject {
             screen: screen
         )
         
+        // CRASH FIX: `NSWindow.isReleasedWhenClosed` defaults to `true` for
+        // windows created programmatically (as opposed to ones unarchived
+        // from a nib). `windowsByScreenId` in this class holds this window
+        // via a strong ARC reference, and `rebuildOverlayWindows()` calls
+        // `window.close()` on every rebuild (screen configuration changes,
+        // e.g. a display is connected/disconnected/sleeps). With the default
+        // left in place, `close()` ALSO releases the window at the AppKit
+        // level, so the window gets released twice: once by AppKit inside
+        // `close()`, and once by ARC when `windowsByScreenId.removeAll()`
+        // drops the dictionary's reference right after. That double-release
+        // corrupts the object and crashes later, asynchronously, when
+        // AppKit's window-close animation machinery tears itself down --
+        // this is the exact `EXC_BAD_ACCESS` in `objc_release` /
+        // `-[_NSWindowTransformAnimation dealloc]` /
+        // `CA::Transaction::flush_as_runloop_observer` seen in
+        // AIChalkboard-2026-08-06-192840.ips. Setting this to `false` makes
+        // ARC (via `windowsByScreenId`) the window's ONLY owner, so `close()`
+        // just orders it out/tears down its AppKit-side state without also
+        // releasing it.
+        window.isReleasedWhenClosed = false
+
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
-        window.sharingType = .none
-        
-        // Window level: Above normal app windows and over fullscreen apps
-        window.level = .floating
+
+        // Born with whatever the user last chose (default `.none` -- hidden from
+        // every screen capture; see the `desiredSharingType` doc comment for the
+        // feedback-loop rationale). Reading it from the stored value rather than
+        // hard-coding `.none` is what makes the setting survive a
+        // `rebuildOverlayWindows()` caused by a display being plugged in.
+        window.sharingType = desiredSharingType
+
+        // Window level: must render above BOTH the Dock and the menu bar, not
+        // just "above normal app windows" -- annotating Dock icons and
+        // menu-bar items (Wi-Fi, Control Center, the clock, ...) is a primary
+        // use case for this app, and `.floating` loses to both.
+        //
+        // MEASURED, NOT ASSUMED (a prior version of this comment claimed
+        // `.floating` was "above ... fullscreen apps", which is true for
+        // fullscreen APP content but says nothing about the Dock/menu bar --
+        // that claim was never actually checked against them):
+        //
+        //   * The Dock's real on-screen window level, read back at runtime via
+        //     `CGWindowListCopyWindowInfo` / `kCGWindowLayer` for the process
+        //     named "Dock": 20 (matches `kCGDockWindowLevel`, but this was
+        //     confirmed empirically rather than trusted from the header).
+        //   * The menu bar is TWO separate pieces at TWO separate levels, also
+        //     read back the same way: the "Menubar" window owned by
+        //     WindowServer sits at level 24 (`kCGMainMenuWindowLevel`), but the
+        //     status-item glyphs on the right -- Wi-Fi, battery, clock, every
+        //     Control Center extra -- are owned by a SEPARATE "Control Center"
+        //     process sitting at level 25 (`kCGStatusWindowLevel`).
+        //
+        // A standalone probe (borderless bright-color window at a candidate
+        // level, `screencapture -x -C`, then a PIL pixel check of exactly the
+        // Dock's icon pixels and the menu bar's glyph pixels, not just the
+        // background band) measured pass/fail per candidate:
+        //
+        //     .floating (3)      -- FAIL Dock, FAIL menu bar (today's bug)
+        //     .modalPanel (8)    -- FAIL Dock, FAIL menu bar
+        //     .mainMenu (24)     -- PASS Dock, FAIL menu bar: beats the
+        //                           Menubar window's tinted background (tied
+        //                           level, order-of-creation win) but loses
+        //                           outright to Control Center's status icons
+        //                           AND to the app-menu title text, which sit
+        //                           at 25 -- only ~47% of real menu-bar glyph
+        //                           pixels were actually covered, so this
+        //                           level is NOT reliable despite "passing" a
+        //                           naive whole-band pixel-area check.
+        //     .statusBar (25)    -- PASS Dock, PASS menu bar (100% of Dock
+        //                           icon pixels and 100% of menu-bar glyph
+        //                           pixels covered, reproduced across 3
+        //                           independent trials). Exactly ties
+        //                           Control Center's own level, but AppKit
+        //                           orders a newly-front window ahead of
+        //                           existing windows at the same level, which
+        //                           is why this consistently won in every
+        //                           trial.
+        //     .popUpMenu (101), CGWindowLevelForKey(.overlayWindow) (102) --
+        //                           also PASS both, with a non-tied margin,
+        //                           but `.statusBar` is already sufficient and
+        //                           the brief is to use the LOWEST level that
+        //                           solves the occlusion, not the highest
+        //                           available.
+        //
+        // CHOSEN: `.statusBar` (25) -- the lowest of the above that measured
+        // as fully sufficient against both the Dock and the real (glyph-level,
+        // not just background-tint) menu bar content. If Control Center ever
+        // starts winning that same-level tie in practice (there is no
+        // documented guarantee, only the observed AppKit ordering behavior),
+        // the next step up is `.popUpMenu` (101), which passed with a clean,
+        // non-tied margin above every measured piece of system chrome.
+        //
+        // DO NOT quietly revert this to `.floating` (3) -- that is the
+        // regression this comment exists to prevent. `.floating` sits below
+        // the Dock (20) and the menu bar (24/25), so annotations placed over
+        // either are silently occluded; see the OverlayWindowController.swift
+        // change notes for the empirical probe that reproduced this.
+        window.level = .statusBar
         window.collectionBehavior = [
             .canJoinAllSpaces,
             .fullScreenAuxiliary,
