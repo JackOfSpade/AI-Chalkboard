@@ -4,9 +4,16 @@ name: Stranded-branch check
 # is therefore skipped by every drain, forever, with no separate alert of its own. Likewise, an
 # unresolved "Auto-merge conflict: <branch>" PR (opened when a merge could not be auto-resolved) just
 # sits open until a human happens to notice it. Neither case fails loudly on its own; both leave real
-# work sitting unmerged, unnoticed. This sweep runs every 6 hours, flags both conditions, and opens a
-# GitHub issue (which notifies the repo owner) so the gap surfaces within hours instead of being
-# discovered by accident days or weeks later.
+# work sitting unmerged, unnoticed. This sweep runs every 6 hours and drives a single alert issue
+# through its full lifecycle:
+#   OPEN    the first sweep that finds a problem (notifies the repo owner).
+#   REFRESH its body on every later sweep that still finds one, so one ongoing incident never spawns
+#           a second issue.
+#   CLOSE   it — with a comment saying why — on the first sweep that comes back clean, so an open
+#           alert issue reliably means "there is a live problem right now" and not "there was one at
+#           some point and nobody has closed it yet". Without this last step the alert would stay
+#           open forever even after the underlying branch/PR problem was fixed, quietly destroying
+#           the signal the alert exists to provide.
 
 on:
   schedule:
@@ -259,3 +266,73 @@ jobs:
               --body-file /tmp/body.md
           fi
           exit 1   # surface red in the Actions tab too
+
+      - name: Close resolved alert issue(s)
+        # GATED ON A GENUINELY CLEAN SWEEP, NEVER ON "NOT PROVEN UNHEALTHY". `problem` is written
+        # 'false' by the detect step ONLY in its trailing `else` branch above — reached ONLY when the
+        # per-branch loop finished with `api_query_failed` never set (every `gh api` CI-run lookup
+        # succeeded for every branch), AND `gh pr list` itself succeeded (`pr_list_failed=0`), AND
+        # neither /tmp/stranded.txt nor /tmp/conflicts.txt ended up with any content. Both read-failure
+        # paths (`pr_list_failed=1`, `api_query_failed=1`) force `problem=true` instead, specifically so
+        # a broken CHECK can never be mistaken for a healthy repo. And if the detect step were to die
+        # before writing any `problem=` output at all, `steps.detect.outputs.problem` is simply empty,
+        # `'' == 'false'` is false, and this step is skipped — a crashed detect step therefore fails
+        # safe (alert stays open) rather than fail-open (alert closed while the real state is unknown).
+        # Closing an alert because the CHECK broke, rather than because the underlying problem is
+        # actually gone, would be the worst possible failure mode: it would erase the exact signal this
+        # whole workflow exists to provide.
+        if: steps.detect.outputs.problem == 'false'
+        # `issues: write` is already declared at the workflow level (see the top of this file); this
+        # step needs nothing beyond that, so no additional `permissions:` block is added here.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+
+          # Only ever touch an issue this automation itself opened. Matching the same title prefix the
+          # create/dedup step above uses is necessary but not sufficient — nothing stops a human from
+          # opening an issue with a coincidentally matching title — so ALSO require the author to be a
+          # bot. Verified empirically against this repo's own real alert issue (opened earlier by this
+          # workflow's GITHUB_TOKEN, via `gh issue view <n> --json author`): `author.login` rendered as
+          # "app/github-actions" and `author.is_bot` was `true`. Filtering on `is_bot` rather than the
+          # exact login string is the more stable choice — the literal rendering of a bot's login is a
+          # GitHub display detail, `is_bot` is the documented, structural signal.
+          if ! open_json="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --json number,title,author 2>/tmp/gh_issue_list_close_err.txt)"; then
+            # A FAILED lookup is NOT the same as "found nothing to close" — mirrors how the detect step
+            # above distinguishes `pr_list_failed` from a genuinely empty /tmp/conflicts.txt. Silently
+            # treating this failure as "nothing to close" could leave a truly resolved alert open
+            # forever if `gh issue list` happened to fail on every sweep after the real fix landed. Warn
+            # loudly and move on instead of failing the run — a stale-but-open issue is a minor gap, not
+            # a reason to redden a healthy sweep's run.
+            echo "::warning::Could not list open issues to look for a resolved stranded-branch alert to close ($(tr '\n' ' ' < /tmp/gh_issue_list_close_err.txt)) — leaving any existing alert issue open rather than risk closing blind."
+          else
+            mapfile -t to_close < <(printf '%s' "$open_json" \
+              | jq -r '.[] | select((.title|startswith("⚠️ Stranded branch")) and (.author.is_bot == true)) | .number')
+
+            if [ "${#to_close[@]}" -eq 0 ]; then
+              echo "No open bot-authored stranded-branch alert issue found — nothing to close."
+            fi
+
+            # Loop, don't just close the first match: the dedup step above means there should only ever
+            # be one, but if two somehow exist, leaving a second one open recreates the exact
+            # stale-signal problem this step exists to fix.
+            run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            for n in "${to_close[@]}"; do
+              # Comment BEFORE closing so the issue's own history explains itself to a future reader
+              # without needing to cross-reference this workflow file. Chained with `&&` so a comment
+              # that fails to post never leads to a silent close with no explanation left behind.
+              if gh issue comment "$n" --repo "$GITHUB_REPOSITORY" \
+                   --body "This sweep found no stranded branches and no open \`Auto-merge conflict:\` PRs. Closing. Run: $run_url" \
+                 && gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed; then
+                echo "Closed resolved alert issue #$n."
+              else
+                # FAIL SOFT, LOUDLY — exactly mirrors how the dedup step above handles a failed
+                # `gh issue edit` ("could not refresh issue #N body"). A failure to close is a minor gap
+                # (a stale issue lingers until the next healthy sweep retries it); it must NOT turn this
+                # healthy sweep's run red, since a red run on a healthy repo would itself be a
+                # misleading signal — so warn via `::warning::` rather than `continue-on-error:`, which
+                # would swallow the failure silently instead of surfacing it in the log.
+                echo "::warning::could not close alert issue #$n even though this sweep is clean (transient gh failure commenting or closing?) — issue remains open; the next healthy sweep retries."
+              fi
+            done
+          fi
