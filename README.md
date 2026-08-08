@@ -58,6 +58,30 @@ Malformed JSON and non-object JSON-RPC payloads (including batch arrays) now rec
 
 ---
 
+## Verifying an MCP refactor: wire-output snapshots
+
+[`tests/mcp_wire_snapshot.py`](tests/mcp_wire_snapshot.py) captures every JSON-RPC response the real
+`AIChalkboard --mcp` binary produces for a fixed, wide set of requests (every tool's success and
+failure modes, `initialize`, `ping`, an unknown method, an unknown tool, …), canonicalises away
+volatile fields (UUIDs, timestamps, whichever app happens to be frontmost), and diffs two such
+captures. Use it before/after a change to the MCP dispatch, validation, or tool-catalog layer:
+
+```bash
+swift build
+python3 tests/mcp_wire_snapshot.py capture .build/debug/AIChalkboard before.json
+# ... make your change, rebuild ...
+python3 tests/mcp_wire_snapshot.py capture .build/debug/AIChalkboard after.json
+python3 tests/mcp_wire_snapshot.py compare before.json after.json
+```
+
+`compare` exits `0` and prints `EQUIVALENT` if nothing meaningful changed, or exits non-zero with a
+readable diff otherwise. **Same-machine only**: screen geometry (resolution, backing scale factor) is
+deliberately left unmasked, since a refactor touching display handling should surface exactly there —
+so a capture is only ever compared against another capture from the same machine, never checked into
+the repo as a baseline, and never compared across machines.
+
+---
+
 ## Build & Run Instructions
 
 ```bash

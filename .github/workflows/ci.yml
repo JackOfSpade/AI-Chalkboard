@@ -154,6 +154,20 @@ jobs:
           python3 -m py_compile test_mcp_stdio.py tests/test_mcp_stdio_harness.py
           python3 -m unittest tests/test_mcp_stdio_harness.py
 
+      - name: MCP wire-snapshot tool syntax + canonicalisation tests
+        # tests/mcp_wire_snapshot.py's own `capture` subcommand launches the real
+        # AIChalkboard binary and, like the full test_mcp_stdio.py integration script,
+        # needs an Aqua GUI session this runner does not have -- so it is exercised by
+        # hand (see the tool's own docstring), never here. Its canonicalisation,
+        # masking, diffing, and self-check logic, however, is pure Python with no
+        # process to launch and no stdio to fake, exactly like test_mcp_stdio_harness.py
+        # above, and unittest actually RUNS it rather than merely importing it -- a
+        # syntax error or an accidentally-deleted test class would fail this step, not
+        # pass it silently.
+        run: |
+          python3 -m py_compile tests/mcp_wire_snapshot.py tests/test_mcp_wire_snapshot.py
+          python3 -m unittest tests/test_mcp_wire_snapshot.py
+
       - name: Swift test target path casing
         # The repository's established directory is lowercase `tests/`. This catches
         # a manifest/new-file case mismatch that case-insensitive macOS volumes hide.
