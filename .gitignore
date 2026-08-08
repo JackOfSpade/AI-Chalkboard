@@ -1,3 +1,16 @@
 .build/
 .DS_Store
 *.swp
+
+# Python bytecode from the MCP stdio harness. CI runs `python3 -m py_compile`
+# on test_mcp_stdio.py and tests/test_mcp_stdio_harness.py, and running the
+# same command locally leaves these behind at the repo root and under tests/.
+__pycache__/
+*.py[cod]
+
+# Tool caches. Both pytest and ruff drop a self-ignoring .gitignore inside
+# their own cache directory, so these are already invisible to git in
+# practice -- listed explicitly so the repo does not depend on that behaviour
+# continuing, and so `git status` stays clean if either tool changes it.
+.pytest_cache/
+.ruff_cache/

@@ -100,10 +100,31 @@ public struct ColorParser {
         if hex.hasPrefix("#") {
             hex.removeFirst()
         }
-        
+
+        // Validate BEFORE trusting Scanner's parse. `scanHexInt64` stops at the
+        // first character it can't consume and still reports success with
+        // whatever prefix it DID consume -- `intVal` is pre-initialised to 0,
+        // so an all-invalid string like "GGGGGG" silently parses to 0 instead
+        // of failing. Branching on `hex.count` alone (below) would then treat
+        // a garbage string as a well-formed value purely because it happened
+        // to have the right length, e.g. "12GG56" is 6 characters and would be
+        // read as a legitimate 6-digit RGB value despite only "12" of it ever
+        // having been parsed.
+        //
+        // Requiring every remaining character to be an ASCII hex digit also
+        // incidentally rejects a "0x"/"0X" prefix (Scanner's `scanHexInt64`
+        // recognizes and skips one): "0xff0000" is 8 characters, which without
+        // this check would be misrouted into the 8-digit RGBA branch below
+        // reading only "ff0000" -- 'x' is not a hex digit, so it now correctly
+        // falls through to the same red fallback other malformed strings get.
+        let isPureHexDigits = !hex.isEmpty && hex.allSatisfy { "0123456789abcdef".contains($0) }
+        guard isPureHexDigits, [3, 6, 8].contains(hex.count) else {
+            return NSColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9) // Invalid colour: same red fallback as wrong-length strings
+        }
+
         var intVal: UInt64 = 0
         Scanner(string: hex).scanHexInt64(&intVal)
-        
+
         let a, r, g, b: UInt64
         switch hex.count {
         case 3: // RGB (12-bit)

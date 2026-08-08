@@ -39,6 +39,25 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 
 ---
 
+## Input Validation & Limits
+
+Drawing tools reject input that could not produce a visible, correct annotation, rather than
+reporting success and drawing nothing useful:
+
+| Rule | Why |
+| --- | --- |
+| `radius`, `width`, `height` must be `> 0` | A negative extent silently drew the rectangle in the opposite direction from the documented top-left origin, and still reported success. |
+| Numbers must be finite; JSON booleans are not numbers | `{"radius": true}` used to coerce to `1.0`, and `"NaN"`/`"Infinity"` parsed through as real values — both produced nonsense annotations that then vanished from `list_annotations`, because the JSON encoder refuses non-finite floats. |
+| `step_px` ≥ 1 physical pixel | The renderer walks `width / step` grid lines. Below roughly `width × 2⁻⁵³` the loop counter stops advancing at all, wedging the main thread permanently — and every later tool call that needs screen info blocks behind it. |
+| `points` ≤ 10,000 per path | Every point is re-walked on each repaint, so an oversized path is a permanent per-frame cost, not a one-off parse cost. |
+| At most 2,000 stored annotations per process | Five of the six draw tools deliberately persist until cleared, so a caller that never passes `duration_seconds` and never calls `clear` would grow the store without bound. Past the cap the oldest are evicted, and the tool result says so rather than dropping them silently. |
+| A draw call with no displays available is an error | Previously the annotation was stored against a synthetic screen id that no overlay window ever matches — permanently invisible, reported as success. |
+
+Malformed JSON and non-object JSON-RPC payloads (including batch arrays) now receive a proper
+`-32700` / `-32600` error response instead of silence.
+
+---
+
 ## Build & Run Instructions
 
 ```bash

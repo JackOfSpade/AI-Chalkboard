@@ -262,7 +262,7 @@ public final class InstanceBroadcast: NSObject {
         // never blocked by the protocol read. A process that registered and
         // then blocked the main thread without running a run loop would
         // receive nothing at all.
-        Logger.shared.log("InstanceBroadcast: registered cross-process observers for '\(Notification.Name.chalkboardClearAll.rawValue)' and '\(Notification.Name.chalkboardQuitAll.rawValue)'.", level: "INFO")
+        Logger.shared.log("InstanceBroadcast: registered cross-process observers for '\(Notification.Name.chalkboardClearAll.rawValue)', '\(Notification.Name.chalkboardQuitAll.rawValue)', and '\(Notification.Name.chalkboardSetCaptureVisible.rawValue)'.", level: "INFO")
     }
 
     // MARK: - Posting (menu-bar side, primary instance only)
@@ -307,12 +307,6 @@ public final class InstanceBroadcast: NSObject {
             userInfo: request.userInfo,
             deliverImmediately: true
         )
-    }
-
-    /// Posts "clear everything, every app" to every instance, including this
-    /// one. Retained as the name for the unscoped case.
-    public func postClearAll() {
-        postClear(scope: .all, appId: nil, appName: nil)
     }
 
     /// Posts a capture-visibility change to every instance, including this one.
@@ -452,7 +446,11 @@ public final class InstanceBroadcast: NSObject {
         // one small value rather than the whole notification.
         let senderScope = notification.object as? String
 
-        onMain { [weak self] in
+        // `MainThread.async` runs this inline when delivery is already on main
+        // (the measured behaviour), so the quit is not deferred by a run-loop
+        // turn -- the same synchronous-when-already-there semantics the old
+        // local `onMain(_:)` helper had.
+        MainThread.async { [weak self] in
             guard let self = self else { return }
 
             // A non-nil scope is a Dock/Cmd-Q quit, which reaches only the
@@ -479,20 +477,6 @@ public final class InstanceBroadcast: NSObject {
             // normal AppKit shutdown, which includes applicationWillTerminate
             // and its shutdown log line. Must happen on the main thread.
             NSApp.terminate(nil)
-        }
-    }
-
-    /// Runs `work` on the main thread, synchronously if already there.
-    ///
-    /// Kept as a plain re-entrancy-safe helper rather than
-    /// `DispatchQueue.main.async` unconditionally: when delivery already is on
-    /// main (the measured behaviour), the handler stays synchronous, so the
-    /// quit is not deferred by a run-loop turn.
-    private func onMain(_ work: @escaping () -> Void) {
-        if Thread.isMainThread {
-            work()
-        } else {
-            DispatchQueue.main.async(execute: work)
         }
     }
 }

@@ -13,11 +13,60 @@ public struct ScreenInfo: Codable {
     public let isMain: Bool
 }
 
+/// An immutable picture of the display layout, taken once and then used for
+/// every screen question a single MCP tool call needs to ask.
+///
+/// See `OverlayWindowController.screenSnapshot()` for why a single snapshot
+/// replaced two separate per-call main-thread reads.
+public struct ScreenSnapshot {
+    public let screens: [ScreenInfo]
+
+    public var isEmpty: Bool { screens.isEmpty }
+
+    /// Resolves a caller-supplied `screen_id` against THIS snapshot.
+    /// Returns nil only when the snapshot contains no screens at all.
+    /// Order: in-bounds integer index -> exact id match -> main screen -> first screen.
+    public func resolve(_ rawId: String?) -> ScreenInfo? {
+        guard !screens.isEmpty else { return nil }
+
+        guard let trimmed = rawId?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            // No id supplied: default to the main screen.
+            return screens.first(where: { $0.isMain }) ?? screens.first
+        }
+
+        // 1. Does rawId match an integer index in bounds 0..<screens.count?
+        if let idx = Int(trimmed), idx >= 0 && idx < screens.count {
+            return screens[idx]
+        }
+
+        // 2. Does rawId match an exact display id string?
+        if let match = screens.first(where: { $0.id == trimmed }) {
+            return match
+        }
+
+        // Unrecognized id: default to the main screen.
+        return screens.first(where: { $0.isMain }) ?? screens.first
+    }
+}
+
 public final class OverlayWindowController: NSObject {
     public static let shared = OverlayWindowController()
-    
-    private var windowsByScreenId: [String: NSWindow] = [:]
-    private var viewsByScreenId: [String: OverlayView] = [:]
+
+    /// One entry per real on-screen display, in the order `NSScreen.screens`
+    /// produced them at the last rebuild.
+    ///
+    /// Plain arrays, not dictionaries keyed by screen id: nothing in this
+    /// codebase ever looks a window or view up BY screen id (grepped to
+    /// confirm before making this change) -- both were only ever iterated via
+    /// `.values`. The prior `windowsByScreenId`/`viewsByScreenId` dictionaries
+    /// also stored every window/view TWICE -- once under its real
+    /// `CGDirectDisplayID` and once under a positional index alias ("0", "1",
+    /// ...) -- so a display whose real id happened to equal another display's
+    /// index string would silently clobber that entry. A flat array can't
+    /// collide, costs one insert instead of two per screen, and matches how
+    /// these are actually consumed.
+    private var overlayWindows: [NSWindow] = []
+    private var overlayViews: [OverlayView] = []
 
     // MARK: - Capture visibility
     //
@@ -37,7 +86,7 @@ public final class OverlayWindowController: NSObject {
     /// Guards `_captureVisible` only. The flag is written from the main thread
     /// (menu / broadcast handler) and read from the MCP server's background read
     /// queue (`get_screens`), so it cannot be plain unsynchronized state like
-    /// the window dictionaries above.
+    /// the window arrays above.
     private let captureLock = NSLock()
     private var _captureVisible = false
 
@@ -80,13 +129,15 @@ public final class OverlayWindowController: NSObject {
 
         guard changed else { return }
 
-        onMain { [weak self] in
+        MainThread.async { [weak self] in
             guard let self = self else { return }
             let sharingType: NSWindow.SharingType = visible ? .readOnly : .none
-            // `windowsByScreenId` holds each window twice (display id + index
-            // alias), so some windows get assigned twice here. Assigning the
-            // same value twice is a no-op.
-            for window in self.windowsByScreenId.values {
+            // `overlayWindows` is a flat array now (one entry per real
+            // display), so each window is visited exactly once here --
+            // unlike the old `windowsByScreenId` dictionary, which stored
+            // every window under both its real CGDirectDisplayID and a
+            // positional index alias ("0"/"1"), visiting it twice per pass.
+            for window in self.overlayWindows {
                 window.sharingType = sharingType
             }
 
@@ -103,26 +154,18 @@ public final class OverlayWindowController: NSObject {
             self.refreshViews()
 
             Logger.shared.log(
-                "OverlayWindowController: capture-debug request set to \(visible) (sharingType = \(visible ? ".readOnly" : ".none")) on \(self.windowsByScreenId.count) window reference(s), applied live without rebuilding. External capture tools retain independent app/window filters, so final inclusion is not guaranteed.",
+                "OverlayWindowController: capture-debug request set to \(visible) (sharingType = \(visible ? ".readOnly" : ".none")) on \(self.overlayWindows.count) window reference(s), applied live without rebuilding. External capture tools retain independent app/window filters, so final inclusion is not guaranteed.",
                 level: "INFO"
             )
-        }
-    }
-
-    private func onMain(_ work: @escaping () -> Void) {
-        if Thread.isMainThread {
-            work()
-        } else {
-            DispatchQueue.main.async(execute: work)
         }
     }
 
     override private init() {
         super.init()
     }
-    
+
     public func setup() {
-        DispatchQueue.main.async { [weak self] in
+        MainThread.async { [weak self] in
             self?.rebuildOverlayWindows()
             self?.observeScreenChanges()
 
@@ -136,7 +179,7 @@ public final class OverlayWindowController: NSObject {
             }
         }
     }
-    
+
     private func observeScreenChanges() {
         NotificationCenter.default.addObserver(
             self,
@@ -145,22 +188,32 @@ public final class OverlayWindowController: NSObject {
             object: nil
         )
     }
-    
+
     @objc private func screenParametersChanged() {
-        DispatchQueue.main.async { [weak self] in
+        MainThread.async { [weak self] in
             self?.rebuildOverlayWindows()
         }
     }
-    
-    public func rebuildOverlayWindows() {
+
+    /// Tears down and recreates one overlay window/view per `NSScreen.screens`
+    /// entry.
+    ///
+    /// PRIVATE and MAIN-THREAD-ONLY, unlike every sibling method in this
+    /// class: it mutates `overlayWindows`/`overlayViews` with no lock and
+    /// closes/creates live `NSWindow`s, so calling it off-main would race
+    /// AppKit's own main-thread affinity assumptions. Both call sites
+    /// (`setup()` and `screenParametersChanged()`) already hop onto main via
+    /// `MainThread.async` before calling this, and there is no third caller --
+    /// grepped to confirm before narrowing this from `public` to `private`.
+    private func rebuildOverlayWindows() {
         // Close existing windows
-        for window in windowsByScreenId.values {
+        for window in overlayWindows {
             window.orderOut(nil)
             window.close()
         }
-        windowsByScreenId.removeAll()
-        viewsByScreenId.removeAll()
-        
+        overlayWindows.removeAll()
+        overlayViews.removeAll()
+
         let screens = NSScreen.screens
         for (idx, screen) in screens.enumerated() {
             let screenId = getScreenId(screen: screen, index: idx)
@@ -171,16 +224,12 @@ public final class OverlayWindowController: NSObject {
                 level: "INFO"
             )
             let window = createOverlayWindow(for: screen, screenId: screenId)
-            windowsByScreenId[screenId] = window
-            
-            // Also alias by index string e.g. "0", "1" if screenId is displayID
-            let indexStr = String(idx)
-            windowsByScreenId[indexStr] = window
+            overlayWindows.append(window)
         }
-        
+
         refreshViews()
     }
-    
+
     private func createOverlayWindow(for screen: NSScreen, screenId: String) -> NSWindow {
         let frame = screen.frame
         let window = NSWindow(
@@ -190,24 +239,24 @@ public final class OverlayWindowController: NSObject {
             defer: false,
             screen: screen
         )
-        
+
         // CRASH FIX: `NSWindow.isReleasedWhenClosed` defaults to `true` for
         // windows created programmatically (as opposed to ones unarchived
-        // from a nib). `windowsByScreenId` in this class holds this window
-        // via a strong ARC reference, and `rebuildOverlayWindows()` calls
+        // from a nib). `overlayWindows` in this class holds this window via a
+        // strong ARC reference, and `rebuildOverlayWindows()` calls
         // `window.close()` on every rebuild (screen configuration changes,
         // e.g. a display is connected/disconnected/sleeps). With the default
         // left in place, `close()` ALSO releases the window at the AppKit
         // level, so the window gets released twice: once by AppKit inside
-        // `close()`, and once by ARC when `windowsByScreenId.removeAll()`
-        // drops the dictionary's reference right after. That double-release
-        // corrupts the object and crashes later, asynchronously, when
-        // AppKit's window-close animation machinery tears itself down --
-        // this is the exact `EXC_BAD_ACCESS` in `objc_release` /
+        // `close()`, and once by ARC when `overlayWindows.removeAll()` drops
+        // the array's reference right after. That double-release corrupts
+        // the object and crashes later, asynchronously, when AppKit's
+        // window-close animation machinery tears itself down -- this is the
+        // exact `EXC_BAD_ACCESS` in `objc_release` /
         // `-[_NSWindowTransformAnimation dealloc]` /
         // `CA::Transaction::flush_as_runloop_observer` seen in
         // AIChalkboard-2026-08-06-192840.ips. Setting this to `false` makes
-        // ARC (via `windowsByScreenId`) the window's ONLY owner, so `close()`
+        // ARC (via `overlayWindows`) the window's ONLY owner, so `close()`
         // just orders it out/tears down its AppKit-side state without also
         // releasing it.
         window.isReleasedWhenClosed = false
@@ -296,64 +345,75 @@ public final class OverlayWindowController: NSObject {
             .stationary,
             .ignoresCycle
         ]
-        
+
         // CRITICAL: Mouse & keyboard input passes 100% straight through to underlying applications
         window.ignoresMouseEvents = true
-        
+
         let overlayView = OverlayView(frame: NSRect(origin: .zero, size: frame.size))
         overlayView.screenId = screenId
         overlayView.scaleFactor = screen.backingScaleFactor
-        
+
         window.contentView = overlayView
-        viewsByScreenId[screenId] = overlayView
-        
+        overlayViews.append(overlayView)
+
         window.setFrame(frame, display: true)
         window.orderFrontRegardless()
-        
+
         return window
     }
-    
+
     public func refreshViews() {
-        DispatchQueue.main.async { [weak self] in
+        MainThread.async { [weak self] in
             guard let self = self else { return }
-            for view in self.viewsByScreenId.values {
+            for view in self.overlayViews {
                 view.needsDisplay = true
             }
         }
     }
-    
+
     public func getScreenId(screen: NSScreen, index: Int) -> String {
         if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
             return String(screenNumber)
         }
         return String(index)
     }
-    
-    public func getScreenInfos() -> [ScreenInfo] {
-        if Thread.isMainThread {
-            return getScreenInfosInternal()
-        } else {
-            var infos: [ScreenInfo] = []
-            DispatchQueue.main.sync {
-                infos = self.getScreenInfosInternal()
-            }
-            return infos
+
+    /// Takes one snapshot of the display layout with a single main-thread hop,
+    /// then answers every screen question a single MCP tool call needs to ask
+    /// against that same snapshot.
+    ///
+    /// WHY: the old shape -- `resolveScreenId(_:)` and `getScreenInfos()`
+    /// called separately per tool call -- did two independent
+    /// `DispatchQueue.main.sync` + `NSScreen.screens` reads per draw call, and
+    /// those two reads were not atomic with each other: the display layout can
+    /// change in the gap between them (display reconfiguration/wake is
+    /// exactly when `NSScreen.screens` can be momentarily empty). In that gap,
+    /// `resolveScreenId` would fall back to the synthetic id "0" while a
+    /// dimension lookup against the SECOND, now-empty read found nothing and
+    /// returned nil -- producing an annotation permanently orphaned on a
+    /// screen id no view will ever match, because the id and its dimensions
+    /// were resolved against two different readings of the screen list.
+    /// Taking one snapshot up front and answering every question against THAT
+    /// snapshot closes both the double-hop cost and this TOCTOU gap.
+    public func screenSnapshot() -> ScreenSnapshot {
+        return MainThread.sync {
+            ScreenSnapshot(screens: buildScreenInfos())
         }
     }
-    
-    private func getScreenInfosInternal() -> [ScreenInfo] {
+
+    private func buildScreenInfos() -> [ScreenInfo] {
         var infos: [ScreenInfo] = []
         let screens = NSScreen.screens
         let mainScreen = NSScreen.main
-        
+
         for (idx, screen) in screens.enumerated() {
             let idStr = getScreenId(screen: screen, index: idx)
             let frame = screen.frame
             let scale = screen.backingScaleFactor
-            
+
             let widthPx = Int(round(frame.width * scale))
             let heightPx = Int(round(frame.height * scale))
-            
+
             infos.append(ScreenInfo(
                 id: idStr,
                 index: idx,
@@ -367,26 +427,5 @@ public final class OverlayWindowController: NSObject {
             ))
         }
         return infos
-    }
-    
-    public func resolveScreenId(_ rawId: String?) -> String {
-        let screens = getScreenInfos()
-        guard let rawId = rawId?.trimmingCharacters(in: .whitespacesAndNewlines), !rawId.isEmpty else {
-            // Default to main screen
-            return screens.first(where: { $0.isMain })?.id ?? screens.first?.id ?? "0"
-        }
-        
-        // 1. Check if rawId matches an integer index in bounds 0..<screens.count
-        if let idx = Int(rawId), idx >= 0 && idx < screens.count {
-            return screens[idx].id
-        }
-        
-        // 2. Check if rawId matches exact display ID string
-        if let match = screens.first(where: { $0.id == rawId }) {
-            return match.id
-        }
-        
-        // Default to main screen
-        return screens.first(where: { $0.isMain })?.id ?? screens.first?.id ?? "0"
     }
 }

@@ -360,8 +360,4 @@ public final class Logger: @unchecked Sendable {
         guard stat(path, &s) == 0 else { return nil }
         return UInt64(s.st_size)
     }
-
-    public var logFilePath: String {
-        return logFileURL.path
-    }
 }

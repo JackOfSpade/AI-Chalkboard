@@ -1,0 +1,74 @@
+import Foundation
+
+/// Accepts arbitrary `Data` chunks read from a byte stream (stdin, in
+/// production) and reassembles them into complete newline-terminated
+/// JSON-RPC messages.
+///
+/// Deliberately dependency-free: no `FileHandle`, no AppKit, nothing that
+/// requires a GUI session or a real stdin descriptor to exercise. Pulled out
+/// of `MCPServer.readLoop()` (which used to do this inline against
+/// `FileHandle.standardInput.availableData`) specifically so a unit test can
+/// feed it arbitrary byte chunks -- a message split mid-line, several
+/// messages arriving in one chunk, CRLF vs bare LF senders, an unterminated
+/// flood -- with no process spawning and no real stdio required.
+struct LineFramer {
+
+    /// Hard cap on how large the buffer's UNTERMINATED tail may grow before
+    /// `feed(_:)` reports an overflow, in bytes.
+    ///
+    /// WHY THIS EXISTS: `feed` only ever shrinks the buffer when it finds a
+    /// newline; a peer that never sends one -- a bug on the other end, or
+    /// something other than line-delimited JSON-RPC writing to this stdin --
+    /// would otherwise grow `buffer` without bound for the lifetime of this
+    /// long-running process. 4 MB is far above any legitimate single
+    /// JSON-RPC message this server accepts (the largest realistic payload is
+    /// a `draw_path` call, itself capped at `DrawingDefaults.maxPathPoints`
+    /// points), so hitting this cap means the peer is not framing messages
+    /// correctly -- a protocol violation, not a slow day -- and
+    /// `MCPServer.readLoop()` treats it as a fatal transport error rather
+    /// than continuing to grow the buffer.
+    static let maxBufferBytes = 4 * 1024 * 1024
+
+    /// The result of feeding one chunk: zero or more complete lines (newline
+    /// stripped, and a trailing `\r` stripped for CRLF senders -- matching
+    /// the original inline implementation this replaced), plus whether the
+    /// still-unterminated remainder has exceeded `maxBufferBytes`.
+    struct FeedResult {
+        let lines: [Data]
+        let overflow: Bool
+    }
+
+    private var buffer = Data()
+
+    /// Appends `data` to the internal buffer and extracts every complete
+    /// line now available. Empty lines (e.g. a bare "\n" keep-alive) are
+    /// silently dropped. Safe to keep calling after an overflow is reported;
+    /// callers that want to treat overflow as fatal (as `MCPServer` does)
+    /// should stop calling `feed` and tear the connection down instead.
+    mutating func feed(_ data: Data) -> FeedResult {
+        buffer.append(data)
+
+        var lines: [Data] = []
+        // Indices are taken RELATIVE TO `buffer.startIndex` rather than assumed
+        // to be 0-based. A `Data` built only by `append`/`removeSubrange` does
+        // in fact keep `startIndex == 0` today (measured), but that is an
+        // implementation detail of Foundation, not a documented guarantee --
+        // `Data` slices are free to carry a non-zero `startIndex`, and the
+        // previous `0..<newlineIndex` form would silently read the wrong bytes
+        // (or trap) if that ever changed. Anchoring to `startIndex` makes the
+        // framing correct by construction instead of by observation.
+        while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+            var lineData = buffer.subdata(in: buffer.startIndex..<newlineIndex)
+            buffer.removeSubrange(buffer.startIndex...newlineIndex)
+
+            if lineData.last == UInt8(ascii: "\r") {
+                lineData.removeLast()
+            }
+
+            if lineData.isEmpty { continue }
+            lines.append(lineData)
+        }
+
+        return FeedResult(lines: lines, overflow: buffer.count > Self.maxBufferBytes)
+    }
+}

@@ -60,6 +60,24 @@ installSignalHandler(SIGTERM, name: "SIGTERM")
 installSignalHandler(SIGINT, name: "SIGINT")
 installSignalHandler(SIGHUP, name: "SIGHUP")
 
+// SIGPIPE: writing to a closed pipe -- here, specifically, the MCP client's
+// end of this process's stdout going away -- raises SIGPIPE at its POSIX
+// default disposition, which terminates this process IMMEDIATELY: no unwind,
+// no log line, and critically, no chance for MCPServer.sendResponse's
+// do/catch around `FileHandle.standardOutput.write(contentsOf:)` to ever run.
+// Ignoring SIGPIPE converts that fatal signal into an ordinary `EPIPE` Error
+// on the write call that would have raised it, which sendResponse already
+// handles: it logs the failure and, in MCP mode, routes into the same
+// graceful shutdown used for stdin EOF (see
+// MCPServer.terminateAfterTransportFailure). This is reachable in normal
+// operation specifically because this process's stdout IS the MCP client's
+// pipe, and the client can close it at any time (crash, force-quit, the user
+// closing Claude Desktop). Unlike SIGTERM/SIGINT/SIGHUP above, SIGPIPE is
+// simply ignored here (not redelivered via a DispatchSource) -- there is no
+// "clean shutdown" action to take in response to a single failed write, only
+// a normal Swift `Error` to hand back to the caller that attempted it.
+signal(SIGPIPE, SIG_IGN)
+
 // MARK: - Uncaught exception logging
 //
 // Objective-C style exceptions (many AppKit failures surface this way)

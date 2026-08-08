@@ -325,9 +325,27 @@ public final class ActiveAppTracker: NSObject {
 
     // MARK: - Resolution
 
+    /// Resolves a user-supplied string against the CURRENT set of running
+    /// applications. Fetches that set from `NSWorkspace` (a main-thread hop --
+    /// see `runningCandidates()`) and delegates all matching logic to the pure
+    /// overload below, which carries the full doc comment for this method's
+    /// contract and history. Kept as the public entry point solely so callers
+    /// (`DrawRequest`) do not need to know `Candidate` exists.
+    public func resolve(_ raw: String?) -> AppResolution {
+        // Answer the empty query BEFORE enumerating anything. `runningCandidates()`
+        // costs a synchronous hop to the main thread (NSWorkspace is AppKit), and
+        // this method is called from the MCP server's background read queue, so
+        // paying for that hop only to hand the same `.notFound` back would be a
+        // needless main-thread round trip on a request that cannot succeed.
+        guard let query = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
+            return .notFound
+        }
+        return resolve(query, among: runningCandidates())
+    }
+
     /// Resolves a user-supplied string -- which may be a bundle identifier
     /// ("com.apple.Terminal") or a display name ("DaVinci Resolve") -- to a
-    /// concrete running application.
+    /// concrete application, matched against `candidates`.
     ///
     /// Matching order, all case-insensitive:
     ///   1. exact bundle id                  -- unambiguous by definition
@@ -386,6 +404,21 @@ public final class ActiveAppTracker: NSObject {
     ///     they are legitimate targets -- and legitimate sources of genuine
     ///     ambiguity, which is reported rather than resolved.
     ///
+    ///     THE EXACT-BUNDLE-ID PASS IS DELIBERATELY EXEMPT from that exclusion,
+    ///     and this has now been re-raised as a suspected bug twice, so:
+    ///     adding `canBeFrontmost` to the first pass would change NOTHING that
+    ///     is observable. A complete bundle id that fails to resolve is accepted
+    ///     verbatim by `MCPServer.resolveTargetApp`'s `.notFound` branch anyway,
+    ///     so the annotation ends up carrying the SAME `appId` either way, and
+    ///     is equally invisible either way (a `.prohibited` process can never be
+    ///     frontmost, so the render-time comparison against that id never
+    ///     matches). The only difference is that the exempt version can still
+    ///     report the process's real display name in the tool result instead of
+    ///     echoing the raw id back -- strictly better diagnostics for identical
+    ///     behaviour. The exclusion exists to stop a FUZZY pass landing on
+    ///     something the user did not mean; an exact, complete id is by
+    ///     construction not an accidental fuzzy hit.
+    ///
     /// LIMITATION, by design: only RUNNING applications are searched, because
     /// `NSWorkspace` is the only name->bundle-id mapping available without
     /// crawling /Applications. Callers handle the "not running yet" case by
@@ -393,12 +426,16 @@ public final class ActiveAppTracker: NSObject {
     /// -- but ONLY on `.notFound`, never on `.ambiguous`: storing the vague
     /// query itself ("com.google") as an appId would produce an annotation that
     /// can never match any app and therefore can never be seen.
-    public func resolve(_ raw: String?) -> AppResolution {
+    ///
+    /// PURE ON PURPOSE: this overload touches no AppKit API at all -- it only
+    /// reads `candidates`, the array `runningCandidates()` built by querying
+    /// `NSWorkspace` -- specifically so it can be exercised in a unit test with
+    /// a hand-built candidate list instead of whatever happens to be running on
+    /// the machine the tests execute on.
+    func resolve(_ raw: String?, among candidates: [Candidate]) -> AppResolution {
         guard let query = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
             return .notFound
         }
-
-        let candidates = runningCandidates()
 
         if let hit = candidates.first(where: { $0.ref.bundleId.caseInsensitiveCompare(query) == .orderedSame }) {
             return .resolved(hit.ref)
@@ -419,6 +456,17 @@ public final class ActiveAppTracker: NSObject {
         // visible when launched; do this before fuzzy passes whose helpers may
         // share its prefix.
         if BundleIdentifierSyntax.looksComplete(query) {
+            // Logged, because this early return is otherwise INVISIBLE in the
+            // log: the plain fall-through `.notFound` at the end of this method
+            // WARNs, but this path returned silently, so "I passed a bundle id
+            // and my annotation never appeared" could not be diagnosed from the
+            // log alone. The outcome is legitimate (the caller accepts the id
+            // verbatim and the annotation appears once that app launches), but
+            // it is also what a typo'd bundle id looks like, so say which.
+            Logger.shared.log(
+                "ActiveAppTracker: '\(query)' is a complete bundle identifier that matched no running application. Not attempting a fuzzy match -- a complete id must not be prefix-matched onto a different app that happens to share its prefix. The caller may store it verbatim, in which case the annotation stays hidden until that app is launched and brought to the front.",
+                level: "INFO"
+            )
             return .notFound
         }
 
@@ -487,7 +535,7 @@ public final class ActiveAppTracker: NSObject {
     /// open" or "Claude itself is frontmost") next to the filtered values.
     public func rawFrontmostApp() -> AppRef? {
         var result: AppRef?
-        onMainSync {
+        MainThread.sync {
             if let app = NSWorkspace.shared.frontmostApplication,
                let bundleId = app.bundleIdentifier, !bundleId.isEmpty {
                 result = AppRef(bundleId: bundleId, name: app.localizedName ?? bundleId)
@@ -497,9 +545,12 @@ public final class ActiveAppTracker: NSObject {
     }
 
     /// A running application plus the two facts `resolve(_:)` needs about it
-    /// beyond its identity. Kept private: `AppRef` is what leaves this class and
-    /// gets stored on annotations, and it should stay a plain identity pair.
-    private struct Candidate {
+    /// beyond its identity. Internal rather than private -- not public: `AppRef`
+    /// is what leaves this class and gets stored on annotations and should stay
+    /// a plain identity pair, but the test target needs `@testable import`
+    /// visibility into `Candidate` (and its synthesized memberwise init) to feed
+    /// hand-built candidate lists to `resolve(_:among:)`.
+    struct Candidate {
         let ref: AppRef
         /// False when `NSRunningApplication.localizedName` was nil and
         /// `ref.name` is therefore just the bundle id echoed back -- i.e. this
@@ -517,7 +568,7 @@ public final class ActiveAppTracker: NSObject {
 
     private func runningCandidates() -> [Candidate] {
         var result: [Candidate] = []
-        onMainSync {
+        MainThread.sync {
             result = NSWorkspace.shared.runningApplications.compactMap { app in
                 guard let bundleId = app.bundleIdentifier, !bundleId.isEmpty else { return nil }
                 let localizedName = app.localizedName
@@ -534,20 +585,6 @@ public final class ActiveAppTracker: NSObject {
 
     private func runningAppRefs() -> [AppRef] {
         return runningCandidates().map { $0.ref }
-    }
-
-    /// Runs `work` on the main thread, synchronously, without deadlocking when
-    /// already there. `NSWorkspace.runningApplications` is an AppKit query, and
-    /// the MCP tool handlers that call `resolve(_:)` run on a background queue.
-    /// Mirrors `OverlayWindowController.getScreenInfos()`, which does the same
-    /// thing for `NSScreen`. Safe because the main run loop is never blocked by
-    /// this app (MCPServer reads stdin on `DispatchQueue.global()`).
-    private func onMainSync(_ work: () -> Void) {
-        if Thread.isMainThread {
-            work()
-        } else {
-            DispatchQueue.main.sync(execute: work)
-        }
     }
 
     private func describe(_ app: NSRunningApplication?) -> String {

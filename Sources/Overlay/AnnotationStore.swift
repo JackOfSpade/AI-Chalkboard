@@ -26,32 +26,85 @@ public final class AnnotationStore: @unchecked Sendable {
     
     private let lock = NSLock()
     private var annotations: [Annotation] = []
-    
+
     public var onStoreChanged: (() -> Void)?
 
     /// Internal so tests and in-process simulations can own isolated stores;
     /// production continues to use `shared`.
     init() {}
 
-    public func add(_ annotation: Annotation, durationSeconds: Double? = nil) {
+    /// Runs `body` with `lock` held, releasing it via `defer` no matter how
+    /// `body` returns.
+    ///
+    /// Every locking method in this class used to pair `lock.lock()` /
+    /// `lock.unlock()` by hand, which deadlocks the whole process the moment
+    /// any future edit adds an early `return` between the two calls. Routing
+    /// everything through here makes that class of bug impossible instead of
+    /// merely avoided-by-convention.
+    ///
+    /// Deliberately does NOT call `notifyChange()` -- callers that need to
+    /// notify must do so AFTER `withLock` returns, once the lock is released.
+    /// `notifyChange()` hops to the main thread and invokes
+    /// `onStoreChanged`, which repaints; doing that while still holding
+    /// `lock` would risk a reentrant call back into this store (e.g. from a
+    /// repaint that reads annotations) blocking on a lock this same thread
+    /// already holds.
+    private func withLock<T>(_ body: () -> T) -> T {
         lock.lock()
-        annotations.append(annotation)
-        lock.unlock()
+        defer { lock.unlock() }
+        return body()
+    }
+
+    /// Appends `annotation`, evicting the oldest stored annotations first if
+    /// doing so would exceed `DrawingDefaults.maxStoredAnnotations`.
+    ///
+    /// Returns the number of annotations evicted to enforce that cap (0 in
+    /// the normal case) so the MCP layer can report it back to the caller.
+    ///
+    /// WHY THE CAP EXISTS: five of the six draw tools deliberately create
+    /// annotations that persist until explicitly cleared -- that is
+    /// documented design intent (see `ClearScope`'s doc comment) and this
+    /// change does not touch it -- but this is a long-lived background
+    /// server, so a caller that never passes `duration_seconds` and never
+    /// calls `clear` grows this store without bound, and every repaint's
+    /// O(n) filter (`getForScreen`) gets steadily more expensive as it does.
+    /// Eviction is reported rather than silent -- logged at WARN and handed
+    /// back as a return value -- specifically so a runaway caller is visible
+    /// instead of just slowly degrading.
+    @discardableResult
+    public func add(_ annotation: Annotation, durationSeconds: Double? = nil) -> Int {
+        let evicted: Int = withLock {
+            annotations.append(annotation)
+            let overflow = annotations.count - DrawingDefaults.maxStoredAnnotations
+            guard overflow > 0 else { return 0 }
+            annotations.removeFirst(overflow)
+            return overflow
+        }
+
+        if evicted > 0 {
+            Logger.shared.log(
+                "AnnotationStore: exceeded maxStoredAnnotations cap (\(DrawingDefaults.maxStoredAnnotations)); evicted \(evicted) oldest annotation(s) to stay under it.",
+                level: "WARN"
+            )
+        }
+
         notifyChange()
-        
+
         if let duration = durationSeconds, duration > 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
                 _ = self?.remove(id: annotation.id)
             }
         }
+
+        return evicted
     }
 
     public func remove(id: String) -> Bool {
-        lock.lock()
-        let initialCount = annotations.count
-        annotations.removeAll { $0.id == id }
-        let removed = annotations.count < initialCount
-        lock.unlock()
+        let removed: Bool = withLock {
+            let initialCount = annotations.count
+            annotations.removeAll { $0.id == id }
+            return annotations.count < initialCount
+        }
         if removed {
             notifyChange()
         }
@@ -60,11 +113,14 @@ public final class AnnotationStore: @unchecked Sendable {
 
     @discardableResult
     public func clearAll() -> Int {
-        lock.lock()
-        let removed = annotations.count
-        annotations.removeAll()
-        lock.unlock()
-        notifyChange()
+        let removed: Int = withLock {
+            let count = annotations.count
+            annotations.removeAll()
+            return count
+        }
+        if removed > 0 {
+            notifyChange()
+        }
         return removed
     }
 
@@ -80,11 +136,11 @@ public final class AnnotationStore: @unchecked Sendable {
     /// Returns the number of annotations removed, for the tool/menu log line.
     @discardableResult
     public func clearVisible(forApp activeAppId: String?) -> Int {
-        lock.lock()
-        let before = annotations.count
-        annotations.removeAll { $0.appId == nil || $0.appId == activeAppId }
-        let removed = before - annotations.count
-        lock.unlock()
+        let removed: Int = withLock {
+            let before = annotations.count
+            annotations.removeAll { $0.appId == nil || $0.appId == activeAppId }
+            return before - annotations.count
+        }
         if removed > 0 {
             notifyChange()
         }
@@ -92,9 +148,7 @@ public final class AnnotationStore: @unchecked Sendable {
     }
 
     public func getAll() -> [Annotation] {
-        lock.lock()
-        defer { lock.unlock() }
-        return annotations
+        return withLock { annotations }
     }
 
     /// Every annotation on `screenId`, with NO per-app filtering.
@@ -106,9 +160,7 @@ public final class AnnotationStore: @unchecked Sendable {
     /// overlay from drawing them even on compatible capture paths. Normal
     /// painting uses `getForScreen(_:visibleForApp:)`.
     public func getForScreen(_ screenId: String) -> [Annotation] {
-        lock.lock()
-        defer { lock.unlock() }
-        return annotations.filter { $0.screenId == screenId }
+        return withLock { annotations.filter { $0.screenId == screenId } }
     }
 
     /// The annotations that should actually be painted on `screenId` right now:
@@ -124,17 +176,29 @@ public final class AnnotationStore: @unchecked Sendable {
     /// global annotations, never everything: showing every app's annotations at
     /// once would be worse than showing none.
     public func getForScreen(_ screenId: String, visibleForApp activeAppId: String?) -> [Annotation] {
-        lock.lock()
-        defer { lock.unlock() }
-        return annotations.filter { annotation in
-            guard annotation.screenId == screenId else { return false }
-            guard let annotationAppId = annotation.appId else { return true } // global
-            return annotationAppId == activeAppId
+        return withLock {
+            annotations.filter { annotation in
+                guard annotation.screenId == screenId else { return false }
+                guard let annotationAppId = annotation.appId else { return true } // global
+                return annotationAppId == activeAppId
+            }
         }
     }
 
+    /// Notifies `onStoreChanged`, always via `MainThread.enqueue` -- NOT
+    /// `MainThread.async`.
+    ///
+    /// The difference matters here specifically: `MainThread.async` runs
+    /// inline when already on the main thread, but every mutating method
+    /// above (`add`, `remove`, `clearAll`, `clearVisible`) can itself be
+    /// called FROM the main thread (e.g. the status-bar menu's "Clear"
+    /// action), and `onStoreChanged` repaints the overlay. Running that
+    /// repaint inline, re-entrantly, from inside the very call stack that is
+    /// still mutating `annotations` is exactly what `enqueue`'s unconditional
+    /// hop avoids: it always schedules the repaint as a NEW main-thread turn,
+    /// after the mutating call has fully returned, never nested inside it.
     private func notifyChange() {
-        DispatchQueue.main.async { [weak self] in
+        MainThread.enqueue { [weak self] in
             self?.onStoreChanged?()
         }
     }
