@@ -4,9 +4,24 @@ import XCTest
 /// `MCPToolCatalog.tools` is the static `tools/list` payload every MCP client
 /// depends on. These tests lock in the structural contract -- names, order,
 /// required schema shape -- without pinning exact prose, and confirm the
-/// description strings that interpolate `DrawingDefaults` constants actually
-/// contain the current values, which is what stops the docs Claude reads from
-/// drifting from the code that applies them.
+/// numeric schema fields an MCP client actually validates against
+/// (`exclusiveMinimum`, `minItems`/`maxItems`, `minimum`) match the
+/// `DrawingDefaults` constants that `DrawValidation` enforces server-side.
+///
+/// That last group used to instead assert that a schema DESCRIPTION STRING
+/// contained a substring built from the very same `DrawingDefaults` constant
+/// being checked -- e.g. asserting `colorDescription.contains(DrawingDefaults
+/// .circleColor)`. That passed even if `circleColor` were wrong, because the
+/// "expected" value and the "actual" value were the same expression evaluated
+/// twice; it protected nothing. Comparing a SCHEMA FIELD like `exclusiveMinimum`
+/// or `maxItems` to the `DrawingDefaults` constant it must equal is not
+/// tautological the same way: the schema literal (`MCPToolCatalog.swift`) and
+/// the runtime check (`DrawValidation`) are two independently-written
+/// expressions of the same limit, so this is what actually catches them
+/// drifting apart -- which is the failure mode worth guarding against, since
+/// an MCP client validates a call against the SCHEMA before this server ever
+/// sees it, and a client-side bound that is looser than the server's would
+/// let a call through that `DrawValidation` then silently rejects.
 final class MCPToolCatalogTests: XCTestCase {
     private var toolsByName: [String: [String: Any]] {
         var result: [String: [String: Any]] = [:]
@@ -101,37 +116,58 @@ final class MCPToolCatalogTests: XCTestCase {
         XCTAssertEqual(scopeSchema?["enum"] as? [String], ["active", "all"])
     }
 
-    func testDrawCircleColorDescriptionContainsTheCurrentDefaultConstant() {
+    func testDrawCircleRadiusSchemaExclusiveMinimumMatchesTheValidationBoundary() {
         guard let tool = toolsByName["draw_circle"] else { return XCTFail("missing draw_circle") }
-        let colorDescription = (properties(tool)["color"] as? [String: Any])?["description"] as? String
-        XCTAssertTrue(colorDescription?.contains(DrawingDefaults.circleColor) ?? false,
-                      "draw_circle's color description must mention the current circleColor default")
+        let radiusSchema = properties(tool)["radius"] as? [String: Any]
+        // `DrawValidation.positiveRadius` rejects `radius <= 0`; the schema's
+        // `exclusiveMinimum: 0` is what lets a well-behaved MCP client refuse
+        // that same call itself, before ever sending it here. If a future
+        // edit loosened one boundary without the other, an MCP client would
+        // accept calls this server then rejects (or vice versa) -- this is
+        // what would catch that.
+        XCTAssertEqual(radiusSchema?["exclusiveMinimum"] as? Int, 0,
+                       "draw_circle's radius schema must declare exclusiveMinimum: 0, matching DrawValidation.positiveRadius's own boundary")
     }
 
-    func testDrawPathDescriptionsContainTheCurrentDefaultConstants() {
+    func testDrawBoxWidthAndHeightSchemaExclusiveMinimumsMatchTheValidationBoundary() {
+        guard let tool = toolsByName["draw_box"] else { return XCTFail("missing draw_box") }
+        let props = properties(tool)
+        let widthSchema = props["width"] as? [String: Any]
+        let heightSchema = props["height"] as? [String: Any]
+        // Mirrors the draw_circle radius test above: DrawValidation.
+        // positiveDimensions rejects `width <= 0 || height <= 0`, and the
+        // schema's `exclusiveMinimum: 0` on both properties is the
+        // independent, client-side expression of that same boundary.
+        XCTAssertEqual(widthSchema?["exclusiveMinimum"] as? Int, 0,
+                       "draw_box's width schema must declare exclusiveMinimum: 0, matching DrawValidation.positiveDimensions's own boundary")
+        XCTAssertEqual(heightSchema?["exclusiveMinimum"] as? Int, 0,
+                       "draw_box's height schema must declare exclusiveMinimum: 0, matching DrawValidation.positiveDimensions's own boundary")
+    }
+
+    func testDrawPathPointsSchemaMinAndMaxItemsMatchTheEnforcedLimits() {
         guard let tool = toolsByName["draw_path"] else { return XCTFail("missing draw_path") }
-        let props = properties(tool)
-        let colorDescription = (props["color"] as? [String: Any])?["description"] as? String
-        let strokeWidthDescription = (props["stroke_width"] as? [String: Any])?["description"] as? String
-
-        XCTAssertTrue(colorDescription?.contains(DrawingDefaults.pathColor) ?? false,
-                      "draw_path's color description must mention the current pathColor default")
-        XCTAssertTrue(strokeWidthDescription?.contains("\(DrawingDefaults.pathStrokeWidthPx)") ?? false,
-                      "draw_path's stroke_width description must mention the current pathStrokeWidthPx default")
+        let pointsSchema = properties(tool)["points"] as? [String: Any]
+        // The lower bound mirrors MCPToolHandlers' own "at least 2 points"
+        // guard; the upper bound must equal DrawingDefaults.maxPathPoints,
+        // the very constant DrawValidation.pathPointCount enforces against
+        // the count of points that actually get stored. The schema literal
+        // in MCPToolCatalog.swift and the runtime check in DrawValidation are
+        // two independently-written expressions of that same cap -- this is
+        // what catches them drifting apart.
+        XCTAssertEqual(pointsSchema?["minItems"] as? Int, 2,
+                       "draw_path's points schema must declare minItems: 2")
+        XCTAssertEqual(pointsSchema?["maxItems"] as? Int, DrawingDefaults.maxPathPoints,
+                       "draw_path's points schema maxItems must equal DrawingDefaults.maxPathPoints, matching DrawValidation.pathPointCount's own limit")
     }
 
-    func testDrawGridDescriptionsContainTheCurrentDefaultConstants() {
+    func testDrawGridStepPxSchemaMinimumMatchesTheHangGuardFloor() {
         guard let tool = toolsByName["draw_grid"] else { return XCTFail("missing draw_grid") }
-        let props = properties(tool)
-        let stepDescription = (props["step_px"] as? [String: Any])?["description"] as? String
-        let colorDescription = (props["color"] as? [String: Any])?["description"] as? String
-        let durationDescription = (props["duration_seconds"] as? [String: Any])?["description"] as? String
-
-        XCTAssertTrue(stepDescription?.contains("\(Int(DrawingDefaults.gridStepPx))") ?? false,
-                      "draw_grid's step_px description must mention the current gridStepPx default")
-        XCTAssertTrue(colorDescription?.contains(DrawingDefaults.gridColor) ?? false,
-                      "draw_grid's color description must mention the current gridColor default")
-        XCTAssertTrue(durationDescription?.contains("\(DrawingDefaults.gridDurationSeconds)") ?? false,
-                      "draw_grid's duration_seconds description must mention the current gridDurationSeconds default")
+        let stepSchema = properties(tool)["step_px"] as? [String: Any]
+        // DrawingDefaults.minGridStepPx is a hang guard (see its doc comment),
+        // not a cosmetic minimum, and DrawValidation.gridStep enforces it at
+        // runtime. The schema's `minimum` field is the independent,
+        // client-side expression of that exact same floor.
+        XCTAssertEqual(stepSchema?["minimum"] as? Double, DrawingDefaults.minGridStepPx,
+                       "draw_grid's step_px schema minimum must equal DrawingDefaults.minGridStepPx, matching DrawValidation.gridStep's own boundary")
     }
 }

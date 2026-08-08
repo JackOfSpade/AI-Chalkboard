@@ -19,7 +19,40 @@ public final class MCPServer: @unchecked Sendable {
     public static let shared = MCPServer()
     private var isRunning = false
 
+    /// Guards `transportFailureFired` below. `readLoop` runs on the
+    /// background `DispatchQueue.global` queue started by `start()`, while
+    /// `terminateAfterTransportFailure` hops to the MAIN queue partway
+    /// through its own body (see that method) to call `NSApp.terminate`; the
+    /// flag itself, though, has to be safe to set and read from either queue,
+    /// since `readLoop` polls it from the background queue while a write
+    /// failure detected inside `sendResponse` -- also on the background
+    /// queue, but logically a separate event from `readLoop`'s own EOF/
+    /// overflow checks -- can set it at effectively any point in that same
+    /// loop's iteration.
+    private let transportFailureLock = NSLock()
+
+    /// Set exactly once, by whichever of `terminateAfterTransportFailure`'s
+    /// three call sites (stdin EOF, LineFramer overflow, failed stdout
+    /// write) gets there first. See `terminateAfterTransportFailure` and
+    /// `hasTransportFailed` for what this guards against.
+    private var transportFailureFired = false
+
     private init() {}
+
+    /// Whether `terminateAfterTransportFailure` has already fired, from any
+    /// cause. `readLoop` polls this after handling each line and after each
+    /// chunk so that once ONE bad write has already kicked off shutdown, it
+    /// stops draining the rest of whatever chunk it is holding instead of
+    /// continuing to hand doomed lines to `handleMessage` (each of which
+    /// would attempt -- and log -- another write into the same dead pipe),
+    /// and stops blocking on `stdin.availableData` for more input from a
+    /// peer that already has no reader on the other end of this process's
+    /// replies.
+    private func hasTransportFailed() -> Bool {
+        transportFailureLock.lock()
+        defer { transportFailureLock.unlock() }
+        return transportFailureFired
+    }
 
     public func log(_ message: String) {
         Logger.shared.log(message, level: "MCP")
@@ -43,12 +76,19 @@ public final class MCPServer: @unchecked Sendable {
         // Set immediately before `break`ing out of the loop below, naming WHY
         // the loop ended, so the shared shutdown logic after it does not have
         // to guess. `isRunning` is only ever set to `true` (in start()); it is
-        // never flipped back to false anywhere, so today every exit from this
-        // loop is one of the two `break`s below, never the `while isRunning`
-        // condition itself going false.
+        // never flipped back to false anywhere, so every exit from this loop
+        // is one of the three `break`s below, never the `while isRunning`
+        // condition itself going false. Two of those three (stdin EOF,
+        // LineFramer overflow) set `terminationReason` and let the `guard`
+        // below call `terminateAfterTransportFailure` exactly once. The third
+        // -- noticing mid-loop that a write already failed inside
+        // `handleMessage` -- deliberately leaves it `nil`: that failure
+        // already called `terminateAfterTransportFailure` itself from inside
+        // `sendResponse`, so calling it again here would only be caught by
+        // that method's own idempotency guard, not prevented at the source.
         var terminationReason: String?
 
-        while isRunning {
+        outer: while isRunning {
             let availableData = stdin.availableData
             if availableData.isEmpty {
                 log("EOF on stdin. Exiting MCP loop.")
@@ -59,6 +99,14 @@ public final class MCPServer: @unchecked Sendable {
             let result = framer.feed(availableData)
             for line in result.lines {
                 handleMessage(line)
+                if hasTransportFailed() {
+                    // A write inside this `handleMessage` call (or an earlier
+                    // one in this same chunk) failed and already triggered
+                    // shutdown. Stop feeding the rest of this chunk's lines
+                    // to a transport that is already gone -- each would
+                    // otherwise attempt, and log, another doomed write.
+                    break outer
+                }
             }
 
             if result.overflow {
@@ -66,14 +114,24 @@ public final class MCPServer: @unchecked Sendable {
                 terminationReason = "MCP stdin framing overflow (peer sent \(LineFramer.maxBufferBytes)+ bytes with no newline)"
                 break
             }
+
+            if hasTransportFailed() {
+                // Every line in this chunk parsed fine individually, but a
+                // write still failed (e.g. the very last line's response),
+                // so there is nothing left to read for. Do not loop back
+                // around to `stdin.availableData`, which would block waiting
+                // for more input from a peer whose reply pipe we already
+                // know is dead.
+                break
+            }
         }
 
         guard let reason = terminationReason else {
-            // Unreachable today (see the comment above): `isRunning` is never
-            // set false, so the loop can only end via one of the two breaks,
-            // both of which set `terminationReason` first. If that ever
-            // changes, falling through to a lifecycle shutdown with no known
-            // cause would be worse than simply doing nothing here.
+            // Reached both in the (currently unreachable) case of
+            // `isRunning` itself going false, and, deliberately, whenever
+            // this loop broke out because `hasTransportFailed()` was already
+            // true -- see that branch above for why no second call belongs
+            // here.
             return
         }
 
@@ -106,7 +164,27 @@ public final class MCPServer: @unchecked Sendable {
     /// shutdown safe: it only fires when a broken pipe actually means "the
     /// MCP client hung up or disappeared", never when it just means "nobody
     /// ever wired a real client up to this stdio."
+    ///
+    /// IDEMPOTENCY GUARD -- do not remove. Before `hasTransportFailed()`
+    /// existed for `readLoop` to poll, a single bad chunk of stdin could
+    /// reach this function more than once: `readLoop` had no way to learn
+    /// that a write inside `handleMessage` had already failed, so it kept
+    /// handing the chunk's remaining lines to `handleMessage`, each of which
+    /// produced another failed write and therefore another call here -- N
+    /// separate `DispatchQueue.main.async { markInternalTermination;
+    /// NSApp.terminate }` closures instead of one. `readLoop` breaking out
+    /// promptly (above) now makes that pile-up far less likely, but this
+    /// guard is what actually GUARANTEES this function's effects happen at
+    /// most once, regardless of how many times, or from which of its three
+    /// call sites (stdin EOF, LineFramer overflow, failed stdout write), it
+    /// gets invoked.
     private func terminateAfterTransportFailure(reason: String) {
+        transportFailureLock.lock()
+        let alreadyFired = transportFailureFired
+        transportFailureFired = true
+        transportFailureLock.unlock()
+        guard !alreadyFired else { return }
+
         guard LaunchMode.isMCPMode else {
             log("Not in MCP mode; leaving app running after \(reason) (expected for a normal GUI launch, where stdin/stdout are not client pipes).")
             return

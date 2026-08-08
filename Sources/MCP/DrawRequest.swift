@@ -84,7 +84,7 @@ struct DrawRequest {
         noun: String
     ) -> DrawOutcome<String> {
         let colorHex = args["color"] as? String ?? defaultColor
-        let duration = MCPServer.shared.getDouble(args["duration_seconds"]) ?? defaultDuration
+        let duration = MCPArgument.double(args["duration_seconds"]) ?? defaultDuration
 
         var appId: String?
         var appName: String?
@@ -217,34 +217,5 @@ extension MCPServer {
             return " (GLOBAL: visible over every app)"
         }
         return " (linked to \(appName ?? appId) [\(appId)]: visible ONLY while that app is frontmost)"
-    }
-
-    /// Coerces an MCP tool argument to `Double`, accepting a JSON number or a
-    /// numeric string and rejecting everything else. This is the single
-    /// shared numeric helper for every draw tool (radius, coordinates,
-    /// duration, step_px, stroke_width, path points), so fixing coercion here
-    /// covers every call site at once.
-    ///
-    /// Two rejections beyond a plain `as?`/`Double(_:)` attempt:
-    ///   * `value as? NSNumber` alone succeeds for JSON `true`/`false` -- a
-    ///     JSON boolean bridges to `NSNumber` (backed by `CFBoolean`) just as
-    ///     readily as a real number does, so without this check
-    ///     `{"radius": true}` would silently become `1.0` instead of being
-    ///     rejected as the wrong type.
-    ///   * Both branches reject non-finite results. `NSNumber.doubleValue`
-    ///     can itself be NaN/infinite, and `Double.init(String)` accepts
-    ///     "nan"/"inf"/"infinity" (case-insensitively) -- either would
-    ///     otherwise flow straight into stored geometry/duration values and
-    ///     corrupt rendering or scheduling.
-    func getDouble(_ value: Any?) -> Double? {
-        if let num = value as? NSNumber {
-            guard CFGetTypeID(num) != CFBooleanGetTypeID() else { return nil }
-            let d = num.doubleValue
-            return d.isFinite ? d : nil
-        }
-        if let str = value as? String, let d = Double(str) {
-            return d.isFinite ? d : nil
-        }
-        return nil
     }
 }

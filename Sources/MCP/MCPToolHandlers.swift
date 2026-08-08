@@ -45,14 +45,14 @@ extension MCPServer {
             sendTextResult(id: id, text: text)
 
         case "draw_circle":
-            guard let rawX = getDouble(args["x"]),
-                  let rawY = getDouble(args["y"]),
-                  let radius = getDouble(args["radius"]) else {
+            guard let rawX = MCPArgument.double(args["x"]),
+                  let rawY = MCPArgument.double(args["y"]),
+                  let radius = MCPArgument.double(args["radius"]) else {
                 sendErrorResult(id: id, text: "Missing required parameters: x, y, radius")
                 return
             }
-            guard radius > 0 else {
-                sendErrorResult(id: id, text: "radius must be > 0.")
+            if let err = DrawValidation.positiveRadius(radius) {
+                sendErrorResult(id: id, text: err)
                 return
             }
             let isNorm = args["is_normalized"] as? Bool ?? false
@@ -80,10 +80,10 @@ extension MCPServer {
             }
 
         case "draw_arrow":
-            guard let rawX1 = getDouble(args["x1"]),
-                  let rawY1 = getDouble(args["y1"]),
-                  let rawX2 = getDouble(args["x2"]),
-                  let rawY2 = getDouble(args["y2"]) else {
+            guard let rawX1 = MCPArgument.double(args["x1"]),
+                  let rawY1 = MCPArgument.double(args["y1"]),
+                  let rawX2 = MCPArgument.double(args["x2"]),
+                  let rawY2 = MCPArgument.double(args["y2"]) else {
                 sendErrorResult(id: id, text: "Missing required parameters: x1, y1, x2, y2")
                 return
             }
@@ -114,10 +114,10 @@ extension MCPServer {
             }
 
         case "draw_box":
-            guard let rawX = getDouble(args["x"]),
-                  let rawY = getDouble(args["y"]),
-                  let rawW = getDouble(args["width"]),
-                  let rawH = getDouble(args["height"]) else {
+            guard let rawX = MCPArgument.double(args["x"]),
+                  let rawY = MCPArgument.double(args["y"]),
+                  let rawW = MCPArgument.double(args["width"]),
+                  let rawH = MCPArgument.double(args["height"]) else {
                 sendErrorResult(id: id, text: "Missing required parameters: x, y, width, height")
                 return
             }
@@ -132,8 +132,8 @@ extension MCPServer {
                 let y = request.normalize(rawY, alongWidth: false, isNormalized: isNorm)
                 let width = request.normalize(rawW, alongWidth: true, isNormalized: isNorm)
                 let height = request.normalize(rawH, alongWidth: false, isNormalized: isNorm)
-                guard width > 0, height > 0 else {
-                    sendErrorResult(id: id, text: "width and height must both be > 0.")
+                if let err = DrawValidation.positiveDimensions(width: width, height: height) {
+                    sendErrorResult(id: id, text: err)
                     return
                 }
                 switch request.finish(
@@ -152,8 +152,8 @@ extension MCPServer {
             }
 
         case "draw_label":
-            guard let rawX = getDouble(args["x"]),
-                  let rawY = getDouble(args["y"]),
+            guard let rawX = MCPArgument.double(args["x"]),
+                  let rawY = MCPArgument.double(args["y"]),
                   let text = args["text"] as? String else {
                 sendErrorResult(id: id, text: "Missing required parameters: x, y, text")
                 return
@@ -190,10 +190,22 @@ extension MCPServer {
                 sendErrorResult(id: id, text: "Missing or invalid 'points' array (must contain at least 2 points).")
                 return
             }
-            guard rawPointsArg.count <= DrawingDefaults.maxPathPoints else {
-                sendErrorResult(id: id, text: "'points' array contains \(rawPointsArg.count) points, exceeding the \(DrawingDefaults.maxPathPoints)-point limit.")
-                return
-            }
+            // NOTE: no separate cap on rawPointsArg.count here, and none is
+            // needed. Two reasons:
+            //   1. The cap this tool actually enforces (DrawValidation.
+            //      pathPointCount, below) is checked against parsedPoints.count
+            //      -- the number of points that will actually reach
+            //      AnnotationStore -- not this raw count, precisely because
+            //      parsing silently drops malformed entries and checking the
+            //      raw length could reject a request that would have produced
+            //      an entirely acceptable number of stored points. See that
+            //      function's doc comment.
+            //   2. Unbounded parse work over an enormous raw array is already
+            //      bounded upstream: LineFramer.maxBufferBytes caps a single
+            //      JSON-RPC line -- and therefore this entire request,
+            //      'points' included -- at 4 MB before this code ever runs. A
+            //      future reader should not re-add a raw-size guard here for
+            //      that reason.
             let isNorm = args["is_normalized"] as? Bool ?? false
             let isClosed = args["is_closed"] as? Bool ?? false
             let label = args["label"] as? String
@@ -205,12 +217,12 @@ extension MCPServer {
                 var parsedPoints: [[Double]] = []
                 for item in rawPointsArg {
                     if let ptArr = item as? [Any], ptArr.count >= 2,
-                       let px = getDouble(ptArr[0]), let py = getDouble(ptArr[1]) {
+                       let px = MCPArgument.double(ptArr[0]), let py = MCPArgument.double(ptArr[1]) {
                         let x = request.normalize(px, alongWidth: true, isNormalized: isNorm)
                         let y = request.normalize(py, alongWidth: false, isNormalized: isNorm)
                         parsedPoints.append([x, y])
                     } else if let dict = item as? [String: Any],
-                              let px = getDouble(dict["x"]), let py = getDouble(dict["y"]) {
+                              let px = MCPArgument.double(dict["x"]), let py = MCPArgument.double(dict["y"]) {
                         let x = request.normalize(px, alongWidth: true, isNormalized: isNorm)
                         let y = request.normalize(py, alongWidth: false, isNormalized: isNorm)
                         parsedPoints.append([x, y])
@@ -222,7 +234,12 @@ extension MCPServer {
                     return
                 }
 
-                let strokeWidth = getDouble(args["stroke_width"]) ?? DrawingDefaults.pathStrokeWidthPx
+                if let err = DrawValidation.pathPointCount(parsedPoints.count) {
+                    sendErrorResult(id: id, text: err)
+                    return
+                }
+
+                let strokeWidth = MCPArgument.double(args["stroke_width"]) ?? DrawingDefaults.pathStrokeWidthPx
 
                 switch request.finish(
                     args: args,
@@ -240,9 +257,9 @@ extension MCPServer {
             }
 
         case "draw_grid":
-            let stepPx = getDouble(args["step_px"]) ?? DrawingDefaults.gridStepPx
-            guard stepPx >= DrawingDefaults.minGridStepPx else {
-                sendErrorResult(id: id, text: "step_px must be >= \(DrawingDefaults.minGridStepPx) physical pixel(s); smaller values can make the grid renderer's line loop run effectively forever and wedge the main thread.")
+            let stepPx = MCPArgument.double(args["step_px"]) ?? DrawingDefaults.gridStepPx
+            if let err = DrawValidation.gridStep(stepPx) {
+                sendErrorResult(id: id, text: err)
                 return
             }
             let label = args["label"] as? String
