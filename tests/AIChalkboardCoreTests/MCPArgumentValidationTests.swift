@@ -2,14 +2,10 @@ import Foundation
 import XCTest
 @testable import AIChalkboardCore
 
-/// `MCPArgument.double` and `DrawValidation`'s geometry/limit checks used to
-/// be reachable only through `MCPServer.shared`, a singleton that writes real
+/// `MCPArgument.double` used to be reachable only through
+/// `MCPServer.shared`, a singleton that writes real
 /// JSON-RPC responses to real stdout and therefore cannot be driven from a
-/// headless CI test -- so the real safety checks behind every `draw_*` tool
-/// (rejecting `{"radius": true}`, rejecting a negative width, rejecting an
-/// oversized path) had ZERO test coverage. Both types were pulled out
-/// specifically to fix that: neither touches AppKit or `MCPServer.shared`, so
-/// both can be exercised directly here.
+/// headless CI test. It is isolated so numeric coercion can be exercised here.
 final class MCPArgumentValidationTests: XCTestCase {
 
     // MARK: - MCPArgument.double: values that must parse
@@ -34,7 +30,7 @@ final class MCPArgumentValidationTests: XCTestCase {
 
     func testNegativeValuesParse() {
         // Numeric coercion is deliberately permissive about sign --
-        // rejecting a negative radius/width/height is DrawValidation's job,
+        // rejecting a semantically invalid negative dimension is the tool's job,
         // not MCPArgument.double's. A caller that needs "positive" has to
         // ask for it separately.
         XCTAssertEqual(MCPArgument.double(-5), -5.0)
@@ -87,6 +83,18 @@ final class MCPArgumentValidationTests: XCTestCase {
                      "a JSON `false` must not coerce to 0.0 either")
     }
 
+    func testStrictBooleanAcceptsOnlyJSONBooleans() throws {
+        let json = try JSONSerialization.jsonObject(with: Data("""
+        {"truth": true, "falsity": false, "one": 1, "zero": 0}
+        """.utf8)) as! [String: Any]
+
+        XCTAssertEqual(MCPArgument.bool(json["truth"]), true)
+        XCTAssertEqual(MCPArgument.bool(json["falsity"]), false)
+        XCTAssertNil(MCPArgument.bool(json["one"]), "JSON number 1 must not enable a boolean flag")
+        XCTAssertNil(MCPArgument.bool(json["zero"]), "JSON number 0 must not disable a boolean flag")
+        XCTAssertNil(MCPArgument.bool("true"))
+    }
+
     // MARK: - MCPArgument.double: non-finite rejection
 
     func testNonFiniteStringSpellingsAreRejectedRegardlessOfCase() {
@@ -121,58 +129,117 @@ final class MCPArgumentValidationTests: XCTestCase {
         XCTAssertNil(MCPArgument.double(["x": 1, "y": 2]))
     }
 
-    // MARK: - DrawValidation.positiveRadius
-
-    func testPositiveRadiusAcceptsAnyValueGreaterThanZero() {
-        XCTAssertNil(DrawValidation.positiveRadius(0.001))
-        XCTAssertNil(DrawValidation.positiveRadius(40))
+    func testSuppliedInvalidDoubleIsNotConfusedWithAnOmittedOptionalArgument() {
+        XCTAssertFalse(MCPArgument.hasInvalidSuppliedDouble([:], key: "opacity"))
+        XCTAssertFalse(MCPArgument.hasInvalidSuppliedDouble(["opacity": 0.5], key: "opacity"))
+        XCTAssertTrue(MCPArgument.hasInvalidSuppliedDouble(["opacity": true], key: "opacity"))
+        XCTAssertTrue(MCPArgument.hasInvalidSuppliedDouble(["opacity": "not-a-number"], key: "opacity"))
+        XCTAssertTrue(MCPArgument.hasInvalidSuppliedDouble(["opacity": NSNull()], key: "opacity"))
     }
 
-    func testPositiveRadiusRejectsZeroAndNegativeValuesWithTheExactShippedMessage() {
-        XCTAssertEqual(DrawValidation.positiveRadius(0), "radius must be > 0.")
-        XCTAssertEqual(DrawValidation.positiveRadius(-1), "radius must be > 0.")
+    func testIntegerAcceptsOnlyWholeFiniteNumericValues() {
+        XCTAssertEqual(MCPArgument.integer(3), 3)
+        XCTAssertEqual(MCPArgument.integer("-2"), -2)
+        XCTAssertNil(MCPArgument.integer(1.5))
+        XCTAssertNil(MCPArgument.integer(true))
     }
 
-    // MARK: - DrawValidation.positiveDimensions
-
-    func testPositiveDimensionsAcceptsWidthAndHeightBothGreaterThanZero() {
-        XCTAssertNil(DrawValidation.positiveDimensions(width: 1, height: 1))
-        XCTAssertNil(DrawValidation.positiveDimensions(width: 200, height: 0.5))
+    func testIntegerRejectsTheRoundedDoublePastIntMaximumWithoutTrapping() {
+        // Double cannot represent Int.max. Its nearest value is 2^63, which
+        // is outside Int's positive range and used to reach trapping Int(...).
+        XCTAssertNil(MCPArgument.integer(Double(Int.max)))
+        XCTAssertNil(MCPArgument.integer(Double(Int.min)), "floating integer spellings beyond 2^53 are ambiguous even when the rounded value happens to be representable")
     }
 
-    func testPositiveDimensionsRejectsEitherSideBeingZeroOrNegativeWithTheExactShippedMessage() {
-        XCTAssertEqual(DrawValidation.positiveDimensions(width: 0, height: 5), "width and height must both be > 0.")
-        XCTAssertEqual(DrawValidation.positiveDimensions(width: 5, height: 0), "width and height must both be > 0.")
-        XCTAssertEqual(DrawValidation.positiveDimensions(width: -1, height: -1), "width and height must both be > 0.")
+    func testIntegerPreservesExactIntegerBackedJSONAndRejectsAmbiguousFloatingSpellings() throws {
+        let json = try JSONSerialization.jsonObject(with: Data("""
+        {"exact": 9007199254740993, "decimal": 9007199254740993.0, "scientific": 9.007199254740993e15}
+        """.utf8)) as! [String: Any]
+
+        XCTAssertEqual(MCPArgument.integer(json["exact"]), 9_007_199_254_740_993)
+        XCTAssertNil(MCPArgument.integer(json["decimal"]))
+        XCTAssertNil(MCPArgument.integer(json["scientific"]))
+        XCTAssertNil(MCPArgument.integer("9007199254740993.0"))
+        XCTAssertEqual(MCPArgument.integer("9007199254740993"), 9_007_199_254_740_993)
     }
 
-    // MARK: - DrawValidation.gridStep
+    // MARK: - tools/call protocol boundary
 
-    func testGridStepAcceptsTheMinimumItselfAndTheDefault() {
-        // >= , not > -- the boundary value itself must be accepted.
-        XCTAssertNil(DrawValidation.gridStep(DrawingDefaults.minGridStepPx))
-        XCTAssertNil(DrawValidation.gridStep(DrawingDefaults.gridStepPx))
+    func testToolCallArgumentsMustBeAnObjectWhenPresent() {
+        let malformed: [String: Any] = ["name": "clear", "arguments": 42]
+        switch MCPProtocolValidation.toolCallParameters(malformed) {
+        case .success:
+            XCTFail("A numeric arguments value must not be treated as an empty object.")
+        case .failure(let message):
+            XCTAssertEqual(message, "tools/call arguments must be an object when supplied.")
+        }
+
+        let omitted: [String: Any] = ["name": "clear"]
+        switch MCPProtocolValidation.toolCallParameters(omitted) {
+        case .success(let params):
+            XCTAssertNil(params["arguments"])
+        case .failure(let message):
+            XCTFail("Omitted arguments are valid: \(message)")
+        }
     }
 
-    func testGridStepRejectsBelowTheMinimumWithTheExactShippedMessage() {
-        XCTAssertEqual(
-            DrawValidation.gridStep(DrawingDefaults.minGridStepPx - 0.5),
-            "step_px must be >= \(DrawingDefaults.minGridStepPx) physical pixel(s); smaller values can make the grid renderer's line loop run effectively forever and wedge the main thread."
-        )
+    func testToolCallParamsMustBeAnObject() {
+        switch MCPProtocolValidation.toolCallParameters(["clear"]) {
+        case .success:
+            XCTFail("An array must not be accepted as tools/call params.")
+        case .failure(let message):
+            XCTAssertEqual(message, "tools/call params must be an object.")
+        }
     }
 
-    // MARK: - DrawValidation.pathPointCount
+    // MARK: - Coordinate transform safety
 
-    func testPathPointCountAcceptsAnythingUpToAndIncludingTheCap() {
-        XCTAssertNil(DrawValidation.pathPointCount(2))
-        XCTAssertNil(DrawValidation.pathPointCount(DrawingDefaults.maxPathPoints))
+    private func testScreen(width: Int = 3_024, height: Int = 1_964) -> ScreenInfo {
+        ScreenInfo(id: "test-screen", index: 0, name: "Test", widthPx: width, heightPx: height,
+                   widthPt: Double(width), heightPt: Double(height), backingScaleFactor: 1, isMain: true)
     }
 
-    func testPathPointCountRejectsOneOverTheCapWithTheExactShippedMessage() {
-        let overCount = DrawingDefaults.maxPathPoints + 1
-        XCTAssertEqual(
-            DrawValidation.pathPointCount(overCount),
-            "'points' array resolved to \(overCount) valid point(s) after parsing, exceeding the \(DrawingDefaults.maxPathPoints)-point limit."
-        )
+    func testScreenshotSubnormalDimensionsAreRejectedBeforeTheyCreateInfiniteScale() {
+        let request = DrawRequest(screen: testScreen())
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": Double.leastNonzeroMagnitude,
+            "screenshot_height": 100
+        ]) {
+        case .success:
+            XCTFail("A subnormal screenshot width must not create an infinite scale.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("invalid coordinate transform"))
+        }
     }
+
+    func testSafeCoordinateTransformRejectsPostTransformOverflow() throws {
+        let transform = DrawRequest.CoordinateTransform(scaleX: Double.greatestFiniteMagnitude, scaleY: 1)
+        XCTAssertNil(transform.transformedX(2))
+        XCTAssertNil(transform.transformedPoint(x: 2, y: 1))
+
+        let geometry = try SVGPathParser.parseGeometry("M2 0 L3 1")
+        XCTAssertFalse(transform.canTransform(geometry))
+    }
+
+    func testHugeNormalizedGeometryIsRejectedForPathImageTextAndBatchCallers() throws {
+        // All four free-draw parsers route their selected-space positions
+        // through these same guarded transform methods. This locks the shared
+        // boundary rather than duplicating four private-handler tests.
+        let normalized = DrawRequest.CoordinateTransform(scaleX: 3_024, scaleY: 1_964, requiresUnitInterval: true)
+        let huge = Double.greatestFiniteMagnitude
+        XCTAssertNil(normalized.transformedPoint(x: huge, y: huge), "image/text positions")
+        XCTAssertNil(normalized.transformedX(huge), "image width / path X")
+        XCTAssertNil(normalized.transformedY(huge), "image height / path Y")
+        let path = try SVGPathParser.parseGeometry("M 1e308 0 L 1e308 1")
+        XCTAssertFalse(normalized.canTransform(path), "standalone and batch path items")
+    }
+
+    func testNormalizedCoordinatesAreStrictlyWithinTheDocumentedUnitInterval() {
+        let normalized = DrawRequest.CoordinateTransform(scaleX: 3_024, scaleY: 1_964, requiresUnitInterval: true)
+        XCTAssertNil(normalized.transformedX(-0.001))
+        XCTAssertNil(normalized.transformedY(1.001))
+        XCTAssertNotNil(normalized.transformedPoint(x: 0, y: 1))
+    }
+
 }

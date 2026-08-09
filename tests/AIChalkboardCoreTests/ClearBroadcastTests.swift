@@ -4,7 +4,7 @@ import XCTest
 
 final class ClearBroadcastTests: XCTestCase {
     private func annotation(_ id: String, appId: String?) -> Annotation {
-        Annotation(id: id, screenId: "1", kind: .grid(stepPx: 100), appId: appId, appName: appId)
+        Annotation(id: id, screenId: "1", kind: .vectorPath(data: "M0 0 L100 100", strokeColorHex: nil, strokeWidth: 2, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1), appId: appId, appName: appId)
     }
 
     private func populatedStore() -> AnnotationStore {

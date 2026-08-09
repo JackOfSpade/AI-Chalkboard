@@ -9,7 +9,7 @@ import XCTest
 /// eviction cap (`DrawingDefaults.maxStoredAnnotations`).
 final class AnnotationStoreConcurrencyTests: XCTestCase {
     private func annotation(id: String) -> Annotation {
-        Annotation(id: id, screenId: "1", kind: .box(x: 0, y: 0, width: 10, height: 10))
+        Annotation(id: id, screenId: "1", kind: .vectorPath(data: "M0 0 L10 10", strokeColorHex: nil, strokeWidth: 2, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1))
     }
 
     /// Adds `count` annotations from `count` concurrent tasks, then removes

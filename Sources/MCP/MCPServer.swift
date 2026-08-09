@@ -1,6 +1,61 @@
 import Foundation
 import AppKit
 
+/// Validates the portion of a JSON-RPC request that is specific to MCP tool
+/// calls before any tool handler receives it. Keeping this pure makes the
+/// destructive-input boundary independently testable without writing to the
+/// server's real stdout singleton.
+enum MCPProtocolValidation {
+    static func toolCallParameters(_ rawParams: Any?) -> DrawOutcome<[String: Any]> {
+        guard let params = rawParams as? [String: Any] else {
+            return .failure("tools/call params must be an object.")
+        }
+        if let arguments = params["arguments"], !(arguments is [String: Any]) {
+            return .failure("tools/call arguments must be an object when supplied.")
+        }
+        return .success(params)
+    }
+}
+
+/// The final authority for outbound MCP response size. Tool-specific guards
+/// (notably verification PNG budgeting and list pagination) make normal
+/// results comfortably smaller, but every response still funnels through this
+/// serializer so metadata or a future tool cannot accidentally write an
+/// unbounded JSON-RPC line.
+enum MCPResponseTransport {
+    static let responseTooLargeMessage = "Error: The requested result exceeds AI Chalkboard's 8 MiB MCP response limit. Reduce the requested page/crop and retry."
+
+    static func serializedLine(_ response: [String: Any]) -> Data? {
+        guard let body = try? JSONSerialization.data(withJSONObject: response, options: []) else {
+            return nil
+        }
+        // Include the newline framing byte in the declared response limit.
+        guard body.count < DrawingDefaults.maxMCPResponseBytes else { return nil }
+        var line = body
+        line.append(0x0A)
+        return line.count <= DrawingDefaults.maxMCPResponseBytes ? line : nil
+    }
+
+    /// Deliberately does not call back into `sendResponse`: an oversized
+    /// result must not recurse through the same failure path. Request IDs are
+    /// bounded by the inbound line cap; a null-ID fallback covers the
+    /// theoretical case that even echoing the id cannot fit.
+    static func compactOversizeErrorLine(id: Any?) -> Data? {
+        func response(id: Any) -> [String: Any] {
+            [
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [
+                    "content": [["type": "text", "text": responseTooLargeMessage]],
+                    "isError": true
+                ]
+            ]
+        }
+        return serializedLine(response(id: id ?? NSNull()))
+            ?? serializedLine(response(id: NSNull()))
+    }
+}
+
 /// The stdio MCP server: owns the read loop, JSON-RPC method routing, and the
 /// three response-writing primitives every handler funnels through.
 ///
@@ -9,8 +64,8 @@ import AppKit
 ///   * `LineFramer.swift`       -- pure newline-framing of stdin bytes.
 ///   * `MCPToolCatalog.swift`   -- the static `tools/list` schema payload.
 ///   * `MCPToolHandlers.swift`  -- `tools/call` dispatch and every tool body.
-///   * `DrawRequest.swift`      -- the shared pipeline behind the six
-///                                 `draw_*` tools (screen resolution,
+///   * `DrawRequest.swift`      -- the shared pipeline behind the free-draw
+///                                 tools (screen resolution,
 ///                                 per-app link resolution, numeric coercion).
 /// What remains here is the class itself: `start()`, the stdin read loop,
 /// top-level JSON-RPC routing, the three `send*` primitives, and the
@@ -234,15 +289,20 @@ public final class MCPServer: @unchecked Sendable {
     /// specifically because this process's stdout IS the MCP client's pipe,
     /// which the client can close at any time.
     private func sendResponse(_ jsonObject: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: jsonObject, options: []),
-              var jsonString = String(data: data, encoding: .utf8) else {
-            log("Failed to serialize response JSON.")
-            return
+        let outputData: Data
+        if let encoded = MCPResponseTransport.serializedLine(jsonObject) {
+            outputData = encoded
+        } else {
+            log("Refusing to write an MCP response larger than \(DrawingDefaults.maxMCPResponseBytes) bytes or one that cannot be serialized; sending a compact error response instead.")
+            guard let fallback = MCPResponseTransport.compactOversizeErrorLine(id: jsonObject["id"]) else {
+                // This is not expected: the fallback has fixed, small content
+                // and a null ID retry. Do not recurse if the runtime itself
+                // cannot serialize it.
+                log("Failed to serialize compact MCP oversize-response error.")
+                return
+            }
+            outputData = fallback
         }
-
-        jsonString += "\n"
-
-        guard let outputData = jsonString.data(using: .utf8) else { return }
 
         do {
             try FileHandle.standardOutput.write(contentsOf: outputData)
@@ -289,7 +349,7 @@ public final class MCPServer: @unchecked Sendable {
 
         let method = json["method"] as? String ?? ""
         let id = json["id"]
-        let params = json["params"] as? [String: Any] ?? [:]
+        let rawParams = json["params"]
 
         log("Received message method: \(method)")
 
@@ -305,7 +365,17 @@ public final class MCPServer: @unchecked Sendable {
         case "tools/list":
             handleToolsList(id: id)
         case "tools/call":
-            handleToolsCall(id: id, params: params)
+            guard let id else { return }
+            switch MCPProtocolValidation.toolCallParameters(rawParams) {
+            case .success(let validatedParams):
+                handleToolsCall(id: id, params: validatedParams)
+            case .failure(let message):
+                // Do not coerce malformed arguments to `{}`: `clear` treats
+                // an omitted annotation_id as a request to clear the active
+                // screen, so that fallback would turn invalid input into a
+                // destructive operation.
+                sendErrorResult(id: id, text: message)
+            }
         default:
             if let id = id {
                 sendResponse([
@@ -329,7 +399,7 @@ public final class MCPServer: @unchecked Sendable {
             ],
             "serverInfo": [
                 "name": "ai-chalkboard",
-                "version": "1.2.0"
+                "version": "2.0.0"
             ]
         ]
         sendResponse(["jsonrpc": "2.0", "id": id, "result": result])
@@ -349,6 +419,29 @@ public final class MCPServer: @unchecked Sendable {
                     [
                         "type": "text",
                         "text": text
+                    ]
+                ]
+            ]
+        ])
+    }
+
+    /// Returns a human/model-readable metadata block followed by a native MCP
+    /// image content block. MCP image data is raw standard base64 -- no data-URL
+    /// prefix -- and `mimeType` uses the protocol's camel-case spelling.
+    func sendImageResult(id: Any, metadataText: String, imageData: Data, mimeType: String = "image/png") {
+        sendResponse([
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": [
+                "content": [
+                    [
+                        "type": "text",
+                        "text": metadataText
+                    ],
+                    [
+                        "type": "image",
+                        "data": imageData.base64EncodedString(),
+                        "mimeType": mimeType
                     ]
                 ]
             ]

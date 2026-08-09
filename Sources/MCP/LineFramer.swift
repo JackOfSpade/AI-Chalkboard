@@ -13,8 +13,8 @@ import Foundation
 /// flood -- with no process spawning and no real stdio required.
 struct LineFramer {
 
-    /// Hard cap on how large the buffer's UNTERMINATED tail may grow before
-    /// `feed(_:)` reports an overflow, in bytes.
+    /// Hard cap on each inbound JSON-RPC line and on the unterminated tail
+    /// while a line is still being assembled, in bytes.
     ///
     /// WHY THIS EXISTS: `feed` only ever shrinks the buffer when it finds a
     /// newline; a peer that never sends one -- a bug on the other end, or
@@ -22,8 +22,8 @@ struct LineFramer {
     /// would otherwise grow `buffer` without bound for the lifetime of this
     /// long-running process. 4 MB is far above any legitimate single
     /// JSON-RPC message this server accepts (the largest realistic payload is
-    /// a `draw_path` call, itself capped at `DrawingDefaults.maxPathPoints`
-    /// points), so hitting this cap means the peer is not framing messages
+    /// a `draw_path` call, whose SVG string has its own lower character cap),
+    /// so hitting this cap means the peer is not framing messages
     /// correctly -- a protocol violation, not a slow day -- and
     /// `MCPServer.readLoop()` treats it as a fatal transport error rather
     /// than continuing to grow the buffer.
@@ -31,8 +31,9 @@ struct LineFramer {
 
     /// The result of feeding one chunk: zero or more complete lines (newline
     /// stripped, and a trailing `\r` stripped for CRLF senders -- matching
-    /// the original inline implementation this replaced), plus whether the
-    /// still-unterminated remainder has exceeded `maxBufferBytes`.
+    /// the original inline implementation this replaced), plus whether a
+    /// complete line or still-unterminated remainder exceeded
+    /// `maxBufferBytes`.
     struct FeedResult {
         let lines: [Data]
         let overflow: Bool
@@ -60,6 +61,16 @@ struct LineFramer {
         while let newlineIndex = buffer.firstIndex(of: UInt8(ascii: "\n")) {
             var lineData = buffer.subdata(in: buffer.startIndex..<newlineIndex)
             buffer.removeSubrange(buffer.startIndex...newlineIndex)
+
+            // Checking only the remaining tail after this loop would let one
+            // complete 20 MB line bypass the intended 4 MB request limit: it
+            // has already been removed from `buffer` by then. Do not hand any
+            // same-chunk lines to the server when one is oversized, so a
+            // preceding destructive request cannot be processed before the
+            // fatal protocol violation is noticed.
+            guard lineData.count <= Self.maxBufferBytes else {
+                return FeedResult(lines: [], overflow: true)
+            }
 
             if lineData.last == UInt8(ascii: "\r") {
                 lineData.removeLast()

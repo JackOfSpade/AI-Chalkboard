@@ -15,16 +15,9 @@ enum DrawOutcome<Success> {
 
 /// The shared pipeline behind every `draw_*` MCP tool.
 ///
-/// Each of the six draw tools used to repeat the same ~8-step sequence by
-/// hand -- resolve screen id, look up its dimensions, normalize coordinates,
-/// read color, read duration, `resolveTargetApp`, build the `Annotation`,
-/// `store.add`, word the success message -- roughly 50 lines each, ~300
-/// lines total. This type does every step that is genuinely shared ONCE;
-/// each call site in `MCPToolHandlers` contributes only what is truly
-/// tool-specific: its own geometry parsing (and any geometry validation),
-/// its own default color, its `AnnotationKind`, its noun for the success
-/// message ("circle", "arrow", "box", "label", "freehand path", "alignment
-/// grid"), and whether it defaults to global (`draw_grid` alone does).
+/// The universal vector/raster/batch tools share screen resolution, lifetime,
+/// app linking, storage, and success reporting. This type performs that
+/// pipeline once; each handler contributes only its media parsing and kind.
 ///
 /// Split into two steps -- `resolveScreen(args:)`, then `finish(...)` -- ON
 /// PURPOSE, matching the original per-tool ordering exactly: screen
@@ -37,6 +30,71 @@ enum DrawOutcome<Success> {
 /// completely before ever calling `resolveTargetApp`).
 struct DrawRequest {
     let screen: ScreenInfo
+
+    struct CoordinateTransform {
+        let scaleX: Double
+        let scaleY: Double
+        let requiresUnitInterval: Bool
+
+        init(scaleX: Double, scaleY: Double, requiresUnitInterval: Bool = false) {
+            self.scaleX = scaleX
+            self.scaleY = scaleY
+            self.requiresUnitInterval = requiresUnitInterval
+        }
+
+        /// Applies one axis of the public-coordinate transform without
+        /// allowing a finite protocol number to turn into infinity. Callers
+        /// must treat `nil` as an invalid geometry error rather than handing
+        /// non-finite values to Core Graphics.
+        func transformedX(_ value: Double) -> Double? {
+            transformed(value, scale: scaleX)
+        }
+
+        /// See `transformedX(_:)`.
+        func transformedY(_ value: Double) -> Double? {
+            transformed(value, scale: scaleY)
+        }
+
+        func transformedPoint(x: Double, y: Double) -> (x: Double, y: Double)? {
+            guard let transformedX = transformedX(x), let transformedY = transformedY(y) else {
+                return nil
+            }
+            return (transformedX, transformedY)
+        }
+
+        /// True only if every scalar used by an SVG path can safely enter its
+        /// backing-pixel render transform. Vector paths retain source-space
+        /// data, so validating their parsed coordinates here is just as
+        /// important as validating image/text positions before storage.
+        func canTransform(_ geometry: SVGPathGeometry) -> Bool {
+            geometry.elements.allSatisfy { element in
+                switch element {
+                case let .move(point), let .line(point):
+                    return transformedPoint(x: point.x, y: point.y) != nil
+                case let .quad(control, to: point):
+                    return transformedPoint(x: control.x, y: control.y) != nil
+                        && transformedPoint(x: point.x, y: point.y) != nil
+                case let .cubic(control1, control2, to: point):
+                    return transformedPoint(x: control1.x, y: control1.y) != nil
+                        && transformedPoint(x: control2.x, y: control2.y) != nil
+                        && transformedPoint(x: point.x, y: point.y) != nil
+                case .close:
+                    return true
+                }
+            }
+        }
+
+        private func transformed(_ value: Double, scale: Double) -> Double? {
+            guard value.isFinite, scale.isFinite,
+                  !requiresUnitInterval || (0...1).contains(value) else { return nil }
+            let result = value * scale
+            guard result.isFinite,
+                  abs(result) <= DrawingDefaults.maxCoordinateMagnitudePx else {
+                return nil
+            }
+            return result
+        }
+    }
 
     /// Resolves the target screen from ONE
     /// `OverlayWindowController.screenSnapshot()` call -- see that method's
@@ -54,6 +112,9 @@ struct DrawRequest {
     /// success. There is no reachable case left that needs a fallback
     /// dimension, so none exists any more: this is a hard error instead.
     static func resolveScreen(args: [String: Any]) -> DrawOutcome<DrawRequest> {
+        if args.keys.contains("screen_id"), !(args["screen_id"] is String) {
+            return .failure("screen_id must be a string when supplied.")
+        }
         let snapshot = OverlayWindowController.shared.screenSnapshot()
         guard let screen = snapshot.resolve(args["screen_id"] as? String) else {
             return .failure("No displays are currently available (NSScreen.screens returned empty -- this can happen momentarily during display reconfiguration or wake). Nothing was drawn; retry the call in a moment.")
@@ -61,13 +122,42 @@ struct DrawRequest {
         return .success(DrawRequest(screen: screen))
     }
 
-    /// Normalizes one coordinate against this request's screen if
-    /// `isNormalized`, else returns it unchanged. `alongWidth` selects which
-    /// physical-pixel axis to scale against (x/width use the screen's width,
-    /// y/height use its height).
-    func normalize(_ raw: Double, alongWidth: Bool, isNormalized: Bool) -> Double {
-        guard isNormalized else { return raw }
-        return raw * Double(alongWidth ? screen.widthPx : screen.heightPx)
+    /// Resolves public geometry coordinates into the backing-pixel geometry
+    /// stored by annotations.  The old surface remains the default; source
+    /// screenshot dimensions are deliberately required rather than guessed.
+    func coordinateTransform(args: [String: Any]) -> DrawOutcome<CoordinateTransform> {
+        if args.keys.contains("coordinate_space"), !(args["coordinate_space"] is String) {
+            return .failure("coordinate_space must be 'backing_pixels', 'normalized', or 'screenshot_pixels' when supplied.")
+        }
+        let space = (args["coordinate_space"] as? String)?.lowercased() ?? "backing_pixels"
+        switch space {
+        case "backing_pixels":
+            return .success(CoordinateTransform(scaleX: 1, scaleY: 1))
+        case "normalized":
+            let scaleX = Double(screen.widthPx)
+            let scaleY = Double(screen.heightPx)
+            guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0 else {
+                return .failure("The selected display has invalid backing-pixel dimensions; nothing was drawn.")
+            }
+            return .success(CoordinateTransform(scaleX: scaleX, scaleY: scaleY, requiresUnitInterval: true))
+        case "screenshot_pixels":
+            for key in ["screenshot_width", "screenshot_height"] where MCPArgument.hasInvalidSuppliedDouble(args, key: key) {
+                return .failure("\(key) must be a finite number greater than 0 for coordinate_space='screenshot_pixels'.")
+            }
+            guard let width = MCPArgument.double(args["screenshot_width"]),
+                  let height = MCPArgument.double(args["screenshot_height"]),
+                  width > 0, height > 0 else {
+                return .failure("coordinate_space='screenshot_pixels' requires screenshot_width and screenshot_height greater than 0.")
+            }
+            let scaleX = Double(screen.widthPx) / width
+            let scaleY = Double(screen.heightPx) / height
+            guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0 else {
+                return .failure("screenshot_width and screenshot_height produce an invalid coordinate transform; use finite dimensions that do not overflow the selected display scale.")
+            }
+            return .success(CoordinateTransform(scaleX: scaleX, scaleY: scaleY))
+        default:
+            return .failure("coordinate_space must be 'backing_pixels', 'normalized', or 'screenshot_pixels'.")
+        }
     }
 
     /// Reads the arguments every draw tool shares beyond geometry
@@ -81,15 +171,46 @@ struct DrawRequest {
         label: String?,
         defaultsToGlobal: Bool,
         kind: AnnotationKind,
-        noun: String
+        noun: String,
+        resolvedTargetApp: AppRef? = nil,
+        onAnnotationCreated: ((Annotation) -> Void)? = nil
     ) -> DrawOutcome<String> {
+        if args.keys.contains("color"), !(args["color"] is String) {
+            return .failure("color must be a string when supplied.")
+        }
         let colorHex = args["color"] as? String ?? defaultColor
-        let duration = MCPArgument.double(args["duration_seconds"]) ?? defaultDuration
+        if args.keys.contains("duration_seconds"),
+           MCPArgument.hasInvalidSuppliedDouble(args, key: "duration_seconds") {
+            return .failure("duration_seconds must be a finite number greater than 0 when supplied.")
+        }
+        let requestedDuration = MCPArgument.double(args["duration_seconds"])
+        if let requestedDuration,
+           (requestedDuration <= 0 || requestedDuration > DrawingDefaults.maxAnnotationDurationSeconds) {
+            return .failure("duration_seconds must be greater than 0 and no more than \(Int(DrawingDefaults.maxAnnotationDurationSeconds)) seconds when supplied; omit it for a persistent annotation.")
+        }
+        let duration = requestedDuration ?? defaultDuration
 
-        var appId: String?
-        var appName: String?
-        if let err = MCPServer.shared.resolveTargetApp(args, defaultsToGlobal: defaultsToGlobal, appId: &appId, appName: &appName) {
-            return .failure(err)
+        if args.keys.contains("z_index"), MCPArgument.integer(args["z_index"]) == nil {
+            return .failure("z_index must be an integer when supplied.")
+        }
+        let zIndex = MCPArgument.integer(args["z_index"]) ?? 0
+
+        let appId: String?
+        let appName: String?
+        if let resolvedTargetApp {
+            // Accessibility lookup has already resolved a single RUNNING app
+            // and must not re-run the normal draw fallback (which can accept
+            // a non-running bundle id or GLOBAL visibility).
+            appId = resolvedTargetApp.bundleId
+            appName = resolvedTargetApp.name
+        } else {
+            var resolvedAppId: String?
+            var resolvedAppName: String?
+            if let err = MCPServer.shared.resolveTargetApp(args, defaultsToGlobal: defaultsToGlobal, appId: &resolvedAppId, appName: &resolvedAppName) {
+                return .failure(err)
+            }
+            appId = resolvedAppId
+            appName = resolvedAppName
         }
 
         let annotation = Annotation(
@@ -98,9 +219,20 @@ struct DrawRequest {
             colorHex: colorHex,
             label: label,
             appId: appId,
-            appName: appName
+            appName: appName,
+            zIndex: zIndex
         )
-        let evicted = AnnotationStore.shared.add(annotation, durationSeconds: duration)
+        let addResult = AnnotationStore.shared.addWithOutcome(annotation, durationSeconds: duration)
+        let evicted: Int
+        switch addResult {
+        case .added(let count):
+            evicted = count
+            onAnnotationCreated?(annotation)
+        case .rejected(.payloadBytes(let limit, let attempted)):
+            return .failure("The annotation was not stored because retained vector/text payload would become \(attempted) bytes, exceeding the \(limit)-byte session limit. Clear old annotations or use smaller geometry.")
+        case .rejected(.primitiveCount(let limit, let attempted)):
+            return .failure("The annotation was not stored because retained primitive count would become \(attempted), exceeding the \(limit)-primitive session limit. Clear old annotations or use a smaller batch.")
+        }
 
         var text = "Created \(noun) annotation: \(annotation.id)\(MCPServer.shared.linkageSuffix(appId: appId, appName: appName))"
         if evicted > 0 {
@@ -134,8 +266,7 @@ extension MCPServer {
     ///                               app the user was in before switching to
     ///                               Claude. See that property's doc comment for
     ///                               why the TRUE frontmost app would be wrong.
-    ///                               (`defaultsToGlobal` flips this to nil for
-    ///                               `draw_grid`.)
+    ///                               (`defaultsToGlobal` can flip this to nil.)
     ///   * `app` is ""            -> GLOBAL (nil). An explicit, discoverable way
     ///                               to pin something over every app.
     ///   * `app` names a running app -> resolved to its real bundle id + name.
@@ -164,6 +295,9 @@ extension MCPServer {
         appId: inout String?,
         appName: inout String?
     ) -> String? {
+        if args.keys.contains("app"), !(args["app"] is String) {
+            return "app must be a string bundle id/display name, or an empty string for global visibility."
+        }
         guard let raw = (args["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
             if defaultsToGlobal {
                 appId = nil

@@ -11,12 +11,33 @@ import Foundation
 /// merely unlikely.
 enum DrawingDefaults {
 
-    /// `draw_grid`'s line spacing, in physical pixels.
-    static let gridStepPx: Double = 200
+    /// Hard ceiling for every serialized JSON-RPC response line, including
+    /// base64 and JSON framing.  The MCP process never writes a larger line:
+    /// `MCPServer` replaces an oversized result with a compact error response.
+    static let maxMCPResponseBytes = 8 * 1_024 * 1_024
 
-    /// `draw_grid`'s auto-clear delay. The grid is a calibration aid, not a
-    /// note: it is the one draw tool that expires by default.
-    static let gridDurationSeconds: Double = 5
+    /// `list_annotations` is intentionally paged.  Keeping its embedded JSON
+    /// well below the transport ceiling leaves room for JSON string escaping
+    /// in the outer MCP response even when SVG data contains many quotes or
+    /// backslashes.
+    static let maxAnnotationListPageItems = 100
+    static let maxAnnotationListTextBytes = 2 * 1_024 * 1_024
+    static let maxAnnotationListEntryBytes = 512 * 1_024
+
+    /// Rendering values become AppKit/Core Graphics scalars.  These broad
+    /// caps prevent finite-but-pathological input from creating enormous text
+    /// layouts, stroke/dash state, images, or rotations that can destabilize a
+    /// repaint.  Coordinates have a separate cap because positions naturally
+    /// exceed style dimensions on multi-display desktops.
+    static let maxStyleDimensionPx = 100_000.0
+    static let maxImageDimensionPx = 1_000_000.0
+    static let maxCoordinateMagnitudePx = 10_000_000.0
+    static let maxRotationDegrees = 360_000.0
+
+    /// A bounded timer horizon prevents finite but absurd duration values from
+    /// overflowing Date/DispatchTime conversion. Seven days remains ample for
+    /// intentional temporary annotations; omit duration for persistence.
+    static let maxAnnotationDurationSeconds = 7 * 24 * 60 * 60.0
 
     /// `draw_path`'s line thickness, in physical pixels.
     static let pathStrokeWidthPx: Double = 3.5
@@ -27,43 +48,36 @@ enum DrawingDefaults {
     // of annotation at once gets a visually distinguishable result without
     // having to pick colors.
 
-    static let circleColor = "#FF0000"
-    static let arrowColor = "#00E0FF"
-    static let boxColor = "#00FF66"
-    static let labelColor = "#FFFF00"
     static let pathColor = "#FF9500"
-    static let gridColor = "#00E0FF"
 
-    // MARK: - Guard rails
+    static let textColor = "#FFFFFF"
+    static let maxTextCharacters = 20_000
 
-    /// Smallest accepted `step_px`, in physical pixels.
-    ///
-    /// NOT a cosmetic minimum -- this is a hang guard. The renderer walks
-    /// `for x in stride(from: step, to: width, by: step)`, so the iteration
-    /// count is `width / step`. Below roughly `width * 2^-53` points the
-    /// accumulator stops advancing at all (the increment is smaller than the
-    /// ULP of the running total) and the loop never terminates, wedging the
-    /// main thread permanently. Values merely *near* that threshold produce a
-    /// finite but effectively infinite loop. One physical pixel is the smallest
-    /// spacing that can possibly be meaningful on screen anyway.
-    static let minGridStepPx: Double = 1
+    /// SVG path strings are parsed once at the API boundary and again by the
+    /// renderer. The MCP line framer already caps requests at 4 MB; this lower
+    /// per-path ceiling keeps one persistent shape from monopolizing repaint
+    /// work while still allowing very detailed vector art.
+    static let maxSVGPathCharacters = 200_000
 
-    /// Hard ceiling on grid lines per axis, enforced in the renderer as
-    /// defense-in-depth independent of whatever the MCP layer validated.
-    static let maxGridLinesPerAxis = 2_000
+    /// Atomic batches are intentionally broad enough for diagrams but bounded
+    /// because every component is redrawn together on every repaint.
+    static let maxBatchItems = 100
 
-    /// Largest `points` array `draw_path` will accept.
-    ///
-    /// Every stored point is re-walked on every repaint of every screen the
-    /// annotation is visible on, and repaints happen on each app switch -- so
-    /// an oversized path is a permanent per-frame cost, not a one-off parse
-    /// cost. Well above any legitimate freehand sketch.
-    static let maxPathPoints = 10_000
+    /// Raster items have a second, stricter batch budget.  Vector components
+    /// remain limited solely by `maxBatchItems`; decoded bitmap memory is what
+    /// needs a byte budget because every image is retained for the annotation's
+    /// full lifetime.
+    static let maxRasterImagesPerBatch = 16
+    static let maxRasterDecodedBytesPerBatch: UInt64 = 128 * 1_024 * 1_024
+
+    /// Dash arrays longer than this have no practical display benefit and can
+    /// make Core Graphics path setup needlessly expensive.
+    static let maxDashElements = 64
 
     /// Largest number of annotations one process will hold at once.
     ///
-    /// Five of the six draw tools deliberately create annotations that persist
-    /// until explicitly cleared (see `AnnotationStore`'s type comment), and this
+    /// Free-draw tools deliberately allow annotations to persist until
+    /// explicitly cleared (see `AnnotationStore`'s type comment), and this
     /// is a long-lived background server, so "the caller never passed
     /// `duration_seconds` and never called `clear`" grows the store without
     /// bound and makes every repaint's O(n) filter steadily more expensive.
@@ -71,4 +85,16 @@ enum DrawingDefaults {
     /// something is wrong, so eviction is logged loudly and reported back in
     /// the tool result rather than done silently.
     static let maxStoredAnnotations = 2_000
+
+    /// Bounds the UTF-8 payload retained by persistent vector/text drawings.
+    /// Per-item limits are not enough here: 2,000 individually valid SVG
+    /// paths can otherwise retain hundreds of megabytes and make every
+    /// repaint parse an unbounded aggregate.  This is deliberately separate
+    /// from the decoded-raster budget in `RasterAssetStore`.
+    static let maxRetainedAnnotationPayloadBytes = 16 * 1_024 * 1_024
+
+    /// Bounds the total number of renderer primitives retained across all
+    /// annotations.  A batch is counted through each of its children, so this
+    /// protects the renderer even when every path/text payload is tiny.
+    static let maxRetainedAnnotationPrimitives = 10_000
 }

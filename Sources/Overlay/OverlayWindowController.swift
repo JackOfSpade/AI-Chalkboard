@@ -1,6 +1,27 @@
 import Foundation
 import AppKit
 
+/// A rectangle in one named desktop coordinate space.  `ScreenInfo` carries
+/// both the AppKit point-space rectangle and the WindowServer rectangle so a
+/// caller that starts with another global API (Accessibility, ScreenCaptureKit
+/// diagnostics, …) never has to guess a monitor's origin from its size alone.
+public struct ScreenCoordinateRect: Codable, Equatable {
+    public let x: Double
+    public let y: Double
+    public let width: Double
+    public let height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+
+    public var maxX: Double { x + width }
+    public var maxY: Double { y + height }
+}
+
 public struct ScreenInfo: Codable {
     public let id: String
     public let index: Int
@@ -11,6 +32,66 @@ public struct ScreenInfo: Codable {
     public let heightPt: Double
     public let backingScaleFactor: Double
     public let isMain: Bool
+    /// Global logical-point rectangle returned by `NSScreen.frame` (AppKit's
+    /// bottom-left desktop coordinate system).
+    public let appKitFrame: ScreenCoordinateRect
+    /// Global WindowServer rectangle returned by `CGDisplayBounds`.  It is
+    /// intentionally reported separately rather than assumed equivalent to
+    /// AppKit's coordinate system.
+    public let windowServerFrame: ScreenCoordinateRect
+    /// The `CGDirectDisplayID` used by ScreenCaptureKit.  It is optional only
+    /// for the old fallback case where AppKit cannot provide a screen number.
+    public let displayID: UInt32?
+
+    public init(
+        id: String,
+        index: Int,
+        name: String,
+        widthPx: Int,
+        heightPx: Int,
+        widthPt: Double,
+        heightPt: Double,
+        backingScaleFactor: Double,
+        isMain: Bool,
+        appKitFrame: ScreenCoordinateRect? = nil,
+        windowServerFrame: ScreenCoordinateRect? = nil,
+        displayID: UInt32? = nil
+    ) {
+        self.id = id
+        self.index = index
+        self.name = name
+        self.widthPx = widthPx
+        self.heightPx = heightPx
+        self.widthPt = widthPt
+        self.heightPt = heightPt
+        self.backingScaleFactor = backingScaleFactor
+        self.isMain = isMain
+        self.appKitFrame = appKitFrame ?? ScreenCoordinateRect(x: 0, y: 0, width: widthPt, height: heightPt)
+        self.windowServerFrame = windowServerFrame ?? ScreenCoordinateRect(x: 0, y: 0, width: Double(widthPx), height: Double(heightPx))
+        self.displayID = displayID
+    }
+}
+
+/// AppKit-only observation of the overlay's input policy.  This is an
+/// attestation from Chalkboard itself, not a capability exposed through
+/// `CGWindowList`; a click dispatcher must explicitly choose to trust it.
+public struct OverlayInputPolicySnapshot: Codable, Equatable {
+    public let screenId: String
+    public let windowNumber: Int?
+    public let isOnScreen: Bool
+    public let hasVisibleContent: Bool
+    public let ignoresMouseEvents: Bool
+    public let sharingType: String
+
+    public init(screenId: String, windowNumber: Int?, isOnScreen: Bool,
+                hasVisibleContent: Bool, ignoresMouseEvents: Bool, sharingType: String) {
+        self.screenId = screenId
+        self.windowNumber = windowNumber
+        self.isOnScreen = isOnScreen
+        self.hasVisibleContent = hasVisibleContent
+        self.ignoresMouseEvents = ignoresMouseEvents
+        self.sharingType = sharingType
+    }
 }
 
 /// An immutable picture of the display layout, taken once and then used for
@@ -90,6 +171,37 @@ public final class OverlayWindowController: NSObject {
     private let captureLock = NSLock()
     private var _captureVisible = false
 
+    /// How long capture-debug mode may stay on with no renewal before it
+    /// reverts to OFF on its own.
+    ///
+    /// WHY: `set_capture_visible(true)` is meant to last for one placement
+    /// check (draw, screenshot, verify), not become a persistent mode -- but
+    /// nothing forces whoever turned it on to ever call
+    /// `set_capture_visible(false)` afterward. An LLM agent mid-conversation
+    /// can get interrupted, decide the debugging session is over without
+    /// remembering the toggle, or simply move on. Left on, it silently
+    /// defeats `OverlayView.draw`'s per-app filter for EVERY annotation on
+    /// EVERY screen indefinitely -- which looks exactly like a rendering bug
+    /// ("I switched apps and the annotation is still there") to whoever is
+    /// watching the screen next, with no obvious cause. Five minutes covers
+    /// a realistic screenshot-and-check loop but is short enough that a
+    /// forgotten toggle self-heals well within one human work session.
+    public static let captureAutoRevertInterval: TimeInterval = 5 * 60
+
+    /// MAIN-THREAD-ONLY, like the `Timer` API it wraps. Every read/write
+    /// happens inside `scheduleCaptureAutoRevert(visible:)`, itself only ever
+    /// called from the main-thread transaction in `setCaptureVisible`.
+    private var captureAutoRevertTimer: Timer?
+
+    /// Single optional observer, invoked on the main thread whenever
+    /// `isCaptureVisible` actually changes (not on a same-value renewal).
+    /// Exists so `AppDelegate` can keep the status-bar icon's "debug mode is
+    /// on" indicator in sync without polling. A single slot, not a list, for
+    /// the same reason as `AnnotationStore.onStoreChanged`: there is exactly
+    /// one process-wide subscriber (this process's `AppDelegate`), so a list
+    /// would be unused generality.
+    public var onCaptureVisibleChanged: ((Bool) -> Void)?
+
     /// Requested capture-debug mode. This controls rendering and the legacy
     /// NSWindow sharing preference, not an external capture tool's filters.
     public var isCaptureVisible: Bool {
@@ -121,43 +233,81 @@ public final class OverlayWindowController: NSObject {
     /// The early return when the value is unchanged is load-bearing: this is
     /// driven by a distributed notification that is also delivered back to the
     /// process that posted it, so the no-op guard is what keeps the echo free.
-    public func setCaptureVisible(_ visible: Bool) {
-        captureLock.lock()
-        let changed = (_captureVisible != visible)
-        _captureVisible = visible
-        captureLock.unlock()
+    @discardableResult
+    public func setCaptureVisible(_ visible: Bool) -> Bool {
+        // MCP success must mean the local AppKit state has already changed.
+        // `MainThread.sync` executes inline for menu/broadcast delivery and
+        // otherwise waits for the main run loop; it therefore avoids both the
+        // old acknowledgement race and a main-thread self-deadlock.
+        MainThread.sync {
+            captureLock.lock()
+            let changed = (_captureVisible != visible)
+            _captureVisible = visible
+            captureLock.unlock()
 
-        guard changed else { return }
+            // Renewed on EVERY request for `true`, including a same-value
+            // renewal where the mode was already on -- not gated behind
+            // `changed` below. A caller re-requesting capture-debug mode
+            // mid-session means "I'm still debugging, push the deadline out".
+            scheduleCaptureAutoRevert(visible: visible)
 
-        MainThread.async { [weak self] in
-            guard let self = self else { return }
+            guard changed else { return changed }
+
             let sharingType: NSWindow.SharingType = visible ? .readOnly : .none
             // `overlayWindows` is a flat array now (one entry per real
-            // display), so each window is visited exactly once here --
-            // unlike the old `windowsByScreenId` dictionary, which stored
-            // every window under both its real CGDirectDisplayID and a
-            // positional index alias ("0"/"1"), visiting it twice per pass.
-            for window in self.overlayWindows {
+            // display), so each window is visited exactly once here.
+            for window in overlayWindows {
                 window.sharingType = sharingType
             }
 
-            // REQUIRED, not cosmetic: `OverlayView.draw(_:)` branches on
-            // `isCaptureVisible` to decide whether to apply the per-app filter
-            // (capture-visible mode renders every annotation so a placement
-            // check cannot come back blank -- see that method). Flipping the
-            // flag therefore changes what should be on screen even though no
-            // annotation was added or removed, and nothing else would repaint:
-            // the store did not mutate, so `onStoreChanged` never fires, and an
-            // app switch may not happen before the next screenshot. Without
-            // this the toggle would appear to do nothing until the user
-            // happened to alt-tab. `refreshViews()` only sets `needsDisplay`.
-            self.refreshViews()
+            // This intentionally runs synchronously with the sharing-type
+            // mutation. A caller may safely inspect capture/debug state after
+            // this method returns; no extra main-run-loop turn is required.
+            refreshViewsNow()
 
             Logger.shared.log(
-                "OverlayWindowController: capture-debug request set to \(visible) (sharingType = \(visible ? ".readOnly" : ".none")) on \(self.overlayWindows.count) window reference(s), applied live without rebuilding. External capture tools retain independent app/window filters, so final inclusion is not guaranteed.",
+                "OverlayWindowController: capture-debug request set to \(visible) (sharingType = \(visible ? ".readOnly" : ".none")) on \(overlayWindows.count) window reference(s), applied live without rebuilding. External capture tools retain independent app/window filters, so final inclusion is not guaranteed.",
                 level: "INFO"
             )
+
+            onCaptureVisibleChanged?(visible)
+            return changed
         }
+    }
+
+    /// Invalidates any pending auto-revert timer and, if `visible` is true,
+    /// starts a fresh one. MAIN-THREAD-ONLY (see `captureAutoRevertTimer`'s
+    /// doc comment).
+    ///
+    /// On fire, this BROADCASTS the revert (`InstanceBroadcast
+    /// .postSetCaptureVisible(false)`) rather than flipping `_captureVisible`
+    /// locally, matching every other state change in this app ("every
+    /// instance owns its own overlay windows" -- see `AppDelegate`'s menu
+    /// actions). Claude Desktop runs two `AIChalkboard --mcp` processes per
+    /// config entry, each with its own timer started from the same broadcast
+    /// that turned capture-debug mode on, so both fire within moments of each
+    /// other regardless -- but broadcasting keeps that synchronization exact
+    /// instead of relying on the coincidence, and reuses the same code path
+    /// (and log line) as a manual toggle-off.
+    private func scheduleCaptureAutoRevert(visible: Bool) {
+        captureAutoRevertTimer?.invalidate()
+        captureAutoRevertTimer = nil
+
+        guard visible else { return }
+
+        let interval = Self.captureAutoRevertInterval
+        let timer = Timer(timeInterval: interval, repeats: false) { _ in
+            Logger.shared.log(
+                "OverlayWindowController: capture-debug mode auto-reverting to OFF after \(Int(interval))s with no renewal (call set_capture_visible(true) again if still debugging).",
+                level: "WARN"
+            )
+            InstanceBroadcast.shared.postSetCaptureVisible(false)
+        }
+        // `.common` keeps the timer firing while a menu is tracking or a
+        // window is being live-resized, matching the other main-run-loop
+        // timers in this app (see `AppDelegate`'s election/watchdog timers).
+        RunLoop.main.add(timer, forMode: .common)
+        captureAutoRevertTimer = timer
     }
 
     override private init() {
@@ -357,18 +507,331 @@ public final class OverlayWindowController: NSObject {
         overlayViews.append(overlayView)
 
         window.setFrame(frame, display: true)
-        window.orderFrontRegardless()
+        // NOT ordered on screen here. `NSWindow` starts off-screen by
+        // construction; the trailing `refreshViews()` call in
+        // `rebuildOverlayWindows()` (which runs immediately after every
+        // window/view pair for every screen has been appended) is what
+        // decides whether THIS window belongs on screen right now, based on
+        // whether this screen actually has anything to paint. See
+        // `refreshViews()`'s doc comment for why "created" and "on screen"
+        // must not be the same thing for this window.
 
         return window
     }
 
+    /// Single source of truth for "what should currently be painted on
+    /// `screenId`" -- shared by `OverlayView.draw(_:)` (what to paint) and
+    /// `refreshViews()` (whether the window itself belongs on screen at
+    /// all). Keeping one definition is what makes those two questions
+    /// impossible to answer inconsistently with each other.
+    public func currentlyVisibleAnnotations(forScreenId screenId: String) -> [Annotation] {
+        if isCaptureVisible {
+            return AnnotationStore.shared.getForScreen(screenId)
+        }
+        return AnnotationStore.shared.getForScreen(screenId, visibleForApp: ActiveAppTracker.shared.currentAppId)
+    }
+
+    /// Repaints every overlay AND decides, per screen, whether its window
+    /// belongs on screen at all.
+    ///
+    /// WHY THE WINDOW ITSELF MUST BE ORDERED OUT WHEN THERE IS NOTHING TO
+    /// PAINT, not merely left on screen and transparent -- this used to
+    /// unconditionally `orderFrontRegardless()` every overlay window at
+    /// creation and leave it there for the rest of the process's life,
+    /// regardless of whether anything was ever drawn:
+    ///
+    /// `ignoresMouseEvents = true` (set once, at window creation -- see
+    /// `createOverlayWindow`) only affects REAL OS mouse-event delivery: the
+    /// window server correctly skips this window and hands a genuine click to
+    /// whatever is underneath it. It does nothing for a DIFFERENT class of
+    /// query -- "which app's window is topmost at this point" -- answered by
+    /// walking the on-screen window list (what `CGWindowListCopyWindowInfo`
+    /// reports, and almost certainly what any tool doing its own
+    /// click-safety/ownership pre-check against an app allowlist is really
+    /// asking, since `ignoresMouseEvents` is not exposed by that API at all).
+    /// A window is either on that list or it is not; there is no
+    /// "on the list but see-through" state to ask for.
+    ///
+    /// This app's overlay windows are, by design, full-screen and at
+    /// `.statusBar` level specifically so an annotation can sit above the
+    /// Dock and the menu bar (see `createOverlayWindow`'s window-level
+    /// comment). That means an always-on-screen overlay window is ALWAYS the
+    /// topmost thing at every point on every screen -- so a caller doing that
+    /// kind of ownership check would conclude every single point on screen
+    /// belongs to AI Chalkboard, forever, whether or not an annotation was
+    /// ever drawn. That is exactly the bug this fixes: computer-use refused
+    /// to click ANYWHERE, including with zero annotations on screen, because
+    /// the overlay window was on screen (and therefore "topmost everywhere")
+    /// even though it was painting nothing.
+    ///
+    /// Ordering the window fully off screen when `currentlyVisibleAnnotations`
+    /// is empty removes it from that window list too, so an idle AI
+    /// Chalkboard -- the common case between draws -- is invisible to that
+    /// kind of check, not just harmlessly click-through to it. This does NOT
+    /// fix the remaining case where an annotation genuinely IS on screen: the
+    /// window still has to cover the full screen to be positionable anywhere
+    /// on it, so a topmost-window ownership check still finds AI Chalkboard
+    /// covering the whole screen, not just the annotated region, for as long
+    /// as that annotation is visible. Shrinking the window to each
+    /// annotation's bounding box would be a materially bigger redesign (it
+    /// would break screen-spanning free-draw paths/images, and every
+    /// draw/move/clear would need its own window resize) and is out of scope
+    /// here.
     public func refreshViews() {
         MainThread.async { [weak self] in
-            guard let self = self else { return }
-            for view in self.overlayViews {
-                view.needsDisplay = true
-            }
+            self?.refreshViewsNow()
         }
+    }
+
+    /// Main-thread half of `refreshViews()`.  Kept separate so
+    /// `presentationStatus(for:)` can synchronously settle the app's own
+    /// ordering/repaint work before asking WindowServer what it registered.
+    /// This is intentionally not public: callers outside this controller must
+    /// retain the ordinary asynchronous repaint behaviour.
+    private func refreshViewsNow() {
+        precondition(Thread.isMainThread, "Overlay window ordering is AppKit-main-thread-only")
+        for (window, view) in zip(overlayWindows, overlayViews) {
+            let hasContent = !currentlyVisibleAnnotations(forScreenId: view.screenId).isEmpty
+            if hasContent {
+                window.orderFrontRegardless()
+            } else {
+                window.orderOut(nil)
+            }
+            view.needsDisplay = true
+        }
+    }
+
+    /// Samples the actual AppKit window and its independently-maintained
+    /// WindowServer registration for an annotation.  Unlike
+    /// `verify_annotation`, this does not synthesize an image: it establishes
+    /// that the live overlay has a retained, attached, visible on-screen
+    /// window at the expected level.  It still cannot prove an individual
+    /// painted pixel was not occluded or filtered from somebody else's capture.
+    func presentationStatus(for annotationId: String) -> PresentationStatus {
+        guard let annotation = AnnotationStore.shared.get(id: annotationId),
+              annotation.expiresAt.map({ $0 > Date() }) ?? true else {
+            let input = PresentationReadinessInput(
+                annotationExists: false,
+                annotationIsInCurrentVisibleSet: false,
+                overlayWindowExists: false,
+                contentViewIsExpectedOverlayView: false,
+                viewIsAttachedToWindow: false,
+                appKitWindowIsVisible: false,
+                appKitFrameMatchesExpectedScreen: false,
+                windowServerEntryFoundInAllWindows: false,
+                windowServerEntryFoundInOnScreenList: false,
+                windowServerBoundsMatchExpectedDisplay: false,
+                appKitAlpha: nil,
+                windowServerAlpha: nil,
+                appKitLevel: nil,
+                windowServerLayer: nil,
+                expectedAlpha: 1,
+                expectedLevel: NSWindow.Level.statusBar.rawValue
+            )
+            let failures = PresentationReadiness.failureReasons(for: input)
+            return PresentationStatus(
+                annotationId: annotationId,
+                annotationExists: false,
+                screenId: nil,
+                annotationIsInCurrentVisibleSet: false,
+                expectedWindowShouldBeOnScreen: false,
+                expectedLevel: NSWindow.Level.statusBar.rawValue,
+                expectedAlpha: 1,
+                expectedFrameAppKitPoints: nil,
+                expectedFrameWindowServerCoordinates: nil,
+                overlayWindowExists: false,
+                windowNumber: nil,
+                appKitWindowIsVisible: nil,
+                contentViewIsExpectedOverlayView: nil,
+                viewIsAttachedToWindow: nil,
+                appKitAlpha: nil,
+                appKitLevel: nil,
+                appKitFramePoints: nil,
+                windowServerEntryInAllWindows: nil,
+                windowServerEntryInOnScreenList: nil,
+                presentationReady: false,
+                failureReasons: failures,
+                note: "The annotation was not found or has expired; no live overlay window can be expected for it."
+            )
+        }
+
+        return MainThread.sync {
+            // Make this a deterministic post-draw check instead of racing the
+            // store's intentionally asynchronous onStoreChanged repaint.
+            refreshViewsNow()
+
+            let visibleIDs = Set(currentlyVisibleAnnotations(forScreenId: annotation.screenId).map(\.id))
+            let annotationIsVisible = visibleIDs.contains(annotation.id)
+            let expectedLevel = NSWindow.Level.statusBar.rawValue
+            let expectedAlpha = 1.0
+
+            guard let index = overlayViews.firstIndex(where: { $0.screenId == annotation.screenId }),
+                  index < overlayWindows.count else {
+                let input = PresentationReadinessInput(
+                    annotationExists: true,
+                    annotationIsInCurrentVisibleSet: annotationIsVisible,
+                    overlayWindowExists: false,
+                    contentViewIsExpectedOverlayView: false,
+                    viewIsAttachedToWindow: false,
+                    appKitWindowIsVisible: false,
+                    appKitFrameMatchesExpectedScreen: false,
+                    windowServerEntryFoundInAllWindows: false,
+                    windowServerEntryFoundInOnScreenList: false,
+                    windowServerBoundsMatchExpectedDisplay: false,
+                    appKitAlpha: nil,
+                    windowServerAlpha: nil,
+                    appKitLevel: nil,
+                    windowServerLayer: nil,
+                    expectedAlpha: expectedAlpha,
+                    expectedLevel: expectedLevel
+                )
+                let failures = PresentationReadiness.failureReasons(for: input)
+                return PresentationStatus(
+                    annotationId: annotation.id,
+                    annotationExists: true,
+                    screenId: annotation.screenId,
+                    annotationIsInCurrentVisibleSet: annotationIsVisible,
+                    expectedWindowShouldBeOnScreen: annotationIsVisible,
+                    expectedLevel: expectedLevel,
+                    expectedAlpha: expectedAlpha,
+                    expectedFrameAppKitPoints: nil,
+                    expectedFrameWindowServerCoordinates: nil,
+                    overlayWindowExists: false,
+                    windowNumber: nil,
+                    appKitWindowIsVisible: nil,
+                    contentViewIsExpectedOverlayView: nil,
+                    viewIsAttachedToWindow: nil,
+                    appKitAlpha: nil,
+                    appKitLevel: nil,
+                    appKitFramePoints: nil,
+                    windowServerEntryInAllWindows: nil,
+                    windowServerEntryInOnScreenList: nil,
+                    presentationReady: false,
+                    failureReasons: failures,
+                    note: "The annotation's display no longer has a retained overlay window."
+                )
+            }
+
+            let window = overlayWindows[index]
+            let view = overlayViews[index]
+            // `displayIfNeeded` forces the same view drawing path used by the
+            // live overlay before sampling registration.  It is deliberately
+            // evidence of a drawable/committed view, not a claim about pixels.
+            view.displayIfNeeded()
+            window.displayIfNeeded()
+
+            let allWindows = cgWindowEntries(options: [.optionAll, .excludeDesktopElements])
+            let onScreenWindows = cgWindowEntries(options: [.optionOnScreenOnly, .excludeDesktopElements])
+            let processID = ProcessInfo.processInfo.processIdentifier
+            let windowNumber = window.windowNumber
+            let allEntry = matchingWindowEntry(in: allWindows, windowNumber: windowNumber, processID: processID)
+            let onScreenEntry = matchingWindowEntry(in: onScreenWindows, windowNumber: windowNumber, processID: processID)
+
+            // Resolve the *target* screen from the annotation/view id, not
+            // `window.screen`: if the window drifted onto a different monitor,
+            // using its current screen would make a wrong-display window look
+            // self-consistent and incorrectly ready.
+            let targetScreen = NSScreen.screens.enumerated().compactMap { index, screen -> NSScreen? in
+                getScreenId(screen: screen, index: index) == annotation.screenId ? screen : nil
+            }.first
+            let expectedFrame = targetScreen.map { presentationRect($0.frame) }
+            let expectedWindowServerFrame = targetScreen.flatMap { windowServerDisplayBounds(for: $0) }
+            let contentViewMatches = window.contentView === view
+            // A window content view is normally parented by AppKit's private
+            // frame view, so `superview == nil` would incorrectly report every
+            // healthy overlay as detached. Identity + `view.window` are the
+            // stable public attachment checks.
+            let viewAttached = contentViewMatches && view.window === window
+            let appKitFrameMatches = targetScreen.map { window.frame == $0.frame } ?? false
+            let input = PresentationReadinessInput(
+                annotationExists: true,
+                annotationIsInCurrentVisibleSet: annotationIsVisible,
+                overlayWindowExists: true,
+                contentViewIsExpectedOverlayView: contentViewMatches,
+                viewIsAttachedToWindow: viewAttached,
+                appKitWindowIsVisible: window.isVisible,
+                appKitFrameMatchesExpectedScreen: appKitFrameMatches,
+                windowServerEntryFoundInAllWindows: allEntry != nil,
+                windowServerEntryFoundInOnScreenList: onScreenEntry != nil,
+                windowServerBoundsMatchExpectedDisplay: WindowServerBoundsMatcher.matchesExpectedDisplay(
+                    actual: allEntry?.bounds,
+                    expected: expectedWindowServerFrame
+                ),
+                appKitAlpha: Double(window.alphaValue),
+                windowServerAlpha: allEntry?.alpha,
+                appKitLevel: window.level.rawValue,
+                windowServerLayer: allEntry?.layer,
+                expectedAlpha: expectedAlpha,
+                expectedLevel: expectedLevel
+            )
+            let failures = PresentationReadiness.failureReasons(for: input)
+            return PresentationStatus(
+                annotationId: annotation.id,
+                annotationExists: true,
+                screenId: annotation.screenId,
+                annotationIsInCurrentVisibleSet: annotationIsVisible,
+                expectedWindowShouldBeOnScreen: annotationIsVisible,
+                expectedLevel: expectedLevel,
+                expectedAlpha: expectedAlpha,
+                expectedFrameAppKitPoints: expectedFrame,
+                expectedFrameWindowServerCoordinates: expectedWindowServerFrame,
+                overlayWindowExists: true,
+                windowNumber: windowNumber,
+                appKitWindowIsVisible: window.isVisible,
+                contentViewIsExpectedOverlayView: contentViewMatches,
+                viewIsAttachedToWindow: viewAttached,
+                appKitAlpha: Double(window.alphaValue),
+                appKitLevel: window.level.rawValue,
+                appKitFramePoints: presentationRect(window.frame),
+                windowServerEntryInAllWindows: allEntry,
+                windowServerEntryInOnScreenList: onScreenEntry,
+                presentationReady: failures.isEmpty,
+                failureReasons: failures,
+                note: "presentationReady is WindowServer/AppKit registration and drawable-state evidence, including a bounded WindowServer-bounds check against the target display. It is not proof of unoccluded pixels or inclusion in an independent capture pipeline."
+            )
+        }
+    }
+
+    private func cgWindowEntries(options: CGWindowListOption) -> [PresentationWindowServerEntry] {
+        let raw = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
+        return raw.map { dictionary in
+            // CGWindow key constants bridge to their documented String values;
+            // normalize them here so the pure decoder does not depend on Quartz.
+            var normalized: [String: Any] = [:]
+            for (key, value) in dictionary {
+                normalized[key] = value
+            }
+            return PresentationWindowServerEntry(dictionary: normalized)
+        }
+    }
+
+    private func matchingWindowEntry(in entries: [PresentationWindowServerEntry], windowNumber: Int, processID: Int32) -> PresentationWindowServerEntry? {
+        entries.first { entry in
+            entry.windowNumber == windowNumber && entry.ownerPID == Int(processID)
+        }
+    }
+
+    private func presentationRect(_ rect: NSRect) -> PresentationRect {
+        PresentationRect(x: Double(rect.origin.x), y: Double(rect.origin.y), width: Double(rect.width), height: Double(rect.height))
+    }
+
+    /// `CGDisplayBounds` is expressed in the same global WindowServer
+    /// coordinate system as `kCGWindowBounds`, unlike `NSScreen.frame` which
+    /// is AppKit points with a different vertical-axis convention.
+    private func windowServerDisplayBounds(for screen: NSScreen) -> PresentationRect? {
+        guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+            return nil
+        }
+        let bounds = CGDisplayBounds(displayID)
+        guard bounds.width.isFinite, bounds.height.isFinite, bounds.width > 0, bounds.height > 0 else {
+            return nil
+        }
+        return PresentationRect(
+            x: Double(bounds.origin.x),
+            y: Double(bounds.origin.y),
+            width: Double(bounds.width),
+            height: Double(bounds.height)
+        )
     }
 
     public func getScreenId(screen: NSScreen, index: Int) -> String {
@@ -401,6 +864,35 @@ public final class OverlayWindowController: NSObject {
         }
     }
 
+    /// A machine-readable description of the live overlay windows' input
+    /// behavior. `NSWindow.ignoresMouseEvents` is not represented in public
+    /// `CGWindowList` metadata, so a computer-use implementation that wants to
+    /// permit click-through annotations needs an explicit integration point
+    /// such as this one rather than inferring ownership from window presence.
+    public func overlayInputPolicySnapshot() -> [OverlayInputPolicySnapshot] {
+        MainThread.sync {
+            zip(overlayWindows, overlayViews).map { window, view in
+                OverlayInputPolicySnapshot(
+                    screenId: view.screenId,
+                    windowNumber: window.windowNumber > 0 ? window.windowNumber : nil,
+                    isOnScreen: window.isVisible,
+                    hasVisibleContent: !currentlyVisibleAnnotations(forScreenId: view.screenId).isEmpty,
+                    ignoresMouseEvents: window.ignoresMouseEvents,
+                    sharingType: overlaySharingTypeName(window.sharingType)
+                )
+            }
+        }
+    }
+
+    private func overlaySharingTypeName(_ sharingType: NSWindow.SharingType) -> String {
+        switch sharingType {
+        case .none: return "none"
+        case .readOnly: return "readOnly"
+        case .readWrite: return "readWrite"
+        @unknown default: return "unknown"
+        }
+    }
+
     private func buildScreenInfos() -> [ScreenInfo] {
         var infos: [ScreenInfo] = []
         let screens = NSScreen.screens
@@ -410,6 +902,8 @@ public final class OverlayWindowController: NSObject {
             let idStr = getScreenId(screen: screen, index: idx)
             let frame = screen.frame
             let scale = screen.backingScaleFactor
+            let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+            let windowServerBounds = displayID.map(CGDisplayBounds)
 
             let widthPx = Int(round(frame.width * scale))
             let heightPx = Int(round(frame.height * scale))
@@ -423,7 +917,20 @@ public final class OverlayWindowController: NSObject {
                 widthPt: Double(frame.width),
                 heightPt: Double(frame.height),
                 backingScaleFactor: Double(scale),
-                isMain: (screen == mainScreen)
+                isMain: (screen == mainScreen),
+                appKitFrame: ScreenCoordinateRect(
+                    x: Double(frame.origin.x), y: Double(frame.origin.y),
+                    width: Double(frame.width), height: Double(frame.height)
+                ),
+                windowServerFrame: windowServerBounds.map {
+                    ScreenCoordinateRect(
+                        x: Double($0.origin.x), y: Double($0.origin.y),
+                        width: Double($0.width), height: Double($0.height)
+                    )
+                } ?? ScreenCoordinateRect(
+                    x: 0, y: 0, width: Double(widthPx), height: Double(heightPx)
+                ),
+                displayID: displayID
             ))
         }
         return infos

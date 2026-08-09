@@ -128,85 +128,54 @@ _TOP_LEVEL_REQUESTS: list[tuple[str, str, dict[str, Any] | None]] = [
 # machine running `capture` -- keeping the fixture itself as deterministic as
 # possible going in, on top of (not instead of) the canonicalisation below.
 _TOOL_CALLS: list[tuple[str, str, dict[str, Any]]] = [
-    # Unknown tool name -> the `default:` branch of the tools/call switch.
     ("call_unknown_tool", "nope", {}),
-
-    # --- draw_circle: success, every failure mode, every app-resolution path.
-    ("call_circle_missing_args", "draw_circle", {"x": 10}),
-    ("call_circle_ok", "draw_circle", {
-        "x": 100, "y": 120, "radius": 40, "color": "blue", "label": "C",
-        "app": "", "duration_seconds": 0,
-    }),
-    ("call_circle_normalized", "draw_circle", {
-        "x": 0.5, "y": 0.5, "radius": 30, "is_normalized": True, "app": "",
-    }),
-    # radius <= 0 (negative, not merely zero, to exercise the same branch a
-    # sign-flipped caller would hit).
-    ("call_circle_radius_nonpositive", "draw_circle", {"x": 1, "y": 1, "radius": -5, "app": ""}),
-    # A JSON boolean where MCPArgument.double requires a number. `True` here
-    # serialises as the JSON literal `true`, which used to coerce to 1.0
-    # through NSNumber before MCPArgument.double's CFBooleanGetTypeID guard.
-    ("call_circle_radius_boolean", "draw_circle", {"x": 1, "y": 1, "radius": True, "app": ""}),
-    # "NaN" as a coordinate: Double("NaN") parses to a non-finite value that
-    # MCPArgument.double must reject rather than store.
-    ("call_circle_nan_coordinate", "draw_circle", {"x": "NaN", "y": 1, "radius": 5, "app": ""}),
-    # Ambiguous app: "com.apple" is a bundle-id PREFIX (not a complete id --
-    # BundleIdentifierSyntax.looksComplete requires >= 3 dot-separated
-    # components) that matches many non-prohibited "com.apple.*" processes
-    # (Finder, Dock, Control Center, ...) on essentially any real macOS
-    # session, regardless of which third-party apps the developer happens to
-    # have open. The exact candidate LIST is still machine/moment-dependent
-    # (which system agents are running right now), which is why it is
-    # normalised structurally by _AMBIGUOUS_LIST_RE rather than relied upon
-    # to match byte-for-byte.
-    ("call_circle_ambiguous_app", "draw_circle", {"x": 1, "y": 1, "radius": 5, "app": "com.apple"}),
-    # Unresolvable: not bundle-id shaped, matches no running app -> .notFound
-    # with the "could not resolve" message (raw query only, fully static).
-    ("call_circle_unresolvable_app", "draw_circle", {
-        "x": 1, "y": 1, "radius": 5, "app": "zzz-definitely-not-a-real-app-xyz",
-    }),
-    # Bundle-id shaped but not running -> accepted verbatim. The id here is
-    # ours, not live data, so it needs no masking to be reproducible.
-    ("call_circle_bundleid_not_running", "draw_circle", {
-        "x": 1, "y": 1, "radius": 5, "app": "com.example.NotRunning-Circle",
-    }),
-
-    # --- draw_arrow: success, missing args, and the OMITTED-app default path
-    # (links to ActiveAppTracker.fallbackAppId, i.e. genuinely live data).
-    # This is the one call in this fixture that deliberately exercises that
-    # path end to end, to prove the harvest-based masking actually handles it
-    # rather than merely being unit-tested in isolation.
-    ("call_arrow_missing_args", "draw_arrow", {"x1": 1, "y1": 2}),
-    ("call_arrow_ok", "draw_arrow", {"x1": 1, "y1": 2, "x2": 3, "y2": 4, "app": ""}),
-    ("call_arrow_default_app", "draw_arrow", {"x1": 5, "y1": 6, "x2": 7, "y2": 8}),
-
-    # --- draw_box: success, missing args, non-positive dimensions.
-    ("call_box_missing_args", "draw_box", {"x": 1, "y": 2, "width": 3}),
-    ("call_box_ok", "draw_box", {"x": 1, "y": 2, "width": 3, "height": 4, "app": ""}),
-    ("call_box_negative_dimensions", "draw_box", {"x": 1, "y": 2, "width": -5, "height": 4, "app": ""}),
-
-    # --- draw_label: success, missing args.
-    ("call_label_missing_args", "draw_label", {"x": 1, "y": 2}),
-    ("call_label_ok", "draw_label", {"x": 1, "y": 2, "text": "hi", "app": ""}),
-
-    # --- draw_path: too few points, unparseable points, success, over-cap.
-    ("call_path_too_few_points", "draw_path", {"points": [[1, 2]]}),
-    ("call_path_unparseable_points", "draw_path", {"points": ["a", "b"]}),
+    # Free-draw vector coverage: missing, malformed, stroke/fill/dash, and app linking.
+    ("call_path_missing_data", "draw_path", {}),
+    ("call_path_malformed", "draw_path", {"path_data": "M 0"}),
     ("call_path_ok", "draw_path", {
-        "points": [[1, 2], {"x": 3, "y": 4}], "is_closed": True, "app": "",
+        "path_data": "M 10 10 C 20 0 30 20 40 10 Z", "stroke_color": "blue",
+        "stroke_width": 4, "stroke_opacity": 0.6, "fill_color": "cyan",
+        "fill_opacity": 0.2, "dash": [8, 4], "z_index": 3,
+        "app": "", "duration_seconds": 60,
     }),
-    # One point past Sources/Support/DrawingDefaults.swift's maxPathPoints
-    # (10,000), each individually well-formed so all 10,001 parse
-    # successfully and DrawValidation.pathPointCount is what actually rejects
-    # the call -- not the separate "too few / unparseable" guards above.
-    ("call_path_over_cap", "draw_path", {"points": [[i, i] for i in range(10_001)], "app": ""}),
+    ("call_path_normalized_ok", "draw_path", {
+        "path_data": "M 0.1 0.2 L 0.8 0.7", "coordinate_space": "normalized",
+        "stroke_width": 4, "app": "",
+    }),
+    ("call_path_screenshot_missing_dimensions", "draw_path", {
+        "path_data": "M 10 20 L 40 80", "coordinate_space": "screenshot_pixels", "app": "",
+    }),
+    ("call_path_default_app", "draw_path", {"path_data": "M 1 1 L 2 2"}),
+    ("call_path_bundleid_not_running", "draw_path", {
+        "path_data": "M 1 1 L 2 2", "app": "com.example.NotRunning-FreeDraw",
+    }),
+    ("call_path_ambiguous_app", "draw_path", {"path_data": "M 1 1 L 2 2", "app": "com.apple"}),
+    ("call_path_bad_opacity", "draw_path", {"path_data": "M 1 1 L 2 2", "fill_opacity": 2}),
+    ("call_path_move_only", "draw_path", {"path_data": "M 1 1", "app": ""}),
+    ("call_path_invisible", "draw_path", {"path_data": "M 1 1 L 2 2", "stroke_width": 0, "fill_color": "blue", "fill_opacity": 0, "app": ""}),
+    ("call_path_invalid_optional", "draw_path", {"path_data": "M 1 1 L 2 2", "stroke_width": True, "app": ""}),
+    ("call_path_overflow", "draw_path", {"path_data": "M 1e308 0 l 1e308 0", "app": ""}),
+    ("call_path_bad_dash", "draw_path", {"path_data": "M 1 1 L 2 2", "dash": [4, 0]}),
 
-    # --- draw_grid: success, app-scoped, step_px below the minimum.
-    ("call_grid_ok", "draw_grid", {"step_px": 150, "label": "G", "duration_seconds": 0}),
-    ("call_grid_scoped", "draw_grid", {"app": "com.example.NotRunning-Grid"}),
-    # Below DrawingDefaults.minGridStepPx (1 physical pixel) -> the hang-guard
-    # rejection in DrawValidation.gridStep.
-    ("call_grid_step_too_small", "draw_grid", {"step_px": 0.25}),
+    # Stable image/batch validation paths avoid machine-specific local files.
+    ("call_image_missing_args", "draw_image", {}),
+    ("call_image_missing_file", "draw_image", {"image_path": "/definitely/missing.png", "x": 1, "y": 2}),
+    ("call_image_invalid_optional", "draw_image", {"image_path": "/definitely/missing.png", "x": 1, "y": 2, "opacity": "not-a-number"}),
+    # Text succeeds without a TCC grant, unlike element lookup and screen
+    # capture. It also protects the first-class primitive's normal lifecycle
+    # and schema from silently regressing back into a caller-rendered image.
+    ("call_text_missing_args", "draw_text", {"x": 10, "y": 20}),
+    ("call_text_ok", "draw_text", {
+        "text": "Fusion", "x": 120, "y": 80, "font_size": 22,
+        "color": "white", "background_color": "#202020", "background_opacity": 0.8,
+        "opacity": 0.9, "z_index": 4, "app": "", "duration_seconds": 60,
+    }),
+    ("call_batch_empty", "draw_batch", {"items": []}),
+    ("call_batch_unknown_type", "draw_batch", {"items": [{"type": "circle"}], "app": ""}),
+    ("call_batch_path_ok", "draw_batch", {"items": [
+        {"type": "path", "path_data": "M 0 0 L 10 10", "stroke_color": "red"},
+        {"type": "path", "path_data": "M 20 20 Q 30 0 40 20", "fill_color": "yellow", "stroke_width": 0},
+    ], "app": ""}),
 
     # --- set_capture_visible: ONLY the missing-argument error path.
     #
@@ -224,14 +193,43 @@ _TOOL_CALLS: list[tuple[str, str, dict[str, Any]]] = [
     ("call_capture_visible_missing_args", "set_capture_visible", {}),
 
     ("call_get_screens", "get_screens", {}),
+    ("call_get_overlay_state", "get_overlay_state", {}),
     ("call_get_active_app", "get_active_app", {}),
+    # Status is intentionally safe without Accessibility permission. The
+    # lookup call below fails before it can require TCC, giving this snapshot
+    # deterministic coverage of dispatch and required-argument validation.
+    ("call_get_accessibility_status", "get_accessibility_status", {}),
+    ("call_highlight_element_missing_label", "highlight_element", {}),
     # Sent after the draw_* calls above so the response reflects a populated
     # store: real annotation ids/timestamps/app-links to canonicalise, not an
     # empty list that would leave that code path untested.
     ("call_list_annotations", "list_annotations", {}),
 
-    # --- clear: annotation_id miss, typo'd scope, scope=all.
+    # verify_annotation success returns a nondeterministic image and requires a
+    # real screenshot file, so the golden wire fixture exercises its stable
+    # validation path. End-to-end image content is covered by test_mcp_stdio.py.
+    ("call_verify_annotation_missing_args", "verify_annotation", {}),
+    ("call_verify_annotation_bad_padding", "verify_annotation", {
+        "annotation_id": "does-not-exist", "capture_source": "chalkboard", "padding_px": "not-a-number",
+    }),
+    # A missing annotation is checked before capture, so this exercises the
+    # Chalkboard-source request shape without triggering Screen Recording TCC.
+    ("call_verify_annotation_chalkboard_missing_annotation", "verify_annotation", {
+        "annotation_id": "does-not-exist", "capture_source": "chalkboard", "request_permission": False,
+    }),
+    ("call_verify_presentation_missing_args", "verify_presentation", {}),
+
+    # Stable-ID adjustment: the not-found branch is deterministic and proves
+    # dispatch/validation without needing to parse a freshly generated ID.
+    ("call_update_annotation_missing", "update_annotation", {
+        "annotation_id": "does-not-exist", "offset_x": 10, "offset_y": -5, "opacity": 0.8, "z_index": 6,
+    }),
+
+    # --- clear: annotation_id miss, explicit app, invalid combination,
+    # typo'd scope, and scope=all.
     ("call_clear_by_id_missing", "clear", {"annotation_id": "does-not-exist"}),
+    ("call_clear_explicit_app", "clear", {"app": "com.example.NotRunning-FreeDraw"}),
+    ("call_clear_all_with_app", "clear", {"scope": "all", "app": "com.example.NotRunning-FreeDraw"}),
     ("call_clear_typo_scope", "clear", {"scope": "TYPO"}),
     ("call_clear_scope_all", "clear", {"scope": "all"}),
 ]
@@ -512,6 +510,10 @@ def _mask_value(node: Any, ids_longest_first: list[str], names_longest_first: li
                 # regex could key off, so this has to be a key-based
                 # replacement rather than a pattern in _mask_plain_text.
                 out[key] = "<TIME>"
+            elif key == "expiresAt" and value is not None:
+                out[key] = "<TIME>"
+            elif key == "remainingSeconds" and value is not None:
+                out[key] = "<TTL>"
             else:
                 out[key] = _mask_value(value, ids_longest_first, names_longest_first)
         return out

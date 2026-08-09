@@ -32,7 +32,7 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>2.0.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHighResolutionMagnifyAllowed</key>
@@ -41,6 +41,8 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <false/>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>AI Chalkboard captures a selected display locally to verify annotation placement. Captures exclude AI Chalkboard overlays and are not written to disk.</string>
 </dict>
 </plist>
 EOF

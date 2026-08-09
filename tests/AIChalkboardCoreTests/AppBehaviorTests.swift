@@ -54,14 +54,107 @@ final class AppBehaviorTests: XCTestCase {
         )
     }
 
+    func testCaptureAutoRevertIntervalIsPositiveAndSelfHealsWithinAWorkSession() {
+        XCTAssertGreaterThan(OverlayWindowController.captureAutoRevertInterval, 0)
+        XCTAssertLessThanOrEqual(
+            OverlayWindowController.captureAutoRevertInterval,
+            30 * 60,
+            "a forgotten capture-debug toggle must self-heal within a reasonable work session, not linger for hours"
+        )
+    }
+
+    func testOnCaptureVisibleChangedFiresOnlyOnActualStateChanges() {
+        addTeardownBlock {
+            OverlayWindowController.shared.onCaptureVisibleChanged = nil
+            OverlayWindowController.shared.setCaptureVisible(false)
+        }
+
+        XCTAssertFalse(OverlayWindowController.shared.isCaptureVisible, "tests assume the default/prior state is off")
+
+        var observedValues: [Bool] = []
+        OverlayWindowController.shared.onCaptureVisibleChanged = { visible in
+            observedValues.append(visible)
+        }
+
+        // Already false: a same-value request must not fire the observer.
+        OverlayWindowController.shared.setCaptureVisible(false)
+        XCTAssertEqual(observedValues, [])
+
+        OverlayWindowController.shared.setCaptureVisible(true)
+        XCTAssertEqual(observedValues, [true])
+
+        // Renewal while already true (the "still debugging" keep-alive) must
+        // not fire the observer again -- only the timer restarts.
+        OverlayWindowController.shared.setCaptureVisible(true)
+        XCTAssertEqual(observedValues, [true])
+
+        OverlayWindowController.shared.setCaptureVisible(false)
+        XCTAssertEqual(observedValues, [true, false])
+    }
+
+    func testBackgroundCaptureRequestReturnsOnlyAfterLocalStateIsApplied() {
+        addTeardownBlock {
+            OverlayWindowController.shared.setCaptureVisible(false)
+        }
+
+        let applied = expectation(description: "background request applied on main")
+        DispatchQueue.global().async {
+            _ = OverlayWindowController.shared.setCaptureVisible(true)
+            XCTAssertTrue(
+                OverlayWindowController.shared.isCaptureVisible,
+                "a caller that received success must not observe the pre-toggle local state"
+            )
+            applied.fulfill()
+        }
+
+        wait(for: [applied], timeout: 2)
+        XCTAssertTrue(OverlayWindowController.shared.isCaptureVisible)
+    }
+
+    func testCurrentlyVisibleAnnotationsHidesOtherAppsButShowsGlobalsAndRespectsCaptureDebugOverride() {
+        let screenId = "test-screen-\(UUID().uuidString)"
+        let globalId = "global-\(UUID().uuidString)"
+        let appLinkedId = "app-linked-\(UUID().uuidString)"
+
+        addTeardownBlock {
+            _ = AnnotationStore.shared.remove(id: globalId)
+            _ = AnnotationStore.shared.remove(id: appLinkedId)
+            OverlayWindowController.shared.setCaptureVisible(false)
+        }
+
+        XCTAssertTrue(
+            OverlayWindowController.shared.currentlyVisibleAnnotations(forScreenId: screenId).isEmpty,
+            "a screen nothing was ever drawn on must report no visible annotations -- this is what lets refreshViews() order its window off screen entirely"
+        )
+
+        AnnotationStore.shared.add(Annotation(id: globalId, screenId: screenId, kind: .vectorPath(data: "M0 0 L1 1", strokeColorHex: nil, strokeWidth: 1, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1), appId: nil))
+        XCTAssertEqual(
+            OverlayWindowController.shared.currentlyVisibleAnnotations(forScreenId: screenId).map(\.id),
+            [globalId],
+            "global annotations must be visible regardless of which app is frontmost"
+        )
+
+        AnnotationStore.shared.add(Annotation(id: appLinkedId, screenId: screenId, kind: .vectorPath(data: "M0 0 L1 1", strokeColorHex: nil, strokeWidth: 1, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1), appId: "com.aichalkboard.test-fixture.never-frontmost"))
+        XCTAssertEqual(
+            OverlayWindowController.shared.currentlyVisibleAnnotations(forScreenId: screenId).map(\.id),
+            [globalId],
+            "an annotation linked to an app that is not frontmost must stay hidden under normal (non-debug) filtering"
+        )
+
+        OverlayWindowController.shared.setCaptureVisible(true)
+        XCTAssertEqual(
+            Set(OverlayWindowController.shared.currentlyVisibleAnnotations(forScreenId: screenId).map(\.id)),
+            Set([globalId, appLinkedId]),
+            "capture-debug mode must bypass the per-app filter and report every annotation on the screen as visible"
+        )
+    }
+
     func testAnnotationKindsExposeStableMCPTypeNames() {
         let kinds: [(AnnotationKind, String)] = [
-            (.circle(x: 1, y: 2, radius: 3), "circle"),
-            (.arrow(x1: 1, y1: 2, x2: 3, y2: 4), "arrow"),
-            (.box(x: 1, y: 2, width: 3, height: 4), "box"),
-            (.label(x: 1, y: 2, text: "label"), "label"),
-            (.grid(stepPx: 100), "grid"),
-            (.path(points: [[1, 2], [3, 4]], strokeWidth: 2, isClosed: false), "path")
+            (.vectorPath(data: "M1 2 L3 4", strokeColorHex: nil, strokeWidth: 2, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1), "path"),
+            (.image(assetId: "asset", x: 1, y: 2, width: 3, height: 4, rotationDegrees: 0, opacity: 1), "image"),
+            (.text(text: "Text", x: 1, y: 2, fontSize: 12, textColorHex: "white", backgroundColorHex: nil, backgroundOpacity: 1, paddingPx: 0, opacity: 1), "text"),
+            (.batch(items: [AnnotationComponent(kind: .vectorPath(data: "M0 0 L1 1", strokeColorHex: nil, strokeWidth: 1, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1))]), "batch")
         ]
 
         for (kind, expectedType) in kinds {

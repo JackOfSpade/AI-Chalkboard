@@ -37,4 +37,68 @@ enum MCPArgument {
         }
         return nil
     }
+
+    /// Coerces a JSON boolean and rejects every other bridged Foundation
+    /// value. In particular, JSON numbers arrive as `NSNumber` too, and a
+    /// plain `as? Bool` accepts some of those NSNumber instances. Tool flags
+    /// such as permission prompts must therefore use this rather than Swift's
+    /// permissive bridge cast.
+    static func bool(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID() else {
+            return nil
+        }
+        return number.boolValue
+    }
+
+    /// Returns true only when the caller supplied `key` with a value that is
+    /// not a finite numeric value.  Draw-tool defaults are for *omitted*
+    /// parameters, never for malformed parameters.  Keeping this distinction
+    /// here prevents `opacity: "oops"` from being silently treated as the
+    /// default opacity of 1, for example.
+    static func hasInvalidSuppliedDouble(_ arguments: [String: Any], key: String) -> Bool {
+        arguments.keys.contains(key) && double(arguments[key]) == nil
+    }
+
+    /// JSON has only one numeric type at the protocol boundary.  `z_index`
+    /// still needs integer semantics, so reject fractional and out-of-range
+    /// doubles explicitly instead of silently truncating them.
+    static func integer(_ value: Any?) -> Int? {
+        if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+
+            // JSONSerialization preserves integral JSON values as integral
+            // NSNumbers where it can. Going through `doubleValue` first loses
+            // precision above 2^53 (for example 9007199254740993 becomes
+            // 9007199254740992), which is unacceptable for z/order and AX
+            // occurrence semantics. Parse the NSNumber's exact decimal value
+            // for integer-backed instances instead.
+            let objcType = String(cString: number.objCType)
+            if !["f", "d", "D"].contains(objcType) {
+                return Int(number.stringValue)
+            }
+
+            // A floating JSON spelling has already crossed IEEE-754. Above
+            // this threshold adjacent integers collapse together, so even an
+            // integral-looking value cannot be accepted as an exact ordering
+            // or occurrence index.
+            let maxExactDoubleInteger = 9_007_199_254_740_991.0 // 2^53 - 1
+            guard let floating = double(number), floating.rounded() == floating,
+                  abs(floating) <= maxExactDoubleInteger else { return nil }
+            // Checked conversion avoids the trap at Double(Int.max), whose
+            // nearest representable Double is one integer beyond Int.max.
+            return Int(exactly: floating)
+        }
+
+        if let string = value as? String {
+            // Prefer an exact textual integer before accepting a floating
+            // spelling such as "3.0". This preserves large textual integers.
+            if let exact = Int(string) { return exact }
+            let maxExactDoubleInteger = 9_007_199_254_740_991.0 // 2^53 - 1
+            guard let floating = double(string), floating.rounded() == floating,
+                  abs(floating) <= maxExactDoubleInteger else { return nil }
+            return Int(exactly: floating)
+        }
+        return nil
+    }
 }

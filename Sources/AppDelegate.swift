@@ -92,9 +92,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         ActiveAppTracker.shared.start()
 
         // The overlay is the entire reason the MCP server exists (it's what
-        // draw_circle/draw_arrow/etc. actually render into), so it must be set up in
+        // draw_path/draw_image/draw_batch actually render into), so it must be set up in
         // BOTH modes, never skipped.
         OverlayWindowController.shared.setup()
+
+        // Assigned unconditionally (not inside `setupStatusMenu()`) so a
+        // process that starts as secondary and is later promoted to primary
+        // (see `startPrimaryElectionRetry`) does not need this re-wired at
+        // promotion time -- `applyCaptureIndicator` already no-ops until
+        // `statusItem` exists. Single-closure property: see its doc comment
+        // on why this must stay one slot, not a list.
+        OverlayWindowController.shared.onCaptureVisibleChanged = { [weak self] visible in
+            self?.applyCaptureIndicator(visible: visible)
+        }
+
         MCPServer.shared.start()
 
         // The status-bar item is gated to the primary instance only (see
@@ -304,17 +315,54 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         startPrimaryLockWatchdog()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        
+
         if let button = statusItem?.button {
             if #available(macOS 11.0, *) {
-                button.image = NSImage(systemSymbolName: "pencil.tip.crop.circle", accessibilityDescription: "AI Chalkboard Overlay")
+                let image = NSImage(systemSymbolName: "pencil.tip.crop.circle", accessibilityDescription: "AI Chalkboard Overlay")
+                // Explicit, not assumed: `contentTintColor` (used by
+                // `applyCaptureIndicator` below to flag capture-debug mode)
+                // only recolors TEMPLATE images. SF Symbols images are
+                // template by default on most systems, but this makes the
+                // dependency load-bearing rather than incidental.
+                image?.isTemplate = true
+                button.image = image
             } else {
                 button.title = "🎨"
             }
-            button.toolTip = "AI Chalkboard (MCP Overlay Agent)"
         }
-        
+
+        // Picks up whatever capture-debug state is already live -- relevant
+        // when THIS process is promoted to primary mid-session (see
+        // `startPrimaryElectionRetry`) rather than starting as primary with
+        // the mode already off.
+        applyCaptureIndicator(visible: OverlayWindowController.shared.isCaptureVisible)
+
         statusItem?.menu = makeStatusMenu()
+    }
+
+    /// Tints the menu-bar icon and updates its tooltip so capture-debug mode
+    /// being left on is visible AT A GLANCE, without opening the menu.
+    ///
+    /// WHY THIS EXISTS: `captureVisibleItem`'s checkmark (set in
+    /// `menuNeedsUpdate(_:)`) only answers the question once the menu is
+    /// already open -- exactly backwards for a mode whose entire failure case
+    /// is "left on and forgotten" (see `OverlayWindowController
+    /// .captureAutoRevertInterval`'s doc comment for the incident that
+    /// motivated both this and the auto-revert timer). This is the single
+    /// place that state is rendered into the icon; it runs both from here
+    /// (initial/promotion state) and from `OverlayWindowController
+    /// .onCaptureVisibleChanged` (live updates from the MCP tool, the menu
+    /// toggle, or a sibling instance's broadcast).
+    ///
+    /// No-ops when this process has no status item: `statusItem` is nil for
+    /// every non-primary instance, and that is exactly the case in which
+    /// there is no icon to update.
+    private func applyCaptureIndicator(visible: Bool) {
+        guard let button = statusItem?.button else { return }
+        button.contentTintColor = visible ? .systemOrange : nil
+        button.toolTip = visible
+            ? "AI Chalkboard (MCP Overlay Agent) — CAPTURE DEBUG MODE ON: every annotation renders on every app. Auto-reverts in \(Int(OverlayWindowController.captureAutoRevertInterval / 60)) min if not renewed."
+            : "AI Chalkboard (MCP Overlay Agent)"
     }
 
     /// Builds the menu independently of installing an `NSStatusItem`. Keeping
@@ -376,9 +424,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     /// label and the action in agreement.
     public func menuNeedsUpdate(_ menu: NSMenu) {
         // "+ Global" is not decoration. This item clears the frontmost app's
-        // annotations AND every GLOBAL one (`appId == nil`) -- including a
-        // `draw_grid`, which the MCP tool documents as global precisely so it
-        // SURVIVES app switches. A title that named only the app was a lie
+        // annotations AND every GLOBAL one (`appId == nil`). A title that named only the app was a lie
         // about the blast radius: the user would click it expecting to lose
         // Safari's circles and silently lose their calibration grid too.
         //

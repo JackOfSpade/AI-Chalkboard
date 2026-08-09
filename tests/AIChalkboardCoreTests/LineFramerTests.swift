@@ -67,6 +67,25 @@ final class LineFramerTests: XCTestCase {
         XCTAssertTrue(result.overflow)
     }
 
+    func testCompleteOversizedLineIsRejectedBeforeItCanReachTheServer() {
+        var framer = LineFramer()
+        let complete = Data(repeating: UInt8(ascii: "x"), count: LineFramer.maxBufferBytes + 1)
+            + Data("\n".utf8)
+        let result = framer.feed(complete)
+        XCTAssertTrue(result.overflow)
+        XCTAssertTrue(result.lines.isEmpty)
+    }
+
+    func testOversizedLineDropsEarlierSameChunkLinesUntilFatalShutdown() {
+        var framer = LineFramer()
+        var chunk = Data("{\"safe-looking\":true}\n".utf8)
+        chunk.append(Data(repeating: UInt8(ascii: "x"), count: LineFramer.maxBufferBytes + 1))
+        chunk.append(UInt8(ascii: "\n"))
+        let result = framer.feed(chunk)
+        XCTAssertTrue(result.overflow)
+        XCTAssertTrue(result.lines.isEmpty, "MCPServer must see the fatal oversized line before dispatching an earlier same-chunk request")
+    }
+
     func testFeedingContinuesToReportOverflowAfterTheCapIsExceeded() {
         // Per the type's doc comment: feed() stays safe to call after
         // overflow is reported; it is the CALLER's responsibility to stop

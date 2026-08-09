@@ -2,166 +2,147 @@ import Foundation
 import XCTest
 @testable import AIChalkboardCore
 
-/// `list_annotations` re-encodes annotations through a plain `JSONEncoder()`
-/// and hands the result straight to MCP clients, so this on-the-wire shape is
-/// a contract other code (and other people's MCP clients) depends on. These
-/// tests round-trip every one of the six `AnnotationKind` cases through
-/// `JSONEncoder`/`JSONDecoder`, and separately inspect the raw JSON structure
-/// (via `JSONSerialization`, not assumptions) to confirm `kind` encodes as the
-/// nested `{"<type>": {...}}` shape `AnnotationKind`'s own doc comment
-/// describes.
+/// Annotation JSON is the MCP-facing persistence shape.  These tests pin the
+/// three free-drawing primitives and, critically, recursive batches.
 final class AnnotationCodableTests: XCTestCase {
-    private func assertKindsEqual(
-        _ lhs: AnnotationKind, _ rhs: AnnotationKind,
-        file: StaticString = #filePath, line: UInt = #line
-    ) {
+    private func path(_ data: String = "M10 20 L30 40") -> AnnotationKind {
+        .vectorPath(
+            data: data,
+            strokeColorHex: "#123456",
+            strokeWidth: 2.5,
+            strokeOpacity: 0.8,
+            fillColorHex: "#ABCDEF",
+            fillOpacity: 0.35,
+            dash: [3, 2],
+            usesEvenOddFillRule: true,
+            coordinateScaleX: 1.5,
+            coordinateScaleY: 2.0
+        )
+    }
+
+    private func assertKindsEqual(_ lhs: AnnotationKind, _ rhs: AnnotationKind,
+                                  file: StaticString = #filePath, line: UInt = #line) {
         switch (lhs, rhs) {
-        case let (.circle(x1, y1, r1), .circle(x2, y2, r2)):
-            XCTAssertEqual(x1, x2, file: file, line: line)
-            XCTAssertEqual(y1, y2, file: file, line: line)
-            XCTAssertEqual(r1, r2, file: file, line: line)
-        case let (.arrow(x1, y1, x2, y2), .arrow(x3, y3, x4, y4)):
-            XCTAssertEqual(x1, x3, file: file, line: line)
-            XCTAssertEqual(y1, y3, file: file, line: line)
-            XCTAssertEqual(x2, x4, file: file, line: line)
-            XCTAssertEqual(y2, y4, file: file, line: line)
-        case let (.box(x1, y1, w1, h1), .box(x2, y2, w2, h2)):
-            XCTAssertEqual(x1, x2, file: file, line: line)
-            XCTAssertEqual(y1, y2, file: file, line: line)
-            XCTAssertEqual(w1, w2, file: file, line: line)
-            XCTAssertEqual(h1, h2, file: file, line: line)
-        case let (.label(x1, y1, t1), .label(x2, y2, t2)):
-            XCTAssertEqual(x1, x2, file: file, line: line)
-            XCTAssertEqual(y1, y2, file: file, line: line)
-            XCTAssertEqual(t1, t2, file: file, line: line)
-        case let (.grid(s1), .grid(s2)):
-            XCTAssertEqual(s1, s2, file: file, line: line)
-        case let (.path(p1, s1, c1), .path(p2, s2, c2)):
-            XCTAssertEqual(p1, p2, file: file, line: line)
-            XCTAssertEqual(s1, s2, file: file, line: line)
-            XCTAssertEqual(c1, c2, file: file, line: line)
+        case let (.vectorPath(a, b, c, d, e, f, g, h, i, j), .vectorPath(k, l, m, n, o, p, q, r, s, t)):
+            XCTAssertEqual(a, k, file: file, line: line)
+            XCTAssertEqual(b, l, file: file, line: line)
+            XCTAssertEqual(c, m, file: file, line: line)
+            XCTAssertEqual(d, n, file: file, line: line)
+            XCTAssertEqual(e, o, file: file, line: line)
+            XCTAssertEqual(f, p, file: file, line: line)
+            XCTAssertEqual(g, q, file: file, line: line)
+            XCTAssertEqual(h, r, file: file, line: line)
+            XCTAssertEqual(i, s, file: file, line: line)
+            XCTAssertEqual(j, t, file: file, line: line)
+        case let (.image(a, b, c, d, e, f, g), .image(h, i, j, k, l, m, n)):
+            XCTAssertEqual(a, h, file: file, line: line)
+            XCTAssertEqual(b, i, file: file, line: line)
+            XCTAssertEqual(c, j, file: file, line: line)
+            XCTAssertEqual(d, k, file: file, line: line)
+            XCTAssertEqual(e, l, file: file, line: line)
+            XCTAssertEqual(f, m, file: file, line: line)
+            XCTAssertEqual(g, n, file: file, line: line)
+        case let (.text(a, b, c, d, e, f, g, h, i), .text(j, k, l, m, n, o, p, q, r)):
+            XCTAssertEqual(a, j, file: file, line: line)
+            XCTAssertEqual(b, k, file: file, line: line)
+            XCTAssertEqual(c, l, file: file, line: line)
+            XCTAssertEqual(d, m, file: file, line: line)
+            XCTAssertEqual(e, n, file: file, line: line)
+            XCTAssertEqual(f, o, file: file, line: line)
+            XCTAssertEqual(g, p, file: file, line: line)
+            XCTAssertEqual(h, q, file: file, line: line)
+            XCTAssertEqual(i, r, file: file, line: line)
+        case let (.batch(left), .batch(right)):
+            XCTAssertEqual(left.count, right.count, file: file, line: line)
+            for (l, r) in zip(left, right) {
+                XCTAssertEqual(l.colorHex, r.colorHex, file: file, line: line)
+                XCTAssertEqual(l.label, r.label, file: file, line: line)
+                assertKindsEqual(l.kind, r.kind, file: file, line: line)
+            }
         default:
             XCTFail("kind mismatch: \(lhs) vs \(rhs)", file: file, line: line)
         }
     }
 
-    private func assertRoundTrips(
-        _ original: Annotation,
-        file: StaticString = #filePath, line: UInt = #line
-    ) throws {
-        let data = try JSONEncoder().encode(original)
-        let decoded = try JSONDecoder().decode(Annotation.self, from: data)
-
+    private func assertRoundTrips(_ original: Annotation,
+                                  file: StaticString = #filePath, line: UInt = #line) throws {
+        let decoded = try JSONDecoder().decode(Annotation.self, from: JSONEncoder().encode(original))
         XCTAssertEqual(decoded.id, original.id, file: file, line: line)
         XCTAssertEqual(decoded.screenId, original.screenId, file: file, line: line)
         XCTAssertEqual(decoded.colorHex, original.colorHex, file: file, line: line)
         XCTAssertEqual(decoded.label, original.label, file: file, line: line)
         XCTAssertEqual(decoded.appId, original.appId, file: file, line: line)
         XCTAssertEqual(decoded.appName, original.appName, file: file, line: line)
-        XCTAssertEqual(
-            decoded.createdAt.timeIntervalSince1970,
-            original.createdAt.timeIntervalSince1970,
-            accuracy: 0.001,
-            file: file, line: line
-        )
+        XCTAssertEqual(decoded.opacity, original.opacity, file: file, line: line)
+        XCTAssertEqual(decoded.offsetX, original.offsetX, file: file, line: line)
+        XCTAssertEqual(decoded.offsetY, original.offsetY, file: file, line: line)
+        XCTAssertEqual(decoded.zIndex, original.zIndex, file: file, line: line)
+        XCTAssertEqual(decoded.revision, 0, "store revision is intentionally not part of MCP's annotation wire shape", file: file, line: line)
+        if let expectedExpiry = original.expiresAt {
+            XCTAssertEqual(try XCTUnwrap(decoded.expiresAt, file: file, line: line).timeIntervalSince1970,
+                           expectedExpiry.timeIntervalSince1970, accuracy: 0.001, file: file, line: line)
+        } else {
+            XCTAssertNil(decoded.expiresAt, file: file, line: line)
+        }
         assertKindsEqual(decoded.kind, original.kind, file: file, line: line)
     }
 
-    // MARK: - Round trip, every kind
-
-    func testRoundTripPreservesEveryFieldForEveryKind() throws {
+    func testRoundTripPreservesEveryFieldForEveryFreeDrawingKind() throws {
+        let nested = AnnotationKind.batch(items: [
+            AnnotationComponent(kind: path("M0 0 L20 20"), colorHex: "#00FF00", label: "inner-path"),
+            AnnotationComponent(kind: .image(assetId: "asset-nested", x: 1, y: 2, width: 3, height: 4, rotationDegrees: 5, opacity: 0.6), colorHex: "#FFFFFF")
+        ])
         let kinds: [AnnotationKind] = [
-            .circle(x: 10, y: 20, radius: 5),
-            .arrow(x1: 1, y1: 2, x2: 3, y2: 4),
-            .box(x: 5, y: 6, width: 7, height: 8),
-            .label(x: 9, y: 10, text: "hello world"),
-            .grid(stepPx: 150),
-            .path(points: [[1, 2], [3, 4], [5, 6]], strokeWidth: 2.5, isClosed: true)
+            path(),
+            .image(assetId: "asset-1", x: 10, y: 20, width: 30, height: 40, rotationDegrees: 15, opacity: 0.75),
+            .text(text: "Hello", x: 10, y: 20, fontSize: 18, textColorHex: "#FFFFFF", backgroundColorHex: "#000000", backgroundOpacity: 0.5, paddingPx: 3, opacity: 0.75),
+            .batch(items: [
+                AnnotationComponent(kind: path("M5 5 H25"), colorHex: "#FF0000", label: "path"),
+                AnnotationComponent(kind: nested, colorHex: "#0000FF", label: "nested")
+            ])
         ]
-
         for (index, kind) in kinds.enumerated() {
-            // Alternate label/appId/appName present vs. nil so the optional
-            // fields' round trip is exercised both ways, not just the
-            // all-present or all-nil case.
-            let withLinkage = index.isMultiple(of: 2)
-            let annotation = Annotation(
-                screenId: "screen-\(index)",
-                kind: kind,
-                colorHex: "#ABCDEF",
-                label: withLinkage ? "label-\(index)" : nil,
-                appId: withLinkage ? "com.example.app\(index)" : nil,
-                appName: withLinkage ? "Example App \(index)" : nil
-            )
-            try assertRoundTrips(annotation)
+            try assertRoundTrips(Annotation(
+                screenId: "screen-\(index)", kind: kind, colorHex: "#ABCDEF",
+                label: index.isMultiple(of: 2) ? "annotation-\(index)" : nil,
+                appId: index.isMultiple(of: 2) ? "com.example.app" : nil,
+                appName: index.isMultiple(of: 2) ? "Example" : nil,
+                expiresAt: index.isMultiple(of: 2) ? Date().addingTimeInterval(60) : nil,
+                opacity: 0.8, offsetX: 3, offsetY: 4, zIndex: index
+            ))
         }
     }
 
-    // MARK: - Wire shape: {"kind": {"<type>": {...}}}
-
-    func testCircleKindEncodesAsNestedCircleObject() throws {
-        let annotation = Annotation(screenId: "1", kind: .circle(x: 10, y: 20, radius: 5))
-        let json = try wireJSON(for: annotation)
-        let kindJSON = try XCTUnwrap(json["kind"] as? [String: Any])
-        XCTAssertEqual(kindJSON.count, 1, "kind must encode as a single-key nested object")
-        let circleJSON = try XCTUnwrap(kindJSON["circle"] as? [String: Any])
-        XCTAssertEqual(circleJSON["x"] as? Double, 10)
-        XCTAssertEqual(circleJSON["y"] as? Double, 20)
-        XCTAssertEqual(circleJSON["radius"] as? Double, 5)
+    func testVectorPathWireShapeCarriesStyleFields() throws {
+        let json = try wireJSON(for: Annotation(screenId: "1", kind: path()))
+        let kind = try XCTUnwrap(json["kind"] as? [String: Any])
+        let vector = try XCTUnwrap(kind["vectorPath"] as? [String: Any])
+        XCTAssertEqual(vector["data"] as? String, "M10 20 L30 40")
+        XCTAssertEqual(vector["strokeWidth"] as? Double, 2.5)
+        XCTAssertEqual(vector["strokeOpacity"] as? Double, 0.8)
+        XCTAssertEqual(vector["fillOpacity"] as? Double, 0.35)
+        XCTAssertEqual(vector["dash"] as? [Double], [3, 2])
+        XCTAssertEqual(vector["usesEvenOddFillRule"] as? Bool, true)
+        XCTAssertEqual(vector["coordinateScaleX"] as? Double, 1.5)
     }
 
-    func testArrowKindEncodesAsNestedArrowObject() throws {
-        let annotation = Annotation(screenId: "1", kind: .arrow(x1: 1, y1: 2, x2: 3, y2: 4))
-        let json = try wireJSON(for: annotation)
-        let kindJSON = try XCTUnwrap(json["kind"] as? [String: Any])
-        let arrowJSON = try XCTUnwrap(kindJSON["arrow"] as? [String: Any])
-        XCTAssertEqual(arrowJSON["x1"] as? Double, 1)
-        XCTAssertEqual(arrowJSON["y1"] as? Double, 2)
-        XCTAssertEqual(arrowJSON["x2"] as? Double, 3)
-        XCTAssertEqual(arrowJSON["y2"] as? Double, 4)
-    }
-
-    func testBoxKindEncodesAsNestedBoxObject() throws {
-        let annotation = Annotation(screenId: "1", kind: .box(x: 1, y: 2, width: 3, height: 4))
-        let json = try wireJSON(for: annotation)
-        let kindJSON = try XCTUnwrap(json["kind"] as? [String: Any])
-        let boxJSON = try XCTUnwrap(kindJSON["box"] as? [String: Any])
-        XCTAssertEqual(boxJSON["x"] as? Double, 1)
-        XCTAssertEqual(boxJSON["y"] as? Double, 2)
-        XCTAssertEqual(boxJSON["width"] as? Double, 3)
-        XCTAssertEqual(boxJSON["height"] as? Double, 4)
-    }
-
-    func testLabelKindEncodesAsNestedLabelObject() throws {
-        let annotation = Annotation(screenId: "1", kind: .label(x: 1, y: 2, text: "hi"))
-        let json = try wireJSON(for: annotation)
-        let kindJSON = try XCTUnwrap(json["kind"] as? [String: Any])
-        let labelJSON = try XCTUnwrap(kindJSON["label"] as? [String: Any])
-        XCTAssertEqual(labelJSON["x"] as? Double, 1)
-        XCTAssertEqual(labelJSON["y"] as? Double, 2)
-        XCTAssertEqual(labelJSON["text"] as? String, "hi")
-    }
-
-    func testGridKindEncodesAsNestedGridObject() throws {
-        let annotation = Annotation(screenId: "1", kind: .grid(stepPx: 250))
-        let json = try wireJSON(for: annotation)
-        let kindJSON = try XCTUnwrap(json["kind"] as? [String: Any])
-        let gridJSON = try XCTUnwrap(kindJSON["grid"] as? [String: Any])
-        XCTAssertEqual(gridJSON["stepPx"] as? Double, 250)
-    }
-
-    func testPathKindEncodesAsNestedPathObject() throws {
-        let annotation = Annotation(screenId: "1", kind: .path(points: [[1, 2], [3, 4]], strokeWidth: 2, isClosed: false))
-        let json = try wireJSON(for: annotation)
-        let kindJSON = try XCTUnwrap(json["kind"] as? [String: Any])
-        let pathJSON = try XCTUnwrap(kindJSON["path"] as? [String: Any])
-        XCTAssertEqual(pathJSON["points"] as? [[Double]], [[1, 2], [3, 4]])
-        XCTAssertEqual(pathJSON["strokeWidth"] as? Double, 2)
-        XCTAssertEqual(pathJSON["isClosed"] as? Bool, false)
+    func testImageAndRecursiveBatchWireShapesRemainNested() throws {
+        let kind = AnnotationKind.batch(items: [
+            AnnotationComponent(kind: .image(assetId: "asset-2", x: 2, y: 3, width: 4, height: 5, rotationDegrees: 6, opacity: 0.7), colorHex: "#FFFFFF"),
+            AnnotationComponent(kind: .batch(items: [AnnotationComponent(kind: path(), colorHex: "#000000")]), colorHex: "#00FF00")
+        ])
+        let json = try wireJSON(for: Annotation(screenId: "1", kind: kind))
+        let top = try XCTUnwrap(json["kind"] as? [String: Any])
+        let batch = try XCTUnwrap(top["batch"] as? [String: Any])
+        let items = try XCTUnwrap(batch["items"] as? [[String: Any]])
+        XCTAssertEqual(items.count, 2)
+        let imageKind = try XCTUnwrap(items[0]["kind"] as? [String: Any])
+        XCTAssertEqual((try XCTUnwrap(imageKind["image"] as? [String: Any]))["assetId"] as? String, "asset-2")
+        let nestedKind = try XCTUnwrap(items[1]["kind"] as? [String: Any])
+        XCTAssertNotNil(nestedKind["batch"] as? [String: Any])
     }
 
     private func wireJSON(for annotation: Annotation) throws -> [String: Any] {
-        let data = try JSONEncoder().encode(annotation)
-        let object = try JSONSerialization.jsonObject(with: data, options: [])
-        return try XCTUnwrap(object as? [String: Any])
+        try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(annotation)) as? [String: Any])
     }
 }

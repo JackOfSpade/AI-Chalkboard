@@ -123,7 +123,7 @@ public final class ActiveAppTracker: NSObject {
     /// WHY THIS EXISTS -- the whole feature is broken without it:
     ///
     /// The draw calls arrive over an MCP pipe from Claude. At the instant
-    /// `draw_box` executes, the app the user is actually looking at is *Claude
+    /// a draw tool executes, the app the user is actually looking at is *Claude
     /// Desktop* -- they just typed "circle the render button in DaVinci" into
     /// it and hit send. If an untagged draw were tagged with the TRUE frontmost
     /// app, every annotation would be linked to Claude: it would show up over

@@ -1,183 +1,204 @@
 import Foundation
 
-/// The static `tools/list` payload: name, description, and JSON Schema for
-/// every MCP tool this server exposes.
-///
-/// Numeric defaults mentioned in these description strings are interpolated
-/// from `DrawingDefaults` rather than hand-typed a second time, so the docs
-/// Claude reads can never drift from the code that actually applies them
-/// (see `DrawingDefaults`'s own doc comment for the history of that drift).
-/// Where a literal's hand-written text ("200", "3.5") would not round-trip
-/// through naive `Double` interpolation (`\(200.0)` prints "200.0", not
-/// "200"), the interpolation is written to reproduce the exact original
-/// text -- verified via the golden wire-output diff, not just by eye.
+/// Static MCP catalog. Drawing uses three universal primitives: arbitrary SVG
+/// paths, caller-rendered raster images, and first-class system text. There
+/// are no canned circles/arrows/boxes/grids; agents construct those (and
+/// anything more complex) from the same free-draw surface.
 enum MCPToolCatalog {
-    /// Shared wording for the optional `app` parameter, so every draw tool
-    /// describes per-app linking identically.
-    static let appParamDescription = "Optional app to LINK this annotation to: a bundle id ('com.apple.Terminal') or a display name ('DaVinci Resolve'). The annotation is then drawn ONLY while that app is frontmost, and hidden whenever the user switches away. If omitted, it links to the app the user was in before switching to Claude (see get_active_app's 'fallback'), which is almost always the app they are asking about. Pass an empty string to make the annotation GLOBAL (visible over every app)."
+    static let appParamDescription = "Optional app to LINK this drawing to: bundle id or display name. It is visible only while that app is frontmost. If omitted, the previous non-Claude app is used. Pass an empty string for GLOBAL visibility."
+
+    private static let sharedDrawProperties: [String: Any] = [
+        "screen_id": ["type": "string", "description": "Screen ID/index from get_screens; defaults to main."],
+        "app": ["type": "string", "description": appParamDescription],
+        "duration_seconds": ["type": "number", "exclusiveMinimum": 0, "maximum": DrawingDefaults.maxAnnotationDurationSeconds, "description": "Optional lifetime up to \(Int(DrawingDefaults.maxAnnotationDurationSeconds)) seconds; omit to persist until clear/eviction."],
+        "coordinate_space": ["type": "string", "enum": ["backing_pixels", "normalized", "screenshot_pixels"], "description": "Position/geometry space; backing_pixels is the default, normalized is 0...1 of the selected display, and screenshot_pixels requires screenshot_width and screenshot_height. Style dimensions stay in backing pixels."],
+        "screenshot_width": ["type": "number", "exclusiveMinimum": 0, "description": "Source full-display screenshot width when coordinate_space=screenshot_pixels."],
+        "screenshot_height": ["type": "number", "exclusiveMinimum": 0, "description": "Source full-display screenshot height when coordinate_space=screenshot_pixels."],
+        "z_index": ["type": "integer", "description": "Paint order; higher values appear above lower values. Default 0; equal values retain creation order."]
+    ]
+
+    private static let pathProperties: [String: Any] = [
+        "path_data": ["type": "string", "maxLength": DrawingDefaults.maxSVGPathCharacters, "description": "SVG path data in the selected top-left-origin coordinate_space. Supports absolute/relative M L H V C S Q T A Z, implicit repeats, curves, arcs, and closed subpaths. The source values are stored with a scale-to-backing-pixels transform."],
+        "stroke_color": ["type": "string", "description": "Stroke color name or hex. Defaults to orange when no fill-only intent is expressed."],
+        "stroke_width": ["type": "number", "minimum": 0, "description": "Stroke width in backing pixels. Set 0 for fill-only art."],
+        "stroke_opacity": ["type": "number", "minimum": 0, "maximum": 1, "description": "Stroke opacity; default 1."],
+        "fill_color": ["type": "string", "description": "Optional fill color name or hex."],
+        "fill_opacity": ["type": "number", "minimum": 0, "maximum": 1, "description": "Fill opacity; default 1."],
+        "fill_rule": ["type": "string", "enum": ["nonzero", "evenodd"], "description": "SVG fill rule; default nonzero."],
+        "dash": ["type": "array", "maxItems": DrawingDefaults.maxDashElements, "items": ["type": "number", "exclusiveMinimum": 0], "description": "Optional repeating dash lengths in backing pixels."]
+    ]
+
+    private static let imageProperties: [String: Any] = [
+        "image_path": ["type": "string", "description": "Absolute path to a PNG/JPEG/HEIC/TIFF raster. Alpha is preserved; pixels are decoded into memory once and the path is not retained."],
+        "x": ["type": "number", "description": "Top-left X in the selected coordinate_space."],
+        "y": ["type": "number", "description": "Top-left Y in the selected coordinate_space."],
+        "width": ["type": "number", "exclusiveMinimum": 0, "description": "Optional output width in the selected coordinate_space. Omit one dimension to preserve aspect ratio; omit both for intrinsic backing-pixel size."],
+        "height": ["type": "number", "exclusiveMinimum": 0, "description": "Optional output height in the selected coordinate_space."],
+        "rotation_degrees": ["type": "number", "description": "Clockwise rotation around image center; default 0."],
+        "opacity": ["type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Overall opacity; default 1. Fully transparent images are rejected because they cannot be shown or verified."]
+    ]
+
+    private static let textProperties: [String: Any] = [
+        "text": ["type": "string", "minLength": 1, "description": "Text to draw; line breaks are supported."],
+        "x": ["type": "number", "description": "Top-left X in the selected coordinate space."],
+        "y": ["type": "number", "description": "Top-left Y in the selected coordinate space."],
+        "font_size": ["type": "number", "exclusiveMinimum": 0, "description": "System font size in backing pixels."],
+        "color": ["type": "string", "description": "Text color name or hex; defaults to white."],
+        "background_color": ["type": "string", "description": "Optional background color name or hex."],
+        "background_opacity": ["type": "number", "minimum": 0, "maximum": 1, "description": "Background opacity; default 1."],
+        "padding_px": ["type": "number", "minimum": 0, "description": "Padding around the text in backing pixels; default 0."],
+        "opacity": ["type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Text opacity; default 1."]
+    ]
+
+    private static func merged(_ dictionaries: [[String: Any]]) -> [String: Any] {
+        dictionaries.reduce(into: [:]) { result, dictionary in
+            for (key, value) in dictionary { result[key] = value }
+        }
+    }
 
     static let tools: [[String: Any]] = [
         [
             "name": "get_screens",
-            "description": "Returns all connected macOS displays, physical pixel resolutions, backing scale factors, and point dimensions, plus the current capture_visible request state. backingScaleFactor follows the active macOS display mode: a Retina panel can legitimately report 1 when configured at native unscaled resolution, and 2 in a HiDPI scaled mode. capture_visible controls AI Chalkboard's renderer and legacy NSWindow sharing preference; the program taking a screenshot may still independently include or exclude overlay windows. Use this first to pick screen_id and determine coordinate bounds.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [:]
-            ]
+            "description": "Returns displays in the exact backing-pixel coordinate space used by free-draw, plus backing scale and capture-debug state. A screenshot may be independently downsampled; compare its dimensions with widthPx/heightPx.",
+            "inputSchema": ["type": "object", "properties": [:]]
         ],
         [
-            "name": "draw_circle",
-            "description": "Draws a transparent highlighted circle on the overlay. Coordinates (x, y, radius) can be physical pixels (default) or normalized 0.0-1.0 (if is_normalized=true). Annotations are LINKED TO AN APP and are only visible while that app is frontmost -- see the 'app' parameter.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [
-                    "screen_id": ["type": "string", "description": "Screen ID or index ('0', '1', or display ID from get_screens). Defaults to main screen."],
-                    "x": ["type": "number", "description": "Center X coordinate (physical pixels or normalized 0.0-1.0)."],
-                    "y": ["type": "number", "description": "Center Y coordinate (physical pixels or normalized 0.0-1.0)."],
-                    "radius": ["type": "number", "exclusiveMinimum": 0, "description": "Radius in physical pixels. Must be greater than 0."],
-                    "color": ["type": "string", "description": "Hex color e.g. '\(DrawingDefaults.circleColor)' or name 'red','green','blue','yellow','orange','purple','pink','white'."],
-                    "label": ["type": "string", "description": "Optional label text attached to circle badge."],
-                    "app": ["type": "string", "description": Self.appParamDescription],
-                    "is_normalized": ["type": "boolean", "description": "Set to true if x and y are normalized 0.0-1.0 ratios."],
-                    "duration_seconds": ["type": "number", "description": "Optional duration in seconds after which drawing automatically disappears."]
-                ],
-                "required": ["x", "y", "radius"]
-            ]
+            "name": "get_overlay_state",
+            "description": "Reports Chalkboard's per-screen input policy and window state. A visible overlay is self-attested as click-through when ignoresMouseEvents is true, but an external click dispatcher must explicitly honor that state; this does not prove raw framebuffer pixels or occlusion.",
+            "inputSchema": ["type": "object", "properties": [:]]
         ],
         [
-            "name": "draw_arrow",
-            "description": "Draws a line with an arrowhead from (x1, y1) to (x2, y2). Supports physical pixels or normalized 0.0-1.0 coordinates. Annotations are LINKED TO AN APP and are only visible while that app is frontmost -- see the 'app' parameter.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [
-                    "screen_id": ["type": "string", "description": "Screen ID or index from get_screens."],
-                    "x1": ["type": "number", "description": "Start X coordinate."],
-                    "y1": ["type": "number", "description": "Start Y coordinate."],
-                    "x2": ["type": "number", "description": "End X (arrowhead tip) coordinate."],
-                    "y2": ["type": "number", "description": "End Y (arrowhead tip) coordinate."],
-                    "color": ["type": "string", "description": "Hex color or name."],
-                    "label": ["type": "string", "description": "Optional label text along arrow."],
-                    "app": ["type": "string", "description": Self.appParamDescription],
-                    "is_normalized": ["type": "boolean", "description": "Set to true if x1, y1, x2, y2 are normalized 0.0-1.0 ratios."],
-                    "duration_seconds": ["type": "number", "description": "Optional duration in seconds after which drawing automatically disappears."]
-                ],
-                "required": ["x1", "y1", "x2", "y2"]
-            ]
-        ],
-        [
-            "name": "draw_box",
-            "description": "Draws a rectangle on the overlay. Coordinates (x, y, width, height) support physical pixels or normalized 0.0-1.0. Annotations are LINKED TO AN APP and are only visible while that app is frontmost -- see the 'app' parameter.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [
-                    "screen_id": ["type": "string", "description": "Screen ID or index from get_screens."],
-                    "x": ["type": "number", "description": "Top-left X coordinate."],
-                    "y": ["type": "number", "description": "Top-left Y coordinate."],
-                    "width": ["type": "number", "exclusiveMinimum": 0, "description": "Width in physical pixels, extending RIGHT from x. Must be greater than 0 -- pass the smaller corner as (x, y) rather than a negative width."],
-                    "height": ["type": "number", "exclusiveMinimum": 0, "description": "Height in physical pixels, extending DOWN from y. Must be greater than 0 -- pass the smaller corner as (x, y) rather than a negative height."],
-                    "color": ["type": "string", "description": "Hex color or name."],
-                    "label": ["type": "string", "description": "Optional label text attached to box."],
-                    "app": ["type": "string", "description": Self.appParamDescription],
-                    "is_normalized": ["type": "boolean", "description": "Set to true if x, y, width, height are normalized 0.0-1.0 ratios."],
-                    "duration_seconds": ["type": "number", "description": "Optional duration in seconds after which drawing automatically disappears."]
-                ],
-                "required": ["x", "y", "width", "height"]
-            ]
-        ],
-        [
-            "name": "draw_label",
-            "description": "Draws a floating label badge at (x, y). Supports physical pixels or normalized 0.0-1.0 coordinates. Annotations are LINKED TO AN APP and are only visible while that app is frontmost -- see the 'app' parameter.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [
-                    "screen_id": ["type": "string", "description": "Screen ID or index from get_screens."],
-                    "x": ["type": "number", "description": "X coordinate."],
-                    "y": ["type": "number", "description": "Y coordinate."],
-                    "text": ["type": "string", "description": "Text to render inside badge."],
-                    "color": ["type": "string", "description": "Border color for badge."],
-                    "app": ["type": "string", "description": Self.appParamDescription],
-                    "is_normalized": ["type": "boolean", "description": "Set to true if x and y are normalized 0.0-1.0 ratios."],
-                    "duration_seconds": ["type": "number", "description": "Optional duration in seconds after which drawing automatically disappears."]
-                ],
-                "required": ["x", "y", "text"]
-            ]
+            "name": "get_accessibility_status",
+            "description": "Reports whether macOS Accessibility permission is available for element lookup. Set request_permission=true only to explicitly ask macOS to show its permission prompt; false/default never prompts.",
+            "inputSchema": ["type": "object", "properties": [
+                "request_permission": ["type": "boolean", "description": "Explicitly request the macOS Accessibility permission prompt when access is not granted; default false."]
+            ]]
         ],
         [
             "name": "draw_path",
-            "description": "Draws a freehand path or organic sketch from an array of points. Ideal for freehand circles, squiggles, custom highlights, checkmarks, or organic loops around UI elements. Annotations are LINKED TO AN APP and are only visible while that app is frontmost -- see the 'app' parameter.",
+            "description": "The vector free-draw primitive. Renders arbitrary SVG path geometry with independent stroke, fill, opacity, dash, and fill rule. Construct circles, arrows, boxes, callouts, handwriting, diagrams, and complex shapes through path_data; no canned shape tools exist.",
             "inputSchema": [
                 "type": "object",
-                "properties": [
-                    "screen_id": ["type": "string", "description": "Screen ID or index from get_screens."],
-                    "points": [
-                        "type": "array",
-                        "minItems": 2,
-                        "maxItems": DrawingDefaults.maxPathPoints,
-                        "description": "Array of points as [[x1, y1], [x2, y2]...] or [{'x': x1, 'y': y1}...]. At least 2 and at most \(DrawingDefaults.maxPathPoints) points; every stored point is re-walked on each repaint, so an oversized path costs frame time for as long as it exists."
-                    ],
-                    "color": ["type": "string", "description": "Hex color e.g. '\(DrawingDefaults.pathColor)' or color name."],
-                    "stroke_width": ["type": "number", "description": "Line thickness in physical pixels. Default \(DrawingDefaults.pathStrokeWidthPx)."],
-                    "is_closed": ["type": "boolean", "description": "Set to true to close the loop from last point back to first point (ideal for freehand circles/lassos)."],
-                    "label": ["type": "string", "description": "Optional label text."],
-                    "app": ["type": "string", "description": Self.appParamDescription],
-                    "is_normalized": ["type": "boolean", "description": "Set to true if points are normalized 0.0-1.0 ratios."],
-                    "duration_seconds": ["type": "number", "description": "Optional duration in seconds after which drawing automatically disappears."]
-                ],
-                "required": ["points"]
+                "properties": merged([sharedDrawProperties, pathProperties]),
+                "required": ["path_data"]
             ]
         ],
         [
-            "name": "draw_grid",
-            "description": "Draws a subtle pixel alignment grid over the specified screen for visual spatial calibration. Unlike the other draw tools this defaults to GLOBAL (visible over every app), because a coordinate ruler is only useful if it stays on screen while you switch to the app you are measuring. Pass 'app' to scope it to one app anyway.",
+            "name": "draw_image",
+            "description": "The raster free-draw primitive. Places arbitrary caller-rendered artwork with alpha, scale, rotation, and opacity. Use this for custom text, brushes, gradients, textures, heatmaps, or anything more naturally produced as pixels.",
             "inputSchema": [
                 "type": "object",
-                "properties": [
-                    "screen_id": ["type": "string", "description": "Screen ID or index from get_screens."],
-                    "step_px": ["type": "number", "minimum": DrawingDefaults.minGridStepPx, "description": "Grid line interval in physical pixels. Default \(Int(DrawingDefaults.gridStepPx)); must be at least \(Int(DrawingDefaults.minGridStepPx)). A spacing below one physical pixel cannot be rendered and is rejected."],
-                    "color": ["type": "string", "description": "Grid line color. Default '\(DrawingDefaults.gridColor)'."],
-                    "label": ["type": "string", "description": "Optional label text used to identify the grid in list_annotations."],
-                    "app": ["type": "string", "description": "Optional app (bundle id or display name) to restrict the grid to. Omit for the default: a GLOBAL grid visible over every app."],
-                    "duration_seconds": ["type": "number", "description": "Duration in seconds before grid clears. Default \(DrawingDefaults.gridDurationSeconds)."]
-                ]
+                "properties": merged([sharedDrawProperties, imageProperties]),
+                "required": ["image_path", "x", "y"]
             ]
+        ],
+        [
+            "name": "draw_text",
+            "description": "Draws first-class system text at a top-left coordinate with optional background, padding, and opacity. No caller-rendered bitmap is required.",
+            "inputSchema": [
+                "type": "object",
+                "properties": merged([sharedDrawProperties, textProperties]),
+                "required": ["text", "x", "y", "font_size"]
+            ]
+        ],
+        [
+            "name": "highlight_element",
+            "description": "Finds one running app's Accessibility element by label and draws a rectangular vector highlight around its live bounds. Matching is exact by default; ambiguous labels are rejected unless occurrence is supplied. The resolved frame is anchored at creation time, not continuously tracked as the UI moves.",
+            "inputSchema": ["type": "object", "properties": [
+                "label": ["type": "string", "minLength": 1, "description": "Accessibility title, description, or value to match."],
+                "app": ["type": "string", "description": "Running target app bundle id or display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."],
+                "role": ["type": "string", "description": "Optional raw Accessibility role, for example AXButton."],
+                "match": ["type": "string", "enum": ["exact", "contains"], "description": "Label matching mode; exact is the default."],
+                "occurrence": ["type": "integer", "minimum": 1, "description": "One-based candidate index, required when a label is ambiguous."],
+                "padding_px": ["type": "number", "minimum": 0, "description": "Outward rectangle padding in backing pixels; default 8."],
+                "stroke_color": ["type": "string", "description": "Rectangle stroke color; color is accepted as an alias. Defaults to orange."],
+                "color": ["type": "string", "description": "Alias for stroke_color; do not supply conflicting values."],
+                "stroke_width": ["type": "number", "exclusiveMinimum": 0, "description": "Rectangle stroke width in backing pixels; default 4."],
+                "stroke_opacity": ["type": "number", "minimum": 0, "maximum": 1, "description": "Stroke opacity; default 1."],
+                "fill_color": ["type": "string", "description": "Optional rectangle fill color."],
+                "fill_opacity": ["type": "number", "minimum": 0, "maximum": 1, "description": "Fill opacity; default 0.15 when fill_color is supplied."],
+                "duration_seconds": ["type": "number", "exclusiveMinimum": 0, "maximum": DrawingDefaults.maxAnnotationDurationSeconds],
+                "z": ["type": "integer", "description": "Paint order; higher values appear above lower values. Alias for z_index."],
+                "z_index": ["type": "integer", "description": "Paint order alias; do not supply a conflicting z value."]
+            ], "required": ["label"]]
+        ],
+        [
+            "name": "draw_batch",
+            "description": "Atomically adds 1–100 mixed free-draw path/image/text primitives under one annotation ID (maximum \(DrawingDefaults.maxRasterImagesPerBatch) raster items / \(DrawingDefaults.maxRasterDecodedBytesPerBatch / (1_024 * 1_024)) MiB decoded raster data). All items appear, verify, expire, and clear together; if any item is invalid, nothing is added.",
+            "inputSchema": [
+                "type": "object",
+                "properties": merged([sharedDrawProperties, [
+                    "items": [
+                        "type": "array", "minItems": 1, "maxItems": DrawingDefaults.maxBatchItems,
+                        "items": [
+                            "type": "object",
+                            "properties": merged([pathProperties, imageProperties, textProperties, ["type": ["type": "string", "enum": ["path", "image", "text"]]]]),
+                            "required": ["type"]
+                        ]
+                    ]
+                ]]),
+                "required": ["items"]
+            ]
+        ],
+        [
+            "name": "update_annotation",
+            "description": "Moves/restyles a live annotation without changing its ID. offset_x/offset_y are absolute backing-pixel offsets; supply at least one patch field. Text-only and path-only style fields are rejected for image/batch annotations rather than silently ignored.",
+            "inputSchema": ["type": "object", "properties": merged([[
+                "annotation_id": ["type": "string"],
+                "offset_x": ["type": "number"], "offset_y": ["type": "number"],
+                "opacity": ["type": "number", "minimum": 0, "maximum": 1],
+                "z_index": ["type": "integer"],
+                "text": ["type": "string"], "x": ["type": "number"], "y": ["type": "number"],
+                "font_size": ["type": "number", "exclusiveMinimum": 0], "color": ["type": "string"],
+                "background_color": ["type": "string"], "background_opacity": ["type": "number", "minimum": 0, "maximum": 1],
+                "padding_px": ["type": "number", "minimum": 0],
+                "stroke_color": ["type": "string"], "stroke_width": ["type": "number", "minimum": 0],
+                "stroke_opacity": ["type": "number", "minimum": 0, "maximum": 1],
+                "fill_color": ["type": "string"], "fill_opacity": ["type": "number", "minimum": 0, "maximum": 1]
+            ]]), "required": ["annotation_id"]]
         ],
         [
             "name": "clear",
-            "description": "Clears annotations. With annotation_id: removes just that one, whatever app it belongs to. Without it, 'scope' decides: 'active' (THE DEFAULT) removes exactly what an untagged draw_* call would have targeted -- the annotations linked to get_active_app's 'fallback' app, plus the global ones -- and leaves notes attached to other apps alone; 'all' wipes every annotation for every app. 'active' targets the fallback app, NOT the literally-frontmost one, because when you call this Claude itself is frontmost: matching the draw path is what makes 'clear what you just drew' actually work. The default is deliberately the narrow one, because annotations linked to a background app are invisible and would otherwise be destroyed without the user ever seeing them.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [
-                    "annotation_id": ["type": "string", "description": "Optional ID of a specific annotation to remove. Takes precedence over scope."],
-                    "scope": ["type": "string", "enum": ["active", "all"], "description": "'active' (default): clear the annotations linked to the same app your untagged draw_* calls target (get_active_app's 'fallback'), plus global ones. 'all': clear everything across all apps."]
-                ]
-            ]
+            "description": "Clears by exact annotation_id, explicit app, fallback active app, or scope='all'. Prefer annotation_id for exact undo.",
+            "inputSchema": ["type": "object", "properties": [
+                "annotation_id": ["type": "string"],
+                "scope": ["type": "string", "enum": ["active", "all"]],
+                "app": ["type": "string", "description": "Explicit app target for active scope; empty string means globals only."]
+            ]]
         ],
         [
             "name": "list_annotations",
-            "description": "Returns every active annotation across all screens with its ID, type, coordinates, and the app it is linked to (appId + appName, or null = global), plus an isVisibleNow flag and which app is currently frontmost. Use this to diagnose 'I drew something but cannot see it' -- usually the annotation is linked to an app that is not frontmost.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [:]
-            ]
+            "description": "Lists a bounded page of live drawings with IDs, geometry (or an explicit oversized-geometry summary), app linkage, visibility, expiresAt, and remainingSeconds. Use nextOffset to page.",
+            "inputSchema": ["type": "object", "properties": [
+                "offset": ["type": "integer", "minimum": 0, "description": "Zero-based page offset; default 0."],
+                "limit": ["type": "integer", "minimum": 1, "maximum": DrawingDefaults.maxAnnotationListPageItems, "description": "Maximum entries to return; default and maximum \(DrawingDefaults.maxAnnotationListPageItems)."]
+            ]]
+        ],
+        [
+            "name": "verify_annotation",
+            "description": "Uses the exact live renderer to composite one drawing into either a supplied clean screenshot or a Chalkboard-owned ScreenCaptureKit image, returning a tight PNG crop. Chalkboard capture is single-flight and times out after 30 seconds. screenshot_path and capture_source are mutually exclusive. This verifies placement against UI pixels, not raw framebuffer presentation or occlusion.",
+            "inputSchema": ["type": "object", "properties": [
+                "annotation_id": ["type": "string"],
+                "screenshot_path": ["type": "string", "description": "Absolute path to a clean uncropped full-display raster screenshot."],
+                "capture_source": ["type": "string", "enum": ["chalkboard"], "description": "Use Chalkboard's in-memory ScreenCaptureKit capture. Required when screenshot_path is omitted."],
+                "request_permission": ["type": "boolean", "description": "For capture_source=chalkboard only: explicitly request Screen Recording permission if absent; default false."],
+                "padding_px": ["type": "number", "minimum": 0, "maximum": AnnotationVerificationCompositor.maxPaddingPx]
+            ], "required": ["annotation_id"]]
+        ],
+        [
+            "name": "verify_presentation",
+            "description": "Checks the retained overlay/view pair and WindowServer registration/on-screen state for one drawing, including bounded WindowServer-display-bounds alignment. presentationReady catches missing, hidden, detached, transparent, wrong-level/frame/display, or unregistered windows. It is drawable-state evidence, not raw framebuffer or occlusion proof.",
+            "inputSchema": ["type": "object", "properties": ["annotation_id": ["type": "string"]], "required": ["annotation_id"]]
         ],
         [
             "name": "get_active_app",
-            "description": "Reports which app is frontmost right now AND which app an untagged draw_* call would link to. These differ on purpose: when the user asks Claude to annotate something, Claude's own window is frontmost, so untagged draws target the app the user was in BEFORE switching to Claude. Call this before drawing if you are unsure which app the user means, and pass that bundle id explicitly as the 'app' parameter.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [:]
-            ]
+            "description": "Reports the frontmost app and the fallback app an untagged draw call would link to.",
+            "inputSchema": ["type": "object", "properties": [:]]
         ],
         [
             "name": "set_capture_visible",
-            "description": "Sets AI Chalkboard's capture-debug mode while keeping the existing API name. false (default) requests NSWindowSharingType.none and uses normal per-app rendering; true requests .readOnly and makes the overlay render EVERY annotation, including annotations linked to an app that is not frontmost, so supported full-display capture paths can verify placement. This is an eligibility/request flag, not a guarantee: modern capture tools such as ScreenCaptureKit or computer-use can independently include or exclude apps and windows. Restore false after debugging to restore normal filtering. Applies to every AI Chalkboard instance immediately; no restart needed.",
-            "inputSchema": [
-                "type": "object",
-                "properties": [
-                    "visible": ["type": "boolean", "description": "true = request capture eligibility (.readOnly) and render all annotations. false = request legacy exclusion (.none) and restore normal app filtering. The capturing program's own filters still decide final inclusion."]
-                ],
-                "required": ["visible"]
-            ]
+            "description": "Applies legacy capture eligibility/exclusion and per-app debug filtering locally before responding, then broadcasts the request to sibling instances. External capture programs retain independent filters; this flag auto-reverts after five minutes.",
+            "inputSchema": ["type": "object", "properties": ["visible": ["type": "boolean"]], "required": ["visible"]]
         ]
     ]
 }

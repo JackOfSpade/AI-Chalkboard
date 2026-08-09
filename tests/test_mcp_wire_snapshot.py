@@ -36,6 +36,8 @@ class CanonicalizationMaskingTests(unittest.TestCase):
                 "annotations": [{
                     "id": "11111111-2222-3333-4444-555555555555",
                     "createdAt": 774238998.5,
+                    "expiresAt": "2025-07-15T12:00:00.000Z",
+                    "remainingSeconds": 42.25,
                     "appId": "com.example.Foo",
                     "appName": "Foo App",
                 }],
@@ -50,10 +52,13 @@ class CanonicalizationMaskingTests(unittest.TestCase):
         self.assertNotIn("com.example.Foo", blob)
         self.assertNotIn("11111111-2222-3333-4444-555555555555", blob)
         self.assertNotIn("774238998.5", blob)
+        self.assertNotIn("2025-07-15T12:00:00.000Z", blob)
+        self.assertNotIn("42.25", blob)
         self.assertIn("<APP>", blob)
         self.assertIn("<APPID>", blob)
         self.assertIn("<UUID>", blob)
         self.assertIn("<TIME>", blob)
+        self.assertIn("<TTL>", blob)
         # count is a legitimate, non-volatile signal (how many annotations
         # actually exist) and must survive untouched.
         self.assertIn('"count": 1', blob)

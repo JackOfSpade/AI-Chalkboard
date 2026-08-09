@@ -96,305 +96,228 @@ public final class OverlayView: NSView {
         // filtering from defeating the debug request; external capture filters
         // remain outside the app's control.
         //
-        // So while the debug toggle is on, render EVERYTHING on this screen
-        // (this is the sole caller of the 1-arg `getForScreen`). The user has
-        // explicitly asked to see the overlay as it really is; showing another
-        // app's annotations for the duration is the intended, reversible cost.
-        let annotations: [Annotation]
-        if OverlayWindowController.shared.isCaptureVisible {
-            annotations = AnnotationStore.shared.getForScreen(screenId)
-        } else {
-            annotations = AnnotationStore.shared.getForScreen(
-                screenId,
-                visibleForApp: ActiveAppTracker.shared.currentAppId
-            )
-        }
+        // So while the debug toggle is on, render EVERYTHING on this screen.
+        // The user has explicitly asked to see the overlay as it really is;
+        // showing another app's annotations for the duration is the intended,
+        // reversible cost.
+        //
+        // Routed through `OverlayWindowController.currentlyVisibleAnnotations`
+        // rather than querying `AnnotationStore`/`ActiveAppTracker` directly:
+        // `refreshViews()` needs this EXACT same "what should be visible right
+        // now" answer to decide whether the window itself belongs on screen at
+        // all (see that method's doc comment), and computing it twice risked
+        // the two independently drifting out of sync with each other.
+        let annotations = OverlayWindowController.shared.currentlyVisibleAnnotations(forScreenId: screenId)
+        drawAnnotations(annotations, in: context, canvasSize: bounds.size)
+    }
+
+    /// Draws an explicit annotation snapshot into an AppKit/Core Graphics
+    /// canvas. The live overlay and `verify_annotation` both call this exact
+    /// method, so the verification image cannot drift into a second,
+    /// approximate implementation of vector paths, images, or batches.
+    ///
+    /// The caller owns filtering and the graphics-state transform. The live
+    /// overlay passes its view bounds unchanged; the verifier scales a source
+    /// screen-sized point canvas into the supplied screenshot before calling.
+    func drawAnnotations(
+        _ annotations: [Annotation],
+        in context: CGContext,
+        canvasSize: CGSize,
+        rasterLease suppliedRasterLease: RasterAssetStore.Lease? = nil
+    ) {
         let scale = scaleFactor > 0 ? scaleFactor : 1.0
-        let viewHeight = bounds.height
+        let viewHeight = canvasSize.height
+        // Snapshot every raster before beginning a frame.  Clearing or expiry
+        // can release the store's ownership concurrently, but this lease owns
+        // strong image references through the entire recursive draw.
+        let assetIDs = annotations.flatMap { $0.kind.rasterAssetIds }
+        let rasterLease = suppliedRasterLease ?? RasterAssetStore.shared.lease(ids: assetIDs)
 
         for annotation in annotations {
-            let color = ColorParser.parse(annotation.colorHex)
             context.saveGState()
-
-            switch annotation.kind {
-            case .circle(let x, let y, let radius):
-                drawCircle(x: x, y: y, radius: radius, label: annotation.label,
-                           color: color, scale: scale, viewHeight: viewHeight, context: context)
-
-            case .box(let x, let y, let width, let height):
-                drawBox(x: x, y: y, width: width, height: height, label: annotation.label,
-                        color: color, scale: scale, viewHeight: viewHeight, context: context)
-
-            case .arrow(let x1, let y1, let x2, let y2):
-                drawArrow(x1: x1, y1: y1, x2: x2, y2: y2, label: annotation.label,
-                          color: color, scale: scale, viewHeight: viewHeight, context: context)
-
-            case .label(let x, let y, let text):
-                drawLabel(x: x, y: y, text: text,
-                          color: color, scale: scale, viewHeight: viewHeight, context: context)
-
-            case .grid(let stepPx):
-                drawGrid(stepPx: stepPx, color: color, scale: scale,
-                         viewWidth: bounds.width, viewHeight: viewHeight, context: context)
-
-            case .path(let rawPoints, let strokeWidth, let isClosed):
-                drawPath(rawPoints: rawPoints, strokeWidth: strokeWidth, isClosed: isClosed, label: annotation.label,
-                         color: color, scale: scale, viewHeight: viewHeight, context: context)
-            }
-
+            context.setAlpha(CGFloat(min(max(annotation.opacity, 0), 1)))
+            context.translateBy(
+                x: OverlayDrawingMetrics.points(forPhysicalPixels: annotation.offsetX, backingScaleFactor: scale),
+                y: -OverlayDrawingMetrics.points(forPhysicalPixels: annotation.offsetY, backingScaleFactor: scale)
+            )
+            drawKind(annotation.kind, colorHex: annotation.colorHex,
+                     scale: scale, viewHeight: viewHeight, context: context,
+                     rasterLease: rasterLease)
             context.restoreGState()
         }
     }
 
-    // MARK: - Per-kind rendering
-    //
-    // UNIT ASYMMETRY IS INTENTIONAL, DO NOT "FIX" IT: the hardcoded stroke
-    // widths and geometry constants below (circle/box outline `3.0`, arrow
-    // line `3.5` and arrowhead length `16.0`) are in AppKit POINTS -- the
-    // correct unit for a line weight that should look the same size on screen
-    // regardless of display scale. `draw_path`'s `stroke_width` parameter, by
-    // contrast, is documented and unit-tested as PHYSICAL PIXELS, so it is
-    // deliberately converted via `OverlayDrawingMetrics.points(forPhysicalPixels:)`
-    // before use while the other constants are not. Making these consistent
-    // would change on-screen appearance; leave both units exactly as they are.
+    /// Recursive renderer used for both a top-level annotation and every item
+    /// inside an atomic batch. Keeping dispatch here means live drawing and
+    /// synthetic verification support exactly the same primitive set.
+    private func drawKind(_ kind: AnnotationKind, colorHex: String,
+                          scale: CGFloat, viewHeight: CGFloat, context: CGContext,
+                          rasterLease: RasterAssetStore.Lease) {
+        let color = ColorParser.parse(colorHex)
+        switch kind {
+            case .vectorPath(let data, let strokeColorHex, let strokeWidth, let strokeOpacity,
+                             let fillColorHex, let fillOpacity, let dash, let usesEvenOddFillRule,
+                             let coordinateScaleX, let coordinateScaleY):
+                drawVectorPath(data: data, strokeColorHex: strokeColorHex, strokeWidth: strokeWidth,
+                               strokeOpacity: strokeOpacity, fillColorHex: fillColorHex, fillOpacity: fillOpacity, dash: dash,
+                               usesEvenOddFillRule: usesEvenOddFillRule,
+                               coordinateScaleX: coordinateScaleX, coordinateScaleY: coordinateScaleY,
+                               fallbackColor: color, scale: scale, viewHeight: viewHeight, context: context)
 
-    private func drawCircle(x xPx: Double, y yPx: Double, radius rPx: Double, label: String?,
-                             color: NSColor, scale: CGFloat, viewHeight: CGFloat, context: CGContext) {
-        let center = OverlayDrawingMetrics.point(forPhysicalPixelX: xPx, y: yPx,
-                                                  backingScaleFactor: scale, viewHeightPoints: viewHeight)
-        let cx = center.x
-        let cy = center.y
-        let radius = OverlayDrawingMetrics.points(forPhysicalPixels: rPx, backingScaleFactor: scale)
+            case .image(let assetId, let x, let y, let width, let height, let rotationDegrees, let opacity):
+                drawImage(assetId: assetId, x: x, y: y, width: width, height: height,
+                          rotationDegrees: rotationDegrees, opacity: opacity,
+                          scale: scale, viewHeight: viewHeight, context: context,
+                          rasterLease: rasterLease)
 
-        let rect = CGRect(x: cx - radius, y: cy - radius, width: radius * 2, height: radius * 2)
+            case .text(let text, let x, let y, let fontSize, let textColorHex, let backgroundColorHex,
+                       let backgroundOpacity, let paddingPx, let opacity):
+                drawText(text: text, x: x, y: y, fontSize: fontSize, textColorHex: textColorHex,
+                         backgroundColorHex: backgroundColorHex, backgroundOpacity: backgroundOpacity,
+                         paddingPx: paddingPx, opacity: opacity, scale: scale, viewHeight: viewHeight,
+                         context: context)
 
-        // Semi-transparent fill
-        context.setFillColor(color.withAlphaComponent(0.18).cgColor)
-        context.fillEllipse(in: rect)
-
-        // Outer glow / stroke
-        context.setStrokeColor(color.cgColor)
-        context.setLineWidth(3.0)
-        context.strokeEllipse(in: rect)
-
-        // Draw inner dot
-        let centerDot = CGRect(x: cx - 3, y: cy - 3, width: 6, height: 6)
-        context.setFillColor(color.cgColor)
-        context.fillEllipse(in: centerDot)
-
-        if let labelText = label, !labelText.isEmpty {
-            drawLabelBadge(text: labelText, at: CGPoint(x: cx + radius + 4, y: cy), color: color, context: context)
+            case .batch(let items):
+                for item in items {
+                    context.saveGState()
+                    drawKind(item.kind, colorHex: item.colorHex,
+                             scale: scale, viewHeight: viewHeight, context: context,
+                             rasterLease: rasterLease)
+                    context.restoreGState()
+                }
         }
     }
 
-    private func drawBox(x xPx: Double, y yPx: Double, width wPx: Double, height hPx: Double, label: String?,
-                          color: NSColor, scale: CGFloat, viewHeight: CGFloat, context: CGContext) {
-        let minX = OverlayDrawingMetrics.points(forPhysicalPixels: xPx, backingScaleFactor: scale)
-        let width = OverlayDrawingMetrics.points(forPhysicalPixels: wPx, backingScaleFactor: scale)
-        let height = OverlayDrawingMetrics.points(forPhysicalPixels: hPx, backingScaleFactor: scale)
-        // Top-left corner flipped into AppKit space, then dropped down by the
-        // (already-converted) box height to get the bottom-left corner CGRect wants.
-        let topY = OverlayDrawingMetrics.viewY(forPhysicalPixelY: yPx, backingScaleFactor: scale, viewHeightPoints: viewHeight)
-        let minY = topY - height
+    // MARK: - Universal free-draw rendering
 
-        let rect = CGRect(x: minX, y: minY, width: width, height: height)
-
-        // Fill
-        context.setFillColor(color.withAlphaComponent(0.15).cgColor)
-        context.fill(rect)
-
-        // Stroke
-        context.setStrokeColor(color.cgColor)
-        context.setLineWidth(3.0)
-        context.stroke(rect)
-
-        if let labelText = label, !labelText.isEmpty {
-            drawLabelBadge(text: labelText, at: CGPoint(x: minX, y: minY + height + 4), color: color, context: context)
-        }
-    }
-
-    private func drawArrow(x1: Double, y1: Double, x2: Double, y2: Double, label: String?,
-                            color: NSColor, scale: CGFloat, viewHeight: CGFloat, context: CGContext) {
-        let p1 = OverlayDrawingMetrics.point(forPhysicalPixelX: x1, y: y1, backingScaleFactor: scale, viewHeightPoints: viewHeight)
-        let p2 = OverlayDrawingMetrics.point(forPhysicalPixelX: x2, y: y2, backingScaleFactor: scale, viewHeightPoints: viewHeight)
-
-        context.setStrokeColor(color.cgColor)
-        context.setLineWidth(3.5)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        // Draw line
-        context.move(to: p1)
-        context.addLine(to: p2)
-        context.strokePath()
-
-        // Draw arrowhead at p2
-        let angle = atan2(p2.y - p1.y, p2.x - p1.x)
-        let arrowLength: CGFloat = 16.0
-        let arrowAngle: CGFloat = .pi / 6.0
-
-        let pArrow1 = CGPoint(
-            x: p2.x - arrowLength * cos(angle - arrowAngle),
-            y: p2.y - arrowLength * sin(angle - arrowAngle)
+    private func drawVectorPath(
+        data: String,
+        strokeColorHex: String?,
+        strokeWidth: Double,
+        strokeOpacity: Double,
+        fillColorHex: String?,
+        fillOpacity: Double,
+        dash: [Double],
+        usesEvenOddFillRule: Bool,
+        coordinateScaleX: Double,
+        coordinateScaleY: Double,
+        fallbackColor: NSColor,
+        scale: CGFloat,
+        viewHeight: CGFloat,
+        context: CGContext
+    ) {
+        guard let sourcePath = try? SVGPathParser.parse(data) else { return }
+        var transform = CGAffineTransform(
+            a: CGFloat(coordinateScaleX) / scale, b: 0,
+            c: 0, d: -CGFloat(coordinateScaleY) / scale,
+            tx: 0, ty: viewHeight
         )
-        let pArrow2 = CGPoint(
-            x: p2.x - arrowLength * cos(angle + arrowAngle),
-            y: p2.y - arrowLength * sin(angle + arrowAngle)
-        )
+        guard let path = sourcePath.copy(using: &transform) else { return }
 
-        context.setFillColor(color.cgColor)
-        context.move(to: p2)
-        context.addLine(to: pArrow1)
-        context.addLine(to: pArrow2)
-        context.closePath()
-        context.fillPath()
-
-        if let labelText = label, !labelText.isEmpty {
-            let midPoint = CGPoint(x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2)
-            drawLabelBadge(text: labelText, at: midPoint, color: color, context: context)
-        }
-    }
-
-    private func drawLabel(x xPx: Double, y yPx: Double, text: String,
-                            color: NSColor, scale: CGFloat, viewHeight: CGFloat, context: CGContext) {
-        let point = OverlayDrawingMetrics.point(forPhysicalPixelX: xPx, y: yPx, backingScaleFactor: scale, viewHeightPoints: viewHeight)
-        drawLabelBadge(text: text, at: point, color: color, context: context)
-    }
-
-    private func drawGrid(stepPx: Double, color: NSColor, scale: CGFloat,
-                           viewWidth: CGFloat, viewHeight: CGFloat, context: CGContext) {
-        // Guard rails -- DEFENSE IN DEPTH. The MCP layer now also rejects an
-        // out-of-range `step_px` at the API boundary, but annotations can also
-        // be built in-process (tests, future callers) without going through
-        // that validation, so the renderer must not trust the value blindly.
-        //
-        // Two INDEPENDENT guards, per `DrawingDefaults.minGridStepPx`'s doc
-        // comment:
-        //   1. Clamp the step itself to at least `minGridStepPx` so it can
-        //      never collapse into a floating-point no-op increment.
-        //   2. Separately cap the number of lines drawn per axis at
-        //      `maxGridLinesPerAxis`, so even a merely-tiny (not quite
-        //      ULP-collapsing) step cannot wedge the main thread by drawing an
-        //      effectively unbounded number of lines.
-        //
-        // Both guards use a bounded `for` loop over an Int line index that is
-        // MULTIPLIED by the step, rather than the old `while` loop that
-        // repeatedly ADDED the step to an accumulator -- that old form both
-        // had no iteration cap (see the fix this replaces) and accumulated
-        // floating-point drift across a wide screen; multiplying from an
-        // integer index has neither problem.
-        let rawStepPx = stepPx > 0 ? stepPx : DrawingDefaults.gridStepPx
-        let clampedStepPx = max(rawStepPx, DrawingDefaults.minGridStepPx)
-        let stepPt = OverlayDrawingMetrics.points(forPhysicalPixels: clampedStepPx, backingScaleFactor: scale)
-
-        let gridColor = color.withAlphaComponent(0.35)
-        context.setStrokeColor(gridColor.cgColor)
-        context.setLineWidth(1.0)
-
-        for lineIndex in 1...DrawingDefaults.maxGridLinesPerAxis {
-            let x = CGFloat(lineIndex) * stepPt
-            guard x < viewWidth else { break }
-            context.move(to: CGPoint(x: x, y: 0))
-            context.addLine(to: CGPoint(x: x, y: viewHeight))
-        }
-
-        for lineIndex in 1...DrawingDefaults.maxGridLinesPerAxis {
-            let y = CGFloat(lineIndex) * stepPt
-            guard y < viewHeight else { break }
-            context.move(to: CGPoint(x: 0, y: y))
-            context.addLine(to: CGPoint(x: viewWidth, y: y))
-        }
-        context.strokePath()
-    }
-
-    private func drawPath(rawPoints: [[Double]], strokeWidth: Double, isClosed: Bool, label: String?,
-                           color: NSColor, scale: CGFloat, viewHeight: CGFloat, context: CGContext) {
-        guard rawPoints.count >= 2 else { return }
-        let physicalStroke = strokeWidth > 0 ? strokeWidth : DrawingDefaults.pathStrokeWidthPx
-        let stroke = OverlayDrawingMetrics.points(
-            forPhysicalPixels: physicalStroke,
-            backingScaleFactor: scale
-        )
-
-        var cgPoints: [CGPoint] = []
-        for pt in rawPoints {
-            if pt.count >= 2 {
-                let point = OverlayDrawingMetrics.point(forPhysicalPixelX: pt[0], y: pt[1],
-                                                         backingScaleFactor: scale, viewHeightPoints: viewHeight)
-                cgPoints.append(point)
-            }
-        }
-
-        guard cgPoints.count >= 2 else { return }
-
-        // Build the point sequence into a single CGPath ONCE and reuse it for
-        // both the optional interior fill and the stroke below, instead of
-        // re-walking `cgPoints` with a second identical sequence of
-        // move/addLine calls (previously done once for the fill pass and
-        // again, identically, for the stroke pass).
-        let path = CGMutablePath()
-        path.addLines(between: cgPoints)
-        if isClosed {
-            path.closeSubpath()
-        }
-
-        context.setStrokeColor(color.cgColor)
-        context.setLineWidth(stroke)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        if isClosed {
-            // Fill translucent interior for closed shapes
+        if let fillColorHex, fillOpacity > 0 {
+            let parsedFill = ColorParser.parse(fillColorHex)
+            let fill = parsedFill.withAlphaComponent(
+                parsedFill.alphaComponent * CGFloat(min(max(fillOpacity, 0), 1))
+            )
             context.addPath(path)
-            context.setFillColor(color.withAlphaComponent(0.18).cgColor)
-            context.fillPath()
+            context.setFillColor(fill.cgColor)
+            context.drawPath(using: usesEvenOddFillRule ? .eoFill : .fill)
         }
 
-        context.addPath(path)
-        context.strokePath()
-
-        if let labelText = label, !labelText.isEmpty, let firstPt = cgPoints.first {
-            drawLabelBadge(text: labelText, at: firstPt, color: color, context: context)
+        if strokeWidth > 0 {
+            let stroke = strokeColorHex.map(ColorParser.parse) ?? fallbackColor
+            context.addPath(path)
+            context.setStrokeColor(stroke.withAlphaComponent(
+                stroke.alphaComponent * CGFloat(min(max(strokeOpacity, 0), 1))
+            ).cgColor)
+            context.setLineWidth(OverlayDrawingMetrics.points(forPhysicalPixels: strokeWidth, backingScaleFactor: scale))
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+            if !dash.isEmpty {
+                context.setLineDash(
+                    phase: 0,
+                    lengths: dash.map { OverlayDrawingMetrics.points(forPhysicalPixels: $0, backingScaleFactor: scale) }
+                )
+            }
+            context.strokePath()
         }
+
     }
 
-    private func drawLabelBadge(text: String, at point: CGPoint, color: NSColor, context: CGContext) {
-        let font = NSFont.systemFont(ofSize: 13, weight: .semibold)
-        let textAttributes: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.white
+    private func drawImage(
+        assetId: String,
+        x xPx: Double,
+        y yPx: Double,
+        width widthPx: Double,
+        height heightPx: Double,
+        rotationDegrees: Double,
+        opacity: Double,
+        scale: CGFloat,
+        viewHeight: CGFloat,
+        context: CGContext,
+        rasterLease: RasterAssetStore.Lease
+    ) {
+        guard let image = rasterLease.image(id: assetId) else { return }
+        let x = OverlayDrawingMetrics.points(forPhysicalPixels: xPx, backingScaleFactor: scale)
+        let width = OverlayDrawingMetrics.points(forPhysicalPixels: widthPx, backingScaleFactor: scale)
+        let height = OverlayDrawingMetrics.points(forPhysicalPixels: heightPx, backingScaleFactor: scale)
+        let topY = OverlayDrawingMetrics.viewY(forPhysicalPixelY: yPx, backingScaleFactor: scale, viewHeightPoints: viewHeight)
+        let rect = CGRect(x: x, y: topY - height, width: width, height: height)
+
+        context.saveGState()
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        context.translateBy(x: center.x, y: center.y)
+        // Public coordinates are top-left/y-down, so positive rotation is
+        // documented as clockwise. AppKit's y-up context needs the negation.
+        context.rotate(by: CGFloat(-rotationDegrees * .pi / 180))
+        context.translateBy(x: -center.x, y: -center.y)
+        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: CGFloat(min(max(opacity, 0), 1)))
+        context.restoreGState()
+
+    }
+
+    private func drawText(
+        text: String,
+        x xPx: Double,
+        y yPx: Double,
+        fontSize fontSizePx: Double,
+        textColorHex: String,
+        backgroundColorHex: String?,
+        backgroundOpacity: Double,
+        paddingPx: Double,
+        opacity: Double,
+        scale: CGFloat,
+        viewHeight: CGFloat,
+        context: CGContext
+    ) {
+        let fontSize = OverlayDrawingMetrics.points(forPhysicalPixels: fontSizePx, backingScaleFactor: scale)
+        let padding = OverlayDrawingMetrics.points(forPhysicalPixels: paddingPx, backingScaleFactor: scale)
+        guard fontSize > 0 else { return }
+        let primitiveOpacity = CGFloat(min(max(opacity, 0), 1))
+        let textColor = ColorParser.parse(textColorHex)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: fontSize),
+            .foregroundColor: textColor.withAlphaComponent(textColor.alphaComponent * primitiveOpacity)
         ]
-
-        let textSize = (text as NSString).size(withAttributes: textAttributes)
-        let paddingX: CGFloat = 8.0
-        let paddingY: CGFloat = 4.0
-
-        let badgeRect = CGRect(
-            x: point.x,
-            y: point.y - (textSize.height / 2 + paddingY),
-            width: textSize.width + (paddingX * 2),
-            height: textSize.height + (paddingY * 2)
-        )
-
-        let path = CGPath(roundedRect: badgeRect, cornerWidth: 6, cornerHeight: 6, transform: nil)
-
-        // Dark background pill with colored border
-        context.setFillColor(NSColor.black.withAlphaComponent(0.85).cgColor)
-        context.addPath(path)
-        context.fillPath()
-
-        context.setStrokeColor(color.cgColor)
-        context.setLineWidth(1.5)
-        context.addPath(path)
-        context.strokePath()
-
-        // Render text directly inside AppKit drawing context
-        let textRect = CGRect(
-            x: badgeRect.origin.x + paddingX,
-            y: badgeRect.origin.y + paddingY,
-            width: textSize.width,
-            height: textSize.height
-        )
-        (text as NSString).draw(in: textRect, withAttributes: textAttributes)
+        let attributed = NSAttributedString(string: text, attributes: attributes)
+        let glyphBounds = attributed.boundingRect(
+            with: CGSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).integral
+        let width = max(1, glyphBounds.width)
+        let height = max(1, glyphBounds.height)
+        let x = OverlayDrawingMetrics.points(forPhysicalPixels: xPx, backingScaleFactor: scale)
+        let topY = OverlayDrawingMetrics.viewY(forPhysicalPixelY: yPx, backingScaleFactor: scale, viewHeightPoints: viewHeight)
+        let textRect = CGRect(x: x + padding, y: topY - padding - height, width: width, height: height)
+        let backgroundRect = textRect.insetBy(dx: -padding, dy: -padding)
+        if let backgroundColorHex, backgroundOpacity > 0 {
+            let parsedBackground = ColorParser.parse(backgroundColorHex)
+            let background = parsedBackground.withAlphaComponent(
+                parsedBackground.alphaComponent * CGFloat(min(max(backgroundOpacity, 0), 1)) * primitiveOpacity
+            )
+            context.setFillColor(background.cgColor)
+            context.fill(backgroundRect)
+        }
+        attributed.draw(with: textRect, options: [.usesLineFragmentOrigin, .usesFontLeading])
     }
 }
