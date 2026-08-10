@@ -25,6 +25,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     /// See `startPrimaryLockWatchdog()`.
     private var primaryLockWatchdog: Timer?
 
+    /// Reconciles the durable suspension lease registry often enough that an
+    /// abandoned short lease restores retained annotations promptly. The
+    /// registry uses monotonic uptime; this timer is merely a wake-up, never a
+    /// clock source.
+    private var suspensionLeaseReconcileTimer: Timer?
+
     /// How often a secondary re-tests whether the primary slot has come free.
     /// Cheap (one `open` + one non-blocking `flock` + one `close`) and the
     /// contention case is not logged, so a few seconds is a good trade between
@@ -91,6 +97,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         // annotation of a session land on the wrong app (or on none).
         ActiveAppTracker.shared.start()
 
+        // Fail closed until this synchronous registry read completes. A newly
+        // launched sibling must not briefly put a full-screen overlay back on
+        // WindowServer while another client still owns a suspension lease.
+        let suspensionBootstrap = SuspensionLeaseCoordinator.shared.bootstrapAndReconcile()
+        if let error = suspensionBootstrap.error {
+            Logger.shared.log("Suspension lease bootstrap failed; overlays remain ordered out: \(error)", level: "ERROR")
+        }
+        startSuspensionLeaseReconciliation()
+
         // The overlay is the entire reason the MCP server exists (it's what
         // draw_path/draw_image/draw_batch actually render into), so it must be set up in
         // BOTH modes, never skipped.
@@ -130,6 +145,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         }
 
         MCPServer.shared.log("AI Chalkboard background agent initialized.")
+    }
+
+    private func startSuspensionLeaseReconciliation() {
+        guard suspensionLeaseReconcileTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] timer in
+            guard self != nil else { timer.invalidate(); return }
+            _ = SuspensionLeaseCoordinator.shared.reconcile()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        suspensionLeaseReconcileTimer = timer
     }
 
     // MARK: - Primary re-election (secondary instances only)

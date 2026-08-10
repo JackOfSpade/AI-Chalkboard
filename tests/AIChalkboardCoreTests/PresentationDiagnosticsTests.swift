@@ -5,6 +5,7 @@ final class PresentationDiagnosticsTests: XCTestCase {
     private func input(
         annotationExists: Bool = true,
         visible: Bool = true,
+        annotationsSuspended: Bool = false,
         windowExists: Bool = true,
         contentMatches: Bool = true,
         viewAttached: Bool = true,
@@ -21,6 +22,7 @@ final class PresentationDiagnosticsTests: XCTestCase {
         PresentationReadinessInput(
             annotationExists: annotationExists,
             annotationIsInCurrentVisibleSet: visible,
+            annotationsSuspended: annotationsSuspended,
             overlayWindowExists: windowExists,
             contentViewIsExpectedOverlayView: contentMatches,
             viewIsAttachedToWindow: viewAttached,
@@ -75,6 +77,33 @@ final class PresentationDiagnosticsTests: XCTestCase {
         XCTAssertEqual(
             PresentationReadiness.failureReasons(for: input(boundsMatch: false)),
             ["windowserver_bounds_mismatch"]
+        )
+    }
+
+    func testReducerReportsOnlyDedicatedReasonForIntentionalSuspension() {
+        XCTAssertEqual(
+            PresentationReadiness.failureReasons(for: input(
+                visible: false,
+                annotationsSuspended: true,
+                appKitVisible: false,
+                onScreenEntry: false
+            )),
+            ["annotations_suspended"]
+        )
+    }
+
+    func testReducerRetainsMissingAnnotationEvidenceDuringSuspension() {
+        XCTAssertEqual(
+            PresentationReadiness.failureReasons(for: input(
+                annotationExists: false,
+                visible: false,
+                annotationsSuspended: true,
+                windowExists: false,
+                appKitVisible: false,
+                allEntry: false,
+                onScreenEntry: false
+            )),
+            ["annotation_not_found", "annotations_suspended"]
         )
     }
 

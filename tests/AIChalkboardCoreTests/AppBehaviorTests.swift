@@ -63,6 +63,14 @@ final class AppBehaviorTests: XCTestCase {
         )
     }
 
+    func testOverlayWindowsDisableImplicitOrderingAnimation() {
+        XCTAssertEqual(
+            OverlayWindowController.overlayWindowAnimationBehavior,
+            .none,
+            "suspend/resume must not leave a transient, partially visible WindowServer overlay"
+        )
+    }
+
     func testOnCaptureVisibleChangedFiresOnlyOnActualStateChanges() {
         addTeardownBlock {
             OverlayWindowController.shared.onCaptureVisibleChanged = nil
@@ -90,6 +98,42 @@ final class AppBehaviorTests: XCTestCase {
 
         OverlayWindowController.shared.setCaptureVisible(false)
         XCTAssertEqual(observedValues, [true, false])
+    }
+
+    func testTemporarySuspensionIsIdempotentPresentationStateAndRetainsAnnotationIdentityAndTTL() throws {
+        let controller = OverlayWindowController.shared
+        let id = "suspension-retention-\(UUID().uuidString)"
+        let expiry = Date().addingTimeInterval(60)
+        let annotation = Annotation(
+            id: id,
+            screenId: "suspension-test-screen",
+            kind: .vectorPath(data: "M0 0 L1 1", strokeColorHex: nil, strokeWidth: 1, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1),
+            expiresAt: expiry
+        )
+
+        addTeardownBlock {
+            _ = AnnotationStore.shared.remove(id: id)
+            _ = controller.setAnnotationsSuspended(false)
+        }
+
+        // Start clean even when a previous failure skipped its normal resume.
+        _ = controller.setAnnotationsSuspended(false)
+        AnnotationStore.shared.add(annotation)
+        let before = try XCTUnwrap(AnnotationStore.shared.get(id: id))
+
+        XCTAssertTrue(controller.setAnnotationsSuspended(true))
+        XCTAssertTrue(controller.isAnnotationsSuspended)
+        XCTAssertFalse(controller.setAnnotationsSuspended(true), "repeat suspension must be idempotent")
+
+        let whileSuspended = try XCTUnwrap(AnnotationStore.shared.get(id: id))
+        XCTAssertEqual(whileSuspended.id, before.id)
+        XCTAssertEqual(whileSuspended.createdAt, before.createdAt)
+        XCTAssertEqual(whileSuspended.expiresAt, before.expiresAt, "suspension must not pause or extend TTL")
+
+        XCTAssertTrue(controller.setAnnotationsSuspended(false))
+        XCTAssertFalse(controller.isAnnotationsSuspended)
+        XCTAssertFalse(controller.setAnnotationsSuspended(false), "repeat resume must be idempotent")
+        XCTAssertEqual(AnnotationStore.shared.get(id: id)?.id, id)
     }
 
     func testBackgroundCaptureRequestReturnsOnlyAfterLocalStateIsApplied() {
@@ -120,7 +164,13 @@ final class AppBehaviorTests: XCTestCase {
             _ = AnnotationStore.shared.remove(id: globalId)
             _ = AnnotationStore.shared.remove(id: appLinkedId)
             OverlayWindowController.shared.setCaptureVisible(false)
+            _ = OverlayWindowController.shared.setAnnotationsSuspended(false)
         }
+
+        // The controller intentionally starts fail-closed until the durable
+        // coordinator bootstraps. This unit test exercises app filtering, not
+        // that global safety gate, so establish its explicit ready state.
+        _ = OverlayWindowController.shared.setAnnotationsSuspended(false)
 
         XCTAssertTrue(
             OverlayWindowController.shared.currentlyVisibleAnnotations(forScreenId: screenId).isEmpty,

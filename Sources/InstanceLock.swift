@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Advisory single-instance guard used to prevent duplicate status-bar items.
 ///
@@ -90,7 +91,12 @@ public final class InstanceLock: @unchecked Sendable {
     }
 
     private init() {
-        lockURLOverride = nil
+        // A subprocess integration test needs each pair of test servers to
+        // elect within its own temporary namespace rather than contend with a
+        // live desktop agent. Never accept an arbitrary production path from
+        // the environment: the override is restricted to the current process'
+        // temporary directory and must name an ordinary file beneath it.
+        lockURLOverride = Self.testLockURLFromEnvironment()
         logHandler = { message, level in
             Logger.shared.log(message, level: level)
         }
@@ -393,6 +399,17 @@ public final class InstanceLock: @unchecked Sendable {
 
     private func log(_ message: String, level: String) {
         logHandler(message, level)
+    }
+
+    private static func testLockURLFromEnvironment() -> URL? {
+        guard let raw = ProcessInfo.processInfo.environment["AI_CHALKBOARD_INSTANCE_LOCK_PATH"],
+              raw.hasPrefix("/") else { return nil }
+        let candidate = URL(fileURLWithPath: raw).standardizedFileURL
+        let temporaryRoot = FileManager.default.temporaryDirectory.standardizedFileURL.path
+        let parent = candidate.deletingLastPathComponent().standardizedFileURL.path
+        guard candidate.lastPathComponent == "instance.lock",
+              parent == temporaryRoot || parent.hasPrefix(temporaryRoot + "/") else { return nil }
+        return candidate
     }
 
     /// Resolves the lock file's URL, creating its directory if needed.

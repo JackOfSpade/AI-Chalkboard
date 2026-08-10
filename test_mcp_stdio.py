@@ -5,15 +5,26 @@ import subprocess
 import json
 import os
 import select
+import shutil
 import struct
 import sys
 import tempfile
 import time
+import uuid
 import zlib
 
 DEFAULT_BINARY_PATH = "./.build/release/AIChalkboard.app/Contents/MacOS/AIChalkboard"
 DEFAULT_RESPONSE_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_TIMEOUT_SECONDS = 2.0
+RESUME_CLEANUP_ATTEMPTS = 3
+PRESENTATION_SETTLE_TIMEOUT_SECONDS = 2.0
+PRESENTATION_POLL_INTERVAL_SECONDS = 0.025
+TRANSIENT_WINDOWSERVER_PRESENTATION_FAILURES = frozenset({
+    "windowserver_entry_missing",
+    "windowserver_window_not_on_screen",
+    "windowserver_bounds_mismatch",
+    "windowserver_alpha_below_expected",
+})
 
 
 def parse_args():
@@ -153,6 +164,91 @@ def send_request(proc, reader, request, timeout_seconds):
         ) from error
 
 
+def resume_annotations_with_retry(proc, reader, timeout_seconds, request_id, lease_token):
+    """Best-effort compensating cleanup for a completed or timed-out suspend.
+
+    A suspension request can affect overlays before its bounded quiescence and
+    final-state checks respond. Retry the idempotent release on an MCP error or transport timeout
+    so this smoke test does not retain its own isolated lease. The caller must
+    pass the exact token returned by suspend_annotations; no broad "resume all"
+    cleanup exists, by design.
+    """
+    failures = []
+    for attempt in range(RESUME_CLEANUP_ATTEMPTS):
+        try:
+            response = send_request(proc, reader, {
+                "jsonrpc": "2.0",
+                "id": request_id + attempt,
+                "method": "tools/call",
+                "params": {"name": "resume_annotations", "arguments": {"lease_token": lease_token}},
+            }, timeout_seconds)
+        except (RuntimeError, TimeoutError) as error:
+            failures.append(f"attempt {attempt + 1}: {error}")
+            continue
+
+        result = response.get("result")
+        if isinstance(result, dict) and not result.get("isError", False):
+            return response
+        failures.append(f"attempt {attempt + 1}: {response!r}")
+
+    raise AssertionError(
+        "resume_annotations did not confirm cleanup after "
+        f"{RESUME_CLEANUP_ATTEMPTS} monotonic-deadline attempt(s): "
+        + "; ".join(failures)
+    )
+
+
+def verify_presentation_until_settled(
+    proc, reader, timeout_seconds, request_id, annotation_id,
+    settle_timeout_seconds=PRESENTATION_SETTLE_TIMEOUT_SECONDS,
+):
+    """Poll only transient WindowServer convergence after a linearized resume.
+
+    The first request is immediate: there is no fixed grace-period sleep that
+    could conceal a regression. `resume_annotations` makes the durable lease
+    transition and local AppKit ordering synchronous, but macOS can publish
+    the corresponding on-screen WindowServer entry on a later compositor
+    turn. Preserve that first observation for diagnostics, then retry only
+    WindowServer registration/geometry/alpha failures against a monotonic
+    deadline. AppKit, annotation, level, or other failures return immediately.
+    """
+    deadline = time.monotonic() + max(0.0, settle_timeout_seconds)
+    first_transient = None
+    attempt = 0
+
+    while True:
+        response = send_request(proc, reader, {
+            "jsonrpc": "2.0",
+            "id": request_id + attempt,
+            "method": "tools/call",
+            "params": {
+                "name": "verify_presentation",
+                "arguments": {"annotation_id": annotation_id},
+            },
+        }, timeout_seconds)
+        result = response.get("result", {})
+        if result.get("isError", False):
+            return response, first_transient
+
+        presentation = json.loads(result["content"][0]["text"])
+        if presentation.get("presentationReady") is True:
+            return response, first_transient
+
+        failure_reasons = set(presentation.get("failureReasons", []))
+        if not failure_reasons or not failure_reasons.issubset(
+            TRANSIENT_WINDOWSERVER_PRESENTATION_FAILURES
+        ):
+            return response, first_transient
+        if first_transient is None:
+            first_transient = presentation
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return response, first_transient
+        time.sleep(min(PRESENTATION_POLL_INTERVAL_SECONDS, remaining))
+        attempt += 1
+
+
 def main():
     args = parse_args()
     # An explicit path lets CI/local verification exercise an isolated scratch
@@ -160,13 +256,23 @@ def main():
     binary_path = args.binary_path
     print(f"Launching MCP process: {binary_path}", flush=True)
 
+    # The smoke process must never address an existing Cowork/Claude instance.
+    # Suspension now has a coordinator root and DNC namespace specifically so
+    # tests can use a random, disposable domain even on a developer desktop.
+    suspension_root = tempfile.mkdtemp(prefix="ai-chalkboard-stdio-suspension-")
+    child_env = os.environ.copy()
+    child_env["AI_CHALKBOARD_SUSPENSION_ROOT"] = suspension_root
+    child_env["AI_CHALKBOARD_SUSPENSION_NAMESPACE"] = f"stdio-{uuid.uuid4()}"
+    child_env["AI_CHALKBOARD_INSTANCE_LOCK_PATH"] = os.path.join(suspension_root, "instance.lock")
+
     proc = subprocess.Popen(
         [binary_path, "--mcp"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        bufsize=1
+        bufsize=1,
+        env=child_env,
     )
     reader = MCPLineReader(proc)
 
@@ -185,6 +291,9 @@ def main():
             }
         }, args.timeout)
         print("Initialize response:", json.dumps(init_res, indent=2), flush=True)
+        server_info = init_res["result"]["serverInfo"]
+        assert server_info["version"] == "2.1.0"
+        assert isinstance(server_info["buildIdentifier"], str) and server_info["buildIdentifier"]
 
         print("\n2. Testing 'tools/list'...", flush=True)
         list_res = send_request(proc, reader, {
@@ -194,7 +303,7 @@ def main():
         }, args.timeout)
         tools = [t["name"] for t in list_res["result"]["tools"]]
         print("Available tools:", tools, flush=True)
-        assert {"draw_path", "draw_image", "draw_text", "draw_batch", "verify_annotation", "verify_presentation"}.issubset(tools)
+        assert {"draw_path", "draw_image", "draw_text", "draw_batch", "suspend_annotations", "resume_annotations", "verify_annotation", "verify_presentation"}.issubset(tools)
         assert not {"draw_circle", "draw_arrow", "draw_box", "draw_label", "draw_grid"}.intersection(tools)
 
         print("\n3. Testing SVG 'draw_path' for a free-drawn circle...", flush=True)
@@ -290,13 +399,99 @@ def main():
         assert text_annotation.get("type") == "text"
         assert any(a.get("type") == "batch" for a in annotations)
 
-        presentation_res = send_request(proc, reader, {
-            "jsonrpc": "2.0", "id": 41, "method": "tools/call",
-            "params": {"name": "verify_presentation", "arguments": {"annotation_id": path_annotation_id}},
+        print("\n6a. Testing temporary annotation suspension preserves the draw state...", flush=True)
+        # The implementation broadcasts suspension to sibling Chalkboard
+        # processes. Always send the compensating resume before continuing,
+        # including when the suspend request itself times out *after* posting
+        # its distributed notification. Start try/finally before sending it,
+        # so this smoke test cannot leave a running desktop session hidden.
+        suspension_token = None
+        try:
+            suspend_res = send_request(proc, reader, {
+                "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+                "params": {"name": "suspend_annotations", "arguments": {
+                    "lease_seconds": 30,
+                    "idempotency_key": str(uuid.uuid4()),
+                }},
+            }, args.timeout)
+            assert "result" in suspend_res, suspend_res
+            assert not suspend_res["result"].get("isError", False), suspend_res
+            suspension_payload = json.loads(suspend_res["result"]["content"][0]["text"])
+            suspension_token = suspension_payload["leaseToken"]
+            assert isinstance(suspension_token, str) and len(suspension_token) == 43
+            assert suspension_payload["protocolVersion"] == 2
+            assert suspension_payload["annotationsSuspended"] is True
+            assert isinstance(suspension_payload["clickSafeAtObservation"], bool)
+            assert isinstance(suspension_payload["peerPresentationSettled"], bool)
+            assert suspension_payload["clickSafeAtObservation"] is False or suspension_payload["peerPresentationSettled"] is True
+            assert isinstance(suspension_payload["candidatePids"], list)
+            assert isinstance(suspension_payload["candidatePidsTruncated"], bool)
+            assert isinstance(suspension_payload["visibleOwnerPids"], list)
+            assert isinstance(suspension_payload["visibleOwnerPidsTruncated"], bool)
+            assert isinstance(suspension_payload["visibleWindowNumbers"], list)
+            assert isinstance(suspension_payload["visibleWindowNumbersTruncated"], bool)
+            assert isinstance(suspension_payload["discoveryErrors"], list)
+            assert isinstance(suspension_payload["discoveryErrorsTruncated"], bool)
+            assert isinstance(suspension_payload["evidenceTruncated"], bool)
+            assert len(suspension_payload["candidatePids"]) <= 64
+            assert len(suspension_payload["visibleOwnerPids"]) <= 64
+            assert len(suspension_payload["visibleWindowNumbers"]) <= 64
+            assert len(suspension_payload["discoveryErrors"]) <= 64
+            assert all(len(message.encode("utf-8")) <= 512 for message in suspension_payload["discoveryErrors"])
+
+            suspended_state_res = send_request(proc, reader, {
+                "jsonrpc": "2.0", "id": 44, "method": "tools/call",
+                "params": {"name": "get_overlay_state", "arguments": {}},
+            }, args.timeout)
+            suspended_state = json.loads(suspended_state_res["result"]["content"][0]["text"])
+            assert suspended_state["annotationsSuspended"] is True
+            assert suspended_state["suspensionProtocolVersion"] == 2
+            assert suspended_state["activeLeaseCount"] == 1
+            assert suspended_state["suspensionRegistryBootstrapped"] is True
+
+            suspended_list_res = send_request(proc, reader, {
+                "jsonrpc": "2.0", "id": 45, "method": "tools/call",
+                "params": {"name": "list_annotations", "arguments": {}},
+            }, args.timeout)
+            suspended_list_payload = json.loads(suspended_list_res["result"]["content"][0]["text"])
+            assert suspended_list_payload["annotationsSuspended"] is True
+            suspended_annotations = suspended_list_payload["annotations"]
+            suspended_text = next((a for a in suspended_annotations if a.get("id") == text_annotation_id), None)
+            assert suspended_text is not None, "suspension must not clear an annotation or mint it a new ID"
+            assert suspended_text.get("type") == "text"
+            assert suspended_text.get("remainingSeconds", 0) > 0, "suspension must not discard a live annotation's TTL"
+        finally:
+            if suspension_token is not None:
+                resume_res = resume_annotations_with_retry(
+                    proc, reader, args.timeout, 46, suspension_token
+                )
+                assert "result" in resume_res, resume_res
+                assert not resume_res["result"].get("isError", False), resume_res
+
+        resumed_state_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": 47, "method": "tools/call",
+            "params": {"name": "get_overlay_state", "arguments": {}},
         }, args.timeout)
+        resumed_state = json.loads(resumed_state_res["result"]["content"][0]["text"])
+        assert resumed_state["annotationsSuspended"] is False
+        assert resumed_state["activeLeaseCount"] == 0
+        assert resumed_state["suspensionProtocolVersion"] == 2
+        assert resumed_state["suspensionRegistryBootstrapped"] is True
+        assert resumed_state["version"] == server_info["version"]
+        assert resumed_state["buildIdentifier"] == server_info["buildIdentifier"]
+
+        presentation_res, first_transient_presentation = verify_presentation_until_settled(
+            proc, reader, args.timeout, 4100, path_annotation_id
+        )
         presentation = json.loads(presentation_res["result"]["content"][0]["text"])
         assert presentation["annotationId"] == path_annotation_id
         assert "presentationReady" in presentation and "failureReasons" in presentation
+        if first_transient_presentation is not None:
+            print(
+                "verify_presentation first transient status:",
+                json.dumps(first_transient_presentation, sort_keys=True),
+                flush=True,
+            )
         print("verify_presentation status:", json.dumps(presentation, sort_keys=True), flush=True)
         assert presentation["presentationReady"] is True, presentation["failureReasons"]
 
@@ -335,6 +530,7 @@ def main():
             (screen for screen in screen_payload["screens"] if screen.get("isMain")),
             screen_payload["screens"][0],
         )
+        assert screen_payload["annotationsSuspended"] is False
         preview_width = 500
         preview_height = max(1, round(preview_width * main_screen["heightPx"] / main_screen["widthPx"]))
         temp_png = tempfile.NamedTemporaryFile(prefix="ai-chalkboard-clean-", suffix=".png", delete=False)
@@ -391,7 +587,7 @@ def main():
         assert not any(annotation.get("appId") == "com.example.ClearTarget" for annotation in after_clear)
         assert any(annotation.get("appId") == "com.example.PreserveTarget" for annotation in after_clear)
 
-        print("\nAll draw, expiry-metadata, annotation-list, image-verification, and explicit-clear MCP tests PASSED!", flush=True)
+        print("\nAll draw, suspension/resume, expiry-metadata, annotation-list, image-verification, and explicit-clear MCP tests PASSED!", flush=True)
     except Exception:
         failed = True
         raise
@@ -402,6 +598,7 @@ def main():
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+        shutil.rmtree(suspension_root, ignore_errors=True)
         diagnostics = stderr_diagnostics(proc)
         if failed and diagnostics:
             print(diagnostics, file=sys.stderr, flush=True)

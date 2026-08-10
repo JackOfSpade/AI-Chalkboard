@@ -8,12 +8,13 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 
 ## Key Features
 
-- **Click-Through Input Transparency**: Built with `window.ignoresMouseEvents = true`. The overlay window never consumes mouse clicks, drags, or keystrokes. It is also ordered fully off screen (not just left transparent) on any screen with nothing currently visible to paint, so a tool that determines click ownership by walking the on-screen window list — rather than by routing a real click and letting the window server honor `ignoresMouseEvents` — never finds AI Chalkboard occupying a screen it isn't actively annotating.
+- **Click-Through Input Transparency**: Built with `window.ignoresMouseEvents = true`. The overlay window never consumes mouse clicks, drags, or keystrokes. It is also ordered fully off screen (not just left transparent) on any screen with nothing currently visible to paint, so a tool that determines click ownership by walking the on-screen window list — rather than by routing a real click and letting the window server honor `ignoresMouseEvents` — never finds AI Chalkboard occupying a screen it isn't actively annotating. For dispatchers that still reject any visible overlay, `suspend_annotations` temporarily orders the overlay out without clearing its annotations; call `resume_annotations` after the click.
 - **Multi-Monitor Aware**: Automatically spawns transparent overlay windows across all connected displays and adjusts when display configurations change.
 - **First-Class Text and Free Drawing**: `draw_text` renders normal UI labels directly. `draw_path` accepts arbitrary SVG geometry, `draw_image` places caller-rendered raster art, and `draw_batch` combines primitives atomically. This keeps shapes unrestricted without making ordinary text a PNG-generation chore.
 - **Coordinate-Space Inputs**: `draw_path`, `draw_image`, `draw_text`, and `draw_batch` accept top-left-origin `backing_pixels` (the default), `normalized` 0…1, or `screenshot_pixels` coordinates. Screenshot-space calls state `screenshot_width` and `screenshot_height`, so their geometry is scaled to the selected display. SVG paths retain source coordinates plus their backing-pixel scale; text/image positions are stored in backing pixels. Stroke, font, padding, and other style dimensions always remain backing pixels. `backingScaleFactor` reflects the active macOS display mode, not the panel's marketing label.
 - **Element-Anchored Highlighting**: `highlight_element` can locate a named accessible UI element (for example, a button titled “Fusion”) and highlight its resolved bounds. `get_accessibility_status` reports whether macOS Accessibility access is available before a call depends on it.
 - **Stable In-Place Adjustment**: `update_annotation` moves or restyles an existing annotation without minting a new ID, preserving the ID used by verification and clear operations. Explicit `z_index` controls ordering between annotations; later batch items remain on top of earlier items within that batch.
+- **Leased Suspension for Click Workflows**: `suspend_annotations` acquires a 1–60-second (15-second default) lease and orders overlay windows out while retaining annotations, IDs, and running TTLs. Keep its `leaseToken` secret and release exactly that token with `resume_annotations`; overlapping callers cannot accidentally resume one another’s overlays. An optional canonical UUID idempotency key makes safe retries return the same active lease only from its creator MCP server process instance. Generate a fresh random UUID and treat it as secret too; reuse from another instance is rejected and never reveals the other lease token. The result only says `clickSafeAtObservation: true` after bounded WindowServer observation and a final durable read confirm that exact live generation and its peer presentation are settled. This is point-in-time evidence, not raw-framebuffer/occlusion proof and not true simultaneous highlight-and-click support.
 - **Auto-Clear Duration**: Optional `duration_seconds` parameter on all drawing tools (e.g. `duration_seconds: 3.0`) causes drawing annotations to automatically disappear after N seconds to keep the screen uncluttered. Durations are bounded to seven days; omit the field for persistence.
 - **Closed-Loop Verification**: `verify_annotation` proves free-draw placement against a clean UI screenshot using the exact live renderer. `verify_presentation` separately checks the retained AppKit window/view, WindowServer on-screen registration, and bounded alignment with the annotation's target display so agents can detect most presentation failures without asking a human to eyeball the display.
 - **Capture Debug Request**: `set_capture_visible(true)` asks compatible capture paths to include the overlay and renders all annotations for placement checks. Capture programs retain their own app/window filters, so inclusion is not guaranteed; `.none` is also not a privacy boundary on modern macOS. Two safety nets guard against forgetting to turn it back off: it auto-reverts to `false` after 5 minutes with no renewal, and the menu-bar icon tints orange for as long as it's on.
@@ -25,8 +26,8 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `get_screens` | `none` | Returns display IDs, physical pixel resolutions, backing scale factors, point dimensions, and coordinate-space guidance. |
-| `get_overlay_state` | `none` | Reports overlay visibility and click-through state for click dispatchers that can honor it. |
+| `get_screens` | `none` | Returns display IDs, physical pixel resolutions, backing scale factors, point dimensions, coordinate-space guidance, and the top-level `annotationsSuspended` presentation state. |
+| `get_overlay_state` | `none` | Reports overlay visibility, click-through state, and top-level `annotationsSuspended` for click dispatchers that can honor it. |
 | `draw_path` | `path_data`, `stroke_color?`, `stroke_width?`, `stroke_opacity?`, `fill_color?`, `fill_opacity?`, `fill_rule?`, `dash?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?`, `duration_seconds?` | Draws arbitrary SVG path data. Supports absolute/relative `M L H V C S Q T A Z`, curves, arcs, fills, dashes, and independent stroke/fill opacity. |
 | `draw_image` | `image_path`, `x`, `y`, `width?`, `height?`, `rotation_degrees?`, `opacity?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?`, `duration_seconds?` | Decodes arbitrary PNG/JPEG/HEIC/TIFF art into memory once and places it with alpha, scaling, rotation, and a selected coordinate space. |
 | `draw_text` | `text`, `x`, `y`, `font_size`, `color?`, `background_color?`, `background_opacity?`, `padding_px?`, `opacity?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?`, `duration_seconds?` | Renders a text label at a top-left position without requiring an intermediate raster image. `font_size` is required. |
@@ -34,11 +35,13 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 | `highlight_element` | `label`, `app?`, `role?`, `match?`, `occurrence?`, `padding_px?`, `stroke_color?`/`color?`, `stroke_width?`, `stroke_opacity?`, `fill_color?`, `fill_opacity?`, `duration_seconds?`, `z?`/`z_index?` | Resolves one element in a running app's Accessibility hierarchy and draws a normal vector rectangle around its bounds. Exact matching is the default; ambiguous results require a one-based occurrence. |
 | `get_accessibility_status` | `request_permission?` | Reports macOS Accessibility authorization. `request_permission` defaults to false; set it true only to explicitly ask macOS to show its permission prompt. |
 | `update_annotation` | `annotation_id`, `offset_x?`, `offset_y?`, `opacity?`, `z_index?`, kind-specific style fields | Moves or restyles an annotation in place. Its ID and creation identity remain stable. |
+| `suspend_annotations` | `lease_seconds?`, `idempotency_key?` | Acquires a short-lived suspension lease and returns secret `leaseToken`. `lease_seconds` is integer 1–60 (default 15); `idempotency_key` is an optional secret lowercase canonical UUID for retries from the same MCP server process instance. Reuse elsewhere errors without revealing a token. Only act on `clickSafeAtObservation: true`. |
+| `resume_annotations` | `lease_token` | Releases exactly one returned secret `leaseToken`. If another lease remains, the result succeeds only when `peerPresentationSettled=true`; otherwise the token is released but the result is an error. With no remaining lease, the result records a linearized snapshot/restoration request, not global convergence proof. Tombstone cleanup lasts 120 seconds. |
 | `clear` | `annotation_id?`, `scope?`, `app?` | Clears one exact ID when supplied. Otherwise pass `app` to target that app plus globals; omission preserves fallback-app behavior. Use `scope="all"` (without `app`) to clear every app. |
-| `list_annotations` | `offset?`, `limit?` | Returns a bounded page of active annotations, including RFC 3339 `expiresAt` and live `remainingSeconds` TTL metadata. Follow `nextOffset` to page; huge geometry is explicitly summarized instead of producing an oversized MCP response. |
+| `list_annotations` | `offset?`, `limit?` | Returns a bounded page of active annotations, including RFC 3339 `expiresAt`, live `remainingSeconds` TTL metadata, and top-level `annotationsSuspended`. Follow `nextOffset` to page; huge geometry is explicitly summarized instead of producing an oversized MCP response. |
 | `verify_annotation` | `annotation_id`, `screenshot_path?` or `capture_source="chalkboard"`, `request_permission?`, `padding_px?` | Returns a PNG crop composited with the exact live renderer. Exactly one screenshot source is required; `request_permission` is valid only for Chalkboard capture and defaults to false. |
 | `verify_presentation` | `annotation_id` | Checks AppKit drawable state plus WindowServer all/on-screen registration and target-display bounds. Catches missing/hidden/detached/transparent/wrong-level/frame/display windows; does not claim raw-framebuffer proof. |
-| `get_active_app` | `none` | Returns raw/current frontmost app state and the fallback app targeted by untagged drawing calls. |
+| `get_active_app` | `none` | Returns raw/current frontmost app state, the fallback app targeted by untagged drawing calls, and local `annotationsSuspended` presentation state. |
 | `set_capture_visible` | `visible` | Applies capture-debug state locally before responding, then broadcasts it to sibling instances; external capture filters still decide inclusion. |
 
 ---
@@ -95,15 +98,45 @@ appears in ordinary topmost-window listings. A computer-use click ownership
 heuristic must consult the reported click-through state (or dispatch a real
 click), rather than treating the presence of any non-allowlisted overlay window
 as ownership. Chalkboard can report that state; it cannot change another
-tool's click-dispatch policy.
+tool's click-dispatch policy. When that dispatcher cannot honor the state, use
+this ordered workaround: draw/highlight → `suspend_annotations` with a short
+lease → retain its secret `leaseToken` → wait for `clickSafeAtObservation: true` →
+perform the computer-use click → `resume_annotations` with that exact token.
+The lease expires automatically (default 15 seconds, maximum 60) if cleanup
+is lost; release it promptly anyway. A retry using the same fresh, lowercase
+canonical UUID `idempotency_key` returns the same active lease instead of
+creating an overlapping one. Both the key and returned token are capabilities:
+do not put either in logs, issue trackers, or shared prompts. The idempotency
+key is scoped to its creator MCP server process instance while that lease
+remains active; another instance reusing it gets an error and never receives
+the token. Never
+reuse a key between independent callers. Releasing an already-released
+or expired token is deliberately successful cleanup only during the bounded
+120-second tombstone window; afterwards it is unknown and returns an error.
+The result names the bounded
+cooperating-process/window-observation scope and is deliberately honest: it is
+not raw-framebuffer or occlusion proof, and a process/window created after the
+observation can change the state. Suspension keeps IDs and does not pause or
+extend TTLs, so an annotation may expire while hidden. It is a compatibility
+workaround, not true concurrent highlight-and-click support: keeping a
+highlight visible during the click still requires the computer-use dispatcher
+to honor `ignoresMouseEvents`.
+
+`resume_annotations` also distinguishes durable state from presentation
+settlement. When another lease remains, a successful response requires
+`peerPresentationSettled=true` for the current generation; a failed settle
+returns an MCP error even though that caller's token has already been released.
+When the released token was the final lease, the response reports only the
+linearized no-lease snapshot and that restoration was requested. It does not
+claim every peer/window has already converged on screen.
 
 ---
 
 ## Verifying an MCP refactor: wire-output snapshots
 
 [`tests/mcp_wire_snapshot.py`](tests/mcp_wire_snapshot.py) captures JSON-RPC responses from the real
-`AIChalkboard --mcp` binary for a fixed, wide set of stable requests (all tool dispatch paths plus
-representative success and failure modes, `initialize`, `ping`, an unknown method, an unknown tool,
+`AIChalkboard --mcp` binary for a fixed, wide set of stable requests (the full tool catalog plus
+non-session-global dispatch paths and representative success/failure modes, `initialize`, `ping`, an unknown method, an unknown tool,
 …), canonicalises away
 volatile fields (UUIDs, timestamps, whichever app happens to be frontmost), and diffs two such
 captures. Use it before/after a change to the MCP dispatch, validation, or tool-catalog layer:
@@ -130,6 +163,12 @@ the repo as a baseline, and never compared across machines.
 ./build_app.sh
 ```
 Executes release compilation and packages `.build/release/AIChalkboard.app`.
+Local release builds are pinned to the persistent `AI Chalkboard Local Code
+Signing` identity in the login keychain (SHA-1
+`65B98DF43D4BF99750538424213806A962381046`). This keeps the app's designated
+requirement stable across rebuilds so macOS Screen Recording and Accessibility
+grants survive ordinary local updates. The build fails instead of falling back
+to ad-hoc signing if that exact identity or its private key is unavailable.
 
 ---
 

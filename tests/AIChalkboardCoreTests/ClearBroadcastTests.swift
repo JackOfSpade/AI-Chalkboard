@@ -52,4 +52,18 @@ final class ClearBroadcastTests: XCTestCase {
             XCTAssertTrue(store.getAll().isEmpty)
         }
     }
+
+    func testDurableSuspensionInvalidationRemainsIsolatedFromDestructiveClear() {
+        XCTAssertEqual(
+            Notification.Name.chalkboardSuspensionInvalidated.rawValue.hasPrefix(
+                "com.aichalkboard.overlay.suspensionLeaseInvalidated.v2"
+            ),
+            true
+        )
+        XCTAssertNotEqual(
+            Notification.Name.chalkboardSuspensionInvalidated,
+            .chalkboardClearAll,
+            "durable suspension invalidation must never share the destructive clear channel"
+        )
+    }
 }

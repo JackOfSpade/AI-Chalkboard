@@ -18,7 +18,7 @@ final class MCPToolCatalogTests: XCTestCase {
 
     func testToolNamesAndOrderAreExactlyTheFreeDrawSurface() {
         XCTAssertEqual(MCPToolCatalog.tools.map { $0["name"] as? String }, [
-            "get_screens", "get_overlay_state", "get_accessibility_status", "draw_path", "draw_image", "draw_text", "highlight_element", "draw_batch", "update_annotation", "clear", "list_annotations",
+            "get_screens", "get_overlay_state", "get_accessibility_status", "draw_path", "draw_image", "draw_text", "highlight_element", "draw_batch", "update_annotation", "suspend_annotations", "resume_annotations", "clear", "list_annotations",
             "verify_annotation", "verify_presentation", "get_active_app", "set_capture_visible"
         ])
     }
@@ -50,6 +50,8 @@ final class MCPToolCatalogTests: XCTestCase {
             "highlight_element": ["label"],
             "draw_batch": ["items"],
             "update_annotation": ["annotation_id"],
+            "suspend_annotations": nil,
+            "resume_annotations": ["lease_token"],
             "clear": nil,
             "list_annotations": nil,
             "verify_annotation": ["annotation_id"],
@@ -115,5 +117,59 @@ final class MCPToolCatalogTests: XCTestCase {
         XCTAssertEqual((highlight["occurrence"] as? [String: Any])?["minimum"] as? Int, 1)
         XCTAssertEqual((highlight["z"] as? [String: Any])?["type"] as? String, "integer")
         XCTAssertEqual((highlight["color"] as? [String: Any])?["type"] as? String, "string")
+    }
+
+    func testSuspensionLeaseSchemasAreStrictAndPreserveTheClickWorkaroundContract() throws {
+        let suspend = try XCTUnwrap(toolsByName["suspend_annotations"])
+        let resume = try XCTUnwrap(toolsByName["resume_annotations"])
+        XCTAssertEqual(inputSchema(suspend)["type"] as? String, "object")
+        XCTAssertEqual(inputSchema(suspend)["additionalProperties"] as? Bool, false)
+        XCTAssertNil(inputSchema(suspend)["required"])
+        let suspendProperties = properties(suspend)
+        XCTAssertEqual(Set(suspendProperties.keys), ["lease_seconds", "idempotency_key"])
+        XCTAssertEqual((suspendProperties["lease_seconds"] as? [String: Any])?["type"] as? String, "integer")
+        XCTAssertEqual((suspendProperties["lease_seconds"] as? [String: Any])?["minimum"] as? Int, 1)
+        XCTAssertEqual((suspendProperties["lease_seconds"] as? [String: Any])?["maximum"] as? Int, 60)
+        XCTAssertEqual((suspendProperties["idempotency_key"] as? [String: Any])?["pattern"] as? String,
+                       "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+        XCTAssertEqual(inputSchema(resume)["type"] as? String, "object")
+        XCTAssertEqual(inputSchema(resume)["additionalProperties"] as? Bool, false)
+        XCTAssertEqual(inputSchema(resume)["required"] as? [String], ["lease_token"])
+        let resumeProperties = properties(resume)
+        XCTAssertEqual(Set(resumeProperties.keys), ["lease_token"])
+        XCTAssertEqual((resumeProperties["lease_token"] as? [String: Any])?["minLength"] as? Int, 43)
+        XCTAssertEqual((resumeProperties["lease_token"] as? [String: Any])?["maxLength"] as? Int, 43)
+        XCTAssertEqual((resumeProperties["lease_token"] as? [String: Any])?["pattern"] as? String, "^[A-Za-z0-9_-]{43}$")
+
+        let suspendDescription = suspend["description"] as? String ?? ""
+        let resumeDescription = resume["description"] as? String ?? ""
+        XCTAssertTrue(suspendDescription.contains("click") && suspendDescription.contains("leaseToken"))
+        XCTAssertTrue(suspendDescription.contains("secret") && suspendDescription.contains("MCP server process instance"))
+        XCTAssertTrue(resumeDescription.contains("suspend_annotations") && resumeDescription.contains("lease"))
+        XCTAssertTrue(resumeDescription.contains("120-second"))
+        XCTAssertTrue(resumeDescription.contains("peer presentation settled"))
+        XCTAssertTrue(resumeDescription.contains("not proof of global window convergence"))
+    }
+
+    func testSuspendedReleaseRequiresPeerPresentationSettlementForMCPSuccess() {
+        XCTAssertTrue(SuspensionLeaseResponsePolicy.isError(
+            operation: "release", operationSucceeded: true,
+            annotationsSuspended: true, peerPresentationSettled: false
+        ))
+        XCTAssertFalse(SuspensionLeaseResponsePolicy.isError(
+            operation: "release", operationSucceeded: true,
+            annotationsSuspended: true, peerPresentationSettled: true
+        ))
+        // Final release deliberately has no global convergence proof, but the
+        // linearized durable mutation itself is still a successful cleanup.
+        XCTAssertFalse(SuspensionLeaseResponsePolicy.isError(
+            operation: "release", operationSucceeded: true,
+            annotationsSuspended: false, peerPresentationSettled: false
+        ))
+        XCTAssertTrue(SuspensionLeaseResponsePolicy.isError(
+            operation: "acquire", operationSucceeded: false,
+            annotationsSuspended: true, peerPresentationSettled: false
+        ))
     }
 }

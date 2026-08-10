@@ -399,7 +399,8 @@ public final class MCPServer: @unchecked Sendable {
             ],
             "serverInfo": [
                 "name": "ai-chalkboard",
-                "version": "2.0.0"
+                "version": BuildMetadata.productVersion,
+                "buildIdentifier": BuildMetadata.buildIdentifier
             ]
         ]
         sendResponse(["jsonrpc": "2.0", "id": id, "result": result])
@@ -410,18 +411,22 @@ public final class MCPServer: @unchecked Sendable {
         sendResponse(["jsonrpc": "2.0", "id": id, "result": ["tools": MCPToolCatalog.tools]])
     }
 
-    func sendTextResult(id: Any, text: String) {
+    func sendTextResult(id: Any, text: String, isError: Bool = false) {
+        var result: [String: Any] = [
+            "content": [
+                [
+                    "type": "text",
+                    "text": text
+                ]
+            ]
+        ]
+        if isError {
+            result["isError"] = true
+        }
         sendResponse([
             "jsonrpc": "2.0",
             "id": id,
-            "result": [
-                "content": [
-                    [
-                        "type": "text",
-                        "text": text
-                    ]
-                ]
-            ]
+            "result": result
         ])
     }
 

@@ -192,6 +192,30 @@ _TOOL_CALLS: list[tuple[str, str, dict[str, Any]]] = [
     # safe way to exercise this tool's dispatch at all.
     ("call_capture_visible_missing_args", "set_capture_visible", {}),
 
+    # Real lease calls alter shared presentation state, so do not invoke their
+    # valid path from this fixture. Each malformed request below is rejected
+    # before a lease, coordinator write, or transport broadcast can occur.
+    ("call_suspend_unexpected_args", "suspend_annotations", {"unexpected": True}),
+    ("call_suspend_bad_duration", "suspend_annotations", {"lease_seconds": 0}),
+    ("call_suspend_boolean_duration", "suspend_annotations", {"lease_seconds": True}),
+    ("call_suspend_numeric_string_duration", "suspend_annotations", {"lease_seconds": "15"}),
+    ("call_suspend_fractional_duration", "suspend_annotations", {"lease_seconds": 1.5}),
+    ("call_suspend_null_duration", "suspend_annotations", {"lease_seconds": None}),
+    ("call_suspend_extreme_duration", "suspend_annotations", {"lease_seconds": 10 ** 100}),
+    ("call_suspend_bad_idempotency_key", "suspend_annotations", {"idempotency_key": "not-a-uuid"}),
+    ("call_suspend_uppercase_idempotency_key", "suspend_annotations", {"idempotency_key": "A0B1C2D3-E4F5-4A6B-8C9D-0E1F2A3B4C5D"}),
+    ("call_suspend_braced_idempotency_key", "suspend_annotations", {"idempotency_key": "{a0b1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d}"}),
+    ("call_suspend_non_string_idempotency_key", "suspend_annotations", {"idempotency_key": 4}),
+    ("call_suspend_null_idempotency_key", "suspend_annotations", {"idempotency_key": None}),
+    ("call_resume_missing_token", "resume_annotations", {}),
+    ("call_resume_bad_token", "resume_annotations", {"lease_token": "not-a-token"}),
+    ("call_resume_unicode_token", "resume_annotations", {"lease_token": "é" * 22}),
+    ("call_resume_null_token", "resume_annotations", {"lease_token": None}),
+    ("call_resume_numeric_token", "resume_annotations", {"lease_token": 1}),
+    ("call_resume_unexpected_args", "resume_annotations", {"lease_token": "A" * 43, "unexpected": True}),
+    # The disposable-process valid lifecycle is exercised by test_mcp_stdio.py,
+    # which always resumes in a finally block.
+
     ("call_get_screens", "get_screens", {}),
     ("call_get_overlay_state", "get_overlay_state", {}),
     ("call_get_active_app", "get_active_app", {}),

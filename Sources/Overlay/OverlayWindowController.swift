@@ -80,15 +80,21 @@ public struct OverlayInputPolicySnapshot: Codable, Equatable {
     public let windowNumber: Int?
     public let isOnScreen: Bool
     public let hasVisibleContent: Bool
+    /// Whether annotations are intentionally hidden while retained in the
+    /// store. When true every process-local overlay window is ordered out, so
+    /// WindowServer ownership scans do not find an AI Chalkboard window.
+    public let annotationsSuspended: Bool
     public let ignoresMouseEvents: Bool
     public let sharingType: String
 
     public init(screenId: String, windowNumber: Int?, isOnScreen: Bool,
-                hasVisibleContent: Bool, ignoresMouseEvents: Bool, sharingType: String) {
+                hasVisibleContent: Bool, annotationsSuspended: Bool,
+                ignoresMouseEvents: Bool, sharingType: String) {
         self.screenId = screenId
         self.windowNumber = windowNumber
         self.isOnScreen = isOnScreen
         self.hasVisibleContent = hasVisibleContent
+        self.annotationsSuspended = annotationsSuspended
         self.ignoresMouseEvents = ignoresMouseEvents
         self.sharingType = sharingType
     }
@@ -133,6 +139,16 @@ public struct ScreenSnapshot {
 public final class OverlayWindowController: NSObject {
     public static let shared = OverlayWindowController()
 
+    /// Ordering a transparent, full-display overlay back in must be
+    /// immediate. AppKit's default window transform animation leaves a
+    /// short-lived WindowServer entry with an interpolated alpha and inset
+    /// bounds after `orderFrontRegardless()`. That makes an acknowledged
+    /// resume look visibly/readiness-incomplete even though the AppKit window
+    /// itself already reports alpha 1. Disabling the transition gives both
+    /// click-workflow resume and `verify_presentation` a single, stable
+    /// postcondition rather than making callers guess a delay.
+    static let overlayWindowAnimationBehavior: NSWindow.AnimationBehavior = .none
+
     /// One entry per real on-screen display, in the order `NSScreen.screens`
     /// produced them at the last rebuild.
     ///
@@ -148,6 +164,32 @@ public final class OverlayWindowController: NSObject {
     /// these are actually consumed.
     private var overlayWindows: [NSWindow] = []
     private var overlayViews: [OverlayView] = []
+
+    /// MAIN-THREAD-ONLY. Suspension is deliberately presentation state, not
+    /// store state: annotations, their stable IDs, creation dates, and TTLs
+    /// remain untouched so resume can make the exact still-live set visible
+    /// again. Every mutation goes through `setAnnotationsSuspended(_:)`, which
+    /// synchronously hops to AppKit's main thread before acknowledging an MCP
+    /// request or a broadcast.
+    // Fail closed until `SuspensionLeaseCoordinator.bootstrapAndReconcile()`
+    // synchronously reads the shared lease registry during launch. A new MCP
+    // process must never flash an overlay while another process owns a lease.
+    private var annotationsSuspended = true
+
+    /// The durable suspension-registry generation which produced the current
+    /// presentation decision.  `nil` means this process has not completed its
+    /// startup reconciliation yet.  Keeping the generation beside the AppKit
+    /// state is important: two background reconciliations can reach the main
+    /// queue in the opposite order, and an older resume must never order a
+    /// newer suspension back on screen.
+    private var annotationsSuspensionGeneration: UInt64?
+
+    /// Whether this process has temporarily ordered all overlay windows out.
+    /// Kept as a synchronous query because MCP diagnostics must describe the
+    /// state that is already in effect, not a pending main-queue mutation.
+    public var isAnnotationsSuspended: Bool {
+        MainThread.sync { annotationsSuspended }
+    }
 
     // MARK: - Capture visibility
     //
@@ -272,6 +314,94 @@ public final class OverlayWindowController: NSObject {
 
             onCaptureVisibleChanged?(visible)
             return changed
+        }
+    }
+
+    /// Temporarily removes or restores this process's overlay windows without
+    /// mutating `AnnotationStore`. Suspending makes every full-screen overlay
+    /// disappear from WindowServer's on-screen list, which is a practical
+    /// workaround for click dispatchers that reject a point merely because an
+    /// overlay window is present. It is not simultaneous visual click-through:
+    /// annotations are absent until a later resume.
+    ///
+    /// This intentionally reapplies the requested ordering even on a same
+    /// value call. The state transition is idempotent, while re-ordering makes
+    /// a repeated suspend/resume self-heal after a display rebuild or another
+    /// AppKit ordering event.
+    @discardableResult
+    public func setAnnotationsSuspended(_ suspended: Bool) -> Bool {
+        MainThread.sync {
+            let changed = annotationsSuspended != suspended
+            annotationsSuspended = suspended
+
+            if suspended {
+                // `orderOut` is stronger than leaving a transparent or
+                // click-through window on screen: it removes every overlay
+                // window in THIS process from WindowServer ownership scans.
+                for window in overlayWindows {
+                    window.orderOut(nil)
+                }
+                for view in overlayViews {
+                    view.needsDisplay = true
+                }
+            } else {
+                // Re-evaluate the current app/capture filters rather than
+                // replaying a stale visibility snapshot taken at suspension
+                // time. New, expired, cleared, or app-switched annotations are
+                // therefore handled exactly as they would have been normally.
+                refreshViewsNow()
+            }
+
+            Logger.shared.log(
+                "OverlayWindowController: annotations suspension set to \(suspended) on \(overlayWindows.count) overlay window reference(s); store contents were retained.",
+                level: "INFO"
+            )
+            return changed
+        }
+    }
+
+    /// Applies the only authoritative presentation decision: one read from
+    /// the durable lease registry.  This is intentionally separate from the
+    /// unversioned compatibility method above, which is used only by older
+    /// in-process tests.  Calls with an older generation are ignored on the
+    /// main thread, where window ordering occurs, so queue reordering cannot
+    /// resurrect an overlay after a later suspension.
+    @discardableResult
+    public func setAnnotationsSuspended(_ suspended: Bool, generation: UInt64) -> Bool {
+        MainThread.sync {
+            if let applied = annotationsSuspensionGeneration, generation < applied {
+                return false
+            }
+            annotationsSuspensionGeneration = generation
+            let changed = annotationsSuspended != suspended
+            annotationsSuspended = suspended
+
+            if suspended {
+                for window in overlayWindows { window.orderOut(nil) }
+                for view in overlayViews { view.needsDisplay = true }
+            } else {
+                refreshViewsNow()
+            }
+
+            Logger.shared.log(
+                "OverlayWindowController: applied durable annotations suspension generation=\(generation) suspended=\(suspended) on \(overlayWindows.count) overlay window reference(s).",
+                level: "INFO"
+            )
+            return changed
+        }
+    }
+
+    /// Storage/lock failures are deliberately more conservative than ordinary
+    /// generation changes: the only safe action is to remove our windows.
+    /// This does not advance the durable generation, so the next successful
+    /// reconciliation (including one with the same generation) can restore
+    /// the registry's actual decision.
+    public func forceAnnotationsSuspendedFailClosed() {
+        MainThread.sync {
+            annotationsSuspended = true
+            for window in overlayWindows { window.orderOut(nil) }
+            for view in overlayViews { view.needsDisplay = true }
+            Logger.shared.log("OverlayWindowController: suspension registry unavailable; ordered overlays out fail-closed.", level: "ERROR")
         }
     }
 
@@ -414,6 +544,7 @@ public final class OverlayWindowController: NSObject {
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
+        window.animationBehavior = Self.overlayWindowAnimationBehavior
 
         // Born with whatever the user last requested (default `.none`; see the
         // `desiredSharingType` doc comment for the legacy-sharing caveat).
@@ -525,6 +656,13 @@ public final class OverlayWindowController: NSObject {
     /// all). Keeping one definition is what makes those two questions
     /// impossible to answer inconsistently with each other.
     public func currentlyVisibleAnnotations(forScreenId screenId: String) -> [Annotation] {
+        // Suspension is an explicit presentation override. Returning no
+        // visible annotations here keeps OverlayView, input-policy diagnostics,
+        // and presentation checks truthful while the retained store remains
+        // completely unchanged for resume.
+        if isAnnotationsSuspended {
+            return []
+        }
         if isCaptureVisible {
             return AnnotationStore.shared.getForScreen(screenId)
         }
@@ -590,6 +728,56 @@ public final class OverlayWindowController: NSObject {
     /// retain the ordinary asynchronous repaint behaviour.
     private func refreshViewsNow() {
         precondition(Thread.isMainThread, "Overlay window ordering is AppKit-main-thread-only")
+        // No state read is sufficient on its own: a concurrent acquire could
+        // persist after the read but before `orderFrontRegardless()`.  The
+        // coordinator keeps the registry operation lock across the short
+        // AppKit closure below, so an acquire cannot cross that gap.  Before
+        // launch reconciliation has installed a durable generation we fail
+        // closed and never order a newly-created overlay on screen.
+        guard annotationsSuspensionGeneration != nil else {
+            orderAllOverlayWindowsOut()
+            return
+        }
+        _ = SuspensionLeaseCoordinator.shared.withPresentationPermit { [weak self] permit in
+            self?.refreshViewsNow(under: permit)
+        }
+    }
+
+    /// Runs only from `withPresentationPermit`, while its durable flock is
+    /// held.  Keep this limited to immediate AppKit ordering and invalidation:
+    /// calling back into the coordinator here would self-contend on flock.
+    private func refreshViewsNow(under permit: SuspensionLeaseSnapshot) {
+        precondition(Thread.isMainThread, "Overlay window ordering is AppKit-main-thread-only")
+        if permit.error != nil || permit.annotationsSuspended {
+            // A failed durable read is deliberately indistinguishable from a
+            // live lease at presentation time: both leave every local overlay
+            // absent from WindowServer ownership scans.
+            if permit.error == nil {
+                if let applied = annotationsSuspensionGeneration {
+                    if permit.generation >= applied {
+                        annotationsSuspensionGeneration = permit.generation
+                    }
+                } else {
+                    annotationsSuspensionGeneration = permit.generation
+                }
+            }
+            annotationsSuspended = true
+            orderAllOverlayWindowsOut()
+            return
+        }
+
+        // A permit that is older than the state this process already applied
+        // must not resurrect a window. This should be unreachable for a valid
+        // registry, but failing closed is the correct response to a replaced
+        // or otherwise non-monotonic state file.
+        if let applied = annotationsSuspensionGeneration, permit.generation < applied {
+            annotationsSuspended = true
+            orderAllOverlayWindowsOut()
+            return
+        }
+        annotationsSuspensionGeneration = permit.generation
+        annotationsSuspended = false
+
         for (window, view) in zip(overlayWindows, overlayViews) {
             let hasContent = !currentlyVisibleAnnotations(forScreenId: view.screenId).isEmpty
             if hasContent {
@@ -601,6 +789,18 @@ public final class OverlayWindowController: NSObject {
         }
     }
 
+    private func orderAllOverlayWindowsOut() {
+        precondition(Thread.isMainThread, "Overlay window ordering is AppKit-main-thread-only")
+        // An externally implemented ownership heuristic can only see an
+        // absent overlay when *every* process-local window is fully ordered
+        // out. Do this before consulting per-app/capture filters: suspension
+        // is an absolute presentation override.
+        for (window, view) in zip(overlayWindows, overlayViews) {
+            window.orderOut(nil)
+            view.needsDisplay = true
+        }
+    }
+
     /// Samples the actual AppKit window and its independently-maintained
     /// WindowServer registration for an annotation.  Unlike
     /// `verify_annotation`, this does not synthesize an image: it establishes
@@ -608,11 +808,13 @@ public final class OverlayWindowController: NSObject {
     /// window at the expected level.  It still cannot prove an individual
     /// painted pixel was not occluded or filtered from somebody else's capture.
     func presentationStatus(for annotationId: String) -> PresentationStatus {
+        let suspendedWithoutAnnotation = isAnnotationsSuspended
         guard let annotation = AnnotationStore.shared.get(id: annotationId),
               annotation.expiresAt.map({ $0 > Date() }) ?? true else {
             let input = PresentationReadinessInput(
                 annotationExists: false,
                 annotationIsInCurrentVisibleSet: false,
+                annotationsSuspended: suspendedWithoutAnnotation,
                 overlayWindowExists: false,
                 contentViewIsExpectedOverlayView: false,
                 viewIsAttachedToWindow: false,
@@ -634,6 +836,7 @@ public final class OverlayWindowController: NSObject {
                 annotationExists: false,
                 screenId: nil,
                 annotationIsInCurrentVisibleSet: false,
+                annotationsSuspended: suspendedWithoutAnnotation,
                 expectedWindowShouldBeOnScreen: false,
                 expectedLevel: NSWindow.Level.statusBar.rawValue,
                 expectedAlpha: 1,
@@ -662,6 +865,7 @@ public final class OverlayWindowController: NSObject {
 
             let visibleIDs = Set(currentlyVisibleAnnotations(forScreenId: annotation.screenId).map(\.id))
             let annotationIsVisible = visibleIDs.contains(annotation.id)
+            let annotationsAreSuspended = annotationsSuspended
             let expectedLevel = NSWindow.Level.statusBar.rawValue
             let expectedAlpha = 1.0
 
@@ -670,6 +874,7 @@ public final class OverlayWindowController: NSObject {
                 let input = PresentationReadinessInput(
                     annotationExists: true,
                     annotationIsInCurrentVisibleSet: annotationIsVisible,
+                    annotationsSuspended: annotationsAreSuspended,
                     overlayWindowExists: false,
                     contentViewIsExpectedOverlayView: false,
                     viewIsAttachedToWindow: false,
@@ -691,7 +896,8 @@ public final class OverlayWindowController: NSObject {
                     annotationExists: true,
                     screenId: annotation.screenId,
                     annotationIsInCurrentVisibleSet: annotationIsVisible,
-                    expectedWindowShouldBeOnScreen: annotationIsVisible,
+                    annotationsSuspended: annotationsAreSuspended,
+                    expectedWindowShouldBeOnScreen: annotationIsVisible && !annotationsAreSuspended,
                     expectedLevel: expectedLevel,
                     expectedAlpha: expectedAlpha,
                     expectedFrameAppKitPoints: nil,
@@ -746,6 +952,7 @@ public final class OverlayWindowController: NSObject {
             let input = PresentationReadinessInput(
                 annotationExists: true,
                 annotationIsInCurrentVisibleSet: annotationIsVisible,
+                annotationsSuspended: annotationsAreSuspended,
                 overlayWindowExists: true,
                 contentViewIsExpectedOverlayView: contentViewMatches,
                 viewIsAttachedToWindow: viewAttached,
@@ -770,7 +977,8 @@ public final class OverlayWindowController: NSObject {
                 annotationExists: true,
                 screenId: annotation.screenId,
                 annotationIsInCurrentVisibleSet: annotationIsVisible,
-                expectedWindowShouldBeOnScreen: annotationIsVisible,
+                annotationsSuspended: annotationsAreSuspended,
+                expectedWindowShouldBeOnScreen: annotationIsVisible && !annotationsAreSuspended,
                 expectedLevel: expectedLevel,
                 expectedAlpha: expectedAlpha,
                 expectedFrameAppKitPoints: expectedFrame,
@@ -787,7 +995,9 @@ public final class OverlayWindowController: NSObject {
                 windowServerEntryInOnScreenList: onScreenEntry,
                 presentationReady: failures.isEmpty,
                 failureReasons: failures,
-                note: "presentationReady is WindowServer/AppKit registration and drawable-state evidence, including a bounded WindowServer-bounds check against the target display. It is not proof of unoccluded pixels or inclusion in an independent capture pipeline."
+                note: annotationsAreSuspended
+                    ? "Annotations are suspended: their store entries are retained, but every AI Chalkboard overlay window in this process is intentionally ordered out. Call resume_annotations before expecting presentationReady."
+                    : "presentationReady is WindowServer/AppKit registration and drawable-state evidence, including a bounded WindowServer-bounds check against the target display. It is not proof of unoccluded pixels or inclusion in an independent capture pipeline."
             )
         }
     }
@@ -871,12 +1081,14 @@ public final class OverlayWindowController: NSObject {
     /// such as this one rather than inferring ownership from window presence.
     public func overlayInputPolicySnapshot() -> [OverlayInputPolicySnapshot] {
         MainThread.sync {
-            zip(overlayWindows, overlayViews).map { window, view in
+            let annotationsAreSuspended = annotationsSuspended
+            return zip(overlayWindows, overlayViews).map { window, view in
                 OverlayInputPolicySnapshot(
                     screenId: view.screenId,
                     windowNumber: window.windowNumber > 0 ? window.windowNumber : nil,
                     isOnScreen: window.isVisible,
                     hasVisibleContent: !currentlyVisibleAnnotations(forScreenId: view.screenId).isEmpty,
+                    annotationsSuspended: annotationsAreSuspended,
                     ignoresMouseEvents: window.ignoresMouseEvents,
                     sharingType: overlaySharingTypeName(window.sharingType)
                 )

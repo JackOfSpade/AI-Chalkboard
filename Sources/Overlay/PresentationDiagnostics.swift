@@ -16,6 +16,11 @@ struct PresentationRect: Codable, Equatable {
 struct PresentationReadinessInput: Equatable {
     let annotationExists: Bool
     let annotationIsInCurrentVisibleSet: Bool
+    /// The annotation can still be in the current app/capture-visible set
+    /// while presentation is deliberately suppressed. This is kept separate
+    /// so diagnostics can distinguish a retained suspended drawing from one
+    /// that is filtered by app linkage or missing entirely.
+    let annotationsSuspended: Bool
     let overlayWindowExists: Bool
     let contentViewIsExpectedOverlayView: Bool
     let viewIsAttachedToWindow: Bool
@@ -41,6 +46,19 @@ enum PresentationReadiness {
     /// an MCP caller can distinguish a hidden annotation from a genuinely
     /// missing/ordered-out overlay window.
     static func failureReasons(for input: PresentationReadinessInput) -> [String] {
+        // Suspension deliberately orders the window out and makes the
+        // renderer-visible set empty while preserving the annotation itself.
+        // Reporting the resulting AppKit/WindowServer absences as ordinary
+        // presentation faults is noisy and misleading: the actionable state
+        // is simply that the caller must resume before asking for readiness.
+        // Keep a genuine missing annotation distinguishable, since suspension
+        // cannot explain its absence.
+        if input.annotationsSuspended {
+            return input.annotationExists
+                ? ["annotations_suspended"]
+                : ["annotation_not_found", "annotations_suspended"]
+        }
+
         var failures: [String] = []
         if !input.annotationExists { failures.append("annotation_not_found") }
         if !input.annotationIsInCurrentVisibleSet { failures.append("annotation_not_in_current_visible_set") }
@@ -164,6 +182,7 @@ struct PresentationStatus: Codable, Equatable {
     let annotationExists: Bool
     let screenId: String?
     let annotationIsInCurrentVisibleSet: Bool
+    let annotationsSuspended: Bool
     let expectedWindowShouldBeOnScreen: Bool
     let expectedLevel: Int
     let expectedAlpha: Double

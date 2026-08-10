@@ -11,6 +11,34 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
+# Pin local builds to one persistent identity so macOS privacy grants see
+# rebuilds as updates of the same app instead of new ad-hoc cdhash identities.
+# Fail instead of silently falling back to ad-hoc signing: that fallback would
+# make Screen Recording and Accessibility permissions unstable again.
+SIGNING_IDENTITY="65B98DF43D4BF99750538424213806A962381046"
+if ! security find-identity -v -p codesigning | grep -Fq "$SIGNING_IDENTITY"; then
+    echo "Required AI Chalkboard code-signing identity is unavailable: $SIGNING_IDENTITY" >&2
+    echo "Expected local certificate: AI Chalkboard Local Code Signing" >&2
+    exit 1
+fi
+
+# The bundled executable needs a deployable identity even though SwiftPM's
+# bare executable has no Info.plist.  Git emits only hexadecimal commit ids;
+# retain an explicit source fallback for archives/build hosts without Git.
+BUILD_IDENTIFIER="${AI_CHALKBOARD_BUILD_IDENTIFIER:-$(git rev-parse --short=12 HEAD 2>/dev/null || echo source)}"
+if [[ -z "${AI_CHALKBOARD_BUILD_IDENTIFIER:-}" ]] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    # A build made from uncommitted source must never identify itself as the
+    # clean commit it diverges from.  Include staged, unstaged, and untracked
+    # changes because any of them can change the executable being packaged.
+    if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+        BUILD_IDENTIFIER="${BUILD_IDENTIFIER}-dirty"
+    fi
+fi
+if [[ ! "$BUILD_IDENTIFIER" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+    echo "Invalid AI_CHALKBOARD_BUILD_IDENTIFIER; using source fallback." >&2
+    BUILD_IDENTIFIER="source"
+fi
+
 echo "Creating .app bundle structure at $APP_DIR..."
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
@@ -18,7 +46,7 @@ mkdir -p "$RESOURCES_DIR"
 
 cp "$BUILD_DIR/AIChalkboard" "$MACOS_DIR/AIChalkboard"
 
-cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
+cat << EOF > "$CONTENTS_DIR/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -32,7 +60,9 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0.0</string>
+    <string>2.1.0</string>
+    <key>AIChalkboardBuildIdentifier</key>
+    <string>${BUILD_IDENTIFIER}</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHighResolutionMagnifyAllowed</key>
@@ -47,10 +77,11 @@ cat << 'EOF' > "$CONTENTS_DIR/Info.plist"
 </plist>
 EOF
 
-# SwiftPM linker-signs the bare executable before it is placed in the bundle.
-# Sign the completed bundle again so the final code directory binds Info.plist
-# (including the bundle identifier and Retina capability) instead of leaving
-# those launch-critical settings outside the signature.
-codesign --force --deep --sign - "$APP_DIR"
+# SwiftPM linker-signs the bare executable ad-hoc before it is placed in the
+# bundle. Sign the completed bundle with the persistent local identity so the
+# final code directory binds Info.plist and keeps a stable designated
+# requirement across rebuilds. This app has no nested code, so --deep is
+# unnecessary and would obscure future nested-signing mistakes.
+codesign --force --timestamp=none --sign "$SIGNING_IDENTITY" "$APP_DIR"
 
 echo "App bundle created successfully at $(pwd)/$APP_DIR"

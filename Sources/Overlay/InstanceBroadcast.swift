@@ -41,8 +41,20 @@ extension Notification.Name {
     /// sharing preference and render filter. Half-applied would make placement
     /// checks show an arbitrary subset on capture paths that include overlays.
     static let chalkboardSetCaptureVisible = Notification.Name("com.aichalkboard.overlay.setCaptureVisible")
-}
 
+    /// A wake-up hint that durable suspension state changed. It carries no
+    /// command: a receiver always re-reads the protected lease registry.
+    static var chalkboardSuspensionInvalidated: Notification.Name {
+        struct Name {
+            static let value: Notification.Name = {
+                let suffix = ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_NAMESPACE"]
+                    .map { "." + $0.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_" }.map(String.init).joined() } ?? ""
+                return Notification.Name("com.aichalkboard.overlay.suspensionLeaseInvalidated.v2\(suffix)")
+            }()
+        }
+        return Name.value
+    }
+}
 /// The QUIT broadcast's `object`, used only to scope Dock/Cmd-Q quits to
 /// instances launched the same way as the poster.
 ///
@@ -78,6 +90,7 @@ private enum BroadcastKey {
     static let appId = "appId"
     static let appName = "appName"
     static let visible = "visible"
+    static let generation = "generation"
 }
 
 /// Canonical encoding and application of a clear broadcast. Keeping payload
@@ -249,6 +262,13 @@ public final class InstanceBroadcast: NSObject {
             object: nil,
             suspensionBehavior: .deliverImmediately
         )
+        center.addObserver(
+            self,
+            selector: #selector(handleSuspensionInvalidatedBroadcast(_:)),
+            name: .chalkboardSuspensionInvalidated,
+            object: nil,
+            suspensionBehavior: .deliverImmediately
+        )
 
         // No matching removeObserver: `self` is a process-lifetime singleton,
         // so the registration is meant to live as long as the process. (The
@@ -262,7 +282,7 @@ public final class InstanceBroadcast: NSObject {
         // never blocked by the protocol read. A process that registered and
         // then blocked the main thread without running a run loop would
         // receive nothing at all.
-        Logger.shared.log("InstanceBroadcast: registered cross-process observers for '\(Notification.Name.chalkboardClearAll.rawValue)', '\(Notification.Name.chalkboardQuitAll.rawValue)', and '\(Notification.Name.chalkboardSetCaptureVisible.rawValue)'.", level: "INFO")
+        Logger.shared.log("InstanceBroadcast: registered cross-process observers for clear, quit, capture visibility, and durable suspension-lease invalidation. Suspension notifications are wake-up hints only; canonical state is read from the lease registry.", level: "INFO")
     }
 
     // MARK: - Posting (menu-bar side, primary instance only)
@@ -319,6 +339,17 @@ public final class InstanceBroadcast: NSObject {
             .chalkboardSetCaptureVisible,
             object: nil,
             userInfo: [BroadcastKey.visible: visible ? "true" : "false"],
+            deliverImmediately: true
+        )
+    }
+
+    /// Broadcasts only a durable-state wake-up hint. It deliberately contains
+    /// no requested presentation state and needs no ACK transport.
+    public func postSuspensionInvalidation(generation: UInt64) {
+        DistributedNotificationCenter.default().postNotificationName(
+            .chalkboardSuspensionInvalidated,
+            object: nil,
+            userInfo: [BroadcastKey.generation: String(generation)],
             deliverImmediately: true
         )
     }
@@ -428,6 +459,13 @@ public final class InstanceBroadcast: NSObject {
         // hop for the window mutation) and no-ops when the value is unchanged,
         // which is what makes the self-delivered copy of this notification free.
         OverlayWindowController.shared.setCaptureVisible(visible)
+    }
+
+    @objc private func handleSuspensionInvalidatedBroadcast(_ notification: Notification) {
+        let generation = (notification.userInfo?[BroadcastKey.generation] as? String).flatMap(UInt64.init)
+        // A malformed or hostile hint is harmless: reconcile reads canonical
+        // state and never executes a desired state supplied by DNC.
+        _ = SuspensionLeaseCoordinator.shared.reconcile(announcedGeneration: generation)
     }
 
     @objc private func handleQuitAllBroadcast(_ notification: Notification) {

@@ -158,6 +158,21 @@ enum MCPToolCatalog {
             ]]), "required": ["annotation_id"]]
         ],
         [
+            "name": "suspend_annotations",
+            "description": "Acquires a short-lived suspension lease, ordering AI Chalkboard overlays out without clearing annotations, IDs, or running TTLs. lease_seconds is 1...60 (default 15). Save the returned secret leaseToken and pass exactly it to resume_annotations. An optional fresh lowercase canonical UUID idempotency_key makes a retry from the same MCP server process instance return the same active lease. It is secret; reuse from another instance is rejected without revealing another lease token. clickSafeAtObservation is true only for the current live generation after bounded peer presentation settlement. This is a temporary click workaround, not true simultaneous highlight-and-click.",
+            "inputSchema": ["type": "object", "properties": [
+                "lease_seconds": ["type": "integer", "minimum": 1, "maximum": 60, "description": "Lease lifetime in seconds; default 15. It expires automatically if not released."],
+                "idempotency_key": ["type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "description": "Optional fresh lowercase canonical UUID capability, scoped to its creator MCP server process instance while active. Retry only from that instance; reuse elsewhere errors without returning a token. Do not log or reuse it across callers." ]
+            ], "additionalProperties": false]
+        ],
+        [
+            "name": "resume_annotations",
+            "description": "Releases exactly one secret suspension lease token returned by suspend_annotations. If another lease remains, success requires bounded confirmation that the current generation's peer presentation settled off screen; otherwise the token is released but the tool result is an error. If no lease remains, the response is only a linearized registry snapshot plus a restoration request, not proof of global window convergence. Releasing an already-released or expired token succeeds only during the 120-second cleanup tombstone; an unknown/old token is an error.",
+            "inputSchema": ["type": "object", "properties": [
+                "lease_token": ["type": "string", "minLength": 43, "maxLength": 43, "pattern": "^[A-Za-z0-9_-]{43}$", "description": "The exact secret leaseToken returned by suspend_annotations. Do not log it." ]
+            ], "required": ["lease_token"], "additionalProperties": false]
+        ],
+        [
             "name": "clear",
             "description": "Clears by exact annotation_id, explicit app, fallback active app, or scope='all'. Prefer annotation_id for exact undo.",
             "inputSchema": ["type": "object", "properties": [
@@ -192,7 +207,7 @@ enum MCPToolCatalog {
         ],
         [
             "name": "get_active_app",
-            "description": "Reports the frontmost app and the fallback app an untagged draw call would link to.",
+            "description": "Reports the frontmost app, the fallback app an untagged draw call would link to, and this process's annotationsSuspended presentation state.",
             "inputSchema": ["type": "object", "properties": [:]]
         ],
         [

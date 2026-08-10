@@ -18,6 +18,17 @@ private func colorHasVisibleAlpha(_ color: String?) -> Bool {
     return ColorParser.parse(color).alphaComponent > 0
 }
 
+/// Pure policy for the MCP `isError` bit. A release can durably remove its
+/// token yet still be unsafe to report as successful when another lease keeps
+/// suspension active and peer presentation did not settle off screen.
+enum SuspensionLeaseResponsePolicy {
+    static func isError(operation: String, operationSucceeded: Bool,
+                        annotationsSuspended: Bool, peerPresentationSettled: Bool) -> Bool {
+        !operationSucceeded
+            || (operation == "release" && annotationsSuspended && !peerPresentationSettled)
+    }
+}
+
 /// A timed-out ScreenCaptureKit operation can complete late (or, in the
 /// worst case, never resume). Keep exactly one outstanding capture task so a
 /// caller cannot turn repeated 30-second timeouts into an unbounded pile of
@@ -55,7 +66,15 @@ extension MCPServer {
         let name = params["name"] as? String ?? ""
         let args = params["arguments"] as? [String: Any] ?? [:]
 
-        if name == "verify_annotation", args["screenshot_path"] != nil {
+        if name == "suspend_annotations" || name == "resume_annotations" {
+            // A lease token can release another caller's suspension, and an
+            // idempotency key can retrieve its active token.  Treat both as
+            // capabilities: MCP request logging must never persist them.
+            var redactedArgs = args
+            if redactedArgs["lease_token"] != nil { redactedArgs["lease_token"] = "<redacted capability>" }
+            if redactedArgs["idempotency_key"] != nil { redactedArgs["idempotency_key"] = "<redacted capability>" }
+            log("Calling tool: \(name) with sensitive arguments redacted: \(redactedArgs)")
+        } else if name == "verify_annotation", args["screenshot_path"] != nil {
             var redactedArgs = args
             redactedArgs["screenshot_path"] = "<redacted local path>"
             log("Calling tool: \(name) with args: \(redactedArgs)")
@@ -81,14 +100,19 @@ extension MCPServer {
                 return
             }
             let captureVisible = OverlayWindowController.shared.isCaptureVisible
+            let annotationsSuspended = OverlayWindowController.shared.isAnnotationsSuspended
             let payload: [String: Any] = [
                 "screens": screenArray,
                 "coordinateSpace": "AppKit backing pixels: widthPx/heightPx are NSScreen.frame point dimensions multiplied by that same screen's NSScreen.backingScaleFactor. Drawing uses this same scale source.",
                 "backingScaleSource": "NSScreen.backingScaleFactor",
                 "captureVisible": captureVisible,
+                "annotationsSuspended": annotationsSuspended,
                 "captureNote": captureVisible
                     ? "Capture-debug mode is ON: overlay windows request sharingType=.readOnly and render every annotation. A capture tool may still omit these windows through its own app/window filter. Call set_capture_visible(false) to restore normal filtering."
-                    : "Capture-debug mode is OFF (default): overlay windows request legacy sharingType=.none and render only annotations visible for the active app. This is not a security guarantee; modern capture tools control their own inclusion filters."
+                    : "Capture-debug mode is OFF (default): overlay windows request legacy sharingType=.none and render only annotations visible for the active app. This is not a security guarantee; modern capture tools control their own inclusion filters.",
+                "suspensionNote": annotationsSuspended
+                    ? "Annotations are suspended: all overlay windows are ordered out while store entries and TTLs are retained. Release the exact suspension lease token with resume_annotations to restore normal presentation once no other lease remains."
+                    : "Annotations are not suspended. suspend_annotations is available as a temporary click-workaround, not simultaneous visual click-through."
             ]
             guard let text = jsonString(payload) else {
                 sendErrorResult(id: id, text: "Failed to encode screen list.")
@@ -98,16 +122,35 @@ extension MCPServer {
 
         case "get_overlay_state":
             let overlays = OverlayWindowController.shared.overlayInputPolicySnapshot()
+            let annotationsSuspended = OverlayWindowController.shared.isAnnotationsSuspended
+            let leaseSnapshot = SuspensionLeaseCoordinator.shared.snapshot()
+            let suspensionNote: String
+            if !leaseSnapshot.isBootstrapped {
+                suspensionNote = "Annotations are hidden because the shared suspension registry is unavailable, not because this process holds a valid lease. activeLeaseCount is not authoritative in this fail-closed state; do not click or attempt token cleanup until suspensionRegistryBootstrapped=true."
+            } else if annotationsSuspended {
+                suspensionNote = "Annotations are suspended: Chalkboard has ordered every overlay window in this process out, while retaining annotation store entries and TTLs. Each overlays[].isOnScreen value is this process's AppKit state only; it is not proof that a sibling process is also off screen. For a click workaround, use a live suspension lease whose suspend_annotations result says clickSafeAtObservation=true."
+            } else {
+                suspensionNote = "ignoresMouseEvents and overlays[].isOnScreen are this process's live AppKit state. They do not prove sibling-process state, raw framebuffer pixels, or occlusion. macOS WindowServer metadata does not expose ignoresMouseEvents, so a click dispatcher that blocks merely because an overlay window is present must explicitly consult and honor this state. suspend_annotations is a fallback workaround, not true simultaneous click-through."
+            }
             guard let overlayJSON = jsonObject(overlays) as? [Any] else {
                 sendErrorResult(id: id, text: "Failed to encode overlay input state.")
                 return
             }
             let payload: [String: Any] = [
                 "overlays": overlayJSON,
+                "version": BuildMetadata.productVersion,
+                "buildIdentifier": BuildMetadata.buildIdentifier,
+                "suspensionProtocolVersion": 2,
                 "rawFramebufferProof": false,
                 "occlusionProof": false,
+                "annotationsSuspended": annotationsSuspended,
+                "activeLeaseCount": leaseSnapshot.activeLeaseCount,
+                "suspensionGeneration": leaseSnapshot.generation,
+                "suspensionRegistryBootstrapped": leaseSnapshot.isBootstrapped,
+                "nextLeaseExpiryInSeconds": leaseSnapshot.nextExpiryInSeconds ?? NSNull(),
+                "suspensionRegistryError": leaseSnapshot.error ?? NSNull(),
                 "externalClickDispatcherMustHonorClickThrough": true,
-                "note": "ignoresMouseEvents is Chalkboard's live AppKit input policy. macOS WindowServer metadata does not expose that flag, so a click dispatcher that blocks merely because an overlay window is present must explicitly consult and honor this state. This is not raw-framebuffer or occlusion proof."
+                "note": suspensionNote
             ]
             guard let text = jsonString(payload) else {
                 sendErrorResult(id: id, text: "Failed to encode overlay input state.")
@@ -171,6 +214,12 @@ extension MCPServer {
 
         case "update_annotation":
             handleUpdateAnnotation(id: id, args: args)
+
+        case "suspend_annotations":
+            handleAcquireAnnotationSuspensionLease(id: id, args: args)
+
+        case "resume_annotations":
+            handleReleaseAnnotationSuspensionLease(id: id, args: args)
 
         case "clear":
             // Validate every recognized selector before mutating anything. In
@@ -312,6 +361,196 @@ extension MCPServer {
         default:
             sendErrorResult(id: id, text: "Unknown tool: \(name)")
         }
+    }
+
+    /// Validates and acquires a bounded, token-scoped suspension lease.  The
+    /// strict boundary matters: a malformed retry must not quietly acquire a
+    /// fresh lease that its caller cannot later release.
+    private func handleAcquireAnnotationSuspensionLease(id: Any, args: [String: Any]) {
+        let allowed: Set<String> = ["lease_seconds", "idempotency_key"]
+        guard args.keys.allSatisfy(allowed.contains) else {
+            sendErrorResult(id: id, text: "suspend_annotations accepts only lease_seconds and idempotency_key.")
+            return
+        }
+
+        let seconds: Int
+        if args.keys.contains("lease_seconds") {
+            guard args["lease_seconds"] is NSNumber,
+                  let supplied = MCPArgument.integer(args["lease_seconds"]),
+                  (1...60).contains(supplied) else {
+                sendErrorResult(id: id, text: "lease_seconds must be an integer from 1 through 60 when supplied.")
+                return
+            }
+            seconds = supplied
+        } else {
+            seconds = 15
+        }
+
+        let idempotencyKey: String?
+        if args.keys.contains("idempotency_key") {
+            guard let raw = args["idempotency_key"] as? String,
+                  let uuid = UUID(uuidString: raw),
+                  raw == uuid.uuidString.lowercased() else {
+                sendErrorResult(id: id, text: "idempotency_key must be a lowercase canonical UUID when supplied.")
+                return
+            }
+            idempotencyKey = raw
+        } else {
+            idempotencyKey = nil
+        }
+
+        let result = SuspensionLeaseCoordinator.shared.acquireLease(
+            seconds: seconds,
+            idempotencyKey: idempotencyKey
+        )
+        sendSuspensionLeaseResult(id: id, operation: "acquire", result: result)
+    }
+
+    /// Releases only the caller's exact lease.  A token is deliberately
+    /// required so an old client cannot resume a different client's active
+    /// click workflow by issuing a global toggle.
+    private func handleReleaseAnnotationSuspensionLease(id: Any, args: [String: Any]) {
+        guard Set(args.keys) == Set(["lease_token"]),
+              let token = args["lease_token"] as? String,
+              isCanonicalSuspensionLeaseToken(token) else {
+            sendErrorResult(id: id, text: "resume_annotations requires exactly one lease_token returned by suspend_annotations.")
+            return
+        }
+        let result = SuspensionLeaseCoordinator.shared.releaseLease(token: token)
+        sendSuspensionLeaseResult(id: id, operation: "release", result: result)
+    }
+
+    private func isCanonicalSuspensionLeaseToken(_ token: String) -> Bool {
+        guard token.utf8.count == 43 else { return false }
+        return token.utf8.allSatisfy { character in
+            (character >= 65 && character <= 90)
+                || (character >= 97 && character <= 122)
+                || (character >= 48 && character <= 57)
+                || character == 45 || character == 95
+        }
+    }
+
+    /// All success and failure operation responses deliberately remain JSON so
+    /// a cleanup caller can inspect the final lease state without parsing
+    /// human prose.  The coordinator owns durable state and cross-process
+    /// synchronization; this boundary adds the MCP protocol/build identity
+    /// and the conservative limitation language that a dispatcher needs.
+    private func sendSuspensionLeaseResult(id: Any,
+                                           operation: String,
+                                           result: SuspensionLeaseOperationResult) {
+        let clickSafeAtObservation = operation == "acquire"
+            && result.success
+            && result.annotationsSuspended
+            && (result.leaseExpiresInSeconds ?? 0) > 0
+            && result.peerPresentationSettled
+            && result.clickSafeAtObservation
+        let releaseWithRemainingLeaseUnsettled = operation == "release"
+            && result.success
+            && result.annotationsSuspended
+            && !result.peerPresentationSettled
+        let responseIsError = SuspensionLeaseResponsePolicy.isError(
+            operation: operation,
+            operationSucceeded: result.success,
+            annotationsSuspended: result.annotationsSuspended,
+            peerPresentationSettled: result.peerPresentationSettled
+        )
+        let note: String
+        if let error = result.error {
+            note = error
+        } else if operation == "acquire" {
+            note = clickSafeAtObservation
+                ? "A suspension lease is active and two consecutive conservative WindowServer samples observed no candidate AI Chalkboard overlay windows. This is point-in-time click-workaround evidence only; it is not raw-framebuffer or occlusion proof. Release this exact leaseToken promptly."
+                : "A suspension lease is active, but conservative WindowServer observation was not quiescent. Do not click through yet; retry or let the short lease expire."
+        } else {
+            if releaseWithRemainingLeaseUnsettled {
+                note = "This lease was durably released, but another active lease remains and bounded WindowServer observation did not confirm that every discovered Chalkboard overlay settled off screen. Treat this response as an error and do not click through yet."
+            } else if result.annotationsSuspended {
+                note = "This lease was released. Another active lease keeps overlays suspended, and bounded observation confirmed the current generation was settled off screen at response time."
+            } else {
+                note = "This lease was released and the linearized registry snapshot has no active lease. Chalkboard requested normal presentation restoration; this response does not prove global peer/window convergence."
+            }
+        }
+        // The WindowServer evidence is diagnostic, not an unbounded process
+        // or window inventory. Bound it here as a second line of defence even
+        // if a future discovery implementation accidentally returns more.
+        let evidence = boundedSuspensionEvidence(result)
+        var payload: [String: Any] = [
+            "protocolVersion": 2,
+            "buildIdentifier": BuildMetadata.buildIdentifier,
+            "operation": operation,
+            "state": result.annotationsSuspended ? "suspended" : "not_suspended",
+            "annotationsSuspended": result.annotationsSuspended,
+            "activeLeaseCount": result.activeLeaseCount,
+            "generation": result.generation,
+            "leaseExpiresInSeconds": result.leaseExpiresInSeconds ?? NSNull(),
+            "leaseReused": result.reused,
+            "clickSafeAtObservation": clickSafeAtObservation,
+            "peerPresentationSettled": result.peerPresentationSettled,
+            "scope": result.scope,
+            "candidatePids": evidence.candidatePIDs,
+            "candidatePidsTruncated": result.candidatePIDsTruncated || evidence.candidatePIDsTruncated,
+            "visibleOwnerPids": evidence.visibleOwnerPIDs,
+            "visibleOwnerPidsTruncated": evidence.visibleOwnerPIDsTruncated,
+            "visibleWindowNumbers": evidence.visibleWindowNumbers,
+            "visibleWindowNumbersTruncated": evidence.visibleWindowNumbersTruncated,
+            "discoveryErrors": evidence.discoveryErrors,
+            "discoveryErrorsTruncated": evidence.discoveryErrorsTruncated,
+            "evidenceTruncated": result.candidatePIDsTruncated || evidence.anyTruncated,
+            "limitation": "WindowServer metadata is not raw-framebuffer or occlusion proof. A future process/window can appear after this bounded observation; true visible-highlight-while-clicking still requires the click dispatcher to honor ignoresMouseEvents.",
+            "note": note
+        ]
+        if let token = result.leaseToken { payload["leaseToken"] = token }
+        if operation == "release" { payload["alreadyReleased"] = result.alreadyReleased }
+        if let error = result.error { payload["error"] = error }
+        if releaseWithRemainingLeaseUnsettled {
+            payload["error"] = "A remaining suspension lease exists, but peer presentation did not settle within the bounded observation."
+        }
+        guard let text = jsonString(payload) else {
+            sendErrorResult(id: id, text: "Failed to encode bounded suspension-lease result.")
+            return
+        }
+        sendTextResult(id: id, text: text, isError: responseIsError)
+    }
+
+    private func boundedSuspensionEvidence(_ result: SuspensionLeaseOperationResult) ->
+        (candidatePIDs: [Int], candidatePIDsTruncated: Bool,
+         visibleOwnerPIDs: [Int], visibleOwnerPIDsTruncated: Bool,
+         visibleWindowNumbers: [Int], visibleWindowNumbersTruncated: Bool,
+         discoveryErrors: [String], discoveryErrorsTruncated: Bool, anyTruncated: Bool) {
+        let maximumItems = 64
+        let maximumErrorCharacters = 512
+        let candidatePIDs = result.candidatePIDs.map(Int.init)
+        let visibleOwnerPIDs = result.visibleOwnerPIDs.map(Int.init)
+        let candidateTruncated = candidatePIDs.count > maximumItems
+        let ownersTruncated = visibleOwnerPIDs.count > maximumItems
+        let windowsTruncated = result.visibleWindowNumbers.count > maximumItems
+        let errorsTruncated = result.discoveryErrors.count > maximumItems
+            || result.discoveryErrors.contains { $0.utf8.count > maximumErrorCharacters }
+        let errors = result.discoveryErrors.prefix(maximumItems).map {
+            truncateUTF8($0, maximumBytes: maximumErrorCharacters)
+        }
+        return (Array(candidatePIDs.prefix(maximumItems)), candidateTruncated,
+                Array(visibleOwnerPIDs.prefix(maximumItems)), ownersTruncated,
+                Array(result.visibleWindowNumbers.prefix(maximumItems)), windowsTruncated,
+                errors, errorsTruncated,
+                candidateTruncated || ownersTruncated || windowsTruncated || errorsTruncated)
+    }
+
+    /// Keep a valid Unicode prefix while enforcing the byte budget used by the
+    /// MCP transport. `String.prefix(_:)` is character-counted and could let a
+    /// small number of multi-byte scalars bypass this evidence cap.
+    private func truncateUTF8(_ value: String, maximumBytes: Int) -> String {
+        guard value.utf8.count > maximumBytes else { return value }
+        var used = 0
+        var end = value.startIndex
+        while end < value.endIndex {
+            let next = value.index(after: end)
+            let count = value[end..<next].utf8.count
+            guard used + count <= maximumBytes else { break }
+            used += count
+            end = next
+        }
+        return String(value[..<end])
     }
 
     // MARK: - Accessibility and verification
@@ -643,7 +882,15 @@ extension MCPServer {
             for (key, value) in sourceMetadata { metadata[key] = value }
             metadata["appId"] = jsonValue(annotation.appId)
             metadata["appName"] = jsonValue(annotation.appName)
-            metadata["isVisibleNow"] = OverlayWindowController.shared.isCaptureVisible || annotation.appId == nil || annotation.appId == ActiveAppTracker.shared.currentAppId
+            let visibility = AnnotationVisibilityDiagnostic(
+                annotationsSuspended: OverlayWindowController.shared.isAnnotationsSuspended,
+                captureVisible: OverlayWindowController.shared.isCaptureVisible,
+                annotationAppId: annotation.appId,
+                activeAppId: ActiveAppTracker.shared.currentAppId
+            )
+            metadata["annotationsSuspended"] = visibility.annotationsSuspended
+            metadata["wouldBeVisibleWithoutSuspension"] = visibility.wouldBeVisibleWithoutSuspension
+            metadata["isVisibleNow"] = visibility.isVisibleNow
             let rawStoredGeometry = jsonObject(annotation.kind) ?? NSNull()
             let rawGeometryBytes = jsonString(rawStoredGeometry)?.lengthOfBytes(using: .utf8) ?? 0
             if rawGeometryBytes <= 16 * 1_024 {
@@ -1298,6 +1545,7 @@ extension MCPServer {
         let annotations = AnnotationStore.shared.getAll()
         let activeId = ActiveAppTracker.shared.currentAppId
         let captureVisible = OverlayWindowController.shared.isCaptureVisible
+        let annotationsSuspended = OverlayWindowController.shared.isAnnotationsSuspended
 
         // `ActiveAppTracker.displayName(forBundleId:)` is only consulted as a
         // fallback for annotations whose `appName` was never captured at
@@ -1336,7 +1584,9 @@ extension MCPServer {
             )
             object["type"] = annotation.kind.typeName
             object["scope"] = annotation.appId == nil ? "global" : "app-linked"
-            object["isVisibleNow"] = captureVisible || annotation.appId == nil || annotation.appId == activeId
+            let wouldBeVisibleWithoutSuspension = captureVisible || annotation.appId == nil || annotation.appId == activeId
+            object["wouldBeVisibleWithoutSuspension"] = wouldBeVisibleWithoutSuspension
+            object["isVisibleNow"] = !annotationsSuspended && wouldBeVisibleWithoutSuspension
             if let expiresAt = annotation.expiresAt {
                 object["expiresAt"] = expiryFormatter.string(from: expiresAt)
                 object["remainingSeconds"] = max(0, expiresAt.timeIntervalSince(now))
@@ -1364,6 +1614,7 @@ extension MCPServer {
                     "name": jsonValue(ActiveAppTracker.shared.currentAppName)
                 ] as [String: Any],
                 "captureVisible": captureVisible,
+                "annotationsSuspended": annotationsSuspended,
                 // `count` remains the number in this response, matching the
                 // old field when the entire list fits. `totalCount` exposes
                 // the full store for callers that page.
@@ -1375,7 +1626,7 @@ extension MCPServer {
                 "nextOffset": hasMore ? nextOffset : NSNull(),
                 "truncated": hasMore,
                 "annotations": page,
-                "note": "With captureVisible=false, an annotation is drawn only when scope='global' or its appId equals activeApp.bundleId. With captureVisible=true, every annotation is drawn for capture-debug placement checks. External capture filters still decide whether the overlay is included. expiresAt is RFC 3339 and remainingSeconds are null for persistent annotations. list_annotations is paged (offset/limit); oversized individual geometry is summarized so this response remains bounded."
+                "note": "With captureVisible=false, an annotation is drawn only when scope='global' or its appId equals activeApp.bundleId. With captureVisible=true, every annotation is drawn for capture-debug placement checks. When annotationsSuspended=true, every retained annotation has isVisibleNow=false because all overlay windows are ordered out; wouldBeVisibleWithoutSuspension reports its normal filter result. External capture filters still decide whether the overlay is included. expiresAt is RFC 3339 and remainingSeconds are null for persistent annotations. list_annotations is paged (offset/limit); oversized individual geometry is summarized so this response remains bounded."
             ]
         }
 
@@ -1425,7 +1676,8 @@ extension MCPServer {
                 "name": jsonValue(raw?.name)
             ] as [String: Any],
             "captureVisible": OverlayWindowController.shared.isCaptureVisible,
-            "note": "'frontmost' is the app whose annotations are on screen right now. 'fallback' is what an untagged draw_* call links to: the last app that was frontmost excluding AI Chalkboard and Claude -- because when you receive a draw request, Claude's own window is frontmost, so tagging the true frontmost app would link every annotation to Claude and it would never show over the app the user meant. 'rawFrontmost' is the unfiltered NSWorkspace value, for debugging only. A null fallback means an untagged draw becomes GLOBAL."
+            "annotationsSuspended": OverlayWindowController.shared.isAnnotationsSuspended,
+            "note": "'frontmost' is the app whose app-linked annotations would normally be eligible to appear. When annotationsSuspended=true, this process has intentionally ordered its overlay windows out, so no retained annotation is on screen from this process even if it matches frontmost. 'fallback' is what an untagged draw_* call links to: the last app that was frontmost excluding AI Chalkboard and Claude -- because when you receive a draw request, Claude's own window is frontmost, so tagging the true frontmost app would link every annotation to Claude and it would never show over the app the user meant. 'rawFrontmost' is the unfiltered NSWorkspace value, for debugging only. A null fallback means an untagged draw becomes GLOBAL."
         ]
 
         guard let text = jsonString(payload) else {
