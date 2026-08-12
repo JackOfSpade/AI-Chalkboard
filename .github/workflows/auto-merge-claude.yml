@@ -116,7 +116,7 @@ jobs:
               if should_retry_failed_ci "$ci_conclusion" "$run_attempt" && [ -n "$run_id" ]; then
                 echo "::notice::$br — CI for ${sha:0:7} failed on attempt 1; requesting a one-shot re-run (run $run_id) before treating it as stranded."
                 gh run rerun "$run_id" --failed 2>/dev/null \
-                  || echo "::warning::Could not request a re-run for $br (run $run_id) — falls through to the existing stranded-branch alert if it stays red."
+                  || echo "::warning::Could not request a re-run for $br (run $run_id) — it will simply stay unmerged until someone looks at it."
               fi
               echo "::notice::Skipping $br — CI for ${sha:0:7} is '$ci_conclusion', not success. It merges once its CI run completes green."
               continue
@@ -125,11 +125,12 @@ jobs:
             # A branch with NO common ancestor (an orphan history) is not a content conflict: `git merge`
             # exits 128 without ever setting MERGE_HEAD, so the abort/hard-stop path below cannot classify
             # it, and the generic conflict branch would open an `Auto-merge conflict:` PR that GitHub can
-            # never merge without --allow-unrelated-histories -- a permanently stuck artifact that would
-            # also re-trip stranded-branch-check.yml on every sweep. Skip it with a distinct message; the
-            # 6-hourly stranded-branch sweep is the correct escalation path for a human to look at it.
+            # never merge without --allow-unrelated-histories -- a permanently stuck artifact. Skip it with
+            # a distinct warning instead. NOTE: stranded-branch-check.yml (the 6-hourly sweep that used to
+            # be the escalation path here) was deleted 2026-08-12, so nothing now flags such a branch
+            # automatically -- this warning in the auto-merge log is the only signal.
             if ! git merge-base "$ref" main >/dev/null 2>&1; then
-              echo "::warning::Skipping $br — it shares no common history with main (orphan branch). This is NOT a content conflict; it needs a human decision, and the stranded-branch sweep will flag it."
+              echo "::warning::Skipping $br — it shares no common history with main (orphan branch). This is NOT a content conflict; it needs a human decision, and nothing will flag it automatically."
               continue
             fi
 
