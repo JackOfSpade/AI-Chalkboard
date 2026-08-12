@@ -215,26 +215,22 @@ jobs:
       - name: swift build (release)
         run: swift build -c release
 
-      # Skipped under act only. The pre-push hook maps macos-latest to
-      # -self-hosted so `swift test` / `swift build` above actually run natively
-      # (act cannot run macOS containers, so this whole job used to be silently
-      # skipped, leaving the Swift build with no local coverage at all). But
-      # build_app.sh codesigns with a pinned identity, and it deliberately
-      # refuses to fall back to ad-hoc signing because that would destabilise
-      # the app's Screen Recording / Accessibility grants. Reaching the keychain
-      # non-interactively blocks on a SecurityAgent password prompt, which hangs
-      # the push indefinitely (observed: a 30-minute stall). Compile regressions
-      # — the thing worth gating a push on — are already caught by the steps
-      # above; bundle assembly runs on GitHub, where the identity is available.
+      # Runs locally too: the pre-push hook maps macos-latest to -self-hosted
+      # (act cannot run macOS containers, so this whole job was otherwise
+      # silently skipped), and build_app.sh codesigns with a pinned identity
+      # rather than falling back to ad-hoc signing, which would destabilise the
+      # app's Screen Recording / Accessibility grants. That requires the signing
+      # key to be granted non-interactive access in the login keychain — if it
+      # is ever revoked, codesign blocks on a SecurityAgent password prompt that
+      # a git hook cannot answer and the push hangs indefinitely rather than
+      # failing. Remedy: re-grant "Always Allow" for the key, or push once with
+      # SKIP_ACT=1 to get unblocked.
       - name: Assemble .app bundle
-        if: ${{ env.ACT != 'true' }}
         run: bash build_app.sh
 
-      # Same act-only skip as the bundle step above: this verifies the artifact
-      # that step produces (and itself calls codesign --verify), so it cannot run
-      # when the bundle was never assembled.
+      # Verifies the artifact the step above produces (and calls codesign
+      # --verify on it), so the two are gated identically — both run everywhere.
       - name: Verify bundle contents
-        if: ${{ env.ACT != 'true' }}
         run: |
           set -euo pipefail
           app=.build/release/AIChalkboard.app
