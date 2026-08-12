@@ -205,15 +205,14 @@ deleted. The gate is **fail-closed**: a red, in-progress, missing, or API-error 
 result all skip the branch for that drain; nothing merges on ambiguity. The branch is
 picked up automatically on the next CI completion for its tip SHA (e.g. a retry, or a
 new push) — but because the gate is fail-closed, a tip SHA whose only CI run was
-**cancelled** (e.g. a manually cancelled run) is never retried automatically.
-`stranded-branch-check.yml` flags that within ~6h; the fix is to re-run CI for the
-branch or push a new commit.
+**cancelled** (e.g. a manually cancelled run) is never retried automatically, and a
+branch stuck this way is not flagged by anything — resolving it (re-run CI or push a
+new commit) is a manual, human-noticed step.
 
 | File | Role |
 | --- | --- |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | The merge gate. Its run conclusion for a branch's tip SHA is what auto-merge reads. |
 | [`.github/workflows/auto-merge-claude.yml`](.github/workflows/auto-merge-claude.yml) | Drains every un-merged branch on each CI completion and re-verifies main's tip post-merge. |
-| [`.github/workflows/stranded-branch-check.yml`](.github/workflows/stranded-branch-check.yml) | Runs every 6 hours; flags a branch that is unmerged and whose CI run has been settled — or is still missing — for more than 6h (measured from the CI run itself, the same signal the merge gate reads, not the tip commit's date), or an open conflict PR. A branch whose CI is genuinely still queued/running is skipped — but a run wedged in a non-terminal status for more than 12h (e.g. a GitHub Actions outage) is flagged too, so it can't hide a branch forever. The alert issue is opened once, refreshed in place on later sweeps while the problem persists, and closed automatically with an explanatory comment on the first sweep that finds nothing wrong — so an OPEN alert issue always means a LIVE problem. |
 | [`scripts/auto_merge_decision.sh`](scripts/auto_merge_decision.sh) | The fail-closed decision predicates (CI-green check, ancestry check, etc.). |
 | [`tests/test_auto_merge_logic.sh`](tests/test_auto_merge_logic.sh) | Unit tests for those predicates. |
 | [`.claude/session-start.sh`](.claude/session-start.sh) | SessionStart hook: resets a remote Claude session's assigned branch to `origin/main`. |
@@ -229,6 +228,6 @@ branch or push a new commit.
 **Requirements**
 
 - Repo Settings → Actions → General → Workflow permissions may be left at the read-only default — each workflow above requests the write scopes it needs via its own `permissions:` block.
-- Issues must stay enabled — `stranded-branch-check.yml` (and the `postmerge` job) alert by opening issues.
-- The stranded-branch alert closes itself only when a sweep completes and proves the repo healthy. If the sweep's own API reads fail, it reports a problem rather than silence, and never closes an open alert — a broken check must not be able to erase the signal it exists to raise.
+- Issues must stay enabled — the `postmerge` job alerts by opening an issue if main's actual merged tip is red.
 - No branch protection is configured on this repo, so the bash gate in `scripts/auto_merge_decision.sh` is the only merge gate that exists.
+- There is no automated alert for a branch stuck on red/cancelled/missing CI or an open `Auto-merge conflict:` PR — these are resolved manually as noticed.
