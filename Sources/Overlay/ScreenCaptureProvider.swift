@@ -121,7 +121,10 @@ public final class ScreenCaptureProvider {
     /// checks should not unexpectedly steal focus with a system permission UI.
     /// Pass `requestPermission: true` only from an explicit user-authorized
     /// tool parameter.
-    public func permissionStatus(requestPermission: Bool = false) -> ScreenCapturePermissionStatus {
+    /// Private: the only caller is `capture()` below. It was `public`, but no
+    /// MCP tool or test ever invoked it standalone, so the wider surface was
+    /// unused API rather than a supported entry point.
+    private func permissionStatus(requestPermission: Bool = false) -> ScreenCapturePermissionStatus {
         let preflightGranted = CGPreflightScreenCaptureAccess()
         let decision = ScreenCapturePermissionDecision.resolve(
             preflightGranted: preflightGranted,

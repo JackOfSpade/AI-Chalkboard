@@ -55,30 +55,30 @@ class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
         self.namespace = f"it-{uuid.uuid4()}"
         self.children = []
         self.readers = []
+        self.drains = []
         self.live_tokens = set()
 
-        env = os.environ.copy()
         # The core deliberately reads these test-only seams before registering
         # its DNC observers.  A randomized pair guarantees this test cannot
         # signal a production Cowork process even when one happens to be open.
-        env["AI_CHALKBOARD_SUSPENSION_ROOT"] = self.tempdir
-        env["AI_CHALKBOARD_SUSPENSION_NAMESPACE"] = self.namespace
-        # A test invocation must not accidentally make a process eligible to
-        # become the user's regular menu-bar instance through a shared lock.
-        env["AI_CHALKBOARD_INSTANCE_LOCK_PATH"] = os.path.join(self.tempdir, "instance.lock")
+        # Both children below intentionally share this exact same env (same
+        # namespace, same coordinator root): the two-process behavior under
+        # test is two peers in the SAME isolated domain, not two isolated
+        # domains.
+        extra_env = {
+            "AI_CHALKBOARD_SUSPENSION_ROOT": self.tempdir,
+            "AI_CHALKBOARD_SUSPENSION_NAMESPACE": self.namespace,
+            # A test invocation must not accidentally make a process eligible
+            # to become the user's regular menu-bar instance through a shared
+            # lock.
+            "AI_CHALKBOARD_INSTANCE_LOCK_PATH": os.path.join(self.tempdir, "instance.lock"),
+        }
 
         for _ in range(2):
-            proc = subprocess.Popen(
-                [str(binary), "--mcp"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                env=env,
-            )
+            proc, reader, drain = mcp.spawn_mcp_child(str(binary), extra_env=extra_env)
             self.children.append(proc)
-            self.readers.append(mcp.MCPLineReader(proc))
+            self.readers.append(reader)
+            self.drains.append(drain)
 
         for index in range(2):
             response = self.call(index, "initialize", {
@@ -110,8 +110,19 @@ class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
                         result = response.get("result", {})
                         if not result.get("isError", False):
                             break
-                    except (RuntimeError, TimeoutError, BrokenPipeError):
-                        pass
+                    except (RuntimeError, TimeoutError, BrokenPipeError) as error:
+                        # Best-effort cleanup: still swallowed so one flaky
+                        # release attempt cannot fail an otherwise-passing
+                        # test, but printed so a real regression here (e.g.
+                        # the release call consistently failing, not just a
+                        # single transient timeout) is visible in the test
+                        # log instead of vanishing silently.
+                        print(
+                            f"warning: resume_annotations cleanup attempt {attempt + 1} "
+                            f"for token {token!r} failed: {error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
             self.live_tokens.clear()
 
         for proc in self.children:

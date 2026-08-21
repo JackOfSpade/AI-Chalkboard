@@ -39,6 +39,20 @@ if [[ ! "$BUILD_IDENTIFIER" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
     BUILD_IDENTIFIER="source"
 fi
 
+# CFBundleShortVersionString is derived from Sources/Support/BuildMetadata.swift
+# (productVersion) rather than duplicated as a second literal here. A hardcoded
+# copy in both places is exactly the drift trap Sources/Support/DrawingDefaults.swift
+# warns about: a version bump can update one and miss the other, and the missed
+# one silently keeps lying about the shipped version. Fail loudly rather than
+# ever emitting an empty or malformed version into the bundled Info.plist.
+PRODUCT_VERSION="$(grep -m 1 -E '^[[:space:]]*static let productVersion = "' \
+    Sources/Support/BuildMetadata.swift | sed -E 's/.*static let productVersion = "([^"]*)".*/\1/')"
+if [[ ! "$PRODUCT_VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+    echo "Could not determine a valid productVersion from Sources/Support/BuildMetadata.swift (got: '${PRODUCT_VERSION}')." >&2
+    echo "Expected a line there like: static let productVersion = \"2.1.0\"" >&2
+    exit 1
+fi
+
 echo "Creating .app bundle structure at $APP_DIR..."
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
@@ -60,7 +74,7 @@ cat << EOF > "$CONTENTS_DIR/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.1.0</string>
+    <string>${PRODUCT_VERSION}</string>
     <key>AIChalkboardBuildIdentifier</key>
     <string>${BUILD_IDENTIFIER}</string>
     <key>NSHighResolutionCapable</key>

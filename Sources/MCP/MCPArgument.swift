@@ -60,6 +60,27 @@ enum MCPArgument {
         arguments.keys.contains(key) && double(arguments[key]) == nil
     }
 
+    /// Scans `keys` in order and returns the first one that was supplied with
+    /// a value that is not a finite double (via `hasInvalidSuppliedDouble`),
+    /// or `nil` if every supplied key among `keys` parses. Several draw-tool
+    /// argument parsers each validated their own short list of numeric-only
+    /// keys with an identical `for key in [...] where hasInvalidSuppliedDouble(...)`
+    /// loop; this is that loop, generalized so each call site keeps its own
+    /// key list and error wording while sharing the scan itself.
+    static func firstInvalidSuppliedDouble(_ args: [String: Any], keys: [String]) -> String? {
+        keys.first { hasInvalidSuppliedDouble(args, key: $0) }
+    }
+
+    /// Scans `keys` in order and returns the first one that was supplied with
+    /// a non-`String` value, or `nil` if every supplied key among `keys` is
+    /// a string (or omitted). The string-argument counterpart to
+    /// `firstInvalidSuppliedDouble`, for the equally repeated
+    /// `for key in [...] where args.keys.contains(key) && !(args[key] is String)`
+    /// loop.
+    static func firstNonStringSupplied(_ args: [String: Any], keys: [String]) -> String? {
+        keys.first { args.keys.contains($0) && !(args[$0] is String) }
+    }
+
     /// JSON has only one numeric type at the protocol boundary.  `z_index`
     /// still needs integer semantics, so reject fractional and out-of-range
     /// doubles explicitly instead of silently truncating them.

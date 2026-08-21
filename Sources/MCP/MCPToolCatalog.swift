@@ -39,7 +39,7 @@ enum MCPToolCatalog {
     ]
 
     private static let textProperties: [String: Any] = [
-        "text": ["type": "string", "minLength": 1, "description": "Text to draw; line breaks are supported."],
+        "text": ["type": "string", "minLength": 1, "maxLength": DrawingDefaults.maxTextCharacters, "description": "Text to draw; line breaks are supported."],
         "x": ["type": "number", "description": "Top-left X in the selected coordinate space."],
         "y": ["type": "number", "description": "Top-left Y in the selected coordinate space."],
         "font_size": ["type": "number", "exclusiveMinimum": 0, "description": "System font size in backing pixels."],
@@ -105,7 +105,7 @@ enum MCPToolCatalog {
             "name": "highlight_element",
             "description": "Finds one running app's Accessibility element by label and draws a rectangular vector highlight around its live bounds. Matching is exact by default; ambiguous labels are rejected unless occurrence is supplied. The resolved frame is anchored at creation time, not continuously tracked as the UI moves.",
             "inputSchema": ["type": "object", "properties": [
-                "label": ["type": "string", "minLength": 1, "description": "Accessibility title, description, or value to match."],
+                "label": ["type": "string", "minLength": 1, "maxLength": DrawingDefaults.maxHighlightLabelCharacters, "description": "Accessibility title, description, or value to match."],
                 "app": ["type": "string", "description": "Running target app bundle id or display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."],
                 "role": ["type": "string", "description": "Optional raw Accessibility role, for example AXButton."],
                 "match": ["type": "string", "enum": ["exact", "contains"], "description": "Label matching mode; exact is the default."],

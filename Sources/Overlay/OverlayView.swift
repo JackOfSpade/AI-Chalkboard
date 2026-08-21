@@ -45,6 +45,18 @@ enum OverlayDrawingMetrics {
             y: viewY(forPhysicalPixelY: y, backingScaleFactor: backingScaleFactor, viewHeightPoints: viewHeightPoints)
         )
     }
+
+    /// Clamps a caller-supplied opacity into the 0...1 alpha range Core
+    /// Graphics expects.
+    ///
+    /// Replaces six separately open-coded `CGFloat(min(max(x, 0), 1))`
+    /// expressions in `OverlayView`. Non-finite input collapses to 0 rather
+    /// than propagating NaN into a `CGColor` alpha, where it would render
+    /// unpredictably instead of simply invisibly.
+    static func clampedAlpha(_ value: Double) -> CGFloat {
+        guard value.isFinite else { return 0 }
+        return CGFloat(min(max(value, 0), 1))
+    }
 }
 
 public final class OverlayView: NSView {
@@ -135,7 +147,7 @@ public final class OverlayView: NSView {
 
         for annotation in annotations {
             context.saveGState()
-            context.setAlpha(CGFloat(min(max(annotation.opacity, 0), 1)))
+            context.setAlpha(OverlayDrawingMetrics.clampedAlpha(annotation.opacity))
             context.translateBy(
                 x: OverlayDrawingMetrics.points(forPhysicalPixels: annotation.offsetX, backingScaleFactor: scale),
                 y: -OverlayDrawingMetrics.points(forPhysicalPixels: annotation.offsetY, backingScaleFactor: scale)
@@ -153,7 +165,6 @@ public final class OverlayView: NSView {
     private func drawKind(_ kind: AnnotationKind, colorHex: String,
                           scale: CGFloat, viewHeight: CGFloat, context: CGContext,
                           rasterLease: RasterAssetStore.Lease) {
-        let color = ColorParser.parse(colorHex)
         switch kind {
             case .vectorPath(let data, let strokeColorHex, let strokeWidth, let strokeOpacity,
                              let fillColorHex, let fillOpacity, let dash, let usesEvenOddFillRule,
@@ -162,7 +173,7 @@ public final class OverlayView: NSView {
                                strokeOpacity: strokeOpacity, fillColorHex: fillColorHex, fillOpacity: fillOpacity, dash: dash,
                                usesEvenOddFillRule: usesEvenOddFillRule,
                                coordinateScaleX: coordinateScaleX, coordinateScaleY: coordinateScaleY,
-                               fallbackColor: color, scale: scale, viewHeight: viewHeight, context: context)
+                               fallbackColor: ColorParser.parse(colorHex), scale: scale, viewHeight: viewHeight, context: context)
 
             case .image(let assetId, let x, let y, let width, let height, let rotationDegrees, let opacity):
                 drawImage(assetId: assetId, x: x, y: y, width: width, height: height,
@@ -206,7 +217,11 @@ public final class OverlayView: NSView {
         viewHeight: CGFloat,
         context: CGContext
     ) {
-        guard let sourcePath = try? SVGPathParser.parse(data) else { return }
+        // Routed through SVGPathCache rather than SVGPathParser directly:
+        // this runs inside draw(_:), so an uncached parse re-tokenised (and
+        // re-converted every arc command) on every repaint. See SVGPathCache
+        // for why reusing the parsed path is pixel-identical.
+        guard let sourcePath = try? SVGPathCache.path(for: data) else { return }
         var transform = CGAffineTransform(
             a: CGFloat(coordinateScaleX) / scale, b: 0,
             c: 0, d: -CGFloat(coordinateScaleY) / scale,
@@ -217,7 +232,7 @@ public final class OverlayView: NSView {
         if let fillColorHex, fillOpacity > 0 {
             let parsedFill = ColorParser.parse(fillColorHex)
             let fill = parsedFill.withAlphaComponent(
-                parsedFill.alphaComponent * CGFloat(min(max(fillOpacity, 0), 1))
+                parsedFill.alphaComponent * OverlayDrawingMetrics.clampedAlpha(fillOpacity)
             )
             context.addPath(path)
             context.setFillColor(fill.cgColor)
@@ -228,7 +243,7 @@ public final class OverlayView: NSView {
             let stroke = strokeColorHex.map(ColorParser.parse) ?? fallbackColor
             context.addPath(path)
             context.setStrokeColor(stroke.withAlphaComponent(
-                stroke.alphaComponent * CGFloat(min(max(strokeOpacity, 0), 1))
+                stroke.alphaComponent * OverlayDrawingMetrics.clampedAlpha(strokeOpacity)
             ).cgColor)
             context.setLineWidth(OverlayDrawingMetrics.points(forPhysicalPixels: strokeWidth, backingScaleFactor: scale))
             context.setLineCap(.round)
@@ -271,7 +286,7 @@ public final class OverlayView: NSView {
         // documented as clockwise. AppKit's y-up context needs the negation.
         context.rotate(by: CGFloat(-rotationDegrees * .pi / 180))
         context.translateBy(x: -center.x, y: -center.y)
-        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: CGFloat(min(max(opacity, 0), 1)))
+        image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: OverlayDrawingMetrics.clampedAlpha(opacity))
         context.restoreGState()
 
     }
@@ -293,7 +308,7 @@ public final class OverlayView: NSView {
         let fontSize = OverlayDrawingMetrics.points(forPhysicalPixels: fontSizePx, backingScaleFactor: scale)
         let padding = OverlayDrawingMetrics.points(forPhysicalPixels: paddingPx, backingScaleFactor: scale)
         guard fontSize > 0 else { return }
-        let primitiveOpacity = CGFloat(min(max(opacity, 0), 1))
+        let primitiveOpacity = OverlayDrawingMetrics.clampedAlpha(opacity)
         let textColor = ColorParser.parse(textColorHex)
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: fontSize),
@@ -313,7 +328,7 @@ public final class OverlayView: NSView {
         if let backgroundColorHex, backgroundOpacity > 0 {
             let parsedBackground = ColorParser.parse(backgroundColorHex)
             let background = parsedBackground.withAlphaComponent(
-                parsedBackground.alphaComponent * CGFloat(min(max(backgroundOpacity, 0), 1)) * primitiveOpacity
+                parsedBackground.alphaComponent * OverlayDrawingMetrics.clampedAlpha(backgroundOpacity) * primitiveOpacity
             )
             context.setFillColor(background.cgColor)
             context.fill(backgroundRect)

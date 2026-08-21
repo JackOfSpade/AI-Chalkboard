@@ -378,13 +378,37 @@ public final class InstanceLock: @unchecked Sendable {
         return .retainPrimary
     }
 
-    private func descriptor(_ fd: Int32, matchesPath path: String) -> Bool {
+    /// The result of asking "is this descriptor still the file at that path?".
+    ///
+    /// Carries the raw stats, not just the verdict, because the retry path in
+    /// `performAcquire` logs the exact dev/ino pair it saw -- that detail is
+    /// what makes a rare "lock file was replaced under us" race diagnosable
+    /// after the fact. A bare Bool would have forced that call site to keep
+    /// its own open-coded copy of this comparison, which is precisely what it
+    /// used to do.
+    private struct DescriptorPathComparison {
+        let fdOK: Bool
+        let pathOK: Bool
+        let fdInfo: stat
+        let pathInfo: stat
+
+        var matches: Bool {
+            fdOK && pathOK
+                && fdInfo.st_dev == pathInfo.st_dev
+                && fdInfo.st_ino == pathInfo.st_ino
+        }
+    }
+
+    private func compare(_ fd: Int32, toPath path: String) -> DescriptorPathComparison {
         var fdInfo = stat()
         var pathInfo = stat()
-        return fstat(fd, &fdInfo) == 0
-            && stat(path, &pathInfo) == 0
-            && fdInfo.st_dev == pathInfo.st_dev
-            && fdInfo.st_ino == pathInfo.st_ino
+        let fdOK = fstat(fd, &fdInfo) == 0
+        let pathOK = stat(path, &pathInfo) == 0
+        return DescriptorPathComparison(fdOK: fdOK, pathOK: pathOK, fdInfo: fdInfo, pathInfo: pathInfo)
+    }
+
+    private func descriptor(_ fd: Int32, matchesPath path: String) -> Bool {
+        compare(fd, toPath: path).matches
     }
 
     private func logRetryAnomalyOnce(key: String, message: String) {
@@ -529,12 +553,13 @@ public final class InstanceLock: @unchecked Sendable {
             // incumbent to duplicate, and failing there would leave nobody with
             // a menu).
             if verifyInode {
-                var fdInfo = stat()
-                var pathInfo = stat()
-                let fdOK = fstat(fd, &fdInfo) == 0
-                let pathOK = stat(lockURL.path, &pathInfo) == 0
+                let comparison = compare(fd, toPath: lockURL.path)
+                let fdOK = comparison.fdOK
+                let pathOK = comparison.pathOK
+                let fdInfo = comparison.fdInfo
+                let pathInfo = comparison.pathInfo
 
-                if !fdOK || !pathOK || fdInfo.st_dev != pathInfo.st_dev || fdInfo.st_ino != pathInfo.st_ino {
+                if !comparison.matches {
                     // Deliberately leaves `lockFileDescriptor` at -1: this
                     // process did NOT become the lock holder, so a later
                     // `retryAcquire()` must go through the whole probe again

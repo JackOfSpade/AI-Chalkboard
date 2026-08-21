@@ -104,14 +104,15 @@ public final class AnnotationStore: @unchecked Sendable {
     /// may be busy for an arbitrary amount of time.
     private func withLiveAnnotations<T>(_ body: ([Annotation]) -> T) -> T {
         let now = Date()
+        let uptime = ProcessInfo.processInfo.systemUptime
         var expired: [Annotation] = []
         let result = withLock {
             expired = annotations.filter { annotation in
-                annotation.expiresAt.map { $0 <= now } ?? false
+                annotation.hasExpired(now: now, uptime: uptime)
             }
             if !expired.isEmpty {
                 annotations.removeAll { annotation in
-                    annotation.expiresAt.map { $0 <= now } ?? false
+                    annotation.hasExpired(now: now, uptime: uptime)
                 }
             }
             return body(annotations)
@@ -165,17 +166,29 @@ public final class AnnotationStore: @unchecked Sendable {
             // The MCP layer rejects excessive durations. This defensive cap
             // protects direct/in-process callers too, before Date and
             // DispatchTime receive a finite-but-overflowing interval.
-            storedAnnotation.expiresAt = Date().addingTimeInterval(
-                min(duration, DrawingDefaults.maxAnnotationDurationSeconds)
-            )
+            let bounded = min(duration, DrawingDefaults.maxAnnotationDurationSeconds)
+            storedAnnotation.expiresAt = Date().addingTimeInterval(bounded)
+            storedAnnotation.expiresAtUptime = ProcessInfo.processInfo.systemUptime + bounded
+        }
+        // A caller may also supply `expiresAt` directly (no durationSeconds).
+        // Derive the monotonic twin from the remaining wall-clock interval at
+        // insertion time, so liveness decisions stay off the wall clock no
+        // matter which way the deadline arrived. Anything already past due
+        // pins to now rather than going negative.
+        if storedAnnotation.expiresAtUptime == nil, let wallDeadline = storedAnnotation.expiresAt {
+            let remaining = max(0, wallDeadline.timeIntervalSinceNow)
+            if remaining.isFinite {
+                storedAnnotation.expiresAtUptime = ProcessInfo.processInfo.systemUptime + remaining
+            }
         }
 
         let now = Date()
+        let uptime = ProcessInfo.processInfo.systemUptime
         var expiredAnnotations: [Annotation] = []
         let mutation: (evicted: [Annotation], rejection: AnnotationStoreResourceLimit?) = withLock {
-            expiredAnnotations = annotations.filter { $0.expiresAt.map { $0 <= now } ?? false }
+            expiredAnnotations = annotations.filter { $0.hasExpired(now: now, uptime: uptime) }
             if !expiredAnnotations.isEmpty {
-                annotations.removeAll { $0.expiresAt.map { $0 <= now } ?? false }
+                annotations.removeAll { $0.hasExpired(now: now, uptime: uptime) }
             }
             var candidate = annotations
             candidate.append(storedAnnotation)
@@ -207,8 +220,9 @@ public final class AnnotationStore: @unchecked Sendable {
 
         notifyChange()
 
-        if let expiresAt = storedAnnotation.expiresAt {
-            let remaining = max(0, expiresAt.timeIntervalSinceNow)
+        if let remaining = storedAnnotation.remainingSeconds(
+            now: Date(), uptime: ProcessInfo.processInfo.systemUptime
+        ) {
             if remaining.isFinite, remaining <= DrawingDefaults.maxAnnotationDurationSeconds {
                 DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
                     _ = self?.remove(id: storedAnnotation.id)
@@ -221,13 +235,14 @@ public final class AnnotationStore: @unchecked Sendable {
 
     public func remove(id: String) -> Bool {
         let now = Date()
+        let uptime = ProcessInfo.processInfo.systemUptime
         let result: (removedLive: [Annotation], expired: [Annotation]) = withLock {
-            let expired = annotations.filter { $0.expiresAt.map { $0 <= now } ?? false }
+            let expired = annotations.filter { $0.hasExpired(now: now, uptime: uptime) }
             let removedLive = annotations.filter {
-                $0.id == id && !($0.expiresAt.map { $0 <= now } ?? false)
+                $0.id == id && !($0.hasExpired(now: now, uptime: uptime))
             }
             annotations.removeAll {
-                $0.id == id || ($0.expiresAt.map { $0 <= now } ?? false)
+                $0.id == id || ($0.hasExpired(now: now, uptime: uptime))
             }
             return (removedLive, expired)
         }
@@ -261,10 +276,11 @@ public final class AnnotationStore: @unchecked Sendable {
         expectedRevision: UInt64? = nil
     ) -> AnnotationStoreUpdateResult {
         let now = Date()
+        let uptime = ProcessInfo.processInfo.systemUptime
         let result: (old: Annotation?, expired: [Annotation], rejection: AnnotationStoreResourceLimit?, stale: Bool) = withLock {
-            let expired = annotations.filter { $0.expiresAt.map { $0 <= now } ?? false }
+            let expired = annotations.filter { $0.hasExpired(now: now, uptime: uptime) }
             if !expired.isEmpty {
-                annotations.removeAll { $0.expiresAt.map { $0 <= now } ?? false }
+                annotations.removeAll { $0.hasExpired(now: now, uptime: uptime) }
             }
             guard let index = annotations.firstIndex(where: { $0.id == id }) else {
                 return (nil, expired, nil, false)
@@ -307,12 +323,13 @@ public final class AnnotationStore: @unchecked Sendable {
     @discardableResult
     public func clearAll() -> Int {
         let now = Date()
+        let uptime = ProcessInfo.processInfo.systemUptime
         let result: (live: [Annotation], expired: [Annotation]) = withLock {
             let removed = annotations
             annotations.removeAll()
             return (
-                removed.filter { !($0.expiresAt.map { $0 <= now } ?? false) },
-                removed.filter { $0.expiresAt.map { $0 <= now } ?? false }
+                removed.filter { !($0.hasExpired(now: now, uptime: uptime)) },
+                removed.filter { $0.hasExpired(now: now, uptime: uptime) }
             )
         }
         releaseRasterAssets(in: result.expired + result.live)
@@ -336,14 +353,15 @@ public final class AnnotationStore: @unchecked Sendable {
     @discardableResult
     public func clearVisible(forApp activeAppId: String?) -> Int {
         let now = Date()
+        let uptime = ProcessInfo.processInfo.systemUptime
         let result: (removedLive: [Annotation], expired: [Annotation]) = withLock {
-            let expired = annotations.filter { $0.expiresAt.map { $0 <= now } ?? false }
+            let expired = annotations.filter { $0.hasExpired(now: now, uptime: uptime) }
             let removedLive = annotations.filter { annotation in
-                let isLive = !(annotation.expiresAt.map { $0 <= now } ?? false)
+                let isLive = !annotation.hasExpired(now: now, uptime: uptime)
                 return isLive && (annotation.appId == nil || annotation.appId == activeAppId)
             }
             annotations.removeAll { annotation in
-                let isExpired = annotation.expiresAt.map { $0 <= now } ?? false
+                let isExpired = annotation.hasExpired(now: now, uptime: uptime)
                 return isExpired || annotation.appId == nil || annotation.appId == activeAppId
             }
             return (removedLive, expired)

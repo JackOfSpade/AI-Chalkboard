@@ -76,11 +76,8 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
-import os
 import re
-import subprocess
 import sys
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -301,81 +298,20 @@ class CaptureValidationError(Exception):
     silently -- see `validate_capture_shape`."""
 
 
-# Bounded tail kept from the child's stderr for failure diagnostics. Bounded
-# deliberately -- see `_StderrDrain`'s doc comment for why an UNBOUNDED read
-# is exactly the bug this class exists to avoid.
-_STDERR_TAIL_BYTES = 16_000
-
-
-class _StderrDrain:
-    """Continuously drains a child process's stderr on a background thread.
-
-    WHY THIS EXISTS: `MCPServer.handleToolsCall` logs one line per call,
-    including a Swift debug description of the entire `arguments` value --
-    and `call_path_over_cap` below deliberately sends 10,001 points, which
-    turns that single log line into several hundred KB. `test_mcp_stdio.py`'s
-    own harness (`stderr_diagnostics`) only reads the child's stderr once, at
-    the very end, after the process has already exited -- which is fine for
-    its own fixtures (none of them log anywhere near this much), but is
-    exactly wrong here: nobody draining stderr while the process is still
-    running means the child's write(2) into a full pipe (64 KB on macOS)
-    blocks indefinitely, and since that logging call happens synchronously
-    BEFORE the tool body runs, it wedges the JSON-RPC response too --
-    indistinguishable, from this script's side, from the server simply
-    hanging. Continuously draining stderr throughout the run, as any
-    reasonable MCP host's stdio transport would, is the actual fix; keeping
-    only a bounded tail (not reusing `stderr_diagnostics`'s unbounded read)
-    keeps the fix itself from becoming an unbounded-memory version of the
-    same problem.
-    """
-
-    def __init__(self, proc: subprocess.Popen):
-        self._buffer = bytearray()
-        self._lock = threading.Lock()
-        self._thread = threading.Thread(target=self._run, args=(proc,), daemon=True)
-        self._thread.start()
-
-    def _run(self, proc: subprocess.Popen) -> None:
-        stream = proc.stderr
-        if stream is None:
-            return
-        fd = stream.fileno()
-        while True:
-            try:
-                chunk = os.read(fd, 65536)
-            except OSError:
-                return
-            if not chunk:
-                return
-            with self._lock:
-                self._buffer.extend(chunk)
-                overflow = len(self._buffer) - _STDERR_TAIL_BYTES
-                if overflow > 0:
-                    del self._buffer[:overflow]
-
-    def join_and_get_tail(self, timeout: float) -> str:
-        """Waits (briefly) for the drain thread to observe EOF -- which
-        `terminate_child` causes by the time this is called -- then returns
-        whatever tail it collected."""
-        self._thread.join(timeout)
-        with self._lock:
-            return bytes(self._buffer).decode("utf-8", errors="replace")
-
-
 def run_capture(binary_path: str, out_path: Path, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> None:
     """Launches `binary_path --mcp`, sends every request in
     `_TOP_LEVEL_REQUESTS` + `_TOOL_CALLS` in order, and writes the
     canonicalised result to `out_path`."""
-    proc = subprocess.Popen(
-        [binary_path, "--mcp"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
-    reader = stdio_harness.MCPLineReader(proc)
-    stderr_drain = _StderrDrain(proc)
+    # `spawn_mcp_child` starts a `StderrDrain` (test_mcp_stdio.py) on the
+    # child immediately, before any request is sent. `MCPServer.handleToolsCall`
+    # logs one line per call, including a Swift debug description of the
+    # entire `arguments` value, synchronously BEFORE the tool body runs -- so
+    # a single large-enough `tools/call` anywhere in `_TOOL_CALLS` below would
+    # be enough to fill the 64 KB macOS pipe and block the child's write(2),
+    # wedging the JSON-RPC response too and looking, from this script's side,
+    # indistinguishable from the server simply hanging. See StderrDrain's own
+    # doc comment for the full story.
+    proc, reader, stderr_drain = stdio_harness.spawn_mcp_child(binary_path)
     results: dict[str, Any] = {}
     next_id = 1
     failed = False
@@ -401,7 +337,7 @@ def run_capture(binary_path: str, out_path: Path, timeout: float = DEFAULT_TIMEO
         if failed:
             diagnostics = stderr_drain.join_and_get_tail(timeout=2.0).strip()
             if diagnostics:
-                print(f"\nChild stderr (last {_STDERR_TAIL_BYTES} bytes):\n{diagnostics}", file=sys.stderr, flush=True)
+                print(f"\nChild stderr (last {stdio_harness.STDERR_TAIL_BYTES} bytes):\n{diagnostics}", file=sys.stderr, flush=True)
 
     missing = EXPECTED_KEYS - results.keys()
     if missing:

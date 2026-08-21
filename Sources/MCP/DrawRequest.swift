@@ -122,6 +122,28 @@ struct DrawRequest {
         return .success(DrawRequest(screen: screen))
     }
 
+    /// `resolveScreen(args:)` followed immediately by `coordinateTransform(args:)`
+    /// on the resolved request -- the identical two-step prologue that
+    /// `draw_path`, `handleDrawImage`, `handleDrawText`, and `handleDrawBatch`
+    /// each ran inline before this helper existed. Kept as two switches
+    /// chained here, rather than collapsed into one, so the ordering stays
+    /// self-evidently a screen-then-transform sequence: a caller who sends
+    /// both a bad `screen_id` and a bad `coordinate_space` must still see the
+    /// screen error first, exactly as every call site produced before this
+    /// extraction (see this type's header comment for why that resolve-before-
+    /// validate ordering is load-bearing all the way through `finish`).
+    static func resolveDrawContext(args: [String: Any]) -> DrawOutcome<(DrawRequest, CoordinateTransform)> {
+        let request: DrawRequest
+        switch resolveScreen(args: args) {
+        case .failure(let err): return .failure(err)
+        case .success(let resolved): request = resolved
+        }
+        switch request.coordinateTransform(args: args) {
+        case .failure(let err): return .failure(err)
+        case .success(let transform): return .success((request, transform))
+        }
+    }
+
     /// Resolves public geometry coordinates into the backing-pixel geometry
     /// stored by annotations.  The old surface remains the default; source
     /// screenshot dimensions are deliberately required rather than guessed.
@@ -160,6 +182,27 @@ struct DrawRequest {
         }
     }
 
+    /// Validates a `duration_seconds` argument the same way `finish(...)`
+    /// does, without resolving it to a value. `handleHighlightElement`
+    /// deliberately re-runs this exact check before it ever resolves a
+    /// process or touches the Accessibility hierarchy (see that handler's own
+    /// comment on why: a malformed highlight must not trigger a TCC prompt or
+    /// cross-process AX IPC merely to fail later at `finish`). That early
+    /// front-loaded rejection is the deliberate part; the validation logic
+    /// itself was a literal copy, so it lives here once and both call sites
+    /// share it.
+    static func validateDurationSeconds(args: [String: Any]) -> String? {
+        if args.keys.contains("duration_seconds"),
+           MCPArgument.hasInvalidSuppliedDouble(args, key: "duration_seconds") {
+            return "duration_seconds must be a finite number greater than 0 when supplied."
+        }
+        if let requestedDuration = MCPArgument.double(args["duration_seconds"]),
+           (requestedDuration <= 0 || requestedDuration > DrawingDefaults.maxAnnotationDurationSeconds) {
+            return "duration_seconds must be greater than 0 and no more than \(Int(DrawingDefaults.maxAnnotationDurationSeconds)) seconds when supplied; omit it for a persistent annotation."
+        }
+        return nil
+    }
+
     /// Reads the arguments every draw tool shares beyond geometry
     /// (`color`/`duration_seconds`/`app`), resolves the per-app link, builds
     /// and stores the `Annotation`, and returns the worded success text -- or
@@ -179,15 +222,10 @@ struct DrawRequest {
             return .failure("color must be a string when supplied.")
         }
         let colorHex = args["color"] as? String ?? defaultColor
-        if args.keys.contains("duration_seconds"),
-           MCPArgument.hasInvalidSuppliedDouble(args, key: "duration_seconds") {
-            return .failure("duration_seconds must be a finite number greater than 0 when supplied.")
+        if let error = DrawRequest.validateDurationSeconds(args: args) {
+            return .failure(error)
         }
         let requestedDuration = MCPArgument.double(args["duration_seconds"])
-        if let requestedDuration,
-           (requestedDuration <= 0 || requestedDuration > DrawingDefaults.maxAnnotationDurationSeconds) {
-            return .failure("duration_seconds must be greater than 0 and no more than \(Int(DrawingDefaults.maxAnnotationDurationSeconds)) seconds when supplied; omit it for a persistent annotation.")
-        }
         let duration = requestedDuration ?? defaultDuration
 
         if args.keys.contains("z_index"), MCPArgument.integer(args["z_index"]) == nil {

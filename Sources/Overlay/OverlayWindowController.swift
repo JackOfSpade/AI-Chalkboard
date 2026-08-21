@@ -108,8 +108,6 @@ public struct OverlayInputPolicySnapshot: Codable, Equatable {
 public struct ScreenSnapshot {
     public let screens: [ScreenInfo]
 
-    public var isEmpty: Bool { screens.isEmpty }
-
     /// Resolves a caller-supplied `screen_id` against THIS snapshot.
     /// Returns nil only when the snapshot contains no screens at all.
     /// Order: in-bounds integer index -> exact id match -> main screen -> first screen.
@@ -328,35 +326,18 @@ public final class OverlayWindowController: NSObject {
     /// value call. The state transition is idempotent, while re-ordering makes
     /// a repeated suspend/resume self-heal after a display rebuild or another
     /// AppKit ordering event.
+    ///
+    /// Delegates to the generation-aware overload rather than hand-rolling the
+    /// transition. Doing it by hand set `annotationsSuspended = false` and then
+    /// called the private no-arg `refreshViewsNow()`, which fails CLOSED (orders
+    /// every window out) while `annotationsSuspensionGeneration` is still nil --
+    /// so a caller arriving before the first durable generation was applied
+    /// would be told "resumed" while every overlay stayed off screen. Reusing
+    /// the one real implementation makes that divergence unrepresentable.
     @discardableResult
     public func setAnnotationsSuspended(_ suspended: Bool) -> Bool {
         MainThread.sync {
-            let changed = annotationsSuspended != suspended
-            annotationsSuspended = suspended
-
-            if suspended {
-                // `orderOut` is stronger than leaving a transparent or
-                // click-through window on screen: it removes every overlay
-                // window in THIS process from WindowServer ownership scans.
-                for window in overlayWindows {
-                    window.orderOut(nil)
-                }
-                for view in overlayViews {
-                    view.needsDisplay = true
-                }
-            } else {
-                // Re-evaluate the current app/capture filters rather than
-                // replaying a stale visibility snapshot taken at suspension
-                // time. New, expired, cleared, or app-switched annotations are
-                // therefore handled exactly as they would have been normally.
-                refreshViewsNow()
-            }
-
-            Logger.shared.log(
-                "OverlayWindowController: annotations suspension set to \(suspended) on \(overlayWindows.count) overlay window reference(s); store contents were retained.",
-                level: "INFO"
-            )
-            return changed
+            setAnnotationsSuspended(suspended, generation: annotationsSuspensionGeneration ?? 0)
         }
     }
 
@@ -377,8 +358,7 @@ public final class OverlayWindowController: NSObject {
             annotationsSuspended = suspended
 
             if suspended {
-                for window in overlayWindows { window.orderOut(nil) }
-                for view in overlayViews { view.needsDisplay = true }
+                orderAllOverlayWindowsOut()
             } else {
                 refreshViewsNow()
             }
@@ -399,8 +379,7 @@ public final class OverlayWindowController: NSObject {
     public func forceAnnotationsSuspendedFailClosed() {
         MainThread.sync {
             annotationsSuspended = true
-            for window in overlayWindows { window.orderOut(nil) }
-            for view in overlayViews { view.needsDisplay = true }
+            orderAllOverlayWindowsOut()
             Logger.shared.log("OverlayWindowController: suspension registry unavailable; ordered overlays out fail-closed.", level: "ERROR")
         }
     }
@@ -810,7 +789,7 @@ public final class OverlayWindowController: NSObject {
     func presentationStatus(for annotationId: String) -> PresentationStatus {
         let suspendedWithoutAnnotation = isAnnotationsSuspended
         guard let annotation = AnnotationStore.shared.get(id: annotationId),
-              annotation.expiresAt.map({ $0 > Date() }) ?? true else {
+              !annotation.hasExpired(now: Date(), uptime: ProcessInfo.processInfo.systemUptime) else {
             let input = PresentationReadinessInput(
                 annotationExists: false,
                 annotationIsInCurrentVisibleSet: false,

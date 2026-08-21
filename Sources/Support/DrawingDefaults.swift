@@ -53,6 +53,12 @@ enum DrawingDefaults {
     static let textColor = "#FFFFFF"
     static let maxTextCharacters = 20_000
 
+    /// `highlight_element`'s `label` argument, matched against Accessibility
+    /// title/description/value strings rather than rendered as drawn text.
+    /// Bounded far below `maxTextCharacters` because it is a lookup key, not
+    /// canvas content.
+    static let maxHighlightLabelCharacters = 1_024
+
     /// SVG path strings are parsed once at the API boundary and again by the
     /// renderer. The MCP line framer already caps requests at 4 MB; this lower
     /// per-path ceiling keeps one persistent shape from monopolizing repaint

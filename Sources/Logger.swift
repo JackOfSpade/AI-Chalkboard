@@ -12,6 +12,42 @@ public final class Logger: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.aichalkboard.logger", qos: .utility)
     private let dateFormatter: DateFormatter
 
+    // Serializes each log line's format-timestamp + build-line +
+    // write-to-stderr sequence (see log()/logSync()), plus every other
+    // FileHandle.standardError.write below (all of which go through
+    // Logger.writeStderr()).
+    //
+    // BUG FIX (interleaved stderr writes corrupt the diagnostic stream):
+    // FileHandle.standardError.write is a raw write(2) with no serialization
+    // of its own, and log()/logSync() are genuinely called concurrently from
+    // multiple threads: AppDelegate/InstanceBroadcast log from the main
+    // thread, MCPServer's read loop logs from a background global queue, and
+    // the uncaught-exception handler in Launcher/main.swift calls logSync()
+    // from its own thread. When stderr is a pipe (the normal case -- an MCP
+    // host captures the child's stderr for diagnostics) and a line exceeds
+    // PIPE_BUF (512 bytes on macOS), the kernel gives no atomicity guarantee
+    // across concurrent writers, so two threads' writes can interleave
+    // mid-line and corrupt the diagnostic stream. A long Swift debug
+    // description of tool arguments easily exceeds 512 bytes. This lock
+    // makes each line's stderr write atomic with respect to every other
+    // line's. As a secondary, minor benefit it also serializes use of the
+    // shared `dateFormatter` in log()/logSync(), though Foundation documents
+    // DateFormatter as safe for concurrent formatting -- that is not why
+    // this lock exists.
+    //
+    // Static rather than instance-scoped: it must also be reachable from the
+    // `static` openAppendHandle(at:), which can run before `self` exists
+    // (called from init()). Logger has exactly one instance (Logger.shared,
+    // via a private init()), so a static lock is equivalent to an
+    // instance-scoped one here.
+    //
+    // MUST be released before entering `queue.async`/`queue.sync`: logSync()
+    // uses queue.sync, and holding this lock across that call while another
+    // thread is blocked on this same lock waiting for its own turn on
+    // `queue` would deadlock. Every acquisition of this lock spans a small,
+    // synchronous block with no dispatch inside it -- see the call sites.
+    private static let stderrLock = NSLock()
+
     // Capped at 5 MB max per log file (total max disk space: 10 MB with 1 backup)
     private let maxFileSizeBytes: UInt64 = 5 * 1024 * 1024
 
@@ -87,24 +123,57 @@ public final class Logger: @unchecked Sendable {
             // stderr only and continue with fileHandle == nil; log() already
             // writes to stderr unconditionally, so output isn't fully lost.
             let msg = "[Logger] Failed to open log file at \(url.path) (errno \(errno)). Logging to stderr only.\n"
-            if let data = msg.data(using: .utf8) {
-                FileHandle.standardError.write(data)
-            }
+            stderrLock.lock()
+            Logger.writeStderr(msg)
+            stderrLock.unlock()
             return nil
         }
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
+    // Encodes `line` as UTF-8 and writes it to stderr, returning the encoded
+    // bytes on success. log()/logSync() reuse that returned Data for their
+    // own (separate, async-queued) write to the log file instead of
+    // re-encoding the same string a second time. Returns nil, writing
+    // nothing, if UTF-8 encoding fails -- effectively impossible for a
+    // native Swift String, but matches every call site's existing tolerance
+    // for silently dropping a diagnostic line rather than crashing the MCP
+    // server over a logging failure.
+    //
+    // Deliberately does NOT take stderrLock itself. log()/logSync() need the
+    // lock to also cover the timestamp-format + line-build step that
+    // precedes the write (see stderrLock's declaration), so the lock must be
+    // acquired by the caller, before this runs -- NSLock is not reentrant,
+    // so this method locking again internally would deadlock those callers.
+    // Every call site in this file (including ones that ignore the return
+    // value) takes stderrLock immediately around its call to this method, so
+    // the "caller always locks" rule is applied uniformly rather than mixed
+    // with locking inside the helper.
+    @discardableResult
+    private static func writeStderr(_ line: String) -> Data? {
+        guard let data = line.data(using: .utf8) else { return nil }
+        FileHandle.standardError.write(data)
+        return data
+    }
+
     public func log(_ message: String, level: String = "INFO") {
+        // stderrLock spans formatting the timestamp, building the line, and
+        // writing it to stderr -- see the lock's declaration for why. It is
+        // released before queue.async below; never hold it across a
+        // dispatch onto `queue` (risk of deadlock against logSync's
+        // queue.sync -- see the lock's declaration).
+        //
+        // NEVER write to stdout: this process is an MCP stdio server
+        // speaking JSON-RPC over stdout, and any stray byte there would
+        // corrupt the protocol stream. writeStderr() only ever touches
+        // stderr.
+        Logger.stderrLock.lock()
         let timestamp = dateFormatter.string(from: Date())
         let pid = ProcessInfo.processInfo.processIdentifier
         let line = "[\(timestamp)] [PID: \(pid)] [\(level)] \(message)\n"
-
-        // Write to stderr. NEVER write to stdout: this process is an MCP stdio
-        // server speaking JSON-RPC over stdout, and any stray byte there would
-        // corrupt the protocol stream.
-        guard let data = line.data(using: .utf8) else { return }
-        FileHandle.standardError.write(data)
+        let data = Logger.writeStderr(line)
+        Logger.stderrLock.unlock()
+        guard let data = data else { return }
 
         // Write to log file asynchronously with size-cap rotation.
         queue.async { [weak self] in
@@ -140,9 +209,14 @@ public final class Logger: @unchecked Sendable {
             // the synchronous FATAL path (logSync).
         } catch {
             let msg = "[Logger] File write failed: \(error). Logging to stderr only for this line.\n"
-            if let errData = msg.data(using: .utf8) {
-                FileHandle.standardError.write(errData)
-            }
+            // Safe to take stderrLock here: writeToFile() only ever runs
+            // inside `queue` (from log()'s queue.async or logSync()'s
+            // queue.sync), and nothing holds stderrLock while waiting on
+            // `queue` (see the lock's declaration), so there is no path back
+            // to a deadlock.
+            Logger.stderrLock.lock()
+            Logger.writeStderr(msg)
+            Logger.stderrLock.unlock()
         }
     }
 
@@ -284,11 +358,15 @@ public final class Logger: @unchecked Sendable {
             // inside `queue` right now, and log() would queue.async back
             // onto this same serial queue -- at best a pointless bounce,
             // and the established rule in this file is that error paths
-            // inside the queue always write to stderr directly.
+            // inside the queue always write to stderr directly. Taking
+            // stderrLock here is still safe -- we're inside `queue`, and
+            // nothing holds stderrLock while waiting on `queue` (see the
+            // lock's declaration) -- it just makes this write atomic with
+            // respect to every other line going to stderr.
             let msg = "[Logger] Rotation failed, leaving oversized log file in place; will retry in \(Int(rotationFailureCooldown))s. Path: \(logFileURL.path) Error: \(error)\n"
-            if let msgData = msg.data(using: .utf8) {
-                FileHandle.standardError.write(msgData)
-            }
+            Logger.stderrLock.lock()
+            Logger.writeStderr(msg)
+            Logger.stderrLock.unlock()
             // Degraded but alive, never dead: fileHandle is untouched and
             // still open on the existing (oversized) file, so logging
             // continues uninterrupted -- just without the size cap enforced
@@ -335,12 +413,18 @@ public final class Logger: @unchecked Sendable {
     // uncaught-exception handler) run on their own thread outside the
     // logger's queue, so this is safe.
     public func logSync(_ message: String, level: String = "FATAL") {
+        // Same stderrLock discipline as log(): span format-timestamp +
+        // build-line + write-to-stderr, then release the lock before
+        // entering queue.sync below. Holding it across queue.sync would
+        // deadlock against any other thread blocked on stderrLock while
+        // waiting for its own turn on `queue` -- see the lock's declaration.
+        Logger.stderrLock.lock()
         let timestamp = dateFormatter.string(from: Date())
         let pid = ProcessInfo.processInfo.processIdentifier
         let line = "[\(timestamp)] [PID: \(pid)] [\(level)] \(message)\n"
-
-        guard let data = line.data(using: .utf8) else { return }
-        FileHandle.standardError.write(data)
+        let data = Logger.writeStderr(line)
+        Logger.stderrLock.unlock()
+        guard let data = data else { return }
 
         queue.sync { [weak self] in
             guard let self = self else { return }

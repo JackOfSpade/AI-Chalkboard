@@ -135,6 +135,51 @@ public struct Annotation: Identifiable, Codable {
     /// updates, not a user-editable drawing property.
     public var revision: UInt64 = 0
 
+    /// The same deadline as `expiresAt`, expressed on the MONOTONIC clock
+    /// (`ProcessInfo.processInfo.systemUptime`) instead of the wall clock.
+    ///
+    /// WHY BOTH EXIST: `expiresAt` is what MCP callers see -- `list_annotations`
+    /// reports it as an RFC 3339 timestamp, which only a wall-clock date can
+    /// express. But deciding whether an annotation is still live must NOT
+    /// depend on the wall clock, because that clock can jump: an NTP
+    /// correction or a user changing the system time would make live
+    /// annotations vanish from every read (or linger past their duration)
+    /// even though the removal timer -- `asyncAfter`, which is monotonic --
+    /// had not fired. That split is exactly the hazard
+    /// `SuspensionLeaseCoordinator` already avoids by keeping lease deadlines
+    /// on `systemUptime` (see its `expiresAtUptime`); annotations now agree
+    /// with it.
+    ///
+    /// So: monotonic for DECISIONS, wall clock for REPORTING.
+    ///
+    /// Deliberately excluded from `CodingKeys`, like `revision` above: it is
+    /// process-local state (uptime is meaningless across processes and
+    /// reboots), and keeping it off the wire leaves the public annotation
+    /// shape unchanged. A decoded annotation therefore has `nil` here and
+    /// falls back to the wall-clock comparison, which is exactly the previous
+    /// behaviour.
+    public var expiresAtUptime: Double?
+
+    /// Whether this annotation's deadline has elapsed.
+    ///
+    /// Prefers the monotonic deadline and falls back to the wall clock only
+    /// when it is absent. Every liveness check in the store routes through
+    /// here rather than re-deriving the comparison -- it was open-coded as
+    /// `expiresAt.map { $0 <= now } ?? false` in sixteen places, which is how
+    /// the clock-source inconsistency went unnoticed.
+    public func hasExpired(now: Date, uptime: Double) -> Bool {
+        if let deadline = expiresAtUptime { return deadline <= uptime }
+        return expiresAt.map { $0 <= now } ?? false
+    }
+
+    /// Seconds until this annotation expires, or nil when it persists.
+    /// Monotonic when available, for the same reason as `hasExpired`.
+    public func remainingSeconds(now: Date, uptime: Double) -> Double? {
+        if let deadline = expiresAtUptime { return max(0, deadline - uptime) }
+        guard let expiresAt else { return nil }
+        return max(0, expiresAt.timeIntervalSince(now))
+    }
+
     /// Revision is server-side concurrency state, deliberately excluded from
     /// MCP's durable/public annotation shape. Older list payloads also remain
     /// decodable because this default is used when the key is absent.
@@ -173,76 +218,5 @@ public struct Annotation: Identifiable, Codable {
         self.offsetY = offsetY
         self.zIndex = zIndex
         self.revision = revision
-    }
-}
-
-public struct ColorParser {
-    public static func parse(_ colorString: String?) -> NSColor {
-        guard let colorString = colorString?.trimmingCharacters(in: .whitespacesAndNewlines), !colorString.isEmpty else {
-            return NSColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9) // Default bright red
-        }
-        
-        let lower = colorString.lowercased()
-        switch lower {
-        case "red": return NSColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9)
-        case "green": return NSColor(red: 0.2, green: 0.85, blue: 0.3, alpha: 0.9)
-        case "blue": return NSColor(red: 0.2, green: 0.5, blue: 1.0, alpha: 0.9)
-        case "yellow": return NSColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 0.9)
-        case "orange": return NSColor(red: 1.0, green: 0.5, blue: 0.0, alpha: 0.9)
-        case "purple": return NSColor(red: 0.6, green: 0.3, blue: 0.9, alpha: 0.9)
-        case "pink": return NSColor(red: 1.0, green: 0.4, blue: 0.7, alpha: 0.9)
-        case "cyan": return NSColor(red: 0.0, green: 0.8, blue: 0.9, alpha: 0.9)
-        case "white": return NSColor(white: 1.0, alpha: 0.9)
-        case "black": return NSColor(white: 0.1, alpha: 0.9)
-        default: break
-        }
-        
-        var hex = lower
-        if hex.hasPrefix("#") {
-            hex.removeFirst()
-        }
-
-        // Validate BEFORE trusting Scanner's parse. `scanHexInt64` stops at the
-        // first character it can't consume and still reports success with
-        // whatever prefix it DID consume -- `intVal` is pre-initialised to 0,
-        // so an all-invalid string like "GGGGGG" silently parses to 0 instead
-        // of failing. Branching on `hex.count` alone (below) would then treat
-        // a garbage string as a well-formed value purely because it happened
-        // to have the right length, e.g. "12GG56" is 6 characters and would be
-        // read as a legitimate 6-digit RGB value despite only "12" of it ever
-        // having been parsed.
-        //
-        // Requiring every remaining character to be an ASCII hex digit also
-        // incidentally rejects a "0x"/"0X" prefix (Scanner's `scanHexInt64`
-        // recognizes and skips one): "0xff0000" is 8 characters, which without
-        // this check would be misrouted into the 8-digit RGBA branch below
-        // reading only "ff0000" -- 'x' is not a hex digit, so it now correctly
-        // falls through to the same red fallback other malformed strings get.
-        let isPureHexDigits = !hex.isEmpty && hex.allSatisfy { "0123456789abcdef".contains($0) }
-        guard isPureHexDigits, [3, 6, 8].contains(hex.count) else {
-            return NSColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9) // Invalid colour: same red fallback as wrong-length strings
-        }
-
-        var intVal: UInt64 = 0
-        Scanner(string: hex).scanHexInt64(&intVal)
-
-        let a, r, g, b: UInt64
-        switch hex.count {
-        case 3: // RGB (12-bit)
-            (a, r, g, b) = (255, (intVal >> 8) * 17, (intVal >> 4 & 0xF) * 17, (intVal & 0xF) * 17)
-        case 6: // RGB (24-bit)
-            (a, r, g, b) = (255, intVal >> 16, intVal >> 8 & 0xFF, intVal & 0xFF)
-        case 8: // ARGB or RGBA (32-bit) -> assume RGBA
-            (r, g, b, a) = (intVal >> 24, intVal >> 16 & 0xFF, intVal >> 8 & 0xFF, intVal & 0xFF)
-        default:
-            return NSColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9)
-        }
-
-        return NSColor(
-            red: CGFloat(r) / 255.0,
-            green: CGFloat(g) / 255.0,
-            blue: CGFloat(b) / 255.0,
-            alpha: CGFloat(a) / 255.0
-        )
     }
 }

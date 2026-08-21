@@ -693,6 +693,20 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     private func openValidatedRegularFile(named name: String, in directoryFD: Int32, create: Bool) throws -> Int32 {
         var before = stat()
         let existed = fstatat(directoryFD, name, &before, AT_SYMLINK_NOFOLLOW) == 0
+        // Tracks whether `before` currently holds a validated stat we are
+        // entitled to compare the opened descriptor against.
+        //
+        // BUG FIX (the inode check was dead on the one path it exists for):
+        // this used to reuse `existed` directly in the final guard below. On
+        // the O_EXCL loser path we re-stat into `before` and then plainly
+        // openat() the winner's file -- but `existed` was bound `let` BEFORE
+        // that branch and stayed false, so `!existed` short-circuited the
+        // dev/ino comparison to true and the verification the comment below
+        // promises never actually ran. `existed` still answers "did it exist
+        // before we tried to create it" for the control flow; this separate
+        // flag answers "is `before` a stat worth comparing against", which is
+        // the question the guard is really asking.
+        var beforeIsValidated = existed
         if existed && ((before.st_mode & S_IFMT) != S_IFREG || before.st_uid != getuid() || before.st_nlink != 1) {
             throw CoordinatorError.unavailable("AI Chalkboard refused an unsafe suspension-state file.")
         }
@@ -710,6 +724,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
                       before.st_uid == getuid(), before.st_nlink == 1 else {
                     throw CoordinatorError.unavailable("AI Chalkboard refused an unsafe suspension-state file.")
                 }
+                beforeIsValidated = true
                 fd = openat(directoryFD, name, baseFlags)
             }
         } else {
@@ -724,7 +739,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
               fstatat(directoryFD, name, &named, AT_SYMLINK_NOFOLLOW) == 0,
               (after.st_mode & S_IFMT) == S_IFREG, after.st_uid == getuid(), after.st_nlink == 1,
               after.st_dev == named.st_dev, after.st_ino == named.st_ino,
-              (!existed || (before.st_dev == after.st_dev && before.st_ino == after.st_ino)) else {
+              (!beforeIsValidated || (before.st_dev == after.st_dev && before.st_ino == after.st_ino)) else {
             close(fd); throw CoordinatorError.unavailable("AI Chalkboard detected a replaced suspension-state file.")
         }
         guard fchmod(fd, 0o600) == 0 else { close(fd); throw CoordinatorError.unavailable("AI Chalkboard could not secure suspension state.") }

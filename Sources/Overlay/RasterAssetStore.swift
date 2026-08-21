@@ -18,14 +18,7 @@ public struct RasterAssetHandle: Equatable, Sendable {
         self.heightPx = heightPx
     }
 
-    /// Readable aliases for callers that use "pixel" rather than "Px" in
-    /// their local vocabulary.
-    public var pixelWidth: Int { widthPx }
-    public var pixelHeight: Int { heightPx }
 }
-
-/// Compatibility spelling for code that treats handles as descriptors.
-public typealias RasterAssetDescriptor = RasterAssetHandle
 
 public enum RasterAssetStoreError: LocalizedError, Equatable {
     case invalidPath

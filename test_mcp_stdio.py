@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import itertools
 import subprocess
 import json
 import os
@@ -9,6 +10,7 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import zlib
@@ -25,6 +27,56 @@ TRANSIENT_WINDOWSERVER_PRESENTATION_FAILURES = frozenset({
     "windowserver_bounds_mismatch",
     "windowserver_alpha_below_expected",
 })
+
+# verify_presentation_until_settled may send more than one request while it
+# polls for WindowServer convergence (see its own docstring below); reserve
+# a block of ids comfortably larger than PRESENTATION_SETTLE_TIMEOUT_SECONDS
+# / PRESENTATION_POLL_INTERVAL_SECONDS could ever consume, so a slow test
+# environment cannot exhaust the reservation and spill an id into one
+# already handed to some unrelated request (see `_next_id_block`).
+_PRESENTATION_POLL_ID_RESERVATION = 1000
+
+# Bounded tail kept from the child's stderr for failure diagnostics. Bounded
+# deliberately -- see `StderrDrain`'s doc comment for why an UNBOUNDED read
+# is exactly the bug this class exists to avoid. Public (no leading
+# underscore): tests/mcp_wire_snapshot.py's own diagnostics message reports
+# this same bound, since it shares this same drain.
+STDERR_TAIL_BYTES = 16_000
+
+# JSON-RPC ids only need to be unique per in-flight request on this
+# synchronous stdio transport (each request's response is read before the
+# next request is sent, so nothing is ever actually ambiguous at the wire
+# level) -- but reusing a literal across two logically different requests is
+# still a latent bug, and hand-numbered literals rot the moment a call is
+# added, removed, or reordered. (This replaced a real instance of exactly
+# that: resume_annotations_with_retry's retry ids and the very next
+# hardcoded call both used id 47.) Draw every id in this script from one
+# monotonic counter instead so a collision is structurally impossible.
+_id_counter = itertools.count(1)
+
+
+def _next_id():
+    """Returns a fresh, script-wide-unique JSON-RPC request id."""
+    return next(_id_counter)
+
+
+def _next_id_block(count):
+    """Reserves `count` consecutive ids and returns the first.
+
+    For callers like `resume_annotations_with_retry` and
+    `verify_presentation_until_settled`, which take a single base id and
+    derive each retry/poll attempt's id as `base + attempt` internally (see
+    their own docstrings -- and see tests/test_mcp_stdio_harness.py, which
+    pins that exact `base + attempt` behavior via mock assertions, so it is
+    not something this allocator can change from the outside). Reserving the
+    whole block up front guarantees none of those derived ids can ever
+    collide with an id handed to an unrelated request in between, no matter
+    how many attempts actually fire.
+    """
+    first = next(_id_counter)
+    for _ in range(count - 1):
+        next(_id_counter)
+    return first
 
 
 def parse_args():
@@ -50,10 +102,18 @@ def parse_args():
     return args
 
 
-def stderr_diagnostics(proc):
-    if proc.stderr is None:
-        return ""
-    output = proc.stderr.read().strip()
+def stderr_diagnostics(drain):
+    """Returns any stderr this harness's `StderrDrain` has collected from the
+    child, formatted for appending to a failure message -- or "" if there is
+    none. This used to read the child's stderr pipe directly, once, after the
+    process had already exited; that is exactly the post-mortem-only read
+    `StderrDrain`'s own doc comment explains is unsafe (a large enough
+    synchronous log line can wedge the child on a full pipe before it ever
+    gets that far). Draining continuously throughout the run instead, via
+    `drain`, is the fix; this function's job is now just formatting whatever
+    tail `drain` already collected.
+    """
+    output = drain.join_and_get_tail(timeout=SHUTDOWN_TIMEOUT_SECONDS).strip()
     if not output:
         return ""
     return f"\nChild stderr:\n{output}"
@@ -68,7 +128,78 @@ def terminate_child(proc):
         proc.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        try:
+            proc.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # A process that survives SIGKILL is (almost always) stuck in
+            # uninterruptible kernel sleep, not something this harness can
+            # fix by waiting longer. Warn loudly instead of letting
+            # TimeoutExpired escape a cleanup path and mask whatever real
+            # exception this was already handling (this is typically called
+            # from a `finally` block).
+            print(
+                f"warning: child PID {proc.pid} did not exit within "
+                f"{SHUTDOWN_TIMEOUT_SECONDS:g}s of SIGKILL; giving up on it.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+class StderrDrain:
+    """Continuously drains a child process's stderr on a background thread.
+
+    WHY THIS EXISTS: `MCPServer.handleToolsCall` logs one line per call,
+    including a Swift debug description of the entire `arguments` value --
+    and tests/mcp_wire_snapshot.py's `call_path_over_cap` fixture
+    deliberately sends 10,001 points, which turns that single log line into
+    several hundred KB. This harness used to read the child's stderr only
+    once, at the very end, after the process had already exited (the old
+    `stderr_diagnostics`) -- which was fine for fixtures that never logged
+    anywhere near that much, but is exactly wrong once one does: nobody
+    draining stderr while the process is still running means the child's
+    write(2) into a full pipe (64 KB on macOS) blocks indefinitely, and
+    since that logging call happens synchronously BEFORE the tool body
+    runs, it wedges the JSON-RPC response too -- indistinguishable, from
+    this script's side, from the server simply hanging. Continuously
+    draining stderr throughout the run, as any reasonable MCP host's stdio
+    transport would, is the actual fix; keeping only a bounded tail (not an
+    unbounded read) keeps the fix itself from becoming an unbounded-memory
+    version of the same problem. Every harness in this repo that spawns an
+    MCP child uses this same drain now (see `spawn_mcp_child`), not just the
+    fixture where the bug was first noticed.
+    """
+
+    def __init__(self, proc):
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, args=(proc,), daemon=True)
+        self._thread.start()
+
+    def _run(self, proc):
+        stream = proc.stderr
+        if stream is None:
+            return
+        fd = stream.fileno()
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            with self._lock:
+                self._buffer.extend(chunk)
+                overflow = len(self._buffer) - STDERR_TAIL_BYTES
+                if overflow > 0:
+                    del self._buffer[:overflow]
+
+    def join_and_get_tail(self, timeout):
+        """Waits (briefly) for the drain thread to observe EOF -- which
+        `terminate_child` causes by the time this is called -- then returns
+        whatever tail it collected."""
+        self._thread.join(timeout)
+        with self._lock:
+            return bytes(self._buffer).decode("utf-8", errors="replace")
 
 
 def write_solid_png(path, width, height, rgba=(36, 42, 52, 255)):
@@ -140,7 +271,7 @@ class MCPLineReader:
             status = f"exit code {exit_code}" if exit_code is not None else "stdout EOF"
             partial = f" Partial response: {bytes(self.buffer)!r}." if self.buffer else ""
             raise RuntimeError(
-                f"MCP child closed stdout before completing its response to "
+                "MCP child closed stdout before completing its response to "
                 f"{method} ({status}).{partial}"
             )
 
@@ -157,11 +288,59 @@ def send_request(proc, reader, request, timeout_seconds):
     line = reader.read_line(method, timeout_seconds)
 
     try:
-        return json.loads(line)
+        response = json.loads(line)
     except json.JSONDecodeError as error:
         raise RuntimeError(
             f"MCP child returned invalid JSON for {method}: {line!r}"
         ) from error
+
+    # A JSON-RPC response must echo the request's id so a caller can match
+    # them up; on this synchronous transport (one response read per request
+    # sent, never pipelined) a mismatch here cannot be ordinary races or
+    # reordering -- it means the child sent something this harness did not
+    # expect for this call, which is exactly the kind of transport-level bug
+    # a silently-returned, unchecked response would let slip through every
+    # assertion downstream that only inspects `result`.
+    request_id = request.get("id")
+    response_id = response.get("id") if isinstance(response, dict) else None
+    if response_id != request_id:
+        raise RuntimeError(
+            f"MCP child echoed id {response_id!r} for {method}, expected "
+            f"{request_id!r} (response: {response!r})."
+        )
+    return response
+
+
+def spawn_mcp_child(binary_path, extra_env=None):
+    """Launches `binary_path --mcp` with stdio pipes, wraps its stdout in an
+    MCPLineReader, and starts a StderrDrain on it immediately -- before this
+    function returns, and therefore before any request is ever sent -- so a
+    large synchronous log line (see StderrDrain's doc comment) can never
+    wedge the child while nothing is listening to its stderr. Returns
+    `(proc, reader, drain)`.
+
+    This same ~10-line Popen call was duplicated three times across this
+    repo's MCP harnesses and had already drifted (only one of the three
+    started its stderr drain immediately); `extra_env`, when given, is
+    merged over a fresh copy of the current process's environment (never
+    mutating os.environ itself) so each caller can still set up its own
+    isolated suspension namespace the way it already did.
+    """
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    proc = subprocess.Popen(
+        [binary_path, "--mcp"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    reader = MCPLineReader(proc)
+    drain = StderrDrain(proc)
+    return proc, reader, drain
 
 
 def resume_annotations_with_retry(proc, reader, timeout_seconds, request_id, lease_token):
@@ -260,21 +439,11 @@ def main():
     # Suspension now has a coordinator root and DNC namespace specifically so
     # tests can use a random, disposable domain even on a developer desktop.
     suspension_root = tempfile.mkdtemp(prefix="ai-chalkboard-stdio-suspension-")
-    child_env = os.environ.copy()
-    child_env["AI_CHALKBOARD_SUSPENSION_ROOT"] = suspension_root
-    child_env["AI_CHALKBOARD_SUSPENSION_NAMESPACE"] = f"stdio-{uuid.uuid4()}"
-    child_env["AI_CHALKBOARD_INSTANCE_LOCK_PATH"] = os.path.join(suspension_root, "instance.lock")
-
-    proc = subprocess.Popen(
-        [binary_path, "--mcp"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        env=child_env,
-    )
-    reader = MCPLineReader(proc)
+    proc, reader, stderr_drain = spawn_mcp_child(binary_path, extra_env={
+        "AI_CHALKBOARD_SUSPENSION_ROOT": suspension_root,
+        "AI_CHALKBOARD_SUSPENSION_NAMESPACE": f"stdio-{uuid.uuid4()}",
+        "AI_CHALKBOARD_INSTANCE_LOCK_PATH": os.path.join(suspension_root, "instance.lock"),
+    })
 
     failed = False
     temporary_paths = []
@@ -282,7 +451,7 @@ def main():
         print("\n1. Testing 'initialize'...", flush=True)
         init_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": _next_id(),
             "method": "initialize",
             "params": {
                 "protocolVersion": "2024-11-05",
@@ -298,7 +467,7 @@ def main():
         print("\n2. Testing 'tools/list'...", flush=True)
         list_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": _next_id(),
             "method": "tools/list"
         }, args.timeout)
         tools = [t["name"] for t in list_res["result"]["tools"]]
@@ -309,7 +478,7 @@ def main():
         print("\n3. Testing SVG 'draw_path' for a free-drawn circle...", flush=True)
         path_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
-            "id": 3,
+            "id": _next_id(),
             "method": "tools/call",
             "params": {
                 "name": "draw_path",
@@ -334,7 +503,7 @@ def main():
         write_solid_png(asset_png.name, 24, 16, rgba=(0, 224, 255, 180))
         image_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
-            "id": 4,
+            "id": _next_id(),
             "method": "tools/call",
             "params": {
                 "name": "draw_image",
@@ -352,7 +521,7 @@ def main():
 
         print("\n5. Testing first-class 'draw_text' rendering...", flush=True)
         text_res = send_request(proc, reader, {
-            "jsonrpc": "2.0", "id": 40, "method": "tools/call",
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
             "params": {"name": "draw_text", "arguments": {
                 "text": "Fusion text smoke test",
                 "x": 120, "y": 80, "font_size": 22,
@@ -366,7 +535,7 @@ def main():
         text_annotation_id = text_draw_message.split("annotation: ", 1)[1].split()[0]
 
         batch_res = send_request(proc, reader, {
-            "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
             "params": {"name": "draw_batch", "arguments": {
                 "app": "",
                 "items": [
@@ -380,7 +549,7 @@ def main():
         print("\n6. Testing 'list_annotations'...", flush=True)
         ann_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
-            "id": 5,
+            "id": _next_id(),
             "method": "tools/call",
             "params": {
                 "name": "list_annotations",
@@ -408,7 +577,7 @@ def main():
         suspension_token = None
         try:
             suspend_res = send_request(proc, reader, {
-                "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+                "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
                 "params": {"name": "suspend_annotations", "arguments": {
                     "lease_seconds": 30,
                     "idempotency_key": str(uuid.uuid4()),
@@ -440,7 +609,7 @@ def main():
             assert all(len(message.encode("utf-8")) <= 512 for message in suspension_payload["discoveryErrors"])
 
             suspended_state_res = send_request(proc, reader, {
-                "jsonrpc": "2.0", "id": 44, "method": "tools/call",
+                "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
                 "params": {"name": "get_overlay_state", "arguments": {}},
             }, args.timeout)
             suspended_state = json.loads(suspended_state_res["result"]["content"][0]["text"])
@@ -450,7 +619,7 @@ def main():
             assert suspended_state["suspensionRegistryBootstrapped"] is True
 
             suspended_list_res = send_request(proc, reader, {
-                "jsonrpc": "2.0", "id": 45, "method": "tools/call",
+                "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
                 "params": {"name": "list_annotations", "arguments": {}},
             }, args.timeout)
             suspended_list_payload = json.loads(suspended_list_res["result"]["content"][0]["text"])
@@ -463,13 +632,13 @@ def main():
         finally:
             if suspension_token is not None:
                 resume_res = resume_annotations_with_retry(
-                    proc, reader, args.timeout, 46, suspension_token
+                    proc, reader, args.timeout, _next_id_block(RESUME_CLEANUP_ATTEMPTS), suspension_token
                 )
                 assert "result" in resume_res, resume_res
                 assert not resume_res["result"].get("isError", False), resume_res
 
         resumed_state_res = send_request(proc, reader, {
-            "jsonrpc": "2.0", "id": 47, "method": "tools/call",
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
             "params": {"name": "get_overlay_state", "arguments": {}},
         }, args.timeout)
         resumed_state = json.loads(resumed_state_res["result"]["content"][0]["text"])
@@ -481,7 +650,7 @@ def main():
         assert resumed_state["buildIdentifier"] == server_info["buildIdentifier"]
 
         presentation_res, first_transient_presentation = verify_presentation_until_settled(
-            proc, reader, args.timeout, 4100, path_annotation_id
+            proc, reader, args.timeout, _next_id_block(_PRESENTATION_POLL_ID_RESERVATION), path_annotation_id
         )
         presentation = json.loads(presentation_res["result"]["content"][0]["text"])
         assert presentation["annotationId"] == path_annotation_id
@@ -497,13 +666,13 @@ def main():
 
         print("\n7. Testing explicit-app clear without fallback drift...", flush=True)
         verification_annotation_id = None
-        for request_id, app_id, x in [
-            (6, "com.example.ClearTarget", 0.4),
-            (7, "com.example.PreserveTarget", 0.6),
+        for app_id, x in [
+            ("com.example.ClearTarget", 0.4),
+            ("com.example.PreserveTarget", 0.6),
         ]:
             draw_res = send_request(proc, reader, {
                 "jsonrpc": "2.0",
-                "id": request_id,
+                "id": _next_id(),
                 "method": "tools/call",
                 "params": {
                     "name": "draw_path",
@@ -521,7 +690,7 @@ def main():
         print("\n8. Testing draw_text verify_annotation image response...", flush=True)
         screen_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
-            "id": 10,
+            "id": _next_id(),
             "method": "tools/call",
             "params": {"name": "get_screens", "arguments": {}},
         }, args.timeout)
@@ -540,7 +709,7 @@ def main():
 
         verify_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
-            "id": 11,
+            "id": _next_id(),
             "method": "tools/call",
             "params": {
                 "name": "verify_annotation",
@@ -565,7 +734,7 @@ def main():
 
         clear_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
-            "id": 12,
+            "id": _next_id(),
             "method": "tools/call",
             "params": {
                 "name": "clear",
@@ -579,7 +748,7 @@ def main():
 
         after_clear_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
-            "id": 13,
+            "id": _next_id(),
             "method": "tools/call",
             "params": {"name": "list_annotations", "arguments": {}},
         }, args.timeout)
@@ -599,7 +768,7 @@ def main():
             except FileNotFoundError:
                 pass
         shutil.rmtree(suspension_root, ignore_errors=True)
-        diagnostics = stderr_diagnostics(proc)
+        diagnostics = stderr_diagnostics(stderr_drain)
         if failed and diagnostics:
             print(diagnostics, file=sys.stderr, flush=True)
 

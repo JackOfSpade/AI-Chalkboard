@@ -170,9 +170,14 @@ jobs:
       - name: MCP stdio harness syntax + framing/timeout tests
         # The full integration script launches AppKit and still requires an Aqua GUI
         # session, but its protocol framing and deadline behavior are pure Python and
-        # must be exercised here rather than merely syntax-checked.
+        # must be exercised here rather than merely syntax-checked. tests/test_suspension_two_process.py
+        # launches AppKit too (twice, opt-in only via its own env-var gate -- see its
+        # module docstring) and needs the same Aqua session, so it gets the same
+        # syntax-check-only treatment as test_mcp_stdio.py above rather than a `swift
+        # test`-style real run; without this it was py_compile'd nowhere, so even a
+        # trivial typo in it would go unnoticed until someone ran it by hand.
         run: |
-          python3 -m py_compile test_mcp_stdio.py tests/test_mcp_stdio_harness.py
+          python3 -m py_compile test_mcp_stdio.py tests/test_mcp_stdio_harness.py tests/test_suspension_two_process.py
           python3 -m unittest tests/test_mcp_stdio_harness.py
 
       - name: MCP wire-snapshot tool syntax + canonicalisation tests

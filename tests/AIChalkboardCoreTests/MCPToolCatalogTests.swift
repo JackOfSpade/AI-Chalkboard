@@ -90,6 +90,10 @@ final class MCPToolCatalogTests: XCTestCase {
         let text = properties(try XCTUnwrap(toolsByName["draw_text"]))
         XCTAssertEqual((text["font_size"] as? [String: Any])?["exclusiveMinimum"] as? Int, 0)
         XCTAssertEqual((text["coordinate_space"] as? [String: Any])?["enum"] as? [String], ["backing_pixels", "normalized", "screenshot_pixels"])
+        // The catalog's advertised cap must match what MCPToolHandlers
+        // actually enforces for draw_text's `text` (DrawingDefaults.maxTextCharacters),
+        // so a caller never discovers the real limit only via a rejection.
+        XCTAssertEqual((text["text"] as? [String: Any])?["maxLength"] as? Int, DrawingDefaults.maxTextCharacters)
         XCTAssertEqual((properties(try XCTUnwrap(toolsByName["update_annotation"]))["offset_x"] as? [String: Any])?["type"] as? String, "number")
     }
 
@@ -117,6 +121,11 @@ final class MCPToolCatalogTests: XCTestCase {
         XCTAssertEqual((highlight["occurrence"] as? [String: Any])?["minimum"] as? Int, 1)
         XCTAssertEqual((highlight["z"] as? [String: Any])?["type"] as? String, "integer")
         XCTAssertEqual((highlight["color"] as? [String: Any])?["type"] as? String, "string")
+        // The catalog's advertised cap must match what MCPToolHandlers
+        // actually enforces for highlight_element's `label`
+        // (DrawingDefaults.maxHighlightLabelCharacters), so a caller never
+        // discovers the real limit only via a rejection.
+        XCTAssertEqual((highlight["label"] as? [String: Any])?["maxLength"] as? Int, DrawingDefaults.maxHighlightLabelCharacters)
     }
 
     func testSuspensionLeaseSchemasAreStrictAndPreserveTheClickWorkaroundContract() throws {

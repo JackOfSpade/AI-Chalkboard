@@ -171,33 +171,32 @@ extension MCPServer {
             sendTextResult(id: id, text: text)
 
         case "draw_path":
-            switch DrawRequest.resolveScreen(args: args) {
+            let request: DrawRequest
+            let transform: DrawRequest.CoordinateTransform
+            switch DrawRequest.resolveDrawContext(args: args) {
             case .failure(let err):
                 sendErrorResult(id: id, text: err)
-            case .success(let request):
-                let transform: DrawRequest.CoordinateTransform
-                switch request.coordinateTransform(args: args) {
-                case .failure(let err): sendErrorResult(id: id, text: err); return
-                case .success(let resolved): transform = resolved
-                }
-                let kind: AnnotationKind
-                switch makeVectorPathKind(args, coordinateTransform: transform) {
-                case .failure(let err): sendErrorResult(id: id, text: err); return
-                case .success(let parsed): kind = parsed
-                }
-                switch request.finish(
-                    args: args,
-                    defaultColor: DrawingDefaults.pathColor,
-                    label: nil,
-                    defaultsToGlobal: false,
-                    kind: kind,
-                    noun: "free-draw SVG path"
-                ) {
-                case .failure(let err):
-                    sendErrorResult(id: id, text: err)
-                case .success(let message):
-                    sendTextResult(id: id, text: message)
-                }
+                return
+            case .success(let resolved):
+                (request, transform) = resolved
+            }
+            let kind: AnnotationKind
+            switch makeVectorPathKind(args, coordinateTransform: transform) {
+            case .failure(let err): sendErrorResult(id: id, text: err); return
+            case .success(let parsed): kind = parsed
+            }
+            switch request.finish(
+                args: args,
+                defaultColor: DrawingDefaults.pathColor,
+                label: nil,
+                defaultsToGlobal: false,
+                kind: kind,
+                noun: "free-draw SVG path"
+            ) {
+            case .failure(let err):
+                sendErrorResult(id: id, text: err)
+            case .success(let message):
+                sendTextResult(id: id, text: message)
             }
 
         case "draw_image":
@@ -375,6 +374,17 @@ extension MCPServer {
 
         let seconds: Int
         if args.keys.contains("lease_seconds") {
+            // Deliberately stricter than every other integer argument in this
+            // file (z_index, occurrence, offset, limit), which accept a
+            // numeric STRING such as "15" through `MCPArgument.integer` alone.
+            // lease_seconds additionally requires `is NSNumber` here because
+            // it is a security-sensitive suspension-duration input and
+            // MCPToolCatalog advertises it as JSON Schema `"type": "integer"`,
+            // which does not admit strings -- the handler must match what the
+            // schema promises, not silently be more permissive than it.
+            // tests/mcp_wire_snapshot.py pins this exact asymmetry with its
+            // `call_suspend_numeric_string_duration` fixture. Do not relax
+            // this to match the other integer args.
             guard args["lease_seconds"] is NSNumber,
                   let supplied = MCPArgument.integer(args["lease_seconds"]),
                   (1...60).contains(supplied) else {
@@ -561,8 +571,8 @@ extension MCPServer {
             return
         }
         let label = suppliedLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !label.isEmpty, label.count <= 1_024 else {
-            sendErrorResult(id: id, text: "label must be a non-empty string containing at most 1024 characters.")
+        guard !label.isEmpty, label.count <= DrawingDefaults.maxHighlightLabelCharacters else {
+            sendErrorResult(id: id, text: "label must be a non-empty string containing at most \(DrawingDefaults.maxHighlightLabelCharacters) characters.")
             return
         }
         if args.keys.contains("role"), !(args["role"] is String) {
@@ -614,17 +624,8 @@ extension MCPServer {
             }
             finishArgs["z_index"] = z
         }
-        if args.keys.contains("duration_seconds"), MCPArgument.hasInvalidSuppliedDouble(args, key: "duration_seconds") {
-            sendErrorResult(id: id, text: "duration_seconds must be a finite number greater than 0 when supplied.")
-            return
-        }
-        if let duration = MCPArgument.double(args["duration_seconds"]),
-           (duration <= 0 || duration > DrawingDefaults.maxAnnotationDurationSeconds) {
-            sendErrorResult(id: id, text: "duration_seconds must be greater than 0 and no more than \(Int(DrawingDefaults.maxAnnotationDurationSeconds)) seconds when supplied; omit it for a persistent annotation.")
-            return
-        }
-        if args.keys.contains("app"), !(args["app"] is String) {
-            sendErrorResult(id: id, text: "app must be a running app's bundle id or display name when supplied.")
+        if let error = DrawRequest.validateDurationSeconds(args: args) {
+            sendErrorResult(id: id, text: error)
             return
         }
         let style: HighlightStyle
@@ -734,10 +735,10 @@ extension MCPServer {
     }
 
     private func makeHighlightStyle(args: [String: Any]) -> DrawOutcome<HighlightStyle> {
-        for key in ["padding_px", "stroke_width", "stroke_opacity", "fill_opacity"] where MCPArgument.hasInvalidSuppliedDouble(args, key: key) {
+        if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["padding_px", "stroke_width", "stroke_opacity", "fill_opacity"]) {
             return .failure("\(key) must be a finite number when supplied.")
         }
-        for key in ["stroke_color", "color", "fill_color"] where args.keys.contains(key) && !(args[key] is String) {
+        if let key = MCPArgument.firstNonStringSupplied(args, keys: ["stroke_color", "color", "fill_color"]) {
             return .failure("\(key) must be a string when supplied.")
         }
         let explicitStroke = args["stroke_color"] as? String
@@ -819,12 +820,15 @@ extension MCPServer {
             sendErrorResult(id: id, text: "screenshot_path and capture_source are mutually exclusive. Supply one clean screenshot source.")
             return
         }
+        // By this point the mutual-exclusivity guard above has already forced
+        // captureSource to nil whenever screenshotPath is non-nil, so the only
+        // way to reach this guard with a non-nil captureSource is
+        // screenshotPath == nil -- meaning an invalid capture_source (any
+        // string other than "chalkboard") is already rejected right here,
+        // with no further "captureSource != 'chalkboard'" branch reachable
+        // afterward.
         guard screenshotPath != nil || captureSource == "chalkboard" else {
-            sendErrorResult(id: id, text: "Supply screenshot_path or capture_source='chalkboard' for verification.")
-            return
-        }
-        if let captureSource, captureSource != "chalkboard" {
-            sendErrorResult(id: id, text: "capture_source must be 'chalkboard'.")
+            sendErrorResult(id: id, text: "Supply screenshot_path, or capture_source='chalkboard' (no other capture_source value is accepted), for verification.")
             return
         }
         if screenshotPath != nil, args.keys.contains("request_permission") {
@@ -907,7 +911,11 @@ extension MCPServer {
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                 metadata["expiresAt"] = formatter.string(from: expiresAt)
-                metadata["remainingSeconds"] = max(0, expiresAt.timeIntervalSinceNow)
+                // Monotonic when available (see Annotation.remainingSeconds);
+                // the RFC 3339 expiresAt above stays wall-clock for the wire.
+                metadata["remainingSeconds"] = annotation.remainingSeconds(
+                    now: Date(), uptime: ProcessInfo.processInfo.systemUptime
+                ) ?? NSNull()
             } else {
                 metadata["expiresAt"] = NSNull()
                 metadata["remainingSeconds"] = NSNull()
@@ -986,10 +994,10 @@ extension MCPServer {
             return .failure("path_data contains coordinates that cannot be represented safely in the selected display's backing-pixel space.")
         }
 
-        for key in ["stroke_width", "stroke_opacity", "fill_opacity"] where MCPArgument.hasInvalidSuppliedDouble(args, key: key) {
+        if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["stroke_width", "stroke_opacity", "fill_opacity"]) {
             return .failure("\(key) must be a finite number when supplied.")
         }
-        for key in ["stroke_color", "fill_color", "fill_rule"] where args.keys.contains(key) && !(args[key] is String) {
+        if let key = MCPArgument.firstNonStringSupplied(args, keys: ["stroke_color", "fill_color", "fill_rule"]) {
             return .failure("\(key) must be a string when supplied.")
         }
 
@@ -1057,7 +1065,7 @@ extension MCPServer {
               let backingY = coordinateTransform.transformedY(y) else {
             return .failure("Image coordinates cannot be represented safely in the selected display's backing-pixel space.")
         }
-        for key in ["width", "height", "rotation_degrees", "opacity"] where MCPArgument.hasInvalidSuppliedDouble(args, key: key) {
+        if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["width", "height", "rotation_degrees", "opacity"]) {
             return .failure("\(key) must be a finite number when supplied.")
         }
         let requestedWidth = MCPArgument.double(args["width"])
@@ -1123,10 +1131,10 @@ extension MCPServer {
         guard text.count <= DrawingDefaults.maxTextCharacters else {
             return .failure("text exceeds the \(DrawingDefaults.maxTextCharacters)-character limit.")
         }
-        for key in ["background_opacity", "padding_px", "opacity"] where MCPArgument.hasInvalidSuppliedDouble(args, key: key) {
+        if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["background_opacity", "padding_px", "opacity"]) {
             return .failure("\(key) must be a finite number when supplied.")
         }
-        for key in ["color", "background_color"] where args.keys.contains(key) && !(args[key] is String) {
+        if let key = MCPArgument.firstNonStringSupplied(args, keys: ["color", "background_color"]) {
             return .failure("\(key) must be a string when supplied.")
         }
         let backgroundOpacity = MCPArgument.double(args["background_opacity"]) ?? 1
@@ -1163,14 +1171,10 @@ extension MCPServer {
 
     private func handleDrawImage(id: Any, args: [String: Any]) {
         let request: DrawRequest
-        switch DrawRequest.resolveScreen(args: args) {
-        case .failure(let err): sendErrorResult(id: id, text: err); return
-        case .success(let resolved): request = resolved
-        }
         let transform: DrawRequest.CoordinateTransform
-        switch request.coordinateTransform(args: args) {
+        switch DrawRequest.resolveDrawContext(args: args) {
         case .failure(let err): sendErrorResult(id: id, text: err); return
-        case .success(let resolved): transform = resolved
+        case .success(let resolved): (request, transform) = resolved
         }
         let kind: AnnotationKind
         switch loadImageKind(args, coordinateTransform: transform) {
@@ -1190,14 +1194,10 @@ extension MCPServer {
 
     private func handleDrawText(id: Any, args: [String: Any]) {
         let request: DrawRequest
-        switch DrawRequest.resolveScreen(args: args) {
-        case .failure(let err): sendErrorResult(id: id, text: err); return
-        case .success(let resolved): request = resolved
-        }
         let transform: DrawRequest.CoordinateTransform
-        switch request.coordinateTransform(args: args) {
+        switch DrawRequest.resolveDrawContext(args: args) {
         case .failure(let err): sendErrorResult(id: id, text: err); return
-        case .success(let resolved): transform = resolved
+        case .success(let resolved): (request, transform) = resolved
         }
         let kind: AnnotationKind
         switch makeTextKind(args, coordinateTransform: transform) {
@@ -1220,14 +1220,10 @@ extension MCPServer {
             return
         }
         let request: DrawRequest
-        switch DrawRequest.resolveScreen(args: args) {
-        case .failure(let err): sendErrorResult(id: id, text: err); return
-        case .success(let resolved): request = resolved
-        }
         let transform: DrawRequest.CoordinateTransform
-        switch request.coordinateTransform(args: args) {
+        switch DrawRequest.resolveDrawContext(args: args) {
         case .failure(let err): sendErrorResult(id: id, text: err); return
-        case .success(let resolved): transform = resolved
+        case .success(let resolved): (request, transform) = resolved
         }
 
         var components: [AnnotationComponent] = []
@@ -1255,8 +1251,20 @@ extension MCPServer {
                         guard let handle = RasterAssetStore.shared.descriptor(for: assetID) else { return total }
                         return total + UInt64(handle.widthPx) * UInt64(handle.heightPx) * 4
                     }
+                    // `maxRasterDecodedBytesPerBatch - rasterDecodedBytes` is only a
+                    // safe UInt64 subtraction because this loop's own accumulation
+                    // just below keeps `rasterDecodedBytes <= maxRasterDecodedBytesPerBatch`
+                    // on every iteration. Compute it as an explicit saturating
+                    // subtraction instead of relying on that invariant holding
+                    // forever, so a future refactor that breaks it (or reorders this
+                    // loop) fails closed -- rejecting the batch -- rather than
+                    // underflowing to a huge remaining-budget value that would
+                    // silently disable this memory cap.
+                    let remainingRasterBudget = rasterDecodedBytes <= DrawingDefaults.maxRasterDecodedBytesPerBatch
+                        ? DrawingDefaults.maxRasterDecodedBytesPerBatch - rasterDecodedBytes
+                        : 0
                     guard rasterImageCount + newAssetIDs.count <= DrawingDefaults.maxRasterImagesPerBatch,
-                          newBytes <= DrawingDefaults.maxRasterDecodedBytesPerBatch - rasterDecodedBytes else {
+                          newBytes <= remainingRasterBudget else {
                         for assetID in newAssetIDs { _ = RasterAssetStore.shared.release(id: assetID) }
                         fail("items contains too many raster images or exceeds the \(DrawingDefaults.maxRasterDecodedBytesPerBatch / (1_024 * 1_024)) MB decoded-raster batch budget.")
                         return
@@ -1334,7 +1342,7 @@ extension MCPServer {
         guard !supplied.subtracting(["annotation_id"]).isEmpty else {
             return .failure("update_annotation requires at least one patch field in addition to annotation_id.")
         }
-        for key in ["offset_x", "offset_y", "opacity"] where MCPArgument.hasInvalidSuppliedDouble(args, key: key) {
+        if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["offset_x", "offset_y", "opacity"]) {
             return .failure("\(key) must be a finite number when supplied.")
         }
         if args.keys.contains("z_index"), MCPArgument.integer(args["z_index"]) == nil {
@@ -1369,10 +1377,10 @@ extension MCPServer {
     private func patchKind(_ current: AnnotationKind, args: [String: Any]) -> DrawOutcome<AnnotationKind> {
         switch current {
         case let .text(existingText, x, y, fontSize, textColor, backgroundColor, backgroundOpacity, padding, opacity):
-            for key in ["x", "y", "font_size", "background_opacity", "padding_px"] where MCPArgument.hasInvalidSuppliedDouble(args, key: key) {
+            if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["x", "y", "font_size", "background_opacity", "padding_px"]) {
                 return .failure("\(key) must be a finite number when supplied.")
             }
-            for key in ["text", "color", "background_color"] where args.keys.contains(key) && !(args[key] is String) {
+            if let key = MCPArgument.firstNonStringSupplied(args, keys: ["text", "color", "background_color"]) {
                 return .failure("\(key) must be a string when supplied.")
             }
             let nextText = (args["text"] as? String) ?? existingText
@@ -1409,10 +1417,10 @@ extension MCPServer {
             ))
 
         case let .vectorPath(data, strokeColor, strokeWidth, strokeOpacity, fillColor, fillOpacity, dash, fillRule, scaleX, scaleY):
-            for key in ["stroke_width", "stroke_opacity", "fill_opacity"] where MCPArgument.hasInvalidSuppliedDouble(args, key: key) {
+            if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["stroke_width", "stroke_opacity", "fill_opacity"]) {
                 return .failure("\(key) must be a finite number when supplied.")
             }
-            for key in ["stroke_color", "fill_color"] where args.keys.contains(key) && !(args[key] is String) {
+            if let key = MCPArgument.firstNonStringSupplied(args, keys: ["stroke_color", "fill_color"]) {
                 return .failure("\(key) must be a string when supplied.")
             }
             let nextWidth = MCPArgument.double(args["stroke_width"]) ?? strokeWidth
@@ -1589,7 +1597,9 @@ extension MCPServer {
             object["isVisibleNow"] = !annotationsSuspended && wouldBeVisibleWithoutSuspension
             if let expiresAt = annotation.expiresAt {
                 object["expiresAt"] = expiryFormatter.string(from: expiresAt)
-                object["remainingSeconds"] = max(0, expiresAt.timeIntervalSince(now))
+                object["remainingSeconds"] = annotation.remainingSeconds(
+                    now: now, uptime: ProcessInfo.processInfo.systemUptime
+                ) ?? NSNull()
             } else {
                 object["expiresAt"] = NSNull()
                 object["remainingSeconds"] = NSNull()
@@ -1630,7 +1640,31 @@ extension MCPServer {
             ]
         }
 
+        // NOTE on what this loop still does the expensive way: each iteration
+        // below re-serializes the ENTIRE growing `candidate` array through
+        // `JSONSerialization` purely to size-check it against
+        // maxAnnotationListTextBytes, which is O(n^2) work bounded only by
+        // maxAnnotationListPageItems (100). An incremental byte-accounting
+        // rewrite that tracks the running serialized size without
+        // re-serializing already-included entries was deliberately NOT done
+        // here: producing an exact byte count without calling
+        // `JSONSerialization` again would mean manually reconstructing its
+        // compact-mode output (concatenating each entry's own serialized
+        // text with "," separators) and trusting that (a) `JSONSerialization`
+        // never inserts incidental whitespace in non-pretty-printed mode and
+        // (b) a dictionary with a fixed key set serializes its keys in the
+        // same relative order every time within one process run. Both are
+        // true in practice, but neither is a documented Foundation contract,
+        // and this function is covered by the wire-snapshot fixtures'
+        // byte-for-byte pin plus the maxAnnotationListTextBytes cutoff being
+        // NON-NEGOTIABLE (same last-included item, same nextOffset). Getting
+        // this wrong would be silent and hard to notice by inspection, so
+        // the redundant re-serialization stays; only the one PROVABLY
+        // byte-identical redundancy below (reusing the last iteration's own
+        // already-computed text instead of recomputing it once more after
+        // the loop) is removed.
         var next = start
+        var lastCandidateText: String?
         while next < requestedEnd {
             guard let entry = enrichedEntry(for: annotations[next]) else {
                 return .failure("Failed to encode annotation \(annotations[next].id) for list_annotations.")
@@ -1650,6 +1684,18 @@ extension MCPServer {
             }
             entries = candidate
             next += 1
+            lastCandidateText = candidateText
+        }
+        // When the loop above ran to completion by exhausting `requestedEnd`
+        // (as opposed to exiting early via `break`), `lastCandidateText` was
+        // already computed for this EXACT (entries, nextOffset: next) pair on
+        // the final iteration -- reuse it instead of re-serializing the same
+        // page a second time. `next == requestedEnd` only holds on that
+        // normal-exit path: `break` always fires while `next < requestedEnd`
+        // still holds, and `next` is never advanced on the failing iteration
+        // that triggers it.
+        if let lastCandidateText, next == requestedEnd {
+            return .success(lastCandidateText)
         }
         guard let text = jsonString(payload(for: entries, nextOffset: next)) else {
             return .failure("Failed to encode annotation list.")
