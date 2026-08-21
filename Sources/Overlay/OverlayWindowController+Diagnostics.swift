@@ -156,29 +156,55 @@ extension OverlayWindowController {
             view.displayIfNeeded()
             window.displayIfNeeded()
 
-            let allWindows = cgWindowEntries(options: [.optionAll, .excludeDesktopElements])
-            let onScreenWindows = cgWindowEntries(options: [.optionOnScreenOnly, .excludeDesktopElements])
             let processID = ProcessInfo.processInfo.processIdentifier
             let windowNumber = window.windowNumber
-            let allEntry = matchingWindowEntry(in: allWindows, windowNumber: windowNumber, processID: processID)
-            let onScreenEntry = matchingWindowEntry(in: onScreenWindows, windowNumber: windowNumber, processID: processID)
+            let allEntry = matchingWindowEntry(
+                options: [.optionAll, .excludeDesktopElements],
+                windowNumber: windowNumber,
+                processID: processID
+            )
+            let onScreenEntry = matchingWindowEntry(
+                options: [.optionOnScreenOnly, .excludeDesktopElements],
+                windowNumber: windowNumber,
+                processID: processID
+            )
 
             // Resolve the *target* screen from the annotation/view id, not
             // `window.screen`: if the window drifted onto a different monitor,
             // using its current screen would make a wrong-display window look
             // self-consistent and incorrectly ready.
-            let targetScreen = NSScreen.screens.enumerated().compactMap { index, screen -> NSScreen? in
-                getScreenId(screen: screen, index: index) == annotation.screenId ? screen : nil
-            }.first
-            let expectedFrame = targetScreen.map { presentationRect($0.frame) }
-            let expectedWindowServerFrame = targetScreen.flatMap { windowServerDisplayBounds(for: $0) }
+            //
+            // Both rectangles come from the same `buildScreenInfos()` that
+            // `get_screens` reports, so a caller comparing this diagnostic
+            // against `get_screens` output cannot be reading two independently
+            // derived versions of the same monitor's geometry.
+            let targetInfo = buildScreenInfos().first(where: { $0.id == annotation.screenId })
+            let expectedFrame = targetInfo.map { presentationRect($0.appKitFrame) }
+            let expectedWindowServerFrame = targetInfo.flatMap { info -> PresentationRect? in
+                // `ScreenInfo.windowServerFrame` substitutes a synthetic
+                // 0,0-origin pixel rect when AppKit reports no display id, and
+                // that synthetic value is not a WindowServer claim -- only a
+                // real `CGDirectDisplayID` makes `CGDisplayBounds` comparable
+                // to `kCGWindowBounds`. The finite/positive guard stays as it
+                // was: an unusable rectangle must read as "no expectation"
+                // rather than as a bounds mismatch.
+                guard info.displayID != nil else { return nil }
+                let bounds = info.windowServerFrame
+                guard bounds.width.isFinite, bounds.height.isFinite,
+                      bounds.width > 0, bounds.height > 0 else {
+                    return nil
+                }
+                return presentationRect(bounds)
+            }
             let contentViewMatches = window.contentView === view
             // A window content view is normally parented by AppKit's private
             // frame view, so `superview == nil` would incorrectly report every
             // healthy overlay as detached. Identity + `view.window` are the
             // stable public attachment checks.
             let viewAttached = contentViewMatches && view.window === window
-            let appKitFrameMatches = targetScreen.map { window.frame == $0.frame } ?? false
+            let appKitFrameMatches = targetInfo.map {
+                presentationRect(window.frame) == presentationRect($0.appKitFrame)
+            } ?? false
             let input = PresentationReadinessInput(
                 annotationExists: true,
                 annotationIsInCurrentVisibleSet: annotationIsVisible,
@@ -232,46 +258,30 @@ extension OverlayWindowController {
         }
     }
 
-    private func cgWindowEntries(options: CGWindowListOption) -> [PresentationWindowServerEntry] {
+    /// Finds this process's overlay window in one WindowServer list.
+    ///
+    /// `CGWindowListCopyWindowInfo` returns EVERY window on the desktop, and
+    /// `verify_presentation` keeps exactly one entry out of each list it
+    /// samples.  Decoding lazily and stopping at the first match means the
+    /// decoder touches only the dictionaries up to the overlay's own entry
+    /// instead of the whole system window list, twice, per call.
+    private func matchingWindowEntry(options: CGWindowListOption, windowNumber: Int, processID: Int32) -> PresentationWindowServerEntry? {
         let raw = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
-        return raw.map { dictionary in
-            // CGWindow key constants bridge to their documented String values;
-            // normalize them here so the pure decoder does not depend on Quartz.
-            var normalized: [String: Any] = [:]
-            for (key, value) in dictionary {
-                normalized[key] = value
-            }
-            return PresentationWindowServerEntry(dictionary: normalized)
-        }
-    }
-
-    private func matchingWindowEntry(in entries: [PresentationWindowServerEntry], windowNumber: Int, processID: Int32) -> PresentationWindowServerEntry? {
-        entries.first { entry in
-            entry.windowNumber == windowNumber && entry.ownerPID == Int(processID)
-        }
+        return raw.lazy
+            .map(PresentationWindowServerEntry.init(dictionary:))
+            .first { $0.windowNumber == windowNumber && $0.ownerPID == Int(processID) }
     }
 
     private func presentationRect(_ rect: NSRect) -> PresentationRect {
         PresentationRect(x: Double(rect.origin.x), y: Double(rect.origin.y), width: Double(rect.width), height: Double(rect.height))
     }
 
-    /// `CGDisplayBounds` is expressed in the same global WindowServer
-    /// coordinate system as `kCGWindowBounds`, unlike `NSScreen.frame` which
-    /// is AppKit points with a different vertical-axis convention.
-    private func windowServerDisplayBounds(for screen: NSScreen) -> PresentationRect? {
-        guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
-            return nil
-        }
-        let bounds = CGDisplayBounds(displayID)
-        guard bounds.width.isFinite, bounds.height.isFinite, bounds.width > 0, bounds.height > 0 else {
-            return nil
-        }
-        return PresentationRect(
-            x: Double(bounds.origin.x),
-            y: Double(bounds.origin.y),
-            width: Double(bounds.width),
-            height: Double(bounds.height)
-        )
+    /// The same wire shape, restated from a `ScreenInfo` rectangle.  Which
+    /// coordinate space it describes is the caller's choice: `ScreenInfo`
+    /// carries the AppKit point frame and the WindowServer frame separately
+    /// precisely so neither is inferred from the other here.
+    private func presentationRect(_ rect: ScreenCoordinateRect) -> PresentationRect {
+        PresentationRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
     }
 
     /// A machine-readable description of the live overlay windows' input

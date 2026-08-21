@@ -79,6 +79,39 @@ final class AccessibilityElementResolverTests: XCTestCase {
         XCTAssertEqual(result.height, 40)
     }
 
+    /// `ScreenInfo.isMain` is "the screen AppKit currently calls main", which
+    /// tracks the focused window.  AX global coordinates are anchored to the
+    /// ZERO-ORIGIN (menu-bar) display instead, so anchoring the conversion to
+    /// `isMain` shifted every y-coordinate by the two displays' height
+    /// difference -- and changed the answer for an unchanged UI whenever focus
+    /// moved to another monitor.
+    func testConversionAnchorsToZeroOriginDisplayNotTheFocusedMainScreen() throws {
+        let zeroOrigin = screen(
+            id: "zero-origin",
+            appKitFrame: ScreenCoordinateRect(x: 0, y: 0, width: 1_512, height: 982),
+            scale: 2
+        )
+        // Focus currently sits on a taller display to the right, so AppKit
+        // reports THIS screen as main even though it is not the AX anchor.
+        let focusedTallerSecondary = screen(
+            id: "main",
+            appKitFrame: ScreenCoordinateRect(x: 1_512, y: -40, width: 1_920, height: 1_080),
+            scale: 1
+        )
+        XCTAssertTrue(focusedTallerSecondary.isMain)
+        XCTAssertFalse(zeroOrigin.isMain)
+
+        let result = try XCTUnwrap(AccessibilityElementResolver.backingRect(
+            forAccessibilityFrame: AccessibilityScreenRect(x: 100, y: 50, width: 120, height: 30),
+            screens: [zeroOrigin, focusedTallerSecondary]
+        ))
+        XCTAssertEqual(result.screenId, "zero-origin")
+        XCTAssertEqual(result.x, 200)
+        XCTAssertEqual(result.y, 100)
+        XCTAssertEqual(result.width, 240)
+        XCTAssertEqual(result.height, 60)
+    }
+
     func testFrameStraddlingDisplaysIsRejectedRatherThanSilentlyClipped() {
         let left = screen(id: "left", appKitFrame: ScreenCoordinateRect(x: -1_000, y: 0, width: 1_000, height: 800), scale: 1)
         let right = screen(id: "main", appKitFrame: ScreenCoordinateRect(x: 0, y: 0, width: 1_000, height: 800), scale: 1)

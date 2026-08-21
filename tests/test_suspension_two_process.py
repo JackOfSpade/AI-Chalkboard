@@ -48,6 +48,16 @@ class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
             self.fail(f"{BINARY_ENV} is not an executable file: {binary}")
 
         self.tempdir = tempfile.mkdtemp(prefix="ai-chalkboard-suspension-it-")
+        # Registered IMMEDIATELY, and likewise for each child below, because
+        # tearDown does not run when setUp itself fails -- and setUp asserts
+        # (directory mode, initialize result, registry bootstrap) AFTER
+        # spawning two real AppKit processes. Without addCleanup, one failed
+        # assertion here would leak both children and this directory for the
+        # rest of the session. addCleanup fires LIFO, so registering in
+        # spawn order gives the same effective sequence tearDown performs:
+        # terminate -> report stderr -> close pipes -> rmtree (the lease
+        # release stays in tearDown, ahead of all of these).
+        self.addCleanup(shutil.rmtree, self.tempdir, ignore_errors=True)
         # Reproduce the production directory left by InstanceLock's ordinary
         # FileManager creation path. The lease coordinator must safely tighten
         # this same-user, non-writable-by-others directory before bootstrap.
@@ -56,6 +66,10 @@ class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
         self.children = []
         self.readers = []
         self.drains = []
+        # Which drains have already had their tail reported, so the cleanup
+        # path and tearDown -- which both cover every drain on an ordinary
+        # passing run -- do not print the same child's stderr twice.
+        self.reported_drains = set()
         self.live_tokens = set()
 
         # The core deliberately reads these test-only seams before registering
@@ -74,8 +88,28 @@ class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
             "AI_CHALKBOARD_INSTANCE_LOCK_PATH": os.path.join(self.tempdir, "instance.lock"),
         }
 
-        for _ in range(2):
+        for index in range(2):
             proc, reader, drain = mcp.spawn_mcp_child(str(binary), extra_env=extra_env)
+            # Registered in the reverse of the order they must run, because
+            # addCleanup fires LIFO: terminate -> report stderr -> close. That
+            # is the same sequence tearDown uses, for the same two reasons.
+            # Close must come last: closing a live child's pipes would leave it
+            # running with a broken stdin, and closing proc.stderr while the
+            # drain thread is still inside os.read() on that fd races the
+            # close. Reporting must come after terminate, because terminate is
+            # what makes the drain thread see EOF and finish. All three are
+            # idempotent (terminate_child returns immediately once the child
+            # has exited, _report_child_stderr skips a drain it already
+            # reported, and file.close() is a no-op on an already-closed
+            # handle), so tearDown's own pass over the same children on the
+            # ordinary success path stays correct. Without the middle
+            # registration, a setUp assertion failure -- which happens AFTER
+            # both real AppKit children are up, and skips tearDown entirely --
+            # would discard the child stderr that is the only place a registry
+            # bootstrap error's text exists (see child_diagnostics).
+            self.addCleanup(self.close_child_pipes, proc)
+            self.addCleanup(self._report_child_stderr, index, drain)
+            self.addCleanup(mcp.terminate_child, proc)
             self.children.append(proc)
             self.readers.append(reader)
             self.drains.append(drain)
@@ -127,14 +161,46 @@ class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
 
         for proc in self.children:
             mcp.terminate_child(proc)
+
+        # Between terminate and close, deliberately -- see
+        # `_report_child_stderr`, which setUp's cleanups also call at exactly
+        # this point in their own sequence.
+        for index, drain in enumerate(self.drains):
+            self._report_child_stderr(index, drain)
+
         for proc in self.children:
-            if proc.stdin:
-                proc.stdin.close()
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
+            self.close_child_pipes(proc)
         shutil.rmtree(self.tempdir, ignore_errors=True)
+
+    def _report_child_stderr(self, index, drain):
+        """Joins one child's drain thread and prints whatever tail it collected.
+
+        The single implementation shared by tearDown and by the per-child
+        cleanup setUp registers, so the two teardown paths cannot drift: both
+        must do this AFTER terminate_child (which is what makes the drain
+        thread see EOF and finish) and BEFORE close_child_pipes (closing
+        proc.stderr first would tear the pipe out from under a drain thread
+        still blocked in os.read on that fd). Printed unconditionally rather
+        than only on failure -- this whole class is opt-in behind
+        AI_CHALKBOARD_RUN_TWO_PROCESS_TEST, so there is no ordinary run to
+        spam, and a child that logged a real problem while still PASSING its
+        assertions is exactly the signal that was being collected and thrown
+        away before this existed. Idempotent, because on a passing run BOTH
+        paths cover every drain: whichever reaches a given drain first reports
+        it, the other returns without reprinting.
+        """
+        if drain in self.reported_drains:
+            return
+        self.reported_drains.add(drain)
+        tail = drain.join_and_get_tail(timeout=mcp.SHUTDOWN_TIMEOUT_SECONDS).strip()
+        if tail:
+            print(f"child {index} stderr:\n{tail}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def close_child_pipes(proc):
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe:
+                pipe.close()
 
     def call(self, child, name, arguments, request_id, raw_method=False):
         if raw_method:
@@ -153,8 +219,11 @@ class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
         return json.loads(result["content"][0]["text"])
 
     def child_diagnostics(self):
-        # Do not call .read while a child is alive (it would block); failure
-        # output is obtained after mcp.terminate_child in tearDown instead.
+        # PID and exit status only. Stderr is deliberately not read here: each
+        # child's output is being collected continuously by its StderrDrain and
+        # is printed by `_report_child_stderr` once the children have been
+        # terminated -- from tearDown on the ordinary path, and from setUp's
+        # own cleanups when an assertion in setUp is what failed.
         return "; ".join(f"pid={proc.pid} status={proc.poll()}" for proc in self.children)
 
     @staticmethod

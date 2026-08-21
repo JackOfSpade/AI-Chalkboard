@@ -237,6 +237,113 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         }
     }
 
+    /// The absent registry file has to satisfy two opposing requirements at
+    /// once, and this pins both halves.
+    ///
+    /// SELF-HEAL: a mark left behind by a registry file that has since been
+    /// deleted (manual troubleshooting, a reset step, a reaped temp root)
+    /// describes a file that no longer exists, so it must not be allowed to
+    /// reject the generation-0 state that is now the truth -- otherwise
+    /// `cachedSnapshot` stays `annotationsSuspended` forever and only an
+    /// explicit acquire/release ever recovers.
+    ///
+    /// STABILITY: yet a state synthesized on EVERY read must not look like a
+    /// NEWLY recreated file each time, or AppDelegate's 2 Hz reconcile zeroes
+    /// the ratchet -- and re-applies presentation -- twice a second.
+    ///
+    /// The stable `absentFileEpoch` sentinel satisfies both: the transition
+    /// into it fires the reset exactly once, and every later read compares
+    /// equal.
+    func testReconcileWithNoRegistryFileNeverRollsBackTheGenerationRatchet() throws {
+        try withTemporaryCoordinator { coordinator, directory in
+            let established = coordinator.testOnlyRecordAndApply(generation: 5, suspended: true,
+                                                                 instanceEpoch: "epoch-one")
+            XCTAssertEqual(established.generation, 5)
+            XCTAssertTrue(established.annotationsSuspended)
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: directory.appendingPathComponent("annotations-suspension-v3.json").path
+                ),
+                "this test is specifically about a registry file that is not there"
+            )
+
+            // The file backing generation 5 is gone, so the mark it left must
+            // be released exactly once and the real, empty state applied.
+            let healed = coordinator.reconcile()
+            XCTAssertEqual(healed.generation, 0,
+                           "a real epoch -> absent-file transition must reset the high-water mark")
+            XCTAssertFalse(healed.annotationsSuspended,
+                           "there is no registry and therefore no lease; the overlays must come back")
+
+            // ...and it must stay released-once: further reads of the SAME
+            // absent file are indistinguishable from each other.
+            XCTAssertEqual(coordinator.reconcile(), healed,
+                           "two successive reads of the same missing file must be indistinguishable")
+            XCTAssertEqual(coordinator.reconcile(), healed)
+            XCTAssertEqual(coordinator.snapshot(), healed)
+
+            // Sharper than equality of two generation-0 snapshots: raise the
+            // mark to 3 while keeping the absent file's own identity, then read
+            // that same absent file again. A per-read epoch would look like
+            // another recreation, reset the mark, and apply generation 0; the
+            // stable sentinel leaves the ratchet doing its job.
+            let raised = coordinator.testOnlyRecordAndApply(
+                generation: 3, suspended: true,
+                instanceEpoch: SuspensionLeaseCoordinator.PersistedState.absentFileEpoch
+            )
+            XCTAssertEqual(raised.generation, 3)
+            XCTAssertEqual(coordinator.reconcile(), raised,
+                           "the absent file must keep ONE identity, or the ratchet is zeroed on every tick")
+        }
+    }
+
+    /// A same-boot registry written by a build that predates `instanceEpoch`
+    /// decodes with nil, which permanently disables the ratchet reset for the
+    /// rest of the boot. `readState` upgrades it in place instead -- once. This
+    /// is the only storage-layer path that mints an epoch for an EXISTING file,
+    /// and it is invisible from the in-memory `testOnlyRecordAndApply*` seams.
+    func testExistingRegistryWithoutAnEpochIsUpgradedOnDiskExactlyOnce() throws {
+        try withTemporaryCoordinator { coordinator, directory in
+            let bootSession = try XCTUnwrap(SuspensionLeaseCoordinator.currentBootSessionIdentifier())
+            let stateURL = directory.appendingPathComponent("annotations-suspension-v3.json")
+            let persisted: [String: Any] = [
+                "schemaVersion": 4,
+                "bootSessionIdentifier": bootSession,
+                "generation": 7,
+                "lastUpdatedUptime": ProcessInfo.processInfo.systemUptime,
+                "leases": [],
+                "idempotencyTokens": [:],
+                "releasedTokens": [:],
+                // `instanceEpoch` is deliberately ABSENT: that is the shape a
+                // pre-epoch build left behind.
+            ]
+            try JSONSerialization.data(withJSONObject: persisted).write(to: stateURL)
+
+            func onDisk() throws -> [String: Any] {
+                try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any])
+            }
+
+            let upgraded = coordinator.reconcile()
+            let afterFirst = try onDisk()
+            let mintedEpoch = try XCTUnwrap(afterFirst["instanceEpoch"] as? String,
+                                            "the upgrade must be durable, not a process-local interpretation")
+            XCTAssertFalse(mintedEpoch.isEmpty)
+            XCTAssertEqual(afterFirst["generation"] as? Int, 8,
+                           "the rewrite is a state transition and must advance the generation by exactly one")
+            XCTAssertEqual(upgraded.generation, 8)
+
+            // Nothing is left to upgrade, and `prune` on a lease-free state
+            // reports no change, so a second reconcile must not rewrite.
+            let second = coordinator.reconcile()
+            let afterSecond = try onDisk()
+            XCTAssertEqual(afterSecond["instanceEpoch"] as? String, mintedEpoch,
+                           "a second read must not re-mint the epoch")
+            XCTAssertEqual(afterSecond["generation"] as? Int, 8,
+                           "a second read must not rewrite the file")
+            XCTAssertEqual(second.generation, 8)
+        }
+    }
+
     /// A registry written before `instanceEpoch` existed decodes with nil.
     /// That must degrade to exactly the old ratchet behaviour rather than
     /// resetting on every read (which would defeat the ratchet entirely).

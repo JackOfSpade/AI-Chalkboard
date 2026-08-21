@@ -14,25 +14,7 @@ extension MCPServer {
         let name = params["name"] as? String ?? ""
         let args = params["arguments"] as? [String: Any] ?? [:]
 
-        if name == "suspend_annotations" || name == "resume_annotations" {
-            // A lease token can release another caller's suspension, and an
-            // idempotency key can retrieve its active token.  Treat both as
-            // capabilities: MCP request logging must never persist them.
-            var redactedArgs = args
-            if redactedArgs["lease_token"] != nil { redactedArgs["lease_token"] = "<redacted capability>" }
-            if redactedArgs["idempotency_key"] != nil { redactedArgs["idempotency_key"] = "<redacted capability>" }
-            log("Calling tool: \(name) with sensitive arguments redacted: \(redactedArgs)")
-        } else if name == "verify_annotation", args["screenshot_path"] != nil {
-            var redactedArgs = args
-            redactedArgs["screenshot_path"] = "<redacted local path>"
-            log("Calling tool: \(name) with args: \(redactedArgs)")
-        } else if name == "draw_image" || name == "draw_batch" {
-            // Local asset paths can expose usernames/project names. The tool
-            // result only retains opaque in-memory IDs, and logs do the same.
-            log("Calling tool: \(name) with local asset paths redacted")
-        } else {
-            log("Calling tool: \(name) with args: \(args)")
-        }
+        log(redactedArgumentSummary(name: name, args: args))
 
         switch name {
         case "get_screens":
@@ -197,9 +179,22 @@ extension MCPServer {
             } else {
                 annotationID = nil
             }
-            if args.keys.contains("app"), !(args["app"] is String) {
-                sendErrorResult(id: id, text: "Invalid clear request: 'app' must be a string bundle id/display name, or an empty string for global annotations only.")
-                return
+            // `app` is parsed exactly once, here: this is the sole fail-closed
+            // authority for its type, and the branches below consume the parsed
+            // value instead of re-inspecting `args`. The previous second guard
+            // inside the .active branch was unreachable (a non-String `app`
+            // could never get past this point) while still carrying its own
+            // copy of the error string -- two places to keep in sync for one
+            // reachable message.
+            let appArgument: String?
+            if args.keys.contains("app") {
+                guard let value = args["app"] as? String else {
+                    sendErrorResult(id: id, text: "Invalid clear request: 'app' must be a string bundle id/display name, or an empty string for global annotations only.")
+                    return
+                }
+                appArgument = value
+            } else {
+                appArgument = nil
             }
 
             // An explicit id wins over a valid scope/app selector: the caller
@@ -214,7 +209,7 @@ extension MCPServer {
                 return
             }
 
-            if scope == .all, args["app"] != nil {
+            if scope == .all, appArgument != nil {
                 sendErrorResult(id: id, text: "Invalid clear request: 'app' cannot be combined with scope='all'. Remove app to clear everything, or use scope='active' to clear one app's annotations plus global annotations.")
                 return
             }
@@ -233,11 +228,7 @@ extension MCPServer {
                 let activeName: String?
                 let targetSource: String
 
-                if args.keys.contains("app") {
-                    guard let rawApp = args["app"] as? String else {
-                        sendErrorResult(id: id, text: "Invalid clear request: 'app' must be a string bundle id/display name, or an empty string for global annotations only.")
-                        return
-                    }
+                if let rawApp = appArgument {
                     var resolvedId: String?
                     var resolvedName: String?
                     if let err = resolveTargetApp(args, defaultsToGlobal: false, appId: &resolvedId, appName: &resolvedName) {
@@ -248,9 +239,13 @@ extension MCPServer {
                     activeName = resolvedName
                     targetSource = rawApp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "explicit-global" : "explicit-app"
                 } else {
-                    let tracker = ActiveAppTracker.shared
-                    activeId = tracker.fallbackAppId
-                    activeName = tracker.fallbackAppName
+                    // Paired read: the id selects what gets cleared and the
+                    // name is reported back as that same target, so they must
+                    // come from a single lock acquisition -- see
+                    // `ActiveAppTracker.fallbackApp`.
+                    let fallback = ActiveAppTracker.shared.fallbackApp
+                    activeId = fallback.bundleId
+                    activeName = fallback.name
                     targetSource = activeId == nil ? "fallback-unavailable/global-only" : "fallback"
                 }
                 let removed = AnnotationStore.shared.clearVisible(forApp: activeId)
@@ -307,6 +302,54 @@ extension MCPServer {
 
         default:
             sendErrorResult(id: id, text: "Unknown tool: \(name)")
+        }
+    }
+
+    /// The single `tools/call` log line: redaction rules plus a hard byte
+    /// budget on the argument description.
+    ///
+    /// THE BUDGET IS THE POINT. `log` writes synchronously on the MCP read-loop
+    /// thread, and tool arguments are caller-sized: one `draw_path` can carry
+    /// hundreds of kilobytes of SVG and a `draw_batch` request is bounded only
+    /// by the ~4 MiB request cap. Interpolating the whole dictionary therefore
+    /// (a) rotated the bounded 5 MiB log file away in a handful of calls,
+    /// destroying the history anyone would actually want to read, and (b) made
+    /// the stderr write proportional to request size, which can wedge the read
+    /// loop outright when the parent process never drains that pipe. The cap
+    /// applies to the redacted branches too: redaction replaces a couple of
+    /// named values, it does not bound the remaining keys.
+    ///
+    /// The tool NAME stays outside the budget and unredacted, so a truncated
+    /// line still says which call it belonged to. stderr is not part of the
+    /// wire format, so nothing here is protocol-visible.
+    private func redactedArgumentSummary(name: String, args: [String: Any]) -> String {
+        let maximumArgumentBytes = 2 * 1_024
+        func capped(_ arguments: [String: Any]) -> String {
+            let description = "\(arguments)"
+            let truncated = truncateUTF8(description, maximumBytes: maximumArgumentBytes)
+            guard truncated.utf8.count < description.utf8.count else { return truncated }
+            return "\(truncated)... <truncated to \(maximumArgumentBytes) bytes>"
+        }
+
+        switch name {
+        case "suspend_annotations", "resume_annotations":
+            // A lease token can release another caller's suspension, and an
+            // idempotency key can retrieve its active token.  Treat both as
+            // capabilities: MCP request logging must never persist them.
+            var redactedArgs = args
+            if redactedArgs["lease_token"] != nil { redactedArgs["lease_token"] = "<redacted capability>" }
+            if redactedArgs["idempotency_key"] != nil { redactedArgs["idempotency_key"] = "<redacted capability>" }
+            return "Calling tool: \(name) with sensitive arguments redacted: \(capped(redactedArgs))"
+        case "verify_annotation" where args["screenshot_path"] != nil:
+            var redactedArgs = args
+            redactedArgs["screenshot_path"] = "<redacted local path>"
+            return "Calling tool: \(name) with args: \(capped(redactedArgs))"
+        case "draw_image", "draw_batch":
+            // Local asset paths can expose usernames/project names. The tool
+            // result only retains opaque in-memory IDs, and logs do the same.
+            return "Calling tool: \(name) with local asset paths redacted"
+        default:
+            return "Calling tool: \(name) with args: \(capped(args))"
         }
     }
 }

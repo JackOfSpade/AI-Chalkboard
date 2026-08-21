@@ -233,7 +233,18 @@ extension SuspensionLeaseCoordinator {
     func readState(in directoryFD: Int32, bootSessionIdentifier: String) throws -> StateRead {
         var pathInfo = stat()
         if fstatat(directoryFD, Self.stateName, &pathInfo, AT_SYMLINK_NOFOLLOW) != 0 {
-            if errno == ENOENT { return StateRead(state: PersistedState(bootSessionIdentifier: bootSessionIdentifier), needsRewrite: false) }
+            // A missing (and, below, an empty) file is synthesized with the
+            // STABLE `absentFileEpoch` sentinel rather than a fresh UUID:
+            // repeated reads of the same absent file must be indistinguishable,
+            // or the generation ratchet resets on every reconcile tick. It is
+            // still an identity, though, so a registry that disappears
+            // mid-session reads as a real epoch change and resets the ratchet
+            // exactly once. See `PersistedState.instanceEpoch`.
+            if errno == ENOENT {
+                return StateRead(state: PersistedState(bootSessionIdentifier: bootSessionIdentifier,
+                                                       instanceEpoch: PersistedState.absentFileEpoch),
+                                 needsRewrite: false)
+            }
             throw CoordinatorError.unavailable("AI Chalkboard could not inspect suspension lease state (errno \(errno)).")
         }
         let fd = try openValidatedRegularFile(named: Self.stateName, in: directoryFD, create: false)
@@ -246,12 +257,25 @@ extension SuspensionLeaseCoordinator {
             data.append(buffer, count: count)
             guard data.count <= Self.maximumSerializedBytes else { throw CoordinatorError.malformedState }
         }
-        guard !data.isEmpty else { return StateRead(state: PersistedState(bootSessionIdentifier: bootSessionIdentifier), needsRewrite: false) }
+        guard !data.isEmpty else {
+            // Same sentinel as the ENOENT branch above: an empty file carries
+            // no identity of its own, and successive reads of it must not look
+            // like successive recreations.
+            return StateRead(state: PersistedState(bootSessionIdentifier: bootSessionIdentifier,
+                                                   instanceEpoch: PersistedState.absentFileEpoch),
+                             needsRewrite: false)
+        }
         do {
             var state = try JSONDecoder().decode(PersistedState.self, from: data)
             // A valid old-boot registry is safely replaced, never revived.
+            // Unlike the ENOENT/empty cases above this genuinely IS a new
+            // registry file about to overwrite a different one, so mint its
+            // identity now rather than leaving peers unable to tell the
+            // replacement apart from the state it replaced.
             if state.bootSessionIdentifier != bootSessionIdentifier {
-                return StateRead(state: PersistedState(bootSessionIdentifier: bootSessionIdentifier), needsRewrite: true)
+                return StateRead(state: PersistedState(bootSessionIdentifier: bootSessionIdentifier,
+                                                       instanceEpoch: UUID().uuidString),
+                                 needsRewrite: true)
             }
             if state.schemaVersion == 3 {
                 // Pre-nonce v3 leases remain valid until their short expiry,
@@ -264,6 +288,21 @@ extension SuspensionLeaseCoordinator {
                           ownerInstanceNonce: $0.ownerInstanceNonce ?? "legacy-\($0.token)",
                           expiresAtUptime: $0.expiresAtUptime, idempotencyKey: $0.idempotencyKey)
                 }
+                try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
+                return StateRead(state: state, needsRewrite: true)
+            }
+            // An EXISTING same-boot file whose optional `instanceEpoch`
+            // decoded as nil -- written by a build that predates the field, or
+            // before the epoch was minted at persist time -- must be upgraded
+            // exactly once here. Returning it unchanged left the file without
+            // an identity for the whole boot, which permanently disables the
+            // ratchet reset: a later read the ratchet rejects then pins
+            // `cachedSnapshot` to state that may no longer exist on disk.
+            // This is deliberately distinct from a MISSING file, which carries
+            // the `absentFileEpoch` sentinel until something actually persists
+            // it and mints a real UUID.
+            if state.instanceEpoch == nil {
+                state.instanceEpoch = UUID().uuidString
                 try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
                 return StateRead(state: state, needsRewrite: true)
             }

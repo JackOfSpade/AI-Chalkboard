@@ -35,6 +35,15 @@ CANONICALISATION -- the part that matters most:
 
   * UUIDs (annotation ids) and `createdAt` timestamps are always fresh, so
     they are normalised unconditionally.
+  * `windowNumber` (emitted by verify_presentation and get_overlay_state) is
+    a WindowServer-assigned id that is different on every app launch, so two
+    captures taken either side of a rebuild -- the only comparison this tool
+    supports -- spuriously differ on it. A null windowNumber is NOT masked:
+    "no window exists" is a reproducible finding worth diffing. Note that
+    `_TOOL_CALLS` reaches verify_presentation only through its missing-args
+    ERROR fixture (`call_verify_presentation_missing_args`), which carries no
+    windowNumber, so `call_get_overlay_state`'s `overlays[].windowNumber` is
+    the only thing this mask actually normalises in a real run today.
   * Live application identity (the frontmost/fallback app `get_active_app`
     and `list_annotations` report, and therefore whatever an untagged
     `draw_*` call links its annotation to) is NOT masked using a hardcoded
@@ -77,7 +86,9 @@ import argparse
 import difflib
 import json
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -255,9 +266,27 @@ _TOOL_CALLS: list[tuple[str, str, dict[str, Any]]] = [
     ("call_clear_scope_all", "clear", {"scope": "all"}),
 ]
 
-EXPECTED_KEYS: frozenset[str] = frozenset(
-    key for key, _, _ in _TOP_LEVEL_REQUESTS
-) | frozenset(key for key, _, _ in _TOOL_CALLS)
+# `run_capture` stores every response into one dict keyed by result_key, so a
+# key duplicated between (or within) the two tables above would silently drop
+# a fixture: the second response overwrites the first, and the capture still
+# validates because EXPECTED_KEYS -- being a set built from the very same
+# tables -- collapses the duplicate too. Nothing downstream could ever notice
+# the missing coverage. An EXPLICIT raise, not an `assert`: assertions are
+# stripped entirely under `python3 -O`, which would turn this guard into a
+# no-op in exactly the environment least likely to be watched closely. A
+# built-in RuntimeError rather than this module's own CaptureValidationError:
+# that type means "a capture FILE cannot be trusted" and is caught-and-reported
+# as a user error by `main`, whereas this is a defect in this file's own
+# fixture tables and must fail at import, loudly and uncatchably.
+_ALL_KEYS: list[str] = [key for key, _, _ in _TOP_LEVEL_REQUESTS] + [key for key, _, _ in _TOOL_CALLS]
+_DUPLICATE_KEYS = sorted({key for key in _ALL_KEYS if _ALL_KEYS.count(key) > 1})
+if _DUPLICATE_KEYS:
+    raise RuntimeError(
+        f"duplicate result_key(s) in _TOP_LEVEL_REQUESTS/_TOOL_CALLS: {_DUPLICATE_KEYS} -- "
+        "each key must be unique or its fixture's response is silently discarded."
+    )
+
+EXPECTED_KEYS: frozenset[str] = frozenset(_ALL_KEYS)
 
 
 def _looks_like_complete_bundle_id(value: str) -> bool:
@@ -269,11 +298,13 @@ def _looks_like_complete_bundle_id(value: str) -> bool:
 
 
 # The `app` values this fixture supplies that are themselves complete,
-# never-running bundle ids (accepted verbatim by resolveTargetApp -- see the
-# "call_circle_bundleid_not_running" / "call_grid_scoped" entries above) are
-# deterministic literals WE chose, not live environment data. If they were
-# masked like a genuinely live app identity, a future regression that
-# corrupted the verbatim-acceptance path (e.g. stored the wrong id, or
+# never-running bundle ids (accepted verbatim by resolveTargetApp) are
+# deterministic literals WE chose, not live environment data. Today that is
+# "com.example.NotRunning-FreeDraw", supplied by the
+# "call_path_bundleid_not_running", "call_clear_explicit_app", and
+# "call_clear_all_with_app" entries above. If they were masked like a
+# genuinely live app identity, a future regression that corrupted the
+# verbatim-acceptance path (e.g. stored the wrong id, or
 # truncated it) would still get harvested-and-masked from THIS SAME
 # capture's list_annotations entry and disappear behind the same "<APPID>"
 # token in both the before and after capture -- exactly the kind of
@@ -303,15 +334,35 @@ def run_capture(binary_path: str, out_path: Path, timeout: float = DEFAULT_TIMEO
     `_TOP_LEVEL_REQUESTS` + `_TOOL_CALLS` in order, and writes the
     canonicalised result to `out_path`."""
     # `spawn_mcp_child` starts a `StderrDrain` (test_mcp_stdio.py) on the
-    # child immediately, before any request is sent. `MCPServer.handleToolsCall`
-    # logs one line per call, including a Swift debug description of the
-    # entire `arguments` value, synchronously BEFORE the tool body runs -- so
-    # a single large-enough `tools/call` anywhere in `_TOOL_CALLS` below would
-    # be enough to fill the 64 KB macOS pipe and block the child's write(2),
-    # wedging the JSON-RPC response too and looking, from this script's side,
-    # indistinguishable from the server simply hanging. See StderrDrain's own
-    # doc comment for the full story.
-    proc, reader, stderr_drain = stdio_harness.spawn_mcp_child(binary_path)
+    # child immediately, before any request is sent, and nothing else reads
+    # that pipe until the child exits. `MCPServer.handleToolsCall` logs one
+    # line per call, synchronously BEFORE the tool body runs, and this
+    # function sends every fixture in `_TOP_LEVEL_REQUESTS` + `_TOOL_CALLS`
+    # into one child -- so it is the CUMULATIVE stderr of the whole run that
+    # would fill the 64 KB macOS pipe and block the child's write(2), wedging
+    # the JSON-RPC response too and looking, from this script's side,
+    # indistinguishable from the server simply hanging. No single line can do
+    # it: `redactedArgumentSummary` (Sources/MCP/MCPToolHandlers.swift) caps
+    # each rendered argument list at 2 KiB. See StderrDrain's own doc comment
+    # for the full story.
+    #
+    # The child is also put in a private, disposable suspension domain (see
+    # `isolated_suspension_env`'s doc comment for what each key does). That is
+    # not merely hygiene here, it is a correctness requirement for THIS tool:
+    # a production-domain child's `call_get_overlay_state` response reports the
+    # machine's LIVE suspension state (`annotationsSuspended`,
+    # `activeLeaseCount`, `suspensionRegistryBootstrapped`), none of which is
+    # masked by `canonicalize_capture`. A live Claude session that happens to
+    # hold a lease during one of the two captures and not the other would
+    # therefore produce exactly the spurious, "is this a real regression?"
+    # diff this tool exists to eliminate -- on top of the child otherwise
+    # writing that session's real lease registry and sharing its DNC
+    # invalidation channel and instance lock.
+    suspension_root = tempfile.mkdtemp(prefix="ai-chalkboard-wiresnap-")
+    proc, reader, stderr_drain = stdio_harness.spawn_mcp_child(
+        binary_path,
+        extra_env=stdio_harness.isolated_suspension_env(suspension_root, "wiresnap"),
+    )
     results: dict[str, Any] = {}
     next_id = 1
     failed = False
@@ -335,9 +386,12 @@ def run_capture(binary_path: str, out_path: Path, timeout: float = DEFAULT_TIMEO
     finally:
         stdio_harness.terminate_child(proc)
         if failed:
-            diagnostics = stderr_drain.join_and_get_tail(timeout=2.0).strip()
+            diagnostics = stderr_drain.join_and_get_tail(
+                timeout=stdio_harness.SHUTDOWN_TIMEOUT_SECONDS
+            ).strip()
             if diagnostics:
                 print(f"\nChild stderr (last {stdio_harness.STDERR_TAIL_BYTES} bytes):\n{diagnostics}", file=sys.stderr, flush=True)
+        shutil.rmtree(suspension_root, ignore_errors=True)
 
     missing = EXPECTED_KEYS - results.keys()
     if missing:
@@ -474,6 +528,22 @@ def _mask_value(node: Any, ids_longest_first: list[str], names_longest_first: li
                 out[key] = "<TIME>"
             elif key == "remainingSeconds" and value is not None:
                 out[key] = "<TTL>"
+            elif key == "windowNumber" and value is not None:
+                # A WindowServer-assigned window id, emitted by
+                # verify_presentation and by get_overlay_state (via
+                # `overlayInputPolicySnapshot`). It is a fresh integer on every
+                # app launch, so two captures taken either side of a rebuild --
+                # the exact thing this tool is for -- always disagree on it.
+                # Like createdAt it is a bare number with no string marker for a
+                # regex to key off, so it has to be masked by key here.
+                # `None` is left alone: "there is no window" is a real,
+                # reproducible finding this tool must still be able to diff.
+                # Of those two emitters only get_overlay_state is reached with
+                # a live window by `_TOOL_CALLS` (verify_presentation appears
+                # there solely as `call_verify_presentation_missing_args`, an
+                # error fixture), so in practice this masks exactly
+                # `call_get_overlay_state`'s `overlays[].windowNumber`.
+                out[key] = "<WINDOWNUM>"
             else:
                 out[key] = _mask_value(value, ids_longest_first, names_longest_first)
         return out

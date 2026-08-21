@@ -32,8 +32,8 @@ enum MCPToolCatalog {
         "image_path": ["type": "string", "description": "Absolute path to a PNG/JPEG/HEIC/TIFF raster. Alpha is preserved; pixels are decoded into memory once and the path is not retained."],
         "x": ["type": "number", "description": "Top-left X in the selected coordinate_space."],
         "y": ["type": "number", "description": "Top-left Y in the selected coordinate_space."],
-        "width": ["type": "number", "exclusiveMinimum": 0, "description": "Optional output width in the selected coordinate_space. Omit one dimension to preserve aspect ratio; omit both for intrinsic backing-pixel size."],
-        "height": ["type": "number", "exclusiveMinimum": 0, "description": "Optional output height in the selected coordinate_space."],
+        "width": ["type": "number", "exclusiveMinimum": 0, "description": "Optional output width in the selected coordinate_space. Omit one dimension and it is derived from the raster's true pixel aspect ratio in backing pixels, for every coordinate_space -- so a normalized width on a non-square display still yields an unstretched image, and the derived dimension may exceed the display. Omit both for intrinsic backing-pixel size."],
+        "height": ["type": "number", "exclusiveMinimum": 0, "description": "Optional output height in the selected coordinate_space. Omitting it derives the height from width and the raster's true pixel aspect ratio; see width."],
         "rotation_degrees": ["type": "number", "description": "Clockwise rotation around image center; default 0."],
         "opacity": ["type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Overall opacity; default 1. Fully transparent images are rejected because they cannot be shown or verified."]
     ]

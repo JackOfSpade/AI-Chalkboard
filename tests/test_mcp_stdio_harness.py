@@ -2,9 +2,18 @@ import subprocess
 import sys
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
-import test_mcp_stdio as harness
+# test_mcp_stdio.py lives at the repo root, one level above this file. Running
+# this module as `python3 -m unittest tests/test_mcp_stdio_harness.py` from the
+# repo root already puts the root on sys.path, but running it directly
+# (`python3 tests/test_mcp_stdio_harness.py`) sets sys.path[0] to tests/ and
+# the import below dies with ModuleNotFoundError. Insert the repo root
+# explicitly so both entry points work, exactly as
+# tests/test_suspension_two_process.py does.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import test_mcp_stdio as harness  # noqa: E402
 
 
 class MCPLineReaderTests(unittest.TestCase):

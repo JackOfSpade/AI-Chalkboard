@@ -218,8 +218,8 @@ jobs:
   # WHY A SEPARATE JOB ON macos-latest, NOT MORE STEPS ON THE `merge` JOB. The source of this workflow
   # ran its equivalent check as trailing steps in the same (credential-free, cheap) job as the merge,
   # because those checks were plain Python with no build step. That shortcut does not carry over here:
-  # this repo's post-merge check has to actually build the macOS app (`swift build`, `build_app.sh`),
-  # which requires a macos-latest runner — GitHub bills macOS minutes at 10x Linux minutes, and this
+  # this repo's post-merge check has to actually compile the macOS app (`swift build`, debug and
+  # release), which requires a macos-latest runner — GitHub bills macOS minutes at 10x Linux minutes, and this
   # repo is private (billed, not free). The `merge` job runs on every CI completion and merges nothing
   # on most runs; putting the build check inline would force EVERY one of those runs onto a macOS
   # runner. Splitting it into its own job, gated on `needs.merge.outputs.did_merge == 'true'`, means
@@ -268,8 +268,21 @@ jobs:
           }
           run_check swift build
           run_check swift build -c release
-          run_check bash build_app.sh
-          run_check test -x .build/release/AIChalkboard.app/Contents/MacOS/AIChalkboard
+          # NO app-assembly check here, deliberately. build_app.sh codesigns
+          # with a pinned local identity and FAILS rather than falling back to
+          # ad-hoc signing (an ad-hoc fallback would change the app's designated
+          # requirement every rebuild and destabilise its Screen Recording /
+          # Accessibility grants -- see README, "Build & Run Instructions", and
+          # ci.yml's matching "Assemble .app bundle" step). That certificate
+          # lives only in this developer's login keychain, so on a GitHub-hosted
+          # runner such a check could never be anything but red -- it would
+          # report a permanently broken main on every merge. Nor can it be
+          # rescued by gating it on act: this workflow's `on:` block is
+          # workflow_run + workflow_dispatch with no `push` trigger, so unlike
+          # ci.yml's `build` job it never executes under the local `act push`
+          # pre-push hook either. App assembly is therefore covered ONLY by
+          # ci.yml when that workflow is run locally via act. Do NOT "fix" this
+          # by adding an ad-hoc signing fallback.
           run_check bash tests/test_auto_merge_logic.sh
           if [ "$fail" -eq 0 ]; then
             echo "result=ok" >> "$GITHUB_OUTPUT"
@@ -286,7 +299,7 @@ jobs:
         run: |
           set -uo pipefail
           {
-            echo "**RED MAIN** — the post-merge check (swift build, release build, app assembly, and the auto-merge decision-logic tests) failed against main's ACTUAL merged tip ($(git rev-parse HEAD)) after this workflow landed one or more branches. Each contributing branch's OWN CI was green individually — GitHub does not re-trigger ci.yml on this job's GITHUB_TOKEN push, so this is the first and only automated signal that the COMBINED tree is broken. See the failing run for which check(s) failed."
+            echo "**RED MAIN** — the post-merge check (swift build, release build, and the auto-merge decision-logic tests) failed against main's ACTUAL merged tip ($(git rev-parse HEAD)) after this workflow landed one or more branches. Each contributing branch's OWN CI was green individually — GitHub does not re-trigger ci.yml on this job's GITHUB_TOKEN push, so this is the first and only automated signal that the COMBINED tree is broken. See the failing run for which check(s) failed."
             echo
             echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           } > /tmp/postmerge_body.md

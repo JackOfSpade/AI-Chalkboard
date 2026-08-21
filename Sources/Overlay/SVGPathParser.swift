@@ -183,25 +183,25 @@ enum SVGPathParser {
                 }
 
             case 108: // L/l
-                try requireSegment(command)
+                try requireSegment()
                 repeat { line(to: try point(absolute: absolute)) } while hasNumberAhead()
 
             case 104: // H/h
-                try requireSegment(command)
+                try requireSegment()
                 repeat {
                     let x = try number()
                     line(to: CGPoint(x: absolute ? x : current.x + x, y: current.y))
                 } while hasNumberAhead()
 
             case 118: // V/v
-                try requireSegment(command)
+                try requireSegment()
                 repeat {
                     let y = try number()
                     line(to: CGPoint(x: current.x, y: absolute ? y : current.y + y))
                 } while hasNumberAhead()
 
             case 99: // C/c
-                try requireSegment(command)
+                try requireSegment()
                 repeat {
                     let c1 = try point(absolute: absolute)
                     let c2 = try point(absolute: absolute)
@@ -210,7 +210,7 @@ enum SVGPathParser {
                 } while hasNumberAhead()
 
             case 115: // S/s
-                try requireSegment(command)
+                try requireSegment()
                 repeat {
                     let c1: CGPoint
                     if previousCommand == 99 || previousCommand == 115, let previousCubicControl {
@@ -224,7 +224,7 @@ enum SVGPathParser {
                 } while hasNumberAhead()
 
             case 113: // Q/q
-                try requireSegment(command)
+                try requireSegment()
                 repeat {
                     let control = try point(absolute: absolute)
                     let end = try point(absolute: absolute)
@@ -232,7 +232,7 @@ enum SVGPathParser {
                 } while hasNumberAhead()
 
             case 116: // T/t
-                try requireSegment(command)
+                try requireSegment()
                 repeat {
                     let control: CGPoint
                     if previousCommand == 113 || previousCommand == 116, let previousQuadControl {
@@ -244,7 +244,7 @@ enum SVGPathParser {
                 } while hasNumberAhead()
 
             case 97: // A/a
-                try requireSegment(command)
+                try requireSegment()
                 repeat {
                     let rx = try number()
                     let ry = try number()
@@ -256,6 +256,11 @@ enum SVGPathParser {
                 } while hasNumberAhead()
 
             case 122: // Z/z
+                // Unreachable given the `missingInitialMove` check at the top
+                // of `parse(command:)`, which already rejects every non-`m`
+                // command before a current point exists. Retained so a future
+                // edit that clears `hasCurrentPoint` cannot silently produce a
+                // close without a current point.
                 guard hasCurrentPoint else { throw SVGPathParseError.missingInitialMove(offset: index) }
                 elements.append(.close)
                 current = subpathStart
@@ -417,7 +422,11 @@ enum SVGPathParser {
             CGPoint(x: 2 * point.x - control.x, y: 2 * point.y - control.y)
         }
 
-        private mutating func requireSegment(_ command: UInt8) throws {
+        /// Every numeric command must be followed by at least one coordinate.
+        /// Takes no argument: the offending command byte is not part of the
+        /// error (`expectedNumber` reports only the offset), so accepting one
+        /// merely implied a per-command distinction the diagnostics never made.
+        private mutating func requireSegment() throws {
             guard hasNumberAhead() else { throw SVGPathParseError.expectedNumber(offset: index) }
         }
 

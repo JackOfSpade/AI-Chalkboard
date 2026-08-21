@@ -27,6 +27,16 @@ public final class OverlayWindowController: NSObject {
     /// index string would silently clobber that entry. A flat array can't
     /// collide, costs one insert instead of two per screen, and matches how
     /// these are actually consumed.
+    ///
+    /// INVARIANT -- THE TWO ARRAYS ARE INDEX-ALIGNED: `overlayWindows[i]` is
+    /// the window whose `contentView` is `overlayViews[i]`, and both describe
+    /// the same display. Consumers rely on this directly: `presentationStatus`
+    /// finds an index by matching `overlayViews[i].screenId` and then reads
+    /// `overlayWindows[i]`, and `overlayInputPolicySnapshot` `zip`s the pair.
+    /// A window appended without its view (or in a different order) would
+    /// silently report one display's window under another display's id, so
+    /// `rebuildOverlayWindows()` is the ONLY place that appends, and it
+    /// appends both halves together.
     // internal (not private): OverlayWindowController+Presentation.swift and
     // OverlayWindowController+Diagnostics.swift read and mutate these arrays.
     var overlayWindows: [NSWindow] = []
@@ -175,14 +185,25 @@ public final class OverlayWindowController: NSObject {
                 "OverlayWindowController: configuring screen id=\(screenId) name='\(screen.localizedName)' points=\(Int(frame.width))x\(Int(frame.height)) backingScaleFactor=\(scale) physicalPixels=\(Int(round(frame.width * scale)))x\(Int(round(frame.height * scale))).",
                 level: "INFO"
             )
-            let window = createOverlayWindow(for: screen, screenId: screenId)
-            overlayWindows.append(window)
+            // Both halves are appended here, together, so the index-alignment
+            // invariant documented on the arrays is visible in one place.
+            let pair = createOverlayWindow(for: screen, screenId: screenId)
+            overlayWindows.append(pair.window)
+            overlayViews.append(pair.view)
         }
 
         refreshViews()
     }
 
-    private func createOverlayWindow(for screen: NSScreen, screenId: String) -> NSWindow {
+    /// Builds one overlay window and its content view for a single display.
+    ///
+    /// Deliberately returns BOTH halves and registers neither: this function
+    /// used to append the view to `overlayViews` itself while its caller
+    /// appended the window to `overlayWindows`, which split the arrays'
+    /// index-alignment invariant across two functions where neither one could
+    /// be read as upholding it. Registration is the caller's job; this is a
+    /// pure factory.
+    private func createOverlayWindow(for screen: NSScreen, screenId: String) -> (window: NSWindow, view: OverlayView) {
         let frame = screen.frame
         let window = NSWindow(
             contentRect: frame,
@@ -307,7 +328,6 @@ public final class OverlayWindowController: NSObject {
         overlayView.scaleFactor = screen.backingScaleFactor
 
         window.contentView = overlayView
-        overlayViews.append(overlayView)
 
         window.setFrame(frame, display: true)
         // NOT ordered on screen here. `NSWindow` starts off-screen by
@@ -319,6 +339,6 @@ public final class OverlayWindowController: NSObject {
         // `refreshViews()`'s doc comment for why "created" and "on screen"
         // must not be the same thing for this window.
 
-        return window
+        return (window: window, view: overlayView)
     }
 }

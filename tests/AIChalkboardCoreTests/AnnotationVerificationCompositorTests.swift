@@ -167,7 +167,6 @@ final class AnnotationVerificationCompositorTests: XCTestCase {
 
     func testRawPNGBudgetIncludesBase64AndJSONReserve() {
         let raw = AnnotationVerificationCompositor.maxRawPNGBytes
-        XCTAssertEqual(raw, AnnotationVerificationCompositor.maxOutputBytes)
         XCTAssertTrue(AnnotationVerificationCompositor.isWithinResponseBudget(rawPNGBytes: raw))
         XCTAssertFalse(AnnotationVerificationCompositor.isWithinResponseBudget(rawPNGBytes: raw + 1))
 

@@ -93,7 +93,7 @@ extension MCPServer {
         case .success(let value): style = value
         }
 
-        let target: (app: AppRef, running: NSRunningApplication)
+        let target: (app: AppRef, pid: pid_t)
         switch resolveRunningHighlightTarget(args) {
         case .failure(let error): sendErrorResult(id: id, text: error); return
         case .success(let value): target = value
@@ -103,7 +103,7 @@ extension MCPServer {
         let match: AccessibilityElementMatch
         do {
             match = try AccessibilityElementResolver.resolve(
-                processID: target.running.processIdentifier,
+                processID: target.pid,
                 request: AccessibilityElementRequest(
                     label: label,
                     role: args["role"] as? String,
@@ -157,7 +157,7 @@ extension MCPServer {
         }
     }
 
-    private func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, running: NSRunningApplication)> {
+    private func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, pid: pid_t)> {
         if args.keys.contains("app"), !(args["app"] is String) {
             return .failure("app must be a running app's bundle id or display name when supplied.")
         }
@@ -176,19 +176,38 @@ extension MCPServer {
                 return .failure("App '\(raw)' is not running or could not be resolved. highlight_element requires a running target application with a PID.")
             }
         } else {
-            guard let bundleId = ActiveAppTracker.shared.fallbackAppId else {
+            // Paired read: the id and the name become one AppRef, so they must
+            // come from a single lock acquisition -- see
+            // `ActiveAppTracker.fallbackApp`.
+            let fallback = ActiveAppTracker.shared.fallbackApp
+            guard let bundleId = fallback.bundleId else {
                 return .failure("No fallback running app is available. Pass app with an exact running app bundle id or display name; GLOBAL highlighting is not supported.")
             }
-            app = AppRef(bundleId: bundleId, name: ActiveAppTracker.shared.fallbackAppName ?? bundleId)
+            app = AppRef(bundleId: bundleId, name: fallback.name ?? bundleId)
         }
 
-        let running = NSWorkspace.shared.runningApplications.filter {
-            $0.bundleIdentifier == app.bundleId && !$0.isTerminated
+        // `NSWorkspace.runningApplications` is AppKit, and this runs on the MCP
+        // server's background read queue, so the enumeration takes the same
+        // main-thread hop every other NSWorkspace query in this package takes
+        // (see MainThread.sync, whose contract names this exact API). The PIDs
+        // are extracted INSIDE the hop so no NSRunningApplication -- a live,
+        // main-thread-owned object -- escapes back to the read queue; a plain
+        // pid_t is just a number.
+        //
+        // This does NOT close the gap between resolving the app above and
+        // enumerating here, nor the one between this snapshot and the
+        // Accessibility query that follows: the process can exit, or a second
+        // instance can launch, in either window. The hop is a threading
+        // correction, not a TOCTOU fix.
+        let runningPIDs: [pid_t] = MainThread.sync {
+            NSWorkspace.shared.runningApplications
+                .filter { $0.bundleIdentifier == app.bundleId && !$0.isTerminated }
+                .map { $0.processIdentifier }
         }
-        guard running.count == 1, let target = running.first else {
-            return running.isEmpty
+        guard runningPIDs.count == 1, let target = runningPIDs.first else {
+            return runningPIDs.isEmpty
                 ? .failure("App '\(app.name)' [\(app.bundleId)] is no longer running, so its Accessibility hierarchy cannot be queried.")
-                : .failure("App '\(app.name)' [\(app.bundleId)] has \(running.count) running processes. highlight_element refuses to guess which PID to inspect.")
+                : .failure("App '\(app.name)' [\(app.bundleId)] has \(runningPIDs.count) running processes. highlight_element refuses to guess which PID to inspect.")
         }
         return .success((app, target))
     }
@@ -215,7 +234,13 @@ extension MCPServer {
               strokeOpacity.isFinite, (0...1).contains(strokeOpacity),
               fillOpacity.isFinite, (0...1).contains(fillOpacity),
               padding.isFinite, padding >= 0, padding <= DrawingDefaults.maxStyleDimensionPx else {
-            return .failure("stroke_width must be 0...\(Int(DrawingDefaults.maxStyleDimensionPx)); opacity values must be 0...1; and padding_px must be 0...\(Int(DrawingDefaults.maxStyleDimensionPx)).")
+            // The stroke_width half of this message says "greater than 0", not
+            // "0...", because the guard above genuinely rejects 0: a
+            // zero-width stroke would satisfy the visible-stroke-or-fill check
+            // immediately below (its color still has alpha) and then draw
+            // nothing at all. The old wording advertised a value the handler
+            // refuses.
+            return .failure("stroke_width must be greater than 0 and no more than \(Int(DrawingDefaults.maxStyleDimensionPx)); opacity values must be 0...1; and padding_px must be 0...\(Int(DrawingDefaults.maxStyleDimensionPx)).")
         }
         guard (colorHasVisibleAlpha(strokeColor) && strokeOpacity > 0)
                 || (colorHasVisibleAlpha(fillColor) && fillOpacity > 0) else {

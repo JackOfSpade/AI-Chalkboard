@@ -71,6 +71,30 @@ final class SVGPathCacheTests: XCTestCase {
         )
     }
 
+    func testARecentlyUsedEntrySurvivesEvictionAndAStaleOneDoesNot() throws {
+        // Recency is a per-entry stamp now rather than a parallel array, so
+        // this pins that a HIT still refreshes it: the first key is re-read
+        // after the second is inserted, making the second the least recently
+        // used entry when the third pushes the total past the budget.
+        // Two of these fit the 4 MiB budget; the third cannot.
+        let chunk = 3 * 1024 * 1024 / 2
+        let keys = (0..<3).map { "M 0 0 L \($0) \($0)\(String(repeating: " ", count: chunk))" }
+
+        _ = try SVGPathCache.path(for: keys[0])
+        _ = try SVGPathCache.path(for: keys[1])
+        _ = try SVGPathCache.path(for: keys[0]) // a hit: refreshes keys[0]
+        _ = try SVGPathCache.path(for: keys[2])
+
+        XCTAssertEqual(SVGPathCache.count, 2, "Exactly one entry must have been evicted.")
+        XCTAssertLessThanOrEqual(SVGPathCache.currentRetainedBytes, SVGPathCache.maximumRetainedBytes)
+        // Retained bytes identify WHICH entry went: the stale keys[1], not the
+        // refreshed keys[0].
+        XCTAssertEqual(SVGPathCache.currentRetainedBytes, keys[0].utf8.count + keys[2].utf8.count)
+        // A hit must not re-parse, so a surviving entry stays interchangeable
+        // with a fresh parse of the same data.
+        XCTAssertEqual(try SVGPathCache.path(for: keys[0]), try SVGPathParser.parse(keys[0]))
+    }
+
     func testSingleOversizedPathIsStillCached() throws {
         // A path larger than the entire budget is exactly the one whose
         // re-parse cost most justifies caching, so it must be retained rather

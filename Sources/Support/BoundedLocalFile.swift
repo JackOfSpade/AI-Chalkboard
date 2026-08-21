@@ -43,12 +43,24 @@ enum BoundedLocalFile {
         let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         guard url.isFileURL else { throw BoundedLocalFileError.invalidPath }
 
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: url)
-        } catch {
-            throw BoundedLocalFileError.unreadable
-        }
+        // BUG FIX (a FIFO path wedges the MCP read loop forever): the previous
+        // implementation opened via `FileHandle(forReadingFrom:)` and only
+        // THEN fstat'd for S_IFREG. Opening a FIFO for reading blocks in
+        // open(2) until a writer appears, so the S_IFREG guard below never
+        // got a chance to reject it -- and because the MCP server has a single
+        // serial read loop, a `draw_image` / `verify_annotation` pointing at a
+        // FIFO hung the whole process for its remaining life. O_NONBLOCK makes
+        // the open return immediately for a FIFO with no writer (and is a
+        // no-op for the regular files this type actually accepts), so the
+        // S_IFREG guard gets to do its job. O_CLOEXEC keeps the descriptor out
+        // of any child process this app spawns.
+        let fd = open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard fd != -1 else { throw BoundedLocalFileError.unreadable }
+        // closeOnDealloc: false because the defer below owns the close.
+        // Letting FileHandle own it too would close the same descriptor
+        // twice -- and a number that has been handed back to the kernel can
+        // by then name a completely unrelated open file.
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
         defer { try? handle.close() }
 
         // fstat the descriptor already opened above, not the pathname again

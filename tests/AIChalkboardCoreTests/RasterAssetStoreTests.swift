@@ -38,6 +38,12 @@ final class RasterAssetStoreTests: XCTestCase {
         XCTAssertEqual(store.cgImage(for: asset.id)?.height, 7)
         XCTAssertEqual(store.image(id: asset.id)?.representations.first?.pixelsWide, 13)
         XCTAssertEqual(store.count, 1)
+        // The store's aggregate accounting and draw_batch's per-batch budget
+        // both charge `RasterAssetHandle.decodedByteCount`; pin that the handle
+        // reports the materialized RGBA size the store actually retained, so
+        // the two budgets cannot silently start measuring different things.
+        XCTAssertEqual(asset.decodedByteCount, 13 * 7 * 4)
+        XCTAssertEqual(store.totalDecodedBytes, asset.decodedByteCount)
     }
 
     func testExplicitRemoveAndCleanupReleaseAssets() throws {

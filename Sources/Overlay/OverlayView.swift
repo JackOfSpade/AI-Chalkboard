@@ -173,7 +173,7 @@ public final class OverlayView: NSView {
                                strokeOpacity: strokeOpacity, fillColorHex: fillColorHex, fillOpacity: fillOpacity, dash: dash,
                                usesEvenOddFillRule: usesEvenOddFillRule,
                                coordinateScaleX: coordinateScaleX, coordinateScaleY: coordinateScaleY,
-                               fallbackColor: ColorParser.parse(colorHex), scale: scale, viewHeight: viewHeight, context: context)
+                               fallbackColorHex: colorHex, scale: scale, viewHeight: viewHeight, context: context)
 
             case .image(let assetId, let x, let y, let width, let height, let rotationDegrees, let opacity):
                 drawImage(assetId: assetId, x: x, y: y, width: width, height: height,
@@ -212,7 +212,7 @@ public final class OverlayView: NSView {
         usesEvenOddFillRule: Bool,
         coordinateScaleX: Double,
         coordinateScaleY: Double,
-        fallbackColor: NSColor,
+        fallbackColorHex: String,
         scale: CGFloat,
         viewHeight: CGFloat,
         context: CGContext
@@ -240,7 +240,15 @@ public final class OverlayView: NSView {
         }
 
         if strokeWidth > 0 {
-            let stroke = strokeColorHex.map(ColorParser.parse) ?? fallbackColor
+            // The fallback hex is parsed HERE, lazily, rather than by the
+            // caller: the annotation-level colour is a safety net that the MCP
+            // layer works to keep unreachable (`patchKind` refuses to leave a
+            // stroked path with no stroke colour -- "instead of allowing the
+            // renderer fallback color to reappear"), so parsing it eagerly on
+            // every repaint bought a colour that is essentially never used. It
+            // stays as the fallback because in-process callers can still build
+            // a stroked path with no stroke colour.
+            let stroke = ColorParser.parse(strokeColorHex ?? fallbackColorHex)
             context.addPath(path)
             context.setStrokeColor(stroke.withAlphaComponent(
                 stroke.alphaComponent * OverlayDrawingMetrics.clampedAlpha(strokeOpacity)

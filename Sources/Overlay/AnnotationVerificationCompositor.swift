@@ -9,6 +9,12 @@ enum AnnotationVerificationError: LocalizedError {
     case imageTooLarge
     case aspectRatioMismatch(scaleX: Double, scaleY: Double)
     case renderFailed
+    /// The renderer ran to completion and produced a valid bitmap, it just
+    /// contains no non-transparent pixel.  Kept separate from `renderFailed`
+    /// because the two need opposite responses from an agent: this one means
+    /// the annotation's own coordinates/colors put nothing on this screen,
+    /// not that Core Graphics failed.
+    case annotationPaintedNothing(screenWidthPx: Int, screenHeightPx: Int)
     case outputTooLarge
 
     var errorDescription: String? {
@@ -28,6 +34,8 @@ enum AnnotationVerificationError: LocalizedError {
             )
         case .renderFailed:
             return "Failed to render the annotation verification image."
+        case .annotationPaintedNothing(let screenWidthPx, let screenHeightPx):
+            return "The annotation rendered without error but painted no pixels anywhere on its \(screenWidthPx)x\(screenHeightPx) screen, so there is no region to crop or verify. Check that its coordinates fall inside that screen and that its stroke/fill colors, opacity, and path data are not empty or fully transparent."
         case .outputTooLarge:
             return "The verification PNG exceeds the raw-image allowance for the 8 MB encoded MCP response limit. Use a smaller or more tightly cropped screenshot."
         }
@@ -69,10 +77,6 @@ enum AnnotationVerificationCompositor {
     /// transport reserve.  Base64 expands every 3 bytes into 4, hence the
     /// floor-to-a-multiple-of-four calculation.
     static let maxRawPNGBytes = ((maxTransportResponseBytes - maxTransportOverheadBytes) / 4) * 3
-
-    /// Compatibility spelling for callers/tests that previously consumed the
-    /// raw output limit directly.
-    static let maxOutputBytes = maxRawPNGBytes
     static let maxRelativeScaleDifference = 0.02
 
     static func composite(
@@ -170,8 +174,16 @@ enum AnnotationVerificationCompositor {
             return overlayRep
         }
 
+        // Reaching here means the bitmap and its context were both created and
+        // the renderer ran; an empty painted box is therefore a statement about
+        // the annotation, not about the rendering machinery. Fully off-screen
+        // coordinates, zero opacity, a transparent color, and an empty path are
+        // all storable and all land exactly here.
         guard let paintedTopLeft = paintedPixelBounds(in: overlayRep) else {
-            throw AnnotationVerificationError.renderFailed
+            throw AnnotationVerificationError.annotationPaintedNothing(
+                screenWidthPx: screen.widthPx,
+                screenHeightPx: screen.heightPx
+            )
         }
         // NSBitmapImageRep's raw rows are top-to-bottom, while NSImage's
         // `draw(from:)` source rect uses AppKit's bottom-left coordinates.

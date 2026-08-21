@@ -211,4 +211,80 @@ final class MCPPureHelperTests: XCTestCase {
         let suffix = MCPServer.shared.linkageSuffix(appId: "com.example.Thing", appName: nil)
         XCTAssertTrue(suffix.contains("com.example.Thing"), "expected the bundle id in: \(suffix)")
     }
+
+    // MARK: - resolveBackingSize (draw_image geometry)
+
+    /// `coordinate_space='normalized'` on a 3840x2160 display: the two axes
+    /// scale by different factors, which is what makes the order of the
+    /// aspect-ratio arithmetic observable.
+    private var normalized4K: DrawRequest.CoordinateTransform {
+        DrawRequest.CoordinateTransform(scaleX: 3840, scaleY: 2160, requiresUnitInterval: true)
+    }
+
+    func testBackingSizeWithBothDimensionsUsesOneAxisEach() throws {
+        let resolved = try XCTUnwrap(MCPServer.resolveBackingSize(
+            requestedWidth: 0.1, requestedHeight: 0.5,
+            intrinsicWidth: 512, intrinsicHeight: 512, transform: normalized4K
+        ))
+        XCTAssertEqual(resolved.width, 384, accuracy: 1e-9)
+        XCTAssertEqual(resolved.height, 1080, accuracy: 1e-9)
+    }
+
+    func testBackingSizeDerivesTheSiblingInBackingSpaceNotCallerSpace() throws {
+        // THE regression this exists for: a SQUARE raster asked for width 0.1.
+        // Deriving the sibling in caller space (0.1) and then transforming it
+        // runs it through the y scale, yielding 384x216 -- a stretched image
+        // from a request that explicitly asked to preserve the aspect ratio.
+        let resolved = try XCTUnwrap(MCPServer.resolveBackingSize(
+            requestedWidth: 0.1, requestedHeight: nil,
+            intrinsicWidth: 512, intrinsicHeight: 512, transform: normalized4K
+        ))
+        XCTAssertEqual(resolved.width, 384, accuracy: 1e-9)
+        XCTAssertEqual(resolved.height, 384, accuracy: 1e-9,
+                       "the sibling must come from the raster's pixel ratio in BACKING space")
+    }
+
+    func testBackingSizeWithHeightOnlyDerivesTheWidthTheSameWay() throws {
+        let resolved = try XCTUnwrap(MCPServer.resolveBackingSize(
+            requestedWidth: nil, requestedHeight: 0.5,
+            intrinsicWidth: 1000, intrinsicHeight: 500, transform: normalized4K
+        ))
+        XCTAssertEqual(resolved.height, 1080, accuracy: 1e-9)
+        XCTAssertEqual(resolved.width, 2160, accuracy: 1e-9, "2:1 raster, so twice the resolved height")
+    }
+
+    func testBackingSizeWithNeitherDimensionUsesTheRastersOwnPixelSize() throws {
+        // The decoded size wins regardless of the coordinate space chosen for
+        // the image's POSITION -- 1024 backing pixels, not 1024 * 3840.
+        let resolved = try XCTUnwrap(MCPServer.resolveBackingSize(
+            requestedWidth: nil, requestedHeight: nil,
+            intrinsicWidth: 1024, intrinsicHeight: 768, transform: normalized4K
+        ))
+        XCTAssertEqual(resolved.width, 1024, accuracy: 1e-9)
+        XCTAssertEqual(resolved.height, 768, accuracy: 1e-9)
+    }
+
+    func testBackingSizeAcceptsADerivedSiblingBeyondTheNormalizedUnitInterval() throws {
+        // A tall raster pinned to the FULL display width runs off the bottom on
+        // purpose. As a normalized value the derived height would be 15360/2160
+        // = 7.1, so routing it through `transformedY` would reject a perfectly
+        // legitimate request. The derived sibling must skip that check.
+        let resolved = try XCTUnwrap(MCPServer.resolveBackingSize(
+            requestedWidth: 1.0, requestedHeight: nil,
+            intrinsicWidth: 1000, intrinsicHeight: 4000, transform: normalized4K
+        ))
+        XCTAssertEqual(resolved.width, 3840, accuracy: 1e-9)
+        XCTAssertEqual(resolved.height, 15360, accuracy: 1e-9,
+                       "an aspect-correct sibling may legitimately exceed the display")
+    }
+
+    func testBackingSizeRejectsASuppliedDimensionTheTransformRefuses() {
+        // The SUPPLIED dimension still goes through the transform, so
+        // normalized 1.5 is out of range and the caller must report a geometry
+        // error rather than silently clamping.
+        XCTAssertNil(MCPServer.resolveBackingSize(
+            requestedWidth: 1.5, requestedHeight: nil,
+            intrinsicWidth: 512, intrinsicHeight: 512, transform: normalized4K
+        ))
+    }
 }

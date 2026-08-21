@@ -111,12 +111,15 @@ jobs:
           # should fail loudly here rather than let this step pass having checked
           # nothing.
           shopt -s nullglob
-          files=(scripts/*.sh tests/*.sh .claude/*.sh)
+          # build_app.sh is named explicitly: it lives at the repo root, so no
+          # directory glob below reaches it, and it was going unlinted despite
+          # being the script that assembles and codesigns the shipped .app.
+          files=(build_app.sh scripts/*.sh tests/*.sh .claude/*.sh)
           shopt -u nullglob
           existing=()
           for f in "${files[@]}"; do [ -f "$f" ] && existing+=("$f"); done
           if [ "${#existing[@]}" -eq 0 ]; then
-            echo "::error::shellcheck found zero .sh files across scripts/, tests/, .claude/ — broken checkout or repo layout, not nothing to check."
+            echo "::error::shellcheck found zero .sh files across build_app.sh, scripts/, tests/, .claude/ — broken checkout or repo layout, not nothing to check."
             exit 1
           fi
           # Floored at -S warning (unpinned, whatever ships on the runner): only
@@ -200,7 +203,7 @@ jobs:
         run: test -d tests/AIChalkboardCoreTests
 
   build:
-    name: swift build (debug + release) + app bundle
+    name: swift build (debug + release) + app bundle (act-local only)
     runs-on: macos-latest
     # macos-latest runners bill at 10x on a private repo, which is exactly why every
     # check above that does NOT need AppKit/the Swift toolchain lives in the cheap
@@ -220,22 +223,39 @@ jobs:
       - name: swift build (release)
         run: swift build -c release
 
-      # Runs locally too: the pre-push hook maps macos-latest to -self-hosted
-      # (act cannot run macOS containers, so this whole job was otherwise
-      # silently skipped), and build_app.sh codesigns with a pinned identity
-      # rather than falling back to ad-hoc signing, which would destabilise the
-      # app's Screen Recording / Accessibility grants. That requires the signing
-      # key to be granted non-interactive access in the login keychain — if it
-      # is ever revoked, codesign blocks on a SecurityAgent password prompt that
-      # a git hook cannot answer and the push hangs indefinitely rather than
-      # failing. Remedy: re-grant "Always Allow" for the key, or push once with
-      # SKIP_ACT=1 to get unblocked.
-      - name: Assemble .app bundle
+      # LOCAL-ONLY, deliberately: build_app.sh codesigns with a pinned local
+      # identity (SHA-1 65B98DF…, "AI Chalkboard Local Code Signing") and FAILS
+      # rather than falling back to ad-hoc signing, because an ad-hoc fallback
+      # would change the app's designated requirement on every rebuild and
+      # destabilise its Screen Recording / Accessibility grants (README, "Build
+      # & Run Instructions"). That certificate exists only in this developer's
+      # login keychain, so on a GitHub-hosted runner this step could never be
+      # anything but red — and Actions is disabled repo-wide for this repo
+      # today anyway. Where it DOES run is the global `act push` pre-push hook:
+      # .actrc maps macos-latest to -self-hosted, so this job executes natively
+      # on the Mac that has the key. Do NOT "fix" this by adding an ad-hoc
+      # signing fallback.
+      #
+      # `env.ACT` is set only by act (same contract the shellcheck-install step
+      # in the `checks` job above relies on) and is unset on GitHub-hosted
+      # runners. `== 'true'` rather than a bare truthiness test, because GitHub
+      # treats ANY non-empty string (including "false") as true.
+      #
+      # Local caveat: the signing key must be granted non-interactive access in
+      # the login keychain. If that is ever revoked, codesign blocks on a
+      # SecurityAgent password prompt a git hook cannot answer and the push
+      # hangs indefinitely rather than failing. Remedy: re-grant "Always Allow"
+      # for the key, or push once with SKIP_ACT=1 to get unblocked.
+      - name: Assemble .app bundle (act-local CI only — needs the local signing identity)
+        if: ${{ env.ACT == 'true' }}
         run: bash build_app.sh
 
       # Verifies the artifact the step above produces (and calls codesign
-      # --verify on it), so the two are gated identically — both run everywhere.
-      - name: Verify bundle contents
+      # --verify on it), so the two are gated identically — both local-only.
+      # Without the same `if:`, this step would fail on a GitHub-hosted runner
+      # looking for a bundle that was never assembled there.
+      - name: Verify bundle contents (act-local CI only — verifies the step above)
+        if: ${{ env.ACT == 'true' }}
         run: |
           set -euo pipefail
           app=.build/release/AIChalkboard.app

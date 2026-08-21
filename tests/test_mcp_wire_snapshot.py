@@ -129,6 +129,54 @@ class CanonicalizationMaskingTests(unittest.TestCase):
         # must survive unmasked.
         self.assertIn("Nothing was drawn, because picking one arbitrarily", blob)
 
+    def test_two_captures_differing_only_in_window_number_are_equivalent(self):
+        # windowNumber is assigned by WindowServer and is a different integer
+        # on every app launch, so a before/after pair captured across a
+        # rebuild -- the only comparison this tool supports -- always differs
+        # on it. The nested copy inside windowServerEntryInAllWindows must be
+        # masked too, or the same spurious diff just reappears one level down.
+        def capture(window_number):
+            return {
+                "call_verify_presentation": _text_result(json.dumps({
+                    "overlayWindowExists": True,
+                    "windowNumber": window_number,
+                    "windowServerEntryInAllWindows": {
+                        "windowNumber": window_number,
+                        "ownerPID": 4321,
+                    },
+                    "presentationReady": True,
+                })),
+            }
+
+        canonical_before = snap.canonicalize_capture(capture(1234))
+        canonical_after = snap.canonicalize_capture(capture(98765))
+
+        self.assertEqual(snap.diff_captures(canonical_before, canonical_after), [])
+        blob = json.dumps(canonical_before)
+        self.assertNotIn("1234", blob)
+        self.assertEqual(blob.count("<WINDOWNUM>"), 2)
+        # Everything around it is a real presentation signal and must survive:
+        # a regression that stopped finding the window at all has to still diff.
+        self.assertIn('"overlayWindowExists": true', blob)
+        self.assertIn('"presentationReady": true', blob)
+        self.assertIn('"ownerPID": 4321', blob)
+
+    def test_a_null_window_number_is_left_alone_so_a_missing_window_still_diffs(self):
+        # "no window exists" is reproducible, not volatile: masking it would
+        # hide the single most important regression verify_presentation can
+        # report -- an overlay that stopped being registered at all.
+        with_window = {"call_verify_presentation": _text_result(json.dumps({"windowNumber": 1234}))}
+        without_window = {"call_verify_presentation": _text_result(json.dumps({"windowNumber": None}))}
+
+        canonical_with = snap.canonicalize_capture(with_window)
+        canonical_without = snap.canonicalize_capture(without_window)
+
+        self.assertIsNone(
+            canonical_without["call_verify_presentation"]["result"]["content"][0]["text"]
+            ["__embedded_json__"]["windowNumber"]
+        )
+        self.assertNotEqual(snap.diff_captures(canonical_with, canonical_without), [])
+
 
 class StaticFixtureLiteralsSurviveMaskingTests(unittest.TestCase):
     def test_own_deterministic_bundle_id_fixture_is_not_masked(self):
@@ -205,12 +253,16 @@ class RealDifferenceIsStillDetectedTests(unittest.TestCase):
         diff = snap.diff_captures(snap.canonicalize_capture(before), snap.canonicalize_capture(after))
         self.assertNotEqual(diff, [])
 
-    def test_a_genuinely_different_live_app_name_is_still_a_real_difference_when_ids_disagree(self):
-        # Masking collapses the SAME identity's every occurrence to one
-        # token, but two captures reporting genuinely different bundle ids
-        # (as opposed to the same one under environment noise) must still
-        # disagree once masked, because they harvest and substitute
-        # different id sets.
+    def test_a_new_field_alongside_a_masked_identity_is_still_detected(self):
+        # Masking does NOT preserve a live identity's difference, and is not
+        # meant to: harvest-and-mask collapses whatever identity each capture
+        # itself reported to the same "<APPID>"/"<APP>" tokens, so two captures
+        # differing ONLY in which app was frontmost are intentionally
+        # equivalent. That is the whole reason this tool is same-machine,
+        # one-change-at-a-time, with no committed baseline (see the module
+        # docstring). What must survive that collapse is everything AROUND the
+        # masked identity -- here, a field present in one build and not the
+        # other, inside the very payload whose identity is being masked.
         before = {"call_get_active_app": _text_result(json.dumps(
             {"frontmost": {"bundleId": "com.example.A", "name": "A App"}}
         ))}
@@ -220,6 +272,18 @@ class RealDifferenceIsStillDetectedTests(unittest.TestCase):
         diff = snap.diff_captures(snap.canonicalize_capture(before), snap.canonicalize_capture(after))
         self.assertNotEqual(diff, [])
         self.assertTrue(any("new-in-this-build" in line for line in diff))
+
+
+class FixtureTableKeysAreUniqueTests(unittest.TestCase):
+    def test_every_result_key_is_unique(self):
+        # `run_capture` keys one dict by result_key, so a duplicate would let
+        # the second fixture's response overwrite the first's and vanish
+        # without a trace -- EXPECTED_KEYS, built from the same tables, would
+        # collapse the duplicate too and still validate. mcp_wire_snapshot.py
+        # raises at import on a duplicate; this is the positive CI signal that
+        # the invariant is actually being checked (and names the count, so a
+        # failure here says how many fixtures were lost).
+        self.assertEqual(len(snap.EXPECTED_KEYS), len(snap._ALL_KEYS))
 
 
 class SelfCheckRejectsUnusableCapturesTests(unittest.TestCase):

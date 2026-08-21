@@ -94,7 +94,13 @@ extension MCPServer {
             return .failure("limit must be an integer between 1 and \(DrawingDefaults.maxAnnotationListPageItems) when supplied.")
         }
         let annotations = AnnotationStore.shared.getAll()
-        let activeId = ActiveAppTracker.shared.currentAppId
+        // One paired read, not two property reads: `activeApp.bundleId` and
+        // `activeApp.name` are reported together as one app in the response,
+        // and every per-annotation visibility decision on this page is computed
+        // against this same id. Re-reading the tracker per entry (or once per
+        // field) would let one response describe two different frontmost apps.
+        let activeApp = ActiveAppTracker.shared.currentApp
+        let activeId = activeApp.bundleId
         let captureVisible = OverlayWindowController.shared.isCaptureVisible
         let annotationsSuspended = OverlayWindowController.shared.isAnnotationsSuspended
 
@@ -117,7 +123,13 @@ extension MCPServer {
         var entries: [[String: Any]] = []
         let expiryFormatter = ISO8601DateFormatter()
         expiryFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        // One (now, uptime) pair for the whole page. `remainingSeconds` mixes a
+        // wall clock with the monotonic one (see Annotation.remainingSeconds),
+        // so re-reading systemUptime inside the per-annotation closure paired
+        // up to 100 monotonic readings with this single wall-clock instant and
+        // let entries in ONE response disagree about when "now" was.
         let now = Date()
+        let uptime = ProcessInfo.processInfo.systemUptime
         let start = min(requestedOffset, annotations.count)
         let requestedEnd = min(annotations.count, start + requestedLimit)
 
@@ -135,13 +147,22 @@ extension MCPServer {
             )
             object["type"] = annotation.kind.typeName
             object["scope"] = annotation.appId == nil ? "global" : "app-linked"
-            let wouldBeVisibleWithoutSuspension = captureVisible || annotation.appId == nil || annotation.appId == activeId
-            object["wouldBeVisibleWithoutSuspension"] = wouldBeVisibleWithoutSuspension
-            object["isVisibleNow"] = !annotationsSuspended && wouldBeVisibleWithoutSuspension
+            // Built from the hoisted page snapshot rather than re-reading
+            // OverlayWindowController per entry: this is the same rule
+            // verify_annotation reports, so it comes from the one shared
+            // implementation instead of a second inline copy that could drift.
+            let visibility = AnnotationVisibilityDiagnostic(
+                annotationsSuspended: annotationsSuspended,
+                captureVisible: captureVisible,
+                annotationAppId: annotation.appId,
+                activeAppId: activeId
+            )
+            object["wouldBeVisibleWithoutSuspension"] = visibility.wouldBeVisibleWithoutSuspension
+            object["isVisibleNow"] = visibility.isVisibleNow
             if let expiresAt = annotation.expiresAt {
                 object["expiresAt"] = expiryFormatter.string(from: expiresAt)
                 object["remainingSeconds"] = annotation.remainingSeconds(
-                    now: now, uptime: ProcessInfo.processInfo.systemUptime
+                    now: now, uptime: uptime
                 ) ?? NSNull()
             } else {
                 object["expiresAt"] = NSNull()
@@ -164,7 +185,7 @@ extension MCPServer {
             return [
                 "activeApp": [
                     "bundleId": jsonValue(activeId),
-                    "name": jsonValue(ActiveAppTracker.shared.currentAppName)
+                    "name": jsonValue(activeApp.name)
                 ] as [String: Any],
                 "captureVisible": captureVisible,
                 "annotationsSuspended": annotationsSuspended,
@@ -259,15 +280,21 @@ extension MCPServer {
     func buildActiveAppJSON() -> String {
         let tracker = ActiveAppTracker.shared
         let raw = tracker.rawFrontmostApp()
+        // Paired read: the id and the name below are published as one app, so
+        // they must come from a single lock acquisition. Two property reads
+        // could straddle an app activation and describe two different apps.
+        let frontmost = tracker.currentApp
+        // Paired for the same reason -- see `ActiveAppTracker.fallbackApp`.
+        let fallback = tracker.fallbackApp
 
         let payload: [String: Any] = [
             "frontmost": [
-                "bundleId": jsonValue(tracker.currentAppId),
-                "name": jsonValue(tracker.currentAppName)
+                "bundleId": jsonValue(frontmost.bundleId),
+                "name": jsonValue(frontmost.name)
             ] as [String: Any],
             "fallback": [
-                "bundleId": jsonValue(tracker.fallbackAppId),
-                "name": jsonValue(tracker.fallbackAppName)
+                "bundleId": jsonValue(fallback.bundleId),
+                "name": jsonValue(fallback.name)
             ] as [String: Any],
             "rawFrontmost": [
                 "bundleId": jsonValue(raw?.bundleId),

@@ -174,13 +174,16 @@ public final class ScreenCaptureProvider {
                 bundleIdentifier: Bundle.main.bundleIdentifier,
                 executablePath: Self.currentExecutablePath()
             )
+            // The executable path is passed unresolved on purpose: resolving it
+            // costs an `NSRunningApplication` lookup plus a 16 KB
+            // `proc_pidpath` buffer PER shareable application, and the policy
+            // below consults it only as a last resort. See the overload's doc
+            // comment.
             let excluded = content.applications.filter {
                 Self.shouldExclude(
-                    ScreenCaptureApplicationIdentity(
-                        processID: $0.processID,
-                        bundleIdentifier: $0.bundleIdentifier,
-                        executablePath: Self.executablePath(for: $0.processID)
-                    ),
+                    processID: $0.processID,
+                    bundleIdentifier: $0.bundleIdentifier,
+                    executablePath: Self.executablePath(for: $0.processID),
                     for: ownIdentity
                 )
             }
@@ -211,18 +214,36 @@ public final class ScreenCaptureProvider {
     /// development launch has no bundle identifier.
     static func shouldExclude(_ candidate: ScreenCaptureApplicationIdentity,
                               for ownIdentity: ScreenCaptureApplicationIdentity) -> Bool {
-        if candidate.processID == ownIdentity.processID { return true }
+        shouldExclude(
+            processID: candidate.processID,
+            bundleIdentifier: candidate.bundleIdentifier,
+            executablePath: candidate.executablePath,
+            for: ownIdentity
+        )
+    }
+
+    /// The same policy, expressed so the executable path can stay unresolved
+    /// until the policy genuinely needs it.
+    ///
+    /// The path is the LAST of three checks and is consulted only when this
+    /// process knows its own executable path, yet resolving a candidate's path
+    /// is by far the most expensive part of building an identity (see
+    /// `executablePath(for:)`). Taking it as an `@autoclosure` keeps the
+    /// decision order identical while charging that cost only for the
+    /// candidates that actually reach the final branch, instead of for every
+    /// application ScreenCaptureKit exposes.
+    static func shouldExclude(processID: pid_t,
+                              bundleIdentifier: String?,
+                              executablePath: @autoclosure () -> String?,
+                              for ownIdentity: ScreenCaptureApplicationIdentity) -> Bool {
+        if processID == ownIdentity.processID { return true }
         if let ownBundle = ownIdentity.bundleIdentifier,
-           let candidateBundle = candidate.bundleIdentifier,
+           let candidateBundle = bundleIdentifier,
            candidateBundle == ownBundle {
             return true
         }
-        if let ownExecutable = ownIdentity.executablePath,
-           let candidateExecutable = candidate.executablePath,
-           ownExecutable == candidateExecutable {
-            return true
-        }
-        return false
+        guard let ownExecutable = ownIdentity.executablePath else { return false }
+        return executablePath() == ownExecutable
     }
 
     static func exclusionScope(for ownIdentity: ScreenCaptureApplicationIdentity) -> ScreenCaptureExclusionScope {

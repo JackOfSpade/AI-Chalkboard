@@ -17,6 +17,14 @@ public struct RasterAssetHandle: Equatable, Sendable {
         self.heightPx = heightPx
     }
 
+    /// Decoded RGBA bytes this asset costs once materialized.
+    ///
+    /// Computed, not stored, so it cannot drift from the dimensions it is
+    /// derived from and the memberwise init keeps its existing shape. Every
+    /// accounting site -- the store's aggregate budget and `draw_batch`'s
+    /// per-batch budget -- must measure the SAME thing, so the formula lives
+    /// here once instead of being open-coded at each of them.
+    public var decodedByteCount: UInt64 { UInt64(widthPx) * UInt64(heightPx) * 4 }
 }
 
 public enum RasterAssetStoreError: LocalizedError, Equatable {
@@ -136,7 +144,7 @@ public final class RasterAssetStore: @unchecked Sendable {
                 cgImage: image,
                 size: NSSize(width: image.width, height: image.height)
             ),
-            decodedByteCount: Self.decodedByteCount(width: image.width, height: image.height)
+            decodedByteCount: descriptor.decodedByteCount
         )
 
         let retained = withLock {
@@ -302,10 +310,6 @@ public final class RasterAssetStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return body()
-    }
-
-    private static func decodedByteCount(width: Int, height: Int) -> UInt64 {
-        UInt64(width) * UInt64(height) * 4
     }
 
     private static let supportedTypeIdentifiers: Set<String> = [

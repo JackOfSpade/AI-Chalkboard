@@ -115,6 +115,19 @@ public final class ActiveAppTracker: NSObject {
         return _currentAppName
     }
 
+    /// `currentAppId` and `currentAppName` as ONE consistent pair.
+    ///
+    /// Reading the two properties in turn takes the lock twice, and `adopt`
+    /// writes both fields under a single acquisition between them if an app
+    /// activation lands in that window -- so a caller that reports the two
+    /// values as one "active app" object can publish a bundle id from one app
+    /// beside the display name of another. Every diagnostic that emits both
+    /// (`get_active_app`, `list_annotations`) should read them from here.
+    public var currentApp: (bundleId: String?, name: String?) {
+        lock.lock(); defer { lock.unlock() }
+        return (_currentAppId, _currentAppName)
+    }
+
     /// The app an UNTAGGED `draw_*` call gets linked to: the most recent
     /// frontmost application excluding AI Chalkboard itself, Claude, and
     /// prohibited/background-only processes and macOS session UI such as
@@ -149,6 +162,18 @@ public final class ActiveAppTracker: NSObject {
     public var fallbackAppName: String? {
         lock.lock(); defer { lock.unlock() }
         return _fallbackAppName
+    }
+
+    /// `fallbackAppId` and `fallbackAppName` as ONE consistent pair, for the
+    /// same reason as `currentApp`: reading the two properties in turn takes
+    /// the lock twice, and `adopt` writes both fields under a single
+    /// acquisition, so an app activation landing between them yields one app's
+    /// bundle id beside another app's display name. Every caller that uses the
+    /// two together -- to tag an annotation, to name a clear target, or to
+    /// report the fallback -- should read them from here.
+    public var fallbackApp: (bundleId: String?, name: String?) {
+        lock.lock(); defer { lock.unlock() }
+        return (_fallbackAppId, _fallbackAppName)
     }
 
     override private init() {

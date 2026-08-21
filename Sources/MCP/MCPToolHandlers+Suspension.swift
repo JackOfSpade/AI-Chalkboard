@@ -86,14 +86,13 @@ extension MCPServer {
     // this is pure token-shape validation guarding a capability, and it is
     // worth pinning against a unit test rather than only reaching it through
     // a full tools/call round trip.
+    //
+    // The coordinator owns the canonical token shape (it mints and validates
+    // every token). Forward rather than keeping a second byte-level copy here:
+    // two independent implementations of the same rule can only drift, and the
+    // permissive one wins at a capability boundary.
     func isCanonicalSuspensionLeaseToken(_ token: String) -> Bool {
-        guard token.utf8.count == 43 else { return false }
-        return token.utf8.allSatisfy { character in
-            (character >= 65 && character <= 90)
-                || (character >= 97 && character <= 122)
-                || (character >= 48 && character <= 57)
-                || character == 45 || character == 95
-        }
+        SuspensionLeaseCoordinator.isCanonicalToken(token)
     }
 
     /// All success and failure operation responses deliberately remain JSON so
@@ -109,7 +108,6 @@ extension MCPServer {
             && result.annotationsSuspended
             && (result.leaseExpiresInSeconds ?? 0) > 0
             && result.peerPresentationSettled
-            && result.clickSafeAtObservation
         let releaseWithRemainingLeaseUnsettled = operation == "release"
             && result.success
             && result.annotationsSuspended

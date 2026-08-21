@@ -341,8 +341,12 @@ extension MCPServer {
                 appId = nil
                 appName = nil
             } else {
-                appId = ActiveAppTracker.shared.fallbackAppId
-                appName = ActiveAppTracker.shared.fallbackAppName
+                // Paired read: both land on one annotation as its appId and
+                // appName, so they must come from a single lock acquisition --
+                // see `ActiveAppTracker.fallbackApp`.
+                let fallback = ActiveAppTracker.shared.fallbackApp
+                appId = fallback.bundleId
+                appName = fallback.name
             }
             return nil
         }

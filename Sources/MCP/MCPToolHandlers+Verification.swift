@@ -127,10 +127,22 @@ extension MCPServer {
             metadata["annotationsSuspended"] = visibility.annotationsSuspended
             metadata["wouldBeVisibleWithoutSuspension"] = visibility.wouldBeVisibleWithoutSuspension
             metadata["isVisibleNow"] = visibility.isVisibleNow
-            let rawStoredGeometry = jsonObject(annotation.kind) ?? NSNull()
-            let rawGeometryBytes = jsonString(rawStoredGeometry)?.lengthOfBytes(using: .utf8) ?? 0
+            // Threshold the ENCODED bytes directly instead of round-tripping
+            // through JSONSerialization first. Stored geometry is caller-sized
+            // -- a persistent batch can hold megabytes of SVG -- and it is
+            // being measured against a 16 KiB budget, so the oversized branch
+            // used to build a full Foundation object graph and re-serialize it
+            // to a String purely to discard all of it. Only the branch that
+            // actually embeds the geometry needs that object.
+            //
+            // When encoding fails, `geometryData` is nil and the byte count is
+            // 0, which lands on the small path and stores JSON null -- exactly
+            // what the previous `jsonObject(...) ?? NSNull()` spelling did.
+            let geometryData = try? JSONEncoder().encode(annotation.kind)
+            let rawGeometryBytes = geometryData?.count ?? 0
             if rawGeometryBytes <= 16 * 1_024 {
-                metadata["storedGeometry"] = rawStoredGeometry
+                metadata["storedGeometry"] = geometryData
+                    .flatMap { try? JSONSerialization.jsonObject(with: $0) } ?? NSNull()
             } else {
                 metadata["storedGeometry"] = [
                     "omitted": true,

@@ -146,6 +146,29 @@ public final class AnnotationStore: @unchecked Sendable {
         return expired
     }
 
+    /// Derives `expiresAtUptime` from `expiresAt` when the monotonic twin is
+    /// missing, using the remaining wall-clock interval AT THIS MOMENT, so
+    /// liveness decisions stay off the wall clock no matter which way the
+    /// deadline arrived (see `Annotation.expiresAtUptime`). Anything already
+    /// past due pins to now rather than going negative.
+    ///
+    /// Shared by `addWithOutcome` and `updateWithOutcome` rather than
+    /// open-coded in each: the update path silently omitted this stamping,
+    /// which quietly reverted an updated timed annotation to wall-clock
+    /// liveness while its un-updated twin kept the monotonic deadline. One
+    /// implementation makes that divergence unrepresentable.
+    ///
+    /// A non-finite remaining interval leaves the monotonic deadline nil, so
+    /// the wall-clock fallback in `hasExpired` decides instead of a NaN
+    /// comparison that is false in both directions.
+    private static func stampMonotonicDeadline(on annotation: inout Annotation) {
+        guard annotation.expiresAtUptime == nil, let wallDeadline = annotation.expiresAt else { return }
+        let remaining = max(0, wallDeadline.timeIntervalSinceNow)
+        if remaining.isFinite {
+            annotation.expiresAtUptime = ProcessInfo.processInfo.systemUptime + remaining
+        }
+    }
+
     /// Appends `annotation`, evicting the oldest stored annotations first if
     /// doing so would exceed `DrawingDefaults.maxStoredAnnotations`.
     ///
@@ -192,16 +215,7 @@ public final class AnnotationStore: @unchecked Sendable {
             storedAnnotation.expiresAtUptime = ProcessInfo.processInfo.systemUptime + bounded
         }
         // A caller may also supply `expiresAt` directly (no durationSeconds).
-        // Derive the monotonic twin from the remaining wall-clock interval at
-        // insertion time, so liveness decisions stay off the wall clock no
-        // matter which way the deadline arrived. Anything already past due
-        // pins to now rather than going negative.
-        if storedAnnotation.expiresAtUptime == nil, let wallDeadline = storedAnnotation.expiresAt {
-            let remaining = max(0, wallDeadline.timeIntervalSinceNow)
-            if remaining.isFinite {
-                storedAnnotation.expiresAtUptime = ProcessInfo.processInfo.systemUptime + remaining
-            }
-        }
+        Self.stampMonotonicDeadline(on: &storedAnnotation)
 
         let now = Date()
         let uptime = ProcessInfo.processInfo.systemUptime
@@ -209,23 +223,26 @@ public final class AnnotationStore: @unchecked Sendable {
         let mutation: (evicted: [Annotation], rejection: AnnotationStoreResourceLimit?) = withLock {
             defer { assertResourceUsageConsistent() }
             expiredAnnotations = sweepExpiredLocked(now: now, uptime: uptime)
-            var candidate = annotations
-            candidate.append(storedAnnotation)
-            let overflow = candidate.count - DrawingDefaults.maxStoredAnnotations
-            let evicted = overflow > 0 ? Array(candidate.prefix(overflow)) : []
-            if overflow > 0 { candidate.removeFirst(overflow) }
-            // O(evicted.count + 1), not a full re-walk of `candidate`: project
-            // what the running total would become if this insertion (and any
-            // cap eviction that comes with it) actually happened, WITHOUT
-            // mutating the real running total yet -- a rejection below must
-            // leave it exactly as it was.
+            // Everything down to the rejection check is a PROJECTION over the
+            // untouched `annotations`: what would this insertion (plus any cap
+            // eviction that comes with it) cost? The array itself is only
+            // mutated once the projection has cleared the caps, which is what
+            // makes a rejection leave both the array and the running total
+            // exactly as they were. Building a full copy of `annotations` to
+            // ask that question was an O(n) copy per insertion -- precisely
+            // the per-mutation walk the running totals exist to avoid.
+            let overflow = annotations.count + 1 - DrawingDefaults.maxStoredAnnotations
+            let evicted = overflow > 0 ? Array(annotations.prefix(overflow)) : []
+            // O(evicted.count + 1), not a full re-walk of `annotations`:
+            // project what the running total would become, WITHOUT mutating
+            // the real running total yet.
             let candidateUsage = usageAfter(removing: evicted, adding: [storedAnnotation])
             if let rejection = resourceLimit(for: candidateUsage) {
                 return ([], rejection)
             }
+            if overflow > 0 { annotations.removeFirst(overflow) }
             storedAnnotation.revision = nextRevision()
-            candidate[candidate.count - 1] = storedAnnotation
-            annotations = candidate
+            annotations.append(storedAnnotation)
             for evictedAnnotation in evicted {
                 trackRemoved(evictedAnnotation)
             }
@@ -329,6 +346,24 @@ public final class AnnotationStore: @unchecked Sendable {
                 return (nil, expired, rejection, false)
             }
             var storedReplacement = replacement
+            // Carry the monotonic deadline across the replacement.  Without
+            // this, an updated timed annotation lost `expiresAtUptime`
+            // entirely and silently reverted to deciding liveness on the WALL
+            // clock (see `Annotation.expiresAtUptime`): a laptop asleep for
+            // longer than the duration would make the updated annotation
+            // vanish on wake while an un-updated twin survived.
+            //
+            // The carry-forward is conditioned on the wall-clock deadline
+            // being unchanged, because that is the only case where `old`'s
+            // monotonic stamp still describes the same instant. A replacement
+            // that MOVES the deadline (or drops it, making the annotation
+            // persistent again) must not inherit the previous one -- it falls
+            // through to `stampMonotonicDeadline`, which re-derives from the
+            // replacement's own `expiresAt`, or leaves it nil when there is
+            // none.
+            storedReplacement.expiresAtUptime = replacement.expiresAtUptime
+                ?? (replacement.expiresAt == old.expiresAt ? old.expiresAtUptime : nil)
+            Self.stampMonotonicDeadline(on: &storedReplacement)
             storedReplacement.revision = nextRevision()
             annotations[index] = storedReplacement
             trackRemoved(old)
@@ -386,9 +421,10 @@ public final class AnnotationStore: @unchecked Sendable {
     /// nil`), which are drawn over every app and are therefore on screen too.
     ///
     /// The predicate is deliberately identical to
-    /// `getForScreen(_:visibleForApp:)`'s, minus the screen filter -- "clear"
-    /// removes what the user can see, on every screen. Anything linked to a
-    /// DIFFERENT app is left untouched: that is the whole point of scoping.
+    /// `isVisible(_:onScreen:forApp:)`'s app clause, minus the screen filter
+    /// -- "clear" removes what the user can see, on every screen, which is why
+    /// it cannot simply call that predicate. Anything linked to a DIFFERENT
+    /// app is left untouched: that is the whole point of scoping.
     ///
     /// Returns the number of annotations removed, for the tool/menu log line.
     @discardableResult
@@ -459,25 +495,52 @@ public final class AnnotationStore: @unchecked Sendable {
         return withLiveAnnotations { ordered($0.filter { $0.screenId == screenId }) }
     }
 
-    /// The annotations that should actually be painted on `screenId` right now:
-    /// those on that screen AND (global OR linked to `activeAppId`).
+    /// The single definition of "this annotation is visible on `screenId`
+    /// while `activeAppId` is frontmost": it is on that screen AND (global OR
+    /// linked to that app).
     ///
-    /// This is the single definition of "visible". `OverlayView.draw(_:)` calls
-    /// it with the CURRENT frontmost app -- never the untagged-draw fallback --
-    /// because display must follow what is genuinely on screen this instant,
-    /// whereas the fallback is a guess about what the user *meant* when they
-    /// asked Claude to draw.
+    /// Every caller that needs the answer -- `getForScreen(_:visibleForApp:)`
+    /// (WHAT to paint) and `hasVisibleAnnotations(forScreenId:visibleForApp:)`
+    /// (WHETHER the overlay window belongs on screen at all) -- is expressed
+    /// on top of this one predicate, so those two questions cannot be answered
+    /// inconsistently by two slightly different filters that drift apart.
     ///
-    /// A `nil` `activeAppId` (nothing frontmost is known yet) shows only the
+    /// A `nil` `activeAppId` (nothing frontmost is known yet) matches only the
     /// global annotations, never everything: showing every app's annotations at
     /// once would be worse than showing none.
+    public static func isVisible(_ annotation: Annotation, onScreen screenId: String, forApp activeAppId: String?) -> Bool {
+        guard annotation.screenId == screenId else { return false }
+        guard let annotationAppId = annotation.appId else { return true } // global
+        return annotationAppId == activeAppId
+    }
+
+    /// The annotations that should actually be painted on `screenId` right now,
+    /// per `isVisible(_:onScreen:forApp:)`, in paint order.
+    ///
+    /// `OverlayView.draw(_:)` calls it with the CURRENT frontmost app -- never
+    /// the untagged-draw fallback -- because display must follow what is
+    /// genuinely on screen this instant, whereas the fallback is a guess about
+    /// what the user *meant* when they asked Claude to draw.
     public func getForScreen(_ screenId: String, visibleForApp activeAppId: String?) -> [Annotation] {
         return withLiveAnnotations {
-            ordered($0.filter { annotation in
-                guard annotation.screenId == screenId else { return false }
-                guard let annotationAppId = annotation.appId else { return true } // global
-                return annotationAppId == activeAppId
-            })
+            ordered($0.filter { Self.isVisible($0, onScreen: screenId, forApp: activeAppId) })
+        }
+    }
+
+    /// Whether ANY annotation is currently visible on `screenId` for
+    /// `activeAppId`, by exactly the same predicate
+    /// `getForScreen(_:visibleForApp:)` paints by.
+    ///
+    /// Exists because the emptiness question has one hot caller --
+    /// `OverlayWindowController.refreshViewsNow`, deciding per screen whether
+    /// the overlay window belongs on WindowServer's on-screen list at all --
+    /// that previously materialised AND SORTED the whole filtered array just
+    /// to read `.isEmpty`, once per screen per repaint, moments before
+    /// `OverlayView.draw(_:)` rebuilt the identical array. `contains(where:)`
+    /// short-circuits on the first match and allocates nothing.
+    public func hasVisibleAnnotations(forScreenId screenId: String, visibleForApp activeAppId: String?) -> Bool {
+        return withLiveAnnotations { liveAnnotations in
+            liveAnnotations.contains { Self.isVisible($0, onScreen: screenId, forApp: activeAppId) }
         }
     }
 
@@ -668,6 +731,17 @@ public final class AnnotationStore: @unchecked Sendable {
     /// annotation.  Used by the incremental add/remove tracking so a single
     /// annotation's contribution can be added to or subtracted from the
     /// running total without touching any other stored annotation.
+    ///
+    /// What the two actually duplicate is the six top-level field lines; the
+    /// kind walk is shared (`addKindUsage`) on purpose, since an iterative
+    /// walk over a nested batch is not worth writing twice.  So the oracle is
+    /// independent of the running total only in those six lines, and that is
+    /// exactly what `AnnotationStoreTests`'
+    /// `testFullRecomputeEqualsSumOfPerAnnotationUsage` can pin: adding a
+    /// top-level field to one copy and forgetting the other fails a test
+    /// instead of quietly disabling `assertResourceUsageConsistent`.  A
+    /// mistake inside `addKindUsage` is made identically on both sides and no
+    /// comparison between them can see it.
     private static func resourceUsage(of annotation: Annotation) -> AnnotationStoreResourceUsage {
         var usage = AnnotationStoreResourceUsage(payloadBytes: 0, primitiveCount: 0)
         addPayload(&usage, annotation.id)

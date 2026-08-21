@@ -83,6 +83,58 @@ extension MCPServer {
         ))
     }
 
+    /// Resolves `draw_image`'s optional `width`/`height` into backing pixels.
+    ///
+    /// Returns nil when a SUPPLIED dimension cannot be represented in the
+    /// display's backing-pixel space; the caller turns that into its geometry
+    /// error. Bounds other than representability (finite, > 0,
+    /// `maxImageDimensionPx`) stay with the caller so every resolved dimension
+    /// meets them the same way.
+    ///
+    /// Omitting BOTH dimensions means the raster's own decoded backing-pixel
+    /// size, regardless of the coordinate space selected for its position.
+    /// Supplying BOTH means geometry in that selected space, one axis each.
+    ///
+    /// Supplying exactly one is the aspect-ratio case, and the order here is
+    /// load-bearing: the SUPPLIED dimension is transformed into backing pixels
+    /// FIRST, then the sibling is derived from the raster's pixel aspect ratio
+    /// IN BACKING SPACE. Deriving the sibling in caller space and then
+    /// transforming it would run it through the OTHER axis's scale, which under
+    /// an anisotropic transform is a different number --
+    /// coordinate_space='normalized' on a 3840x2160 display scales x by 3840
+    /// and y by 2160, so a square raster asked for width 0.1 would render
+    /// 384x216 instead of 384x384. That silently stretches the very thing the
+    /// caller asked us to preserve.
+    ///
+    /// The derived sibling deliberately never goes through `transformedX/Y`, so
+    /// it also skips the transform's unit-interval check. That is intended: an
+    /// aspect-correct dimension may legitimately exceed the display (a tall
+    /// raster pinned to the full display width runs off the bottom), and
+    /// normalized siblings > 1.0 must not be rejected.
+    ///
+    /// internal, and pure, so `MCPPureHelperTests` can pin all four shapes
+    /// without a real raster file or a display: `loadImageKind` is private and
+    /// every image fixture in the wire-snapshot harness is an error path that
+    /// never reaches this arithmetic.
+    static func resolveBackingSize(requestedWidth: Double?, requestedHeight: Double?,
+                                   intrinsicWidth: Double, intrinsicHeight: Double,
+                                   transform: DrawRequest.CoordinateTransform) -> (width: Double, height: Double)? {
+        if let requestedWidth, let requestedHeight {
+            guard let width = transform.transformedX(requestedWidth),
+                  let height = transform.transformedY(requestedHeight) else { return nil }
+            return (width, height)
+        }
+        if let requestedWidth {
+            guard let width = transform.transformedX(requestedWidth) else { return nil }
+            return (width, width * intrinsicHeight / intrinsicWidth)
+        }
+        if let requestedHeight {
+            guard let height = transform.transformedY(requestedHeight) else { return nil }
+            return (height * intrinsicWidth / intrinsicHeight, height)
+        }
+        return (intrinsicWidth, intrinsicHeight)
+    }
+
     private func loadImageKind(_ args: [String: Any], coordinateTransform: DrawRequest.CoordinateTransform = .init(scaleX: 1, scaleY: 1)) -> DrawOutcome<AnnotationKind> {
         guard let path = args["image_path"] as? String, !path.isEmpty,
               let x = MCPArgument.double(args["x"]),
@@ -111,36 +163,22 @@ extension MCPServer {
         do { handle = try RasterAssetStore.shared.load(path: path) }
         catch { return .failure(error.localizedDescription) }
 
-        let intrinsicWidth = Double(handle.widthPx)
-        let intrinsicHeight = Double(handle.heightPx)
-        let width: Double
-        let height: Double
-        if let requestedWidth, let requestedHeight {
-            width = requestedWidth; height = requestedHeight
-        } else if let requestedWidth {
-            width = requestedWidth; height = intrinsicHeight * requestedWidth / intrinsicWidth
-        } else if let requestedHeight {
-            height = requestedHeight; width = intrinsicWidth * requestedHeight / intrinsicHeight
-        } else {
-            width = intrinsicWidth; height = intrinsicHeight
-        }
-        let usesRequestedSize = requestedWidth != nil || requestedHeight != nil
-        let backingWidth = usesRequestedSize ? coordinateTransform.transformedX(width) : width
-        let backingHeight = usesRequestedSize ? coordinateTransform.transformedY(height) : height
-        guard let backingWidth, let backingHeight,
+        let resolved = Self.resolveBackingSize(
+            requestedWidth: requestedWidth, requestedHeight: requestedHeight,
+            intrinsicWidth: Double(handle.widthPx), intrinsicHeight: Double(handle.heightPx),
+            transform: coordinateTransform
+        )
+        // Rotation and opacity were already validated above; re-checking them
+        // here would only make this message describe conditions it cannot
+        // actually reject.
+        guard let (backingWidth, backingHeight) = resolved,
               backingWidth.isFinite, backingHeight.isFinite,
               backingWidth > 0, backingHeight > 0,
               backingWidth <= DrawingDefaults.maxImageDimensionPx,
-              backingHeight <= DrawingDefaults.maxImageDimensionPx,
-              rotation.isFinite, abs(rotation) <= DrawingDefaults.maxRotationDegrees,
-              opacity.isFinite, (0...1).contains(opacity) else {
+              backingHeight <= DrawingDefaults.maxImageDimensionPx else {
             _ = RasterAssetStore.shared.release(id: handle.id)
-            return .failure("Image geometry must be finite with width/height > 0 and at most \(Int(DrawingDefaults.maxImageDimensionPx)) backing pixels; rotation must be within ±\(Int(DrawingDefaults.maxRotationDegrees)) degrees; opacity must be between 0 and 1.")
+            return .failure("Image width/height must resolve to finite backing-pixel values greater than 0 and at most \(Int(DrawingDefaults.maxImageDimensionPx)).")
         }
-        // An omitted size means the raster's own decoded backing-pixel size,
-        // regardless of the coordinate space selected for its position. Once
-        // either dimension is supplied, both resolved dimensions are geometry
-        // in that selected space (including aspect-ratio-derived sibling).
         return .success(.image(
             assetId: handle.id, x: backingX, y: backingY,
             width: backingWidth, height: backingHeight,
@@ -280,7 +318,7 @@ extension MCPServer {
                 if !newAssetIDs.isEmpty {
                     let newBytes = newAssetIDs.reduce(UInt64(0)) { total, assetID in
                         guard let handle = RasterAssetStore.shared.descriptor(for: assetID) else { return total }
-                        return total + UInt64(handle.widthPx) * UInt64(handle.heightPx) * 4
+                        return total + handle.decodedByteCount
                     }
                     // `maxRasterDecodedBytesPerBatch - rasterDecodedBytes` is only a
                     // safe UInt64 subtraction because this loop's own accumulation
@@ -396,14 +434,19 @@ extension MCPServer {
         case .failure(let error): return .failure(error)
         case .success(let value): kind = value
         }
-        return .success(Annotation(
+        let patched = Annotation(
             id: current.id, screenId: current.screenId, kind: kind, colorHex: current.colorHex,
             label: current.label, appId: current.appId, appName: current.appName,
             expiresAt: current.expiresAt, opacity: opacity,
             offsetX: offsetX, offsetY: offsetY,
             zIndex: MCPArgument.integer(args["z_index"]) ?? current.zIndex,
             createdAt: current.createdAt
-        ))
+        )
+        // Deliberately leaves `expiresAtUptime` nil: `AnnotationStore.updateWithOutcome`
+        // is the single authority on the monotonic deadline, carrying the old one
+        // forward only while the wall deadline is unchanged and otherwise
+        // re-deriving it -- a copy here would always win that `??` and disarm it.
+        return .success(patched)
     }
 
     private func patchKind(_ current: AnnotationKind, args: [String: Any]) -> DrawOutcome<AnnotationKind> {

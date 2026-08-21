@@ -322,14 +322,25 @@ public enum AccessibilityElementResolver {
         forAccessibilityFrame frame: AccessibilityScreenRect,
         screens: [ScreenInfo]
     ) -> AccessibilityBackingRect? {
-        // AX's global top-left origin is anchored to the main display, not
-        // the topmost display in an arbitrarily arranged desktop.  Using the
-        // latter happens to work for side-by-side screens but shifts every
-        // target when a monitor sits above the main display.
+        // AX's global top-left origin is anchored to the ZERO-ORIGIN display
+        // -- the one carrying the menu bar, whose AppKit frame origin is
+        // exactly (0, 0) -- not to the topmost display in an arbitrarily
+        // arranged desktop and not to whichever screen AppKit currently calls
+        // `main`.  `ScreenInfo.isMain` follows the focused window, so anchoring
+        // to it made every AX y-coordinate shift by the height difference the
+        // moment focus moved to a shorter or taller secondary display:
+        // highlights landed off their control, or the frame stopped fitting on
+        // any one screen and the lookup threw `frameCannotBeMapped`, with the
+        // result differing call to call for an unchanged UI.  Deliberately do
+        // not route this through `windowServerFrame`: that rectangle is in
+        // WindowServer's global top-left space (`CGDisplayBounds`), and only
+        // degrades to a synthetic pixel rect when AppKit reports no display id;
+        // this arithmetic is in AppKit bottom-left logical points.
         guard isUsable(frame),
-              let desktopTop = (screens.first(where: { $0.isMain })?.appKitFrame.maxY
-                  ?? screens.map({ $0.appKitFrame.maxY }).max())
+              let anchor = (screens.first(where: { $0.appKitFrame.x == 0 && $0.appKitFrame.y == 0 })
+                  ?? screens.first)
         else { return nil }
+        let desktopTop = anchor.appKitFrame.maxY
 
         let appKitRect = ScreenCoordinateRect(
             x: frame.x,

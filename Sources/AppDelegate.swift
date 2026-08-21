@@ -342,18 +342,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
         if let button = statusItem?.button {
-            if #available(macOS 11.0, *) {
-                let image = NSImage(systemSymbolName: "pencil.tip.crop.circle", accessibilityDescription: "AI Chalkboard Overlay")
-                // Explicit, not assumed: `contentTintColor` (used by
-                // `applyCaptureIndicator` below to flag capture-debug mode)
-                // only recolors TEMPLATE images. SF Symbols images are
-                // template by default on most systems, but this makes the
-                // dependency load-bearing rather than incidental.
-                image?.isTemplate = true
-                button.image = image
-            } else {
-                button.title = "🎨"
-            }
+            let image = NSImage(systemSymbolName: "pencil.tip.crop.circle", accessibilityDescription: "AI Chalkboard Overlay")
+            // Explicit, not assumed: `contentTintColor` (used by
+            // `applyCaptureIndicator` below to flag capture-debug mode)
+            // only recolors TEMPLATE images. SF Symbols images are
+            // template by default on most systems, but this makes the
+            // dependency load-bearing rather than incidental.
+            image?.isTemplate = true
+            button.image = image
         }
 
         // Picks up whatever capture-debug state is already live -- relevant
@@ -501,9 +497,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     /// handling the same click a few milliseconds apart could target different
     /// apps. See `InstanceBroadcast.postClear(scope:appId:appName:)`.
     @objc private func clearAnnotationsForActiveApp() {
-        let appId = ActiveAppTracker.shared.currentAppId
-        let appName = ActiveAppTracker.shared.currentAppName
-        InstanceBroadcast.shared.postClear(scope: .active, appId: appId, appName: appName)
+        // One paired read, not two acquisitions: the id and the name travel in
+        // a single payload, so they must describe the same app even if an
+        // activation lands between them. See `ActiveAppTracker.currentApp`.
+        let active = ActiveAppTracker.shared.currentApp
+        InstanceBroadcast.shared.postClear(scope: .active, appId: active.bundleId, appName: active.name)
     }
 
     @objc private func clearEverything() {

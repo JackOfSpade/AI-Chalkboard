@@ -30,7 +30,6 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         public let annotationsSuspended: Bool
         public let activeLeaseCount: Int
         public let leaseExpiresInSeconds: Int?
-        public let clickSafeAtObservation: Bool
         /// True only when the final durable generation was stable across a
         /// conservative presentation observation. An unsuspended release is a
         /// linearized registry snapshot, not proof that every peer has painted.
@@ -61,8 +60,10 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         /// this registry. Uptime-only comparisons cannot distinguish a reboot
         /// from an old state whose values happen to be small.
         var bootSessionIdentifier: String
-        /// Random identity for THIS registry file, minted whenever a fresh
-        /// state is created (see `init(bootSessionIdentifier:)`).
+        /// Random identity for THIS registry file, minted immediately before
+        /// the file is written (see `withLockedState` /
+        /// `withLockedPresentationState`) and never when a state is merely
+        /// synthesized during a read.
         ///
         /// BUG FIX (the generation ratchet froze permanently on a recreated
         /// file): `recordState` rejects any read whose generation is below the
@@ -88,7 +89,32 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         /// spuriously. `bootSessionIdentifier` continues to cover the reboot
         /// case; this covers same-boot recreation, and the two are
         /// independent.
+        ///
+        /// BUG FIX (a 2 Hz ratchet rollback on a machine that has never
+        /// written the registry): this used to be minted by
+        /// `init(bootSessionIdentifier:)`, which `readState` calls to
+        /// synthesize a state for a missing or empty file. Every reconcile --
+        /// AppDelegate runs one twice a second -- therefore produced a
+        /// DIFFERENT epoch for the very same absent file, `recordState` read
+        /// that as "the file was recreated", and the high-water mark it exists
+        /// to defend was zeroed on every tick. The generation-0 read was then
+        /// applied unconditionally, repainting every overlay and re-logging
+        /// twice a second. An absent file instead carries ONE stable identity,
+        /// `absentFileEpoch`, so repeated reads of it are indistinguishable --
+        /// while the real-epoch -> sentinel transition a DELETED registry
+        /// produces still trips the reset exactly once, which is what lets a
+        /// snapshot pinned to a file that no longer exists self-heal instead of
+        /// ordering the overlays out for the rest of the session. A random
+        /// epoch is minted only when a real file is about to be written.
         var instanceEpoch: String?
+
+        /// The identity carried by a state synthesized for a MISSING or EMPTY
+        /// registry file. Deliberately a constant rather than a fresh UUID (see
+        /// `instanceEpoch`), and deliberately never persisted:
+        /// `withLockedState`/`withLockedPresentationState` replace it with a
+        /// real UUID immediately before `writeState`, because a file that
+        /// exists must be distinguishable from the absence it replaced.
+        static let absentFileEpoch = "<no-registry-file>"
         var generation: UInt64 = 0
         var lastUpdatedUptime: Double = 0
         var leases: [Lease] = []
@@ -98,9 +124,14 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         /// not arbitrary historical tokens valid forever.
         var releasedTokens: [String: Double] = [:]
 
-        init(bootSessionIdentifier: String) {
+        /// `instanceEpoch` defaults to nil, which is exactly the shape a
+        /// pre-epoch registry decodes to; every synthesizing call site in
+        /// `readState` passes one explicitly -- `absentFileEpoch` for a
+        /// missing/empty file, a fresh UUID for the old-boot reset, which is a
+        /// genuinely NEW file about to overwrite a different one.
+        init(bootSessionIdentifier: String, instanceEpoch: String? = nil) {
             self.bootSessionIdentifier = bootSessionIdentifier
-            self.instanceEpoch = UUID().uuidString
+            self.instanceEpoch = instanceEpoch
         }
     }
 
@@ -162,7 +193,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         guard (1...60).contains(seconds) else {
             return failedOperation("lease_seconds must be an integer from 1 through 60.")
         }
-        return mutate(includeQuiescence: true) { state, now in
+        return mutate(requiresCallerLeaseLive: true) { state, now in
             if let idempotencyKey,
                let token = state.idempotencyTokens[idempotencyKey],
                let lease = state.leases.first(where: { $0.token == token }) {
@@ -193,7 +224,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         guard Self.isCanonicalToken(token) else {
             return failedOperation("lease_token must be exactly a 32-byte base64url token.")
         }
-        return mutate(includeQuiescence: false) { state, now in
+        return mutate(requiresCallerLeaseLive: false) { state, now in
             if let index = state.leases.firstIndex(where: { $0.token == token }) {
                 let lease = state.leases.remove(at: index)
                 if let key = lease.idempotencyKey, state.idempotencyTokens[key] == token {
@@ -291,7 +322,11 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         let changed: Bool
     }
 
-    private func mutate(includeQuiescence: Bool,
+    /// `requiresCallerLeaseLive` does NOT gate whether quiescence is observed
+    /// -- every mutation observes it while suspended.  It gates only whether
+    /// the caller's own lease must still exist for the settle loop to accept a
+    /// stable generation, and the two error strings that requirement produces.
+    private func mutate(requiresCallerLeaseLive: Bool,
                         _ mutation: (inout PersistedState, Double) throws -> MutationOutcome) -> OperationResult {
         do {
             let locked = try withLockedState { state, now in
@@ -327,12 +362,19 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
                     // honest WindowServer proof that every peer has repainted.
                     break
                 }
+                // Unconditional by design: a release that leaves another lease
+                // active must observe quiescence too, or it would report
+                // peerPresentationSettled=false for a still-hidden desktop.
+                // Pinned by tests/test_suspension_two_process.py's
+                // release-with-remaining-lease assertion
+                // (`released_a["peerPresentationSettled"]`); cited by name
+                // because line numbers in that file move.
                 observation = observeQuiescence(timeout: 1.0)
                 let after = try readCanonicalState()
                 if after.didPersist { InstanceBroadcast.shared.postSuspensionInvalidation(generation: after.state.generation) }
                 snapshot = recordAndApply(after.state, error: nil)
                 let callerLeaseLive: Bool
-                if includeQuiescence, let token = locked.value.token {
+                if requiresCallerLeaseLive, let token = locked.value.token {
                     callerLeaseLive = after.state.leases.contains(where: { $0.token == token })
                 } else {
                     callerLeaseLive = true
@@ -341,13 +383,13 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
                     peerPresentationSettled = observation.quiescent
                     break
                 }
-                if includeQuiescence, let token = locked.value.token,
+                if requiresCallerLeaseLive, let token = locked.value.token,
                    !after.state.leases.contains(where: { $0.token == token }) {
                     recheckError = "The caller's suspension lease ended while presentation was being sampled; do not click."
                     break
                 }
                 if attempt == 2 {
-                    recheckError = includeQuiescence
+                    recheckError = requiresCallerLeaseLive
                         ? "Suspension state kept changing while click safety was sampled; do not click and retry."
                         : nil
                 }
@@ -360,7 +402,6 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
                                    alreadyReleased: locked.value.alreadyReleased, generation: snapshot.generation,
                                    annotationsSuspended: snapshot.annotationsSuspended,
                                    activeLeaseCount: snapshot.activeLeaseCount, leaseExpiresInSeconds: expiry,
-                                   clickSafeAtObservation: peerPresentationSettled && recheckError == nil,
                                    peerPresentationSettled: peerPresentationSettled,
                                    scope: observation.scope, candidatePIDs: observation.candidatePIDs,
                                    candidatePIDsTruncated: observation.candidatePIDsTruncated,
@@ -391,7 +432,6 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         return OperationResult(success: false, error: error, leaseToken: nil, reused: false, alreadyReleased: false,
                                generation: snapshot.generation, annotationsSuspended: snapshot.annotationsSuspended,
                                activeLeaseCount: snapshot.activeLeaseCount, leaseExpiresInSeconds: nil,
-                               clickSafeAtObservation: false,
                                peerPresentationSettled: false,
                                scope: "durable shared lease registry across this OS boot", candidatePIDs: [],
                                candidatePIDsTruncated: false, visibleOwnerPIDs: [], visibleWindowNumbers: [], discoveryErrors: [])
@@ -415,6 +455,15 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         if bodyChanged || read.needsRewrite {
             state.generation &+= 1
             state.lastUpdatedUptime = now
+            // Mint the file identity here, not when a read synthesizes a state
+            // for a missing file: this is the first moment the file actually
+            // exists. Skipping it would durably write a nil-epoch registry and
+            // permanently disable the ratchet reset for this file. The
+            // absent-file sentinel is treated exactly like nil, so it stays an
+            // in-memory marker and never reaches disk.
+            if state.instanceEpoch == nil || state.instanceEpoch == PersistedState.absentFileEpoch {
+                state.instanceEpoch = UUID().uuidString
+            }
             try writeState(state, held: held)
         }
         // A replacement after the write is just as unsafe as one before it:
@@ -443,6 +492,13 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         if pruned || read.needsRewrite {
             state.generation &+= 1
             state.lastUpdatedUptime = now
+            // Same rule as `withLockedState`: a persist is what turns a
+            // synthesized state into a real file, so it is what mints the
+            // file's identity -- and the absent-file sentinel is as much "not
+            // an identity yet" as nil is.
+            if state.instanceEpoch == nil || state.instanceEpoch == PersistedState.absentFileEpoch {
+                state.instanceEpoch = UUID().uuidString
+            }
             try writeState(state, held: held)
         }
         try validateHeldLock(held)
@@ -476,6 +532,10 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         // not be allowed to reject the new file's genuinely-current state.
         // Requiring both sides to be non-nil keeps pre-epoch registries on
         // exactly the old behaviour rather than resetting on missing data.
+        // `PersistedState.absentFileEpoch` participates like any other epoch:
+        // a file that DISAPPEARS mid-session is a real transition and must
+        // reset the mark once, after which every further read of that same
+        // absent file compares equal and changes nothing.
         if let observed = state.instanceEpoch,
            let remembered = lastAppliedInstanceEpoch,
            observed != remembered {

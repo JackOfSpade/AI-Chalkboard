@@ -102,6 +102,99 @@ final class AnnotationExpiryClockTests: XCTestCase {
         XCTAssertTrue(store.getAll().isEmpty, "An already-elapsed annotation must not read as live.")
     }
 
+    func testUpdateKeepsTheMonotonicDeadlineOfTheAnnotationItReplaces() throws {
+        // The update path used to store the replacement verbatim, dropping
+        // `expiresAtUptime` and quietly reverting a timed annotation to
+        // wall-clock liveness -- so a machine asleep longer than the duration
+        // made an UPDATED annotation vanish on wake while an un-updated twin
+        // survived. The replacement the MCP layer builds carries `expiresAt`
+        // forward but has no monotonic twin of its own (that value is never on
+        // the wire), which is exactly the shape reproduced here.
+        //
+        // The stored deadline is first moved to a SENTINEL instant that no
+        // re-derivation could produce. Carrying `old.expiresAtUptime` forward
+        // and re-deriving from `expiresAt` land on the same number under a
+        // still wall clock, so without this the assertion below passes even
+        // with the carry-forward deleted -- the branch would be untested.
+        let store = AnnotationStore()
+        let original = makeAnnotation(expiresAt: nil, expiresAtUptime: nil)
+        _ = store.addWithOutcome(original, durationSeconds: 300)
+        let stored = try XCTUnwrap(store.getAll().first)
+
+        // 300s from `expiresAt`, so a re-derivation cannot reach it, yet still
+        // comfortably live so the annotation is not swept before the update.
+        let sentinelDeadline = ProcessInfo.processInfo.systemUptime + 9_000
+        var restamp = Annotation(
+            id: stored.id, screenId: stored.screenId, kind: stored.kind, colorHex: stored.colorHex,
+            label: stored.label, appId: stored.appId, appName: stored.appName,
+            expiresAt: stored.expiresAt, opacity: stored.opacity, offsetX: stored.offsetX,
+            offsetY: stored.offsetY, zIndex: stored.zIndex, createdAt: stored.createdAt
+        )
+        restamp.expiresAtUptime = sentinelDeadline
+        XCTAssertEqual(store.updateWithOutcome(id: stored.id, with: restamp), .updated)
+        XCTAssertEqual(try XCTUnwrap(store.get(id: stored.id)).expiresAtUptime, sentinelDeadline,
+                       "A replacement that brings its own monotonic deadline keeps it.")
+
+        let replacement = Annotation(
+            id: stored.id, screenId: stored.screenId, kind: stored.kind, colorHex: stored.colorHex,
+            label: stored.label, appId: stored.appId, appName: stored.appName,
+            expiresAt: stored.expiresAt, opacity: 0.5, offsetX: 10, offsetY: 20,
+            zIndex: stored.zIndex, createdAt: stored.createdAt
+        )
+        XCTAssertNil(replacement.expiresAtUptime, "The replacement must arrive without a monotonic twin.")
+        XCTAssertEqual(store.updateWithOutcome(id: stored.id, with: replacement), .updated)
+
+        let updated = try XCTUnwrap(store.get(id: stored.id))
+        let deadlineAfterUpdate = try XCTUnwrap(
+            updated.expiresAtUptime,
+            "An updated timed annotation must keep deciding liveness on the monotonic clock."
+        )
+        XCTAssertEqual(deadlineAfterUpdate, sentinelDeadline,
+                       "The ORIGINAL monotonic instant must be carried forward exactly, not re-derived.")
+        XCTAssertEqual(updated.offsetX, 10, "The patch itself must still have been applied.")
+    }
+
+    func testUpdateThatClearsTheWallClockDeadlineDoesNotInheritTheOldMonotonicOne() throws {
+        // The mirror image: a replacement that drops `expiresAt` is asking for
+        // a persistent annotation. Inheriting the previous monotonic deadline
+        // would expire it anyway, because `hasExpired` prefers that clock.
+        let store = AnnotationStore()
+        _ = store.addWithOutcome(makeAnnotation(expiresAt: nil, expiresAtUptime: nil), durationSeconds: 300)
+        let stored = try XCTUnwrap(store.getAll().first)
+
+        let persistent = Annotation(
+            id: stored.id, screenId: stored.screenId, kind: stored.kind, colorHex: stored.colorHex,
+            label: stored.label, appId: stored.appId, appName: stored.appName,
+            expiresAt: nil, opacity: stored.opacity, offsetX: stored.offsetX, offsetY: stored.offsetY,
+            zIndex: stored.zIndex, createdAt: stored.createdAt
+        )
+        XCTAssertEqual(store.updateWithOutcome(id: stored.id, with: persistent), .updated)
+
+        let updated = try XCTUnwrap(store.get(id: stored.id))
+        XCTAssertNil(updated.expiresAt)
+        XCTAssertNil(updated.expiresAtUptime, "A cleared deadline must not survive on the monotonic clock.")
+    }
+
+    func testUpdateThatMovesTheDeadlineRederivesTheMonotonicTwin() throws {
+        let store = AnnotationStore()
+        _ = store.addWithOutcome(makeAnnotation(expiresAt: nil, expiresAtUptime: nil), durationSeconds: 10)
+        let stored = try XCTUnwrap(store.getAll().first)
+
+        let extended = Annotation(
+            id: stored.id, screenId: stored.screenId, kind: stored.kind, colorHex: stored.colorHex,
+            label: stored.label, appId: stored.appId, appName: stored.appName,
+            expiresAt: Date().addingTimeInterval(600), opacity: stored.opacity,
+            offsetX: stored.offsetX, offsetY: stored.offsetY,
+            zIndex: stored.zIndex, createdAt: stored.createdAt
+        )
+        XCTAssertEqual(store.updateWithOutcome(id: stored.id, with: extended), .updated)
+
+        let updated = try XCTUnwrap(store.get(id: stored.id))
+        let deadline = try XCTUnwrap(updated.expiresAtUptime)
+        XCTAssertEqual(deadline, ProcessInfo.processInfo.systemUptime + 600, accuracy: 5,
+                       "A moved wall-clock deadline must produce a matching monotonic deadline.")
+    }
+
     func testMonotonicDeadlineIsNotPutOnTheWire() throws {
         // expiresAtUptime is process-local; encoding it would change the public
         // annotation shape and would be meaningless to any other process.

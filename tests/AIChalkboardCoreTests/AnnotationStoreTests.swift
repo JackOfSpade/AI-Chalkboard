@@ -142,6 +142,54 @@ final class AnnotationStoreTests: XCTestCase {
         )
     }
 
+    func testEmptinessQueryAgreesWithTheFilteredArrayItAvoidsBuilding() {
+        // `hasVisibleAnnotations` exists so the repaint path can answer "is
+        // there anything to paint on this screen" without materialising and
+        // sorting the array.
+        //
+        // The EXPECTED answer is written out by hand below, because both
+        // queries delegate to the same `isVisible(_:onScreen:forApp:)`:
+        // comparing them only against each other would agree just as happily on
+        // a wrong visibility rule, and would pin nothing beyond "neither has
+        // re-inlined its own filter". The agreement assertion is kept as that
+        // secondary property.
+        let store = AnnotationStore()
+        store.add(annotation(id: "global-1", appId: nil))
+        store.add(annotation(id: "finder-1", appId: "com.apple.finder"))
+        store.add(annotation(id: "terminal-2", screen: "2", appId: "com.apple.Terminal"))
+
+        // Screen 1 holds the global annotation, which is visible under EVERY
+        // active app (including none); screen 2 holds only a Terminal-tagged
+        // annotation; screen 3 holds nothing at all.
+        let expectations: [(screen: String, app: String?, visible: Bool)] = [
+            ("1", nil, true),
+            ("1", "com.apple.finder", true),
+            ("1", "com.apple.Terminal", true),
+            ("1", "com.apple.Safari", true),
+            ("2", nil, false),
+            ("2", "com.apple.finder", false),
+            ("2", "com.apple.Terminal", true),
+            ("2", "com.apple.Safari", false),
+            ("3", nil, false),
+            ("3", "com.apple.finder", false),
+            ("3", "com.apple.Terminal", false),
+            ("3", "com.apple.Safari", false),
+        ]
+        for expectation in expectations {
+            let context = "screen \(expectation.screen) / app \(expectation.app ?? "nil")"
+            XCTAssertEqual(
+                store.hasVisibleAnnotations(forScreenId: expectation.screen, visibleForApp: expectation.app),
+                expectation.visible,
+                context
+            )
+            XCTAssertEqual(
+                !store.getForScreen(expectation.screen, visibleForApp: expectation.app).isEmpty,
+                expectation.visible,
+                "\(context) -- the array the emptiness query avoids building must agree"
+            )
+        }
+    }
+
     func testUpdatePreservesIdentityAndStableSlotWhileChangingPaintOrder() throws {
         let store = AnnotationStore()
         let first = annotation(id: "first", appId: nil)
@@ -413,6 +461,77 @@ final class AnnotationStoreTests: XCTestCase {
 
         XCTAssertEqual(store.retainedResourceUsage.primitiveCount, 1)
         XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    /// One annotation with EVERY top-level optional string field populated and
+    /// one with all of them nil.
+    ///
+    /// Deliberately no longer a tour of every `AnnotationKind`: the two
+    /// `resourceUsage` overloads duplicate only the six top-level
+    /// `addPayload(&usage, annotation.<field>)` lines and then both delegate
+    /// the kind walk to the SAME `addKindUsage`, so a fixture of nested batches
+    /// and mixed kinds reads like coverage while being unable to fail -- both
+    /// sides of the comparison walk it through the identical function.
+    private func topLevelFieldAnnotations() -> [Annotation] {
+        [
+            Annotation(
+                id: "path-every-field", screenId: "1",
+                kind: .vectorPath(data: "M0 0 L10 10", strokeColorHex: "#112233",
+                                  strokeWidth: 2, strokeOpacity: 1, fillColorHex: "#445566", fillOpacity: 0.5,
+                                  dash: [2, 3], usesEvenOddFillRule: true, coordinateScaleX: 1, coordinateScaleY: 1),
+                colorHex: "#778899", label: "path label",
+                appId: "com.apple.finder", appName: "Finder"
+            ),
+            // Optional fields all nil: both implementations must skip them
+            // identically rather than one of them counting something.
+            Annotation(
+                id: "path-no-optional-fields", screenId: "1",
+                kind: .vectorPath(data: "M0 0 L1 1", strokeColorHex: nil, strokeWidth: 1, strokeOpacity: 1,
+                                  fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false,
+                                  coordinateScaleX: 1, coordinateScaleY: 1)
+            )
+        ]
+    }
+
+    /// `AnnotationStore.resourceUsage(of:)` exists in two forms: the array
+    /// version, which is the oracle `assertResourceUsageConsistent` (and
+    /// `fullRecomputeResourceUsageForTesting`) checks against, and the
+    /// single-annotation version the incremental running total is built from.
+    ///
+    /// Only the six top-level field lines are genuinely duplicated between
+    /// them, and only those can this test discriminate: editing one copy and
+    /// forgetting the other would otherwise silently disable the invariant
+    /// check instead of failing. The kind walk is SHARED (`addKindUsage`) by
+    /// design, so no kind-accounting mistake can be caught here -- it would be
+    /// made identically on both sides. This claims exactly the first property
+    /// and no more.
+    func testFullRecomputeEqualsSumOfPerAnnotationUsage() {
+        let annotations = topLevelFieldAnnotations()
+
+        // Each per-annotation figure comes from a store holding exactly one
+        // annotation, whose running total is by construction the
+        // SINGLE-annotation implementation; the combined store's
+        // `fullRecomputeResourceUsageForTesting()` is the ARRAY one. Summing
+        // the former and comparing with the latter is what ties the two
+        // copies together.
+        var summed = AnnotationStoreResourceUsage(payloadBytes: 0, primitiveCount: 0)
+        for annotation in annotations {
+            let isolated = AnnotationStore()
+            isolated.add(annotation)
+            let usage = isolated.retainedResourceUsage
+            summed = AnnotationStoreResourceUsage(
+                payloadBytes: summed.payloadBytes + usage.payloadBytes,
+                primitiveCount: summed.primitiveCount + usage.primitiveCount
+            )
+        }
+
+        let combined = AnnotationStore()
+        for annotation in annotations { combined.add(annotation) }
+
+        XCTAssertEqual(combined.fullRecomputeResourceUsageForTesting(), summed)
+        XCTAssertEqual(combined.retainedResourceUsage, summed)
+        XCTAssertGreaterThan(summed.payloadBytes, 0)
+        XCTAssertEqual(summed.primitiveCount, 2, "one primitive per path annotation")
     }
 
     func testRunningResourceUsageMatchesFullRecomputeAcrossMixedOperations() {

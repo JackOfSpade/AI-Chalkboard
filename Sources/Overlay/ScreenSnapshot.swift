@@ -82,7 +82,16 @@ public struct ScreenSnapshot {
 
     /// Resolves a caller-supplied `screen_id` against THIS snapshot.
     /// Returns nil only when the snapshot contains no screens at all.
-    /// Order: in-bounds integer index -> exact id match -> main screen -> first screen.
+    /// Order: exact id match -> in-bounds integer index -> main screen -> first screen.
+    ///
+    /// WHY THE EXACT ID GOES FIRST: `getScreenId` reports a display's real
+    /// `CGDirectDisplayID`, and nothing stops that id from being a small
+    /// integer that also happens to be a valid positional index -- which is
+    /// exactly the id `get_screens` just handed the caller. With the index
+    /// checked first, such a display was unreachable BY ITS OWN REPORTED ID:
+    /// the request silently landed on whichever monitor occupied that
+    /// position instead. An id a screen actually reports must always win over
+    /// the positional convenience alias.
     public func resolve(_ rawId: String?) -> ScreenInfo? {
         guard !screens.isEmpty else { return nil }
 
@@ -91,14 +100,14 @@ public struct ScreenSnapshot {
             return screens.first(where: { $0.isMain }) ?? screens.first
         }
 
-        // 1. Does rawId match an integer index in bounds 0..<screens.count?
-        if let idx = Int(trimmed), idx >= 0 && idx < screens.count {
-            return screens[idx]
-        }
-
-        // 2. Does rawId match an exact display id string?
+        // 1. Does rawId match an exact display id string?
         if let match = screens.first(where: { $0.id == trimmed }) {
             return match
+        }
+
+        // 2. Does rawId match an integer index in bounds 0..<screens.count?
+        if let idx = Int(trimmed), idx >= 0 && idx < screens.count {
+            return screens[idx]
         }
 
         // Unrecognized id: default to the main screen.
@@ -137,7 +146,12 @@ extension OverlayWindowController {
         }
     }
 
-    private func buildScreenInfos() -> [ScreenInfo] {
+    /// MAIN-THREAD-ONLY (`NSScreen`): every caller must already be inside a
+    /// `MainThread.sync` block.
+    // internal (not private): OverlayWindowController+Diagnostics.swift's
+    // presentationStatus(for:) derives its expected geometry from these same
+    // ScreenInfos rather than re-deriving a third copy from NSScreen itself.
+    func buildScreenInfos() -> [ScreenInfo] {
         var infos: [ScreenInfo] = []
         let screens = NSScreen.screens
         let mainScreen = NSScreen.main

@@ -42,10 +42,17 @@ public extension SuspensionLeaseCoordinator {
     private typealias Sample = (pids: [pid_t], truncated: Bool, errors: [String], visible: [(pid_t, Int)], visibleTruncated: Bool)
 
     private static func sample() -> Sample {
-        let discovery = discoverCandidateProcesses()
+        // One WindowServer list per sample, shared by both halves. Taking two
+        // independent snapshots meant the candidate PIDs were matched against
+        // a window list that never contained them (or vice versa), so a single
+        // "sample" was really a torn pair -- and a suspend/resume made up to
+        // twelve of these list calls.
+        let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                    kCGNullWindowID) as? [[String: Any]]
+        let discovery = discoverCandidateProcesses(windowList: windowList)
         // When discovery itself is incomplete do not infer absence from an
         // arbitrary partial PID list. The result remains unsafe either way.
-        let visible = visibleWindows(ownedBy: Set(discovery.pids))
+        let visible = visibleWindows(ownedBy: Set(discovery.pids), in: windowList)
         let visibleTruncated = visible.count > maximumEvidenceEntries
         return (discovery.pids, discovery.truncated, discovery.errors,
                 Array(visible.prefix(maximumEvidenceEntries)), visibleTruncated)
@@ -67,7 +74,9 @@ public extension SuspensionLeaseCoordinator {
         )
     }
 
-    private static func discoverCandidateProcesses() -> (pids: [pid_t], truncated: Bool, errors: [String]) {
+    /// `windowList` is this sample's single on-screen snapshot, or nil when
+    /// WindowServer refused to produce one.
+    private static func discoverCandidateProcesses(windowList: [[String: Any]]?) -> (pids: [pid_t], truncated: Bool, errors: [String]) {
         var pids: Set<pid_t> = [ProcessInfo.processInfo.processIdentifier]
         var errors: [String] = []
         let identity = currentExecutableIdentity()
@@ -113,7 +122,7 @@ public extension SuspensionLeaseCoordinator {
         // based on owner name, which is deliberately conservative.
         let names = Set(["aichalkboard", "AI Chalkboard", Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String]
             .compactMap { $0 }.map(normalizedOwnerName))
-        if let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
+        if let infos = windowList {
             for info in infos {
                 guard let rawName = info[kCGWindowOwnerName as String] as? String,
                       names.contains(normalizedOwnerName(rawName)),
@@ -129,8 +138,9 @@ public extension SuspensionLeaseCoordinator {
         return (Array(sorted.prefix(limit)), sorted.count > limit, errors)
     }
 
-    private static func visibleWindows(ownedBy candidates: Set<pid_t>) -> [(pid_t, Int)] {
-        guard let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+    private static func visibleWindows(ownedBy candidates: Set<pid_t>,
+                                       in windowList: [[String: Any]]?) -> [(pid_t, Int)] {
+        guard let infos = windowList else {
             // A missing list is unsafe. Use an impossible sentinel PID/window
             // so the caller produces quiescent=false without inventing a real
             // process identity.

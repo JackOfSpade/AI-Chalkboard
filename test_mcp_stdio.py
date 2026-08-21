@@ -148,25 +148,28 @@ def terminate_child(proc):
 class StderrDrain:
     """Continuously drains a child process's stderr on a background thread.
 
-    WHY THIS EXISTS: `MCPServer.handleToolsCall` logs one line per call,
-    including a Swift debug description of the entire `arguments` value --
-    and tests/mcp_wire_snapshot.py's `call_path_over_cap` fixture
-    deliberately sends 10,001 points, which turns that single log line into
-    several hundred KB. This harness used to read the child's stderr only
+    WHY THIS EXISTS: the risk is AGGREGATE, not per-call.
+    `MCPServer.handleToolsCall` logs one line per call, synchronously BEFORE
+    the tool body runs, and this harness used to read the child's stderr only
     once, at the very end, after the process had already exited (the old
-    `stderr_diagnostics`) -- which was fine for fixtures that never logged
-    anywhere near that much, but is exactly wrong once one does: nobody
-    draining stderr while the process is still running means the child's
-    write(2) into a full pipe (64 KB on macOS) blocks indefinitely, and
-    since that logging call happens synchronously BEFORE the tool body
-    runs, it wedges the JSON-RPC response too -- indistinguishable, from
-    this script's side, from the server simply hanging. Continuously
-    draining stderr throughout the run, as any reasonable MCP host's stdio
-    transport would, is the actual fix; keeping only a bounded tail (not an
-    unbounded read) keeps the fix itself from becoming an unbounded-memory
-    version of the same problem. Every harness in this repo that spawns an
-    MCP child uses this same drain now (see `spawn_mcp_child`), not just the
-    fixture where the bug was first noticed.
+    `stderr_diagnostics`). Nothing therefore drained the pipe while the child
+    was running, so the CUMULATIVE stderr of a run -- a harness sends dozens
+    of tools/call requests, and the child also logs outside the dispatch path
+    -- eventually fills the 64 KB macOS pipe buffer, at which point the
+    child's next write(2) blocks indefinitely. Because that logging happens
+    ahead of the tool body, a wedged log wedges the JSON-RPC response too --
+    indistinguishable, from this script's side, from the server simply
+    hanging. No SINGLE line can do this any more: the argument rendering goes
+    through `redactedArgumentSummary` (Sources/MCP/MCPToolHandlers.swift),
+    whose `capped()` helper truncates to 2 KiB, so even a 100-item
+    `draw_batch` or a path near the 200,000-character cap logs ~2 KiB. It is
+    the sum across a run that overruns the buffer. Continuously draining
+    stderr throughout the run, as any reasonable MCP host's stdio transport
+    would, is the actual fix; keeping only a bounded tail (not an unbounded
+    read) keeps the fix itself from becoming an unbounded-memory version of
+    the same problem. Every harness in this repo that spawns an MCP child
+    uses this same drain now (see `spawn_mcp_child`), not just the one where
+    the bug was first noticed.
     """
 
     def __init__(self, proc):
@@ -343,6 +346,50 @@ def spawn_mcp_child(binary_path, extra_env=None):
     return proc, reader, drain
 
 
+def isolated_suspension_env(suspension_root, namespace_prefix):
+    """Returns the env overrides that put an MCP child in a private, disposable
+    suspension domain rooted at `suspension_root`.
+
+    Every harness in this repo that spawns an MCP child needs exactly this set,
+    for two separate reasons, and had drifted into either hand-rolling it or
+    (tests/mcp_wire_snapshot.py) omitting it entirely:
+
+      * ISOLATION. Without these, the child joins the USER'S PRODUCTION
+        suspension domain: it reconciles against (and writes) the real lease
+        registry under Application Support, observes and posts on the
+        production DistributedNotificationCenter suspension-invalidation
+        channel, and competes for the real instance lock -- i.e. a test can
+        reach into a live Claude Desktop/Cowork session.
+      * DETERMINISM. A production-domain child's `get_overlay_state` reports
+        whatever the machine's live suspension state happens to be
+        (`annotationsSuspended`, `activeLeaseCount`,
+        `suspensionRegistryBootstrapped`), so a real session merely holding a
+        lease while a capture runs changes the captured bytes.
+
+    `suspension_root` must be a caller-owned temp directory the caller also
+    removes; the lock file inside it must be named exactly "instance.lock",
+    because InstanceLock.testLockURLFromEnvironment rejects (silently, falling
+    back to the production path) any override whose last path component differs
+    or whose parent is not under the temporary directory. `namespace_prefix`
+    only labels the randomized DNC namespace for readability in logs -- the
+    fresh UUID is what actually guarantees no sibling process can hear it.
+
+    ONE DELIBERATE EXCEPTION, which is not drift and must not be "migrated":
+    tests/test_suspension_two_process.py hand-rolls these same three keys
+    because its TWO children have to SHARE one
+    `AI_CHALKBOARD_SUSPENSION_NAMESPACE` -- the behaviour under test is two
+    peers in the SAME isolated domain. This helper mints a fresh uuid4 on
+    every call, so calling it once per child would put those peers in separate
+    domains and silently defeat the only cross-process suspension test in the
+    repo. Treat this helper as being for SINGLE-child harnesses only.
+    """
+    return {
+        "AI_CHALKBOARD_SUSPENSION_ROOT": suspension_root,
+        "AI_CHALKBOARD_SUSPENSION_NAMESPACE": f"{namespace_prefix}-{uuid.uuid4()}",
+        "AI_CHALKBOARD_INSTANCE_LOCK_PATH": os.path.join(suspension_root, "instance.lock"),
+    }
+
+
 def resume_annotations_with_retry(proc, reader, timeout_seconds, request_id, lease_token):
     """Best-effort compensating cleanup for a completed or timed-out suspend.
 
@@ -439,11 +486,9 @@ def main():
     # Suspension now has a coordinator root and DNC namespace specifically so
     # tests can use a random, disposable domain even on a developer desktop.
     suspension_root = tempfile.mkdtemp(prefix="ai-chalkboard-stdio-suspension-")
-    proc, reader, stderr_drain = spawn_mcp_child(binary_path, extra_env={
-        "AI_CHALKBOARD_SUSPENSION_ROOT": suspension_root,
-        "AI_CHALKBOARD_SUSPENSION_NAMESPACE": f"stdio-{uuid.uuid4()}",
-        "AI_CHALKBOARD_INSTANCE_LOCK_PATH": os.path.join(suspension_root, "instance.lock"),
-    })
+    proc, reader, stderr_drain = spawn_mcp_child(
+        binary_path, extra_env=isolated_suspension_env(suspension_root, "stdio")
+    )
 
     failed = False
     temporary_paths = []
@@ -570,10 +615,19 @@ def main():
 
         print("\n6a. Testing temporary annotation suspension preserves the draw state...", flush=True)
         # The implementation broadcasts suspension to sibling Chalkboard
-        # processes. Always send the compensating resume before continuing,
-        # including when the suspend request itself times out *after* posting
-        # its distributed notification. Start try/finally before sending it,
-        # so this smoke test cannot leave a running desktop session hidden.
+        # processes, so a lease left behind hides a running desktop session.
+        # The try/finally below is opened BEFORE the suspend request is sent,
+        # which guarantees a compensating resume on every path -- assertion
+        # failure, transport error, KeyboardInterrupt -- once a lease token has
+        # been OBSERVED.
+        #
+        # What it deliberately does NOT cover: a suspend whose RESPONSE is lost
+        # (timeout after the server already took the lease and posted its
+        # distributed notification). There is no token to release in that case,
+        # and no broad "resume all" exists by design -- see
+        # resume_annotations_with_retry's docstring. Recovery there relies on
+        # the bounded `lease_seconds: 30` this request asks for: the lease
+        # expires on its own.
         suspension_token = None
         try:
             suspend_res = send_request(proc, reader, {
@@ -665,12 +719,11 @@ def main():
         assert presentation["presentationReady"] is True, presentation["failureReasons"]
 
         print("\n7. Testing explicit-app clear without fallback drift...", flush=True)
-        verification_annotation_id = None
         for app_id, x in [
             ("com.example.ClearTarget", 0.4),
             ("com.example.PreserveTarget", 0.6),
         ]:
-            draw_res = send_request(proc, reader, {
+            send_request(proc, reader, {
                 "jsonrpc": "2.0",
                 "id": _next_id(),
                 "method": "tools/call",
@@ -683,9 +736,6 @@ def main():
                     },
                 },
             }, args.timeout)
-            if app_id == "com.example.ClearTarget":
-                draw_text = draw_res["result"]["content"][0]["text"]
-                verification_annotation_id = draw_text.split("annotation: ", 1)[1].split()[0]
 
         print("\n8. Testing draw_text verify_annotation image response...", flush=True)
         screen_res = send_request(proc, reader, {

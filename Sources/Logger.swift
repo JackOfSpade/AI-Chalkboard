@@ -132,7 +132,8 @@ public final class Logger: @unchecked Sendable {
     }
 
     // Encodes `line` as UTF-8 and writes it to stderr, returning the encoded
-    // bytes on success. log()/logSync() reuse that returned Data for their
+    // bytes (whether or not the stderr write itself succeeded -- see the
+    // write below). log()/logSync() reuse that returned Data for their
     // own (separate, async-queued) write to the log file instead of
     // re-encoding the same string a second time. Returns nil, writing
     // nothing, if UTF-8 encoding fails -- effectively impossible for a
@@ -152,7 +153,20 @@ public final class Logger: @unchecked Sendable {
     @discardableResult
     private static func writeStderr(_ line: String) -> Data? {
         guard let data = line.data(using: .utf8) else { return nil }
-        FileHandle.standardError.write(data)
+        // Throwing `write(contentsOf:)`, never the legacy non-throwing
+        // `write(_:)`, for exactly the reason spelled out on writeToFile
+        // below: the legacy API raises an UNCATCHABLE Objective-C exception
+        // on failure, and EPIPE here is routine rather than exotic -- the MCP
+        // host closes our stderr pipe during teardown while SIGPIPE is
+        // ignored (see the launcher), so a clean shutdown would abort the
+        // process mid-log. Swallowing the error still returns `data`, so
+        // log()/logSync() go on to write the line to the log file even when
+        // stderr is dead.
+        do {
+            try FileHandle.standardError.write(contentsOf: data)
+        } catch {
+            // Nowhere left to report a stderr failure to, by definition.
+        }
         return data
     }
 
@@ -178,8 +192,8 @@ public final class Logger: @unchecked Sendable {
         // Write to log file asynchronously with size-cap rotation.
         queue.async { [weak self] in
             guard let self = self else { return }
-            self.reopenIfRotatedAwayFromUnderUs()
-            self.rotateIfNeeded()
+            let currentSize = self.reopenIfRotatedAwayFromUnderUs()
+            self.rotateIfNeeded(currentSize: currentSize)
             self.writeToFile(data)
         }
     }
@@ -233,26 +247,41 @@ public final class Logger: @unchecked Sendable {
     // our own descriptor and stat the current path, and if the inodes differ,
     // someone else rotated, so close and reopen against the path to land back
     // on the live file.
-    private func reopenIfRotatedAwayFromUnderUs() {
+    //
+    // Returns the live log path's size as observed by the stat this method
+    // already had to perform, purely so the rotateIfNeeded() call that always
+    // follows can reuse it instead of stat()ing the very same path a second
+    // time on every single log line. Returns nil whenever that number would
+    // be missing or stale -- no handle yet, either stat failed, or we just
+    // reopened -- and rotateIfNeeded() then takes its own fresh measurement.
+    @discardableResult
+    private func reopenIfRotatedAwayFromUnderUs() -> UInt64? {
         guard let handle = fileHandle else {
             fileHandle = Logger.openAppendHandle(at: logFileURL)
-            return
+            return nil
         }
 
         var handleStat = stat()
         var pathStat = stat()
 
-        guard fstat(handle.fileDescriptor, &handleStat) == 0 else { return }
+        guard fstat(handle.fileDescriptor, &handleStat) == 0 else { return nil }
         guard stat(logFileURL.path, &pathStat) == 0 else {
             // Path momentarily missing (e.g. another process mid-rename);
             // leave the handle as-is and retry on the next log() call.
-            return
+            return nil
         }
 
         if handleStat.st_ino != pathStat.st_ino {
             try? handle.close()
             fileHandle = Logger.openAppendHandle(at: logFileURL)
+            // Another process is actively rotating this path right now, so
+            // the size read a moment ago is exactly the kind of number that
+            // goes stale between the stat and the reopen. Report nothing and
+            // let rotateIfNeeded() measure the file we actually ended up on.
+            return nil
         }
+
+        return UInt64(max(pathStat.st_size, 0))
     }
 
     // Rotates the log file when it exceeds maxFileSizeBytes.
@@ -275,9 +304,14 @@ public final class Logger: @unchecked Sendable {
     // serialize rotation across processes with flock() on a dedicated lock
     // file, then re-check the size after acquiring the lock, since another
     // process may have already rotated while we were waiting for it.
-    private func rotateIfNeeded() {
+    //
+    // `currentSize` is the size reopenIfRotatedAwayFromUnderUs() already
+    // measured on the caller's behalf (it stats this same path immediately
+    // before every call to this method); nil means it had no trustworthy
+    // number to hand over, so we stat the path ourselves.
+    private func rotateIfNeeded(currentSize: UInt64?) {
         guard fileHandle != nil else { return }
-        guard let currentSize = Logger.fileSize(atPath: logFileURL.path),
+        guard let currentSize = currentSize ?? Logger.fileSize(atPath: logFileURL.path),
               currentSize >= maxFileSizeBytes else { return }
 
         // BUG FIX (permanent silent rotation failure spins forever): if a
@@ -324,7 +358,10 @@ public final class Logger: @unchecked Sendable {
         defer { flock(lockFd, LOCK_UN) }
 
         // Re-check under the lock: another process may have already rotated
-        // while we were waiting to acquire it.
+        // while we were waiting to acquire it. This MUST be a fresh stat and
+        // must never reuse `currentSize` -- that number was measured before
+        // the lock was held, which is precisely the window this re-check
+        // exists to close.
         guard let sizeAfterLock = Logger.fileSize(atPath: logFileURL.path),
               sizeAfterLock >= maxFileSizeBytes else {
             // Someone else already rotated (or the file otherwise shrank);
@@ -428,8 +465,8 @@ public final class Logger: @unchecked Sendable {
 
         queue.sync { [weak self] in
             guard let self = self else { return }
-            self.reopenIfRotatedAwayFromUnderUs()
-            self.rotateIfNeeded()
+            let currentSize = self.reopenIfRotatedAwayFromUnderUs()
+            self.rotateIfNeeded(currentSize: currentSize)
             self.writeToFile(data)
             // Durability matters here specifically: the process is about to
             // abort()/exit and this may be the only record of why. This is

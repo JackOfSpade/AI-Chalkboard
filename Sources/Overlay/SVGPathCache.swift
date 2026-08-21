@@ -44,12 +44,22 @@ enum SVGPathCache {
     static let maximumRetainedBytes = 4 * 1024 * 1024
 
     private static let lock = NSLock()
-    private static var entries: [String: CGPath] = [:]
-    /// Recency order, least-recently-used first. Kept alongside `entries`
-    /// rather than as an ordered map because the working set here is small
-    /// (the paths currently on screen) and a plain array keeps the eviction
-    /// logic obvious.
-    private static var recency: [String] = []
+    /// Each entry carries the `useCounter` value at its most recent hit, so
+    /// recency is stored WITH the entry rather than in a parallel array.
+    ///
+    /// It used to be a parallel `[String]` in least-recently-used order, which
+    /// made every cache HIT a linear scan (`firstIndex(of:)`) doing full string
+    /// comparisons against keys up to `DrawingDefaults.maxSVGPathCharacters`
+    /// long -- on the render hot path this cache exists to keep cheap. A
+    /// per-entry stamp turns a hit into one dictionary lookup plus one in-place
+    /// write; only eviction has to consider every entry, and it does so once
+    /// per CALL (one ordering pass, then victims taken from the front) rather
+    /// than once per evicted entry.
+    private static var entries: [String: (path: CGPath, lastUsed: UInt64)] = [:]
+    /// Logical clock for recency ordering: the entry with the smallest
+    /// `lastUsed` is the least recently used one. Wrapping would need 2^64
+    /// lookups in one process lifetime, which no repaint rate reaches.
+    private static var useCounter: UInt64 = 0
     private static var retainedBytes = 0
 
     /// Returns the parsed, untransformed path for `pathData`, parsing only on
@@ -65,7 +75,7 @@ enum SVGPathCache {
         if let cached = entries[pathData] {
             touch(pathData)
             lock.unlock()
-            return cached
+            return cached.path
         }
         lock.unlock()
 
@@ -79,8 +89,8 @@ enum SVGPathCache {
         lock.lock()
         defer { lock.unlock() }
         if entries[pathData] == nil {
-            entries[pathData] = parsed
-            recency.append(pathData)
+            useCounter &+= 1
+            entries[pathData] = (path: parsed, lastUsed: useCounter)
             retainedBytes += pathData.utf8.count
             evictIfNeeded()
         } else {
@@ -95,7 +105,6 @@ enum SVGPathCache {
         lock.lock()
         defer { lock.unlock() }
         entries.removeAll()
-        recency.removeAll()
         retainedBytes = 0
     }
 
@@ -116,23 +125,31 @@ enum SVGPathCache {
     // MARK: - Private (all callers already hold `lock`)
 
     private static func touch(_ key: String) {
-        guard let index = recency.firstIndex(of: key) else { return }
-        recency.remove(at: index)
-        recency.append(key)
+        useCounter &+= 1
+        entries[key]?.lastUsed = useCounter
     }
 
     private static func evictIfNeeded() {
-        // `recency.count > 1` is load-bearing, not a micro-optimisation: a
+        guard retainedBytes > maximumRetainedBytes, entries.count > 1 else { return }
+        // One ordering pass for the whole eviction, rather than a fresh
+        // `entries.min(by:)` full scan per victim: inserting one path near the
+        // 200,000-character cap into a cache holding tens of thousands of small
+        // ones evicts thousands of entries, and a scan each made that O(entries
+        // x evicted) on the main-thread render path this cache exists to keep
+        // cheap.
+        let leastRecentlyUsedFirst = entries.map { (key: $0.key, lastUsed: $0.value.lastUsed) }
+            .sorted { $0.lastUsed < $1.lastUsed }
+        // `entries.count > 1` is load-bearing, not a micro-optimisation: a
         // single path bigger than the entire budget must stay cached. Without
         // this guard the loop would evict the entry it was just handed, so the
         // most expensive path imaginable -- the one whose re-parse cost most
         // justifies caching -- would be the one path re-parsed on every single
         // frame. Overshooting the budget by one outsized entry is the strictly
         // cheaper failure.
-        while retainedBytes > maximumRetainedBytes, recency.count > 1, let oldest = recency.first {
-            recency.removeFirst()
-            if entries.removeValue(forKey: oldest) != nil {
-                retainedBytes -= oldest.utf8.count
+        for victim in leastRecentlyUsedFirst {
+            guard retainedBytes > maximumRetainedBytes, entries.count > 1 else { return }
+            if entries.removeValue(forKey: victim.key) != nil {
+                retainedBytes -= victim.key.utf8.count
             }
         }
     }

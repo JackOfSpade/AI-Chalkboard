@@ -189,9 +189,14 @@ extension OverlayWindowController {
     }
 
     /// Single source of truth for "what should currently be painted on
-    /// `screenId`" -- shared by `OverlayView.draw(_:)` (what to paint) and
-    /// `refreshViews()` (whether the window itself belongs on screen at
-    /// all). Keeping one definition is what makes those two questions
+    /// `screenId`" -- used by `OverlayView.draw(_:)` (what to paint) and by
+    /// the diagnostics in `OverlayWindowController+Diagnostics`.
+    ///
+    /// `refreshViewsNow(under:)` needs only the EMPTINESS of this answer, and
+    /// asks `hasCurrentlyVisibleAnnotations(forScreenId:)` below instead. The
+    /// two share the annotation-level predicate they are ultimately built on
+    /// (`AnnotationStore.isVisible(_:onScreen:forApp:)`), which is what makes
+    /// "what to paint" and "does the window belong on screen at all"
     /// impossible to answer inconsistently with each other.
     public func currentlyVisibleAnnotations(forScreenId screenId: String) -> [Annotation] {
         // Suspension is an explicit presentation override. Returning no
@@ -205,6 +210,36 @@ extension OverlayWindowController {
             return AnnotationStore.shared.getForScreen(screenId)
         }
         return AnnotationStore.shared.getForScreen(screenId, visibleForApp: ActiveAppTracker.shared.currentAppId)
+    }
+
+    /// The emptiness half of `currentlyVisibleAnnotations(forScreenId:)`,
+    /// answered WITHOUT materialising (or z-sorting) the filtered array.
+    ///
+    /// `refreshViewsNow(under:)` asks this once per screen on every repaint
+    /// purely to decide whether that screen's overlay window belongs on
+    /// WindowServer's on-screen list -- and `OverlayView.draw(_:)` then
+    /// rebuilds the identical array moments later anyway, so building and
+    /// sorting it here was pure duplicated work on the repaint path.
+    ///
+    /// What is duplicated here is only the suspension/capture-visibility
+    /// BRANCHING (kept deliberately in lockstep with the method above, and
+    /// covered by the same reasoning in its comments); the per-annotation
+    /// visibility predicate is NOT duplicated -- both sides bottom out in
+    /// `AnnotationStore.isVisible(_:onScreen:forApp:)`.
+    func hasCurrentlyVisibleAnnotations(forScreenId screenId: String) -> Bool {
+        if isAnnotationsSuspended {
+            return false
+        }
+        if isCaptureVisible {
+            // Capture-debug mode paints everything on this screen, so there is
+            // no app predicate to apply on either side. It is a short-lived,
+            // auto-reverting debug toggle, so the array build that answers this
+            // is not on any hot path worth its own store method.
+            return !AnnotationStore.shared.getForScreen(screenId).isEmpty
+        }
+        return AnnotationStore.shared.hasVisibleAnnotations(
+            forScreenId: screenId, visibleForApp: ActiveAppTracker.shared.currentAppId
+        )
     }
 
     /// Repaints every overlay AND decides, per screen, whether its window
@@ -240,8 +275,9 @@ extension OverlayWindowController {
     /// the overlay window was on screen (and therefore "topmost everywhere")
     /// even though it was painting nothing.
     ///
-    /// Ordering the window fully off screen when `currentlyVisibleAnnotations`
-    /// is empty removes it from that window list too, so an idle AI
+    /// Ordering the window fully off screen when
+    /// `hasCurrentlyVisibleAnnotations(forScreenId:)` is false removes it from
+    /// that window list too, so an idle AI
     /// Chalkboard -- the common case between draws -- is invisible to that
     /// kind of check, not just harmlessly click-through to it. This does NOT
     /// fix the remaining case where an annotation genuinely IS on screen: the
@@ -319,7 +355,7 @@ extension OverlayWindowController {
         annotationsSuspended = false
 
         for (window, view) in zip(overlayWindows, overlayViews) {
-            let hasContent = !currentlyVisibleAnnotations(forScreenId: view.screenId).isEmpty
+            let hasContent = hasCurrentlyVisibleAnnotations(forScreenId: view.screenId)
             if hasContent {
                 window.orderFrontRegardless()
             } else {
