@@ -58,4 +58,51 @@ final class AnnotationStoreConcurrencyTests: XCTestCase {
         XCTAssertEqual(remainingIds, (overflowBy..<totalToAdd).map { "a-\($0)" },
                        "eviction must drop the oldest entries first and keep the newest, in order")
     }
+
+    /// Cap eviction is one of the paths that must decrement the running
+    /// resource total for every evicted annotation, not just the live
+    /// insertion path. `retainedResourceUsage` (the incrementally maintained
+    /// total) must land on exactly what `fullRecomputeResourceUsageForTesting()`
+    /// (an independent from-scratch walk) reports once eviction has settled.
+    func testRunningResourceUsageMatchesFullRecomputeAfterEvictionPastCap() {
+        let store = AnnotationStore()
+        let capacity = DrawingDefaults.maxStoredAnnotations
+        let overflowBy = 25
+        let totalToAdd = capacity + overflowBy
+
+        for i in 0..<totalToAdd {
+            store.add(annotation(id: "u-\(i)"))
+        }
+
+        XCTAssertEqual(store.getAll().count, capacity)
+        XCTAssertEqual(store.retainedResourceUsage.primitiveCount, capacity)
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    /// Runs the same concurrent add/remove wave as
+    /// `testConcurrentAddRemoveAndGetAllProduceAConsistentFinalCountWithoutCrashing`,
+    /// then checks the running resource total landed exactly where a full
+    /// recompute says it should. The store's internal `NSLock` serializes
+    /// every `trackAdded`/`trackRemoved` call, so this must hold even though
+    /// the adds and removes themselves ran from many concurrent tasks.
+    func testRunningResourceUsageMatchesFullRecomputeAfterConcurrentAddsAndRemoves() {
+        let store = AnnotationStore()
+        let addCount = 500
+        let ids = (0..<addCount).map { "ru-\($0)" }
+
+        DispatchQueue.concurrentPerform(iterations: addCount) { index in
+            store.add(annotation(id: ids[index]))
+        }
+        XCTAssertEqual(store.getAll().count, addCount)
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+
+        let removeIndices = Array(stride(from: 0, to: addCount, by: 2))
+        DispatchQueue.concurrentPerform(iterations: removeIndices.count) { i in
+            _ = store.remove(id: ids[removeIndices[i]])
+        }
+
+        XCTAssertEqual(store.getAll().count, addCount - removeIndices.count)
+        XCTAssertEqual(store.retainedResourceUsage.primitiveCount, addCount - removeIndices.count)
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
 }

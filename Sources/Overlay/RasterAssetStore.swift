@@ -1,5 +1,4 @@
 import AppKit
-import Darwin
 import Foundation
 import ImageIO
 
@@ -232,14 +231,17 @@ public final class RasterAssetStore: @unchecked Sendable {
     }
 
     private func decode(path: String) throws -> CGImage {
-        guard path.hasPrefix("/") else { throw RasterAssetStoreError.invalidPath }
-        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
-        guard url.isFileURL else { throw RasterAssetStoreError.invalidPath }
-
         // Open once, validate that opened descriptor, then decode the exact
         // bounded byte snapshot read from it.  This avoids validating one
         // pathname and asking ImageIO to reopen a different replacement file.
-        let data = try readBoundedRegularFile(at: url)
+        let data: Data
+        do {
+            data = try BoundedLocalFile.read(path: path, maxBytes: maxInputFileBytes)
+        } catch BoundedLocalFileError.invalidPath {
+            throw RasterAssetStoreError.invalidPath
+        } catch {
+            throw RasterAssetStoreError.unreadableFile
+        }
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               CGImageSourceGetCount(source) == 1,
               let type = CGImageSourceGetType(source) as String?,
@@ -270,38 +272,6 @@ public final class RasterAssetStore: @unchecked Sendable {
               height <= maxDecodedDimension,
               width <= maxDecodedPixels / height else {
             throw RasterAssetStoreError.imageTooLarge
-        }
-    }
-
-    private func readBoundedRegularFile(at url: URL) throws -> Data {
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: url)
-        } catch {
-            throw RasterAssetStoreError.unreadableFile
-        }
-        defer { try? handle.close() }
-
-        var status = stat()
-        guard fstat(handle.fileDescriptor, &status) == 0,
-              (status.st_mode & S_IFMT) == S_IFREG,
-              status.st_size >= 0,
-              UInt64(status.st_size) <= maxInputFileBytes,
-              maxInputFileBytes <= UInt64(Int.max) else {
-            throw RasterAssetStoreError.unreadableFile
-        }
-
-        do {
-            let data = try handle.read(upToCount: Int(maxInputFileBytes)) ?? Data()
-            // A file can grow after fstat.  Probe one further byte rather than
-            // trusting metadata or allocating an unbounded Data buffer.
-            let trailingByte = try handle.read(upToCount: 1) ?? Data()
-            guard trailingByte.isEmpty else { throw RasterAssetStoreError.unreadableFile }
-            return data
-        } catch let error as RasterAssetStoreError {
-            throw error
-        } catch {
-            throw RasterAssetStoreError.unreadableFile
         }
     }
 

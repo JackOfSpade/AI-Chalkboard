@@ -271,4 +271,165 @@ final class AnnotationStoreTests: XCTestCase {
         XCTAssertEqual(attempted, DrawingDefaults.maxRetainedAnnotationPrimitives + 1)
         XCTAssertTrue(store.getAll().isEmpty)
     }
+
+    // MARK: - Incremental running-total accounting
+    //
+    // `AnnotationStore` used to recompute `retainedResourceUsage` from
+    // scratch (walking every stored annotation, recursively for batches) on
+    // every add/update. It now maintains a running total incrementally and
+    // only falls back to a full recompute as a DEBUG-only invariant check
+    // (`assertResourceUsageConsistent`, which fires automatically on every
+    // mutation these tests perform) plus the `fullRecomputeResourceUsageForTesting()`
+    // hook these tests call explicitly. Every test below asserts
+    // `retainedResourceUsage` (the incremental total) equals
+    // `fullRecomputeResourceUsageForTesting()` (an independent from-scratch
+    // recompute) after the mutation under test.
+
+    func testRunningResourceUsageMatchesFullRecomputeAfterAdds() {
+        let store = AnnotationStore()
+        store.add(annotation(id: "a", appId: nil))
+        store.add(annotation(id: "b", appId: "com.apple.finder"))
+        store.add(annotation(id: "c", appId: "com.apple.Terminal"))
+
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+        XCTAssertEqual(store.retainedResourceUsage.primitiveCount, 3)
+        XCTAssertGreaterThan(store.retainedResourceUsage.payloadBytes, 0)
+    }
+
+    func testRunningResourceUsageMatchesFullRecomputeAfterUpdate() {
+        let store = AnnotationStore()
+        let initial = annotation(id: "target", appId: nil)
+        store.add(initial)
+        store.add(annotation(id: "other", appId: "com.apple.finder"))
+
+        let replacement = Annotation(
+            id: initial.id, screenId: initial.screenId,
+            kind: .text(text: "a fairly different payload than the original path", x: 0, y: 0,
+                        fontSize: 12, textColorHex: "#FFFFFF", backgroundColorHex: nil,
+                        backgroundOpacity: 0, paddingPx: 0, opacity: 1),
+            createdAt: initial.createdAt
+        )
+        XCTAssertEqual(store.updateWithOutcome(id: initial.id, with: replacement), .updated)
+
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    func testRejectedAddLeavesRunningResourceUsageExactlyUnchanged() {
+        let store = AnnotationStore()
+        let halfBudgetPlusMargin = DrawingDefaults.maxRetainedAnnotationPayloadBytes / 2 + 4_096
+        let first = Annotation(
+            id: "first-large", screenId: "1",
+            kind: .text(text: String(repeating: "a", count: halfBudgetPlusMargin), x: 0, y: 0,
+                        fontSize: 12, textColorHex: "#FFFFFF", backgroundColorHex: nil,
+                        backgroundOpacity: 0, paddingPx: 0, opacity: 1)
+        )
+        let second = Annotation(
+            id: "second-large", screenId: "1",
+            kind: .vectorPath(data: String(repeating: "M0 0 L1 1 ", count: halfBudgetPlusMargin / 10 + 1),
+                              strokeColorHex: "#FFFFFF", strokeWidth: 1, strokeOpacity: 1,
+                              fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false,
+                              coordinateScaleX: 1, coordinateScaleY: 1)
+        )
+        guard case .added = store.addWithOutcome(first) else {
+            return XCTFail("first annotation should fit the aggregate payload budget")
+        }
+
+        let before = store.retainedResourceUsage
+        let outcome = store.addWithOutcome(second)
+        guard case .rejected = outcome else {
+            return XCTFail("expected payload-budget rejection, got \(outcome)")
+        }
+
+        XCTAssertEqual(store.retainedResourceUsage, before)
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    func testRejectedUpdateLeavesRunningResourceUsageExactlyUnchanged() {
+        let store = AnnotationStore()
+        let initial = annotation(id: "target", appId: nil)
+        store.add(initial)
+        store.add(annotation(id: "bystander", appId: "com.apple.finder"))
+        let oversized = Annotation(
+            id: initial.id, screenId: initial.screenId,
+            kind: .text(text: String(repeating: "x", count: DrawingDefaults.maxRetainedAnnotationPayloadBytes),
+                        x: 0, y: 0, fontSize: 12, textColorHex: "#FFFFFF", backgroundColorHex: nil,
+                        backgroundOpacity: 0, paddingPx: 0, opacity: 1),
+            createdAt: initial.createdAt
+        )
+
+        let before = store.retainedResourceUsage
+        let outcome = store.updateWithOutcome(id: initial.id, with: oversized)
+        guard case .rejected = outcome else {
+            return XCTFail("expected payload-budget rejection, got \(outcome)")
+        }
+
+        XCTAssertEqual(store.retainedResourceUsage, before)
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    func testRunningResourceUsageMatchesFullRecomputeAfterRemove() {
+        let store = AnnotationStore()
+        store.add(annotation(id: "first", appId: nil))
+        store.add(annotation(id: "second", appId: "com.apple.finder"))
+
+        XCTAssertTrue(store.remove(id: "first"))
+
+        XCTAssertEqual(store.retainedResourceUsage.primitiveCount, 1)
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    func testRunningResourceUsageIsZeroAfterClearAllAndMatchesFullRecompute() {
+        let store = AnnotationStore()
+        store.add(annotation(id: "first", appId: nil))
+        store.add(annotation(id: "second", appId: "com.apple.finder"))
+
+        XCTAssertEqual(store.clearAll(), 2)
+
+        XCTAssertEqual(store.retainedResourceUsage, AnnotationStoreResourceUsage(payloadBytes: 0, primitiveCount: 0))
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    func testRunningResourceUsageMatchesFullRecomputeAfterClearVisible() {
+        let store = AnnotationStore()
+        store.add(annotation(id: "global", appId: nil))
+        store.add(annotation(id: "finder", appId: "com.apple.finder"))
+        store.add(annotation(id: "terminal", appId: "com.apple.Terminal"))
+
+        XCTAssertEqual(store.clearVisible(forApp: "com.apple.finder"), 2)
+
+        XCTAssertEqual(store.retainedResourceUsage.primitiveCount, 1)
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    func testRunningResourceUsageMatchesFullRecomputeAfterExpiry() {
+        let store = AnnotationStore()
+        store.add(annotation(id: "expiring", appId: nil), durationSeconds: 0.01)
+        store.add(annotation(id: "persisting", appId: "com.apple.finder"))
+
+        Thread.sleep(forTimeInterval: 0.03)
+
+        // A plain read triggers the expiry sweep as a side effect.
+        XCTAssertEqual(store.getAll().map(\.id), ["persisting"])
+
+        XCTAssertEqual(store.retainedResourceUsage.primitiveCount, 1)
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    func testRunningResourceUsageMatchesFullRecomputeAcrossMixedOperations() {
+        let store = AnnotationStore()
+        for i in 0..<25 {
+            store.add(annotation(id: "seed-\(i)", appId: i.isMultiple(of: 2) ? nil : "com.apple.finder"))
+        }
+        XCTAssertTrue(store.remove(id: "seed-3"))
+        XCTAssertGreaterThan(store.clearVisible(forApp: "com.apple.finder"), 0)
+        store.add(annotation(id: "post-clear", appId: "com.apple.Terminal"))
+        let replacement = Annotation(
+            id: "post-clear", screenId: "1",
+            kind: .text(text: "replacement payload", x: 0, y: 0, fontSize: 12, textColorHex: "#FFFFFF",
+                        backgroundColorHex: nil, backgroundOpacity: 0, paddingPx: 0, opacity: 1)
+        )
+        XCTAssertEqual(store.updateWithOutcome(id: "post-clear", with: replacement), .updated)
+
+        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
 }

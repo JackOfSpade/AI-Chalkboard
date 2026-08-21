@@ -113,7 +113,26 @@ enum AnnotationVerificationCompositor {
             throw AnnotationVerificationError.aspectRatioMismatch(scaleX: scaleX, scaleY: scaleY)
         }
 
-        return try MainThread.sync {
+        // Rendering the annotation onto its own transparent layer genuinely
+        // needs the main thread -- it goes through AppKit/Core Graphics
+        // state (NSGraphicsContext.current, the shared graphics-state
+        // stack). Finding the painted bounding box afterwards is a plain
+        // byte scan over an already-produced buffer -- up to
+        // `maxImagePixels` of it -- so it deliberately runs AFTER this
+        // block, on the calling thread, instead of inside it. Scanning 20
+        // megapixels one byte at a time on the main thread would block
+        // AppKit's run loop (window ordering, and any other queued
+        // `MainThread.sync` work, including the overlay's own repaints) for
+        // the scan's whole duration.
+        //
+        // This is race-free: `overlayRep` is a freshly allocated,
+        // self-owned `NSBitmapImageRep` (never a CGImage-backed or
+        // otherwise lazily-produced one -- see `makeBitmap`), it is fully
+        // written by `flushGraphics()` before this block returns it, and
+        // nothing mutates it afterwards. Handing it from the main thread to
+        // the calling thread here is a one-way, one-time transfer, not
+        // concurrent access.
+        let overlayRep: NSBitmapImageRep = try MainThread.sync {
             guard let overlayRep = makeBitmap(width: imageWidth, height: imageHeight),
                   let overlayContext = NSGraphicsContext(bitmapImageRep: overlayRep) else {
                 throw AnnotationVerificationError.renderFailed
@@ -148,33 +167,41 @@ enum AnnotationVerificationCompositor {
             cgContext.restoreGState()
             overlayContext.flushGraphics()
             NSGraphicsContext.restoreGraphicsState()
+            return overlayRep
+        }
 
-            guard let paintedTopLeft = paintedPixelBounds(in: overlayRep) else {
-                throw AnnotationVerificationError.renderFailed
-            }
-            // NSBitmapImageRep's raw rows are top-to-bottom, while NSImage's
-            // `draw(from:)` source rect uses AppKit's bottom-left coordinates.
-            // Keep both explicit; conflating them crops the vertically mirrored
-            // UI region even though the annotation itself rendered correctly.
-            let paintedAppKit = CGRect(
-                x: paintedTopLeft.minX,
-                y: CGFloat(imageHeight) - paintedTopLeft.maxY,
-                width: paintedTopLeft.width,
-                height: paintedTopLeft.height
-            )
+        guard let paintedTopLeft = paintedPixelBounds(in: overlayRep) else {
+            throw AnnotationVerificationError.renderFailed
+        }
+        // NSBitmapImageRep's raw rows are top-to-bottom, while NSImage's
+        // `draw(from:)` source rect uses AppKit's bottom-left coordinates.
+        // Keep both explicit; conflating them crops the vertically mirrored
+        // UI region even though the annotation itself rendered correctly.
+        let paintedAppKit = CGRect(
+            x: paintedTopLeft.minX,
+            y: CGFloat(imageHeight) - paintedTopLeft.maxY,
+            width: paintedTopLeft.width,
+            height: paintedTopLeft.height
+        )
 
-            let safePadding = CGFloat(min(max(paddingPx, 0), maxPaddingPx))
-            let fullBounds = CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight)
-            let cropAppKit = paintedAppKit
-                .insetBy(dx: -safePadding, dy: -safePadding)
-                .integral
-                .intersection(fullBounds)
-            guard cropAppKit.width >= 1, cropAppKit.height >= 1 else {
-                throw AnnotationVerificationError.renderFailed
-            }
+        let safePadding = CGFloat(min(max(paddingPx, 0), maxPaddingPx))
+        let fullBounds = CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight)
+        let cropAppKit = paintedAppKit
+            .insetBy(dx: -safePadding, dy: -safePadding)
+            .integral
+            .intersection(fullBounds)
+        guard cropAppKit.width >= 1, cropAppKit.height >= 1 else {
+            throw AnnotationVerificationError.renderFailed
+        }
 
-            let cropWidth = Int(cropAppKit.width)
-            let cropHeight = Int(cropAppKit.height)
+        let cropWidth = Int(cropAppKit.width)
+        let cropHeight = Int(cropAppKit.height)
+
+        // Compositing the crop is rendering too (NSImage.draw through
+        // AppKit), so it goes back through the main thread -- this second,
+        // short hop is cheap compared to the scan this restructuring just
+        // moved out of the main thread's way.
+        let pngData: Data = try MainThread.sync {
             guard let cropRep = makeBitmap(width: cropWidth, height: cropHeight),
                   let cropContext = NSGraphicsContext(bitmapImageRep: cropRep) else {
                 throw AnnotationVerificationError.renderFailed
@@ -198,74 +225,53 @@ enum AnnotationVerificationCompositor {
             guard let pngData = cropRep.representation(using: .png, properties: [:]) else {
                 throw AnnotationVerificationError.renderFailed
             }
-            guard isWithinResponseBudget(rawPNGBytes: pngData.count) else {
-                throw AnnotationVerificationError.outputTooLarge
-            }
-
-            let cropTopLeftY = CGFloat(imageHeight) - cropAppKit.maxY
-            let clipped = cropAppKit.minX == 0 || cropAppKit.minY == 0
-                || cropAppKit.maxX == CGFloat(imageWidth) || cropAppKit.maxY == CGFloat(imageHeight)
-
-            let metadata: [String: Any] = [
-                "annotationId": annotation.id,
-                "annotationType": annotation.kind.typeName,
-                "screenId": annotation.screenId,
-                "screenBackingPixels": ["width": screen.widthPx, "height": screen.heightPx],
-                "screenPoints": ["width": screen.widthPt, "height": screen.heightPt],
-                "backingScaleFactor": screen.backingScaleFactor,
-                "screenshotPixels": ["width": imageWidth, "height": imageHeight],
-                "scaleToScreenshot": ["x": scaleX, "y": scaleY],
-                "scaleDifferencePercent": relativeDifference * 100,
-                "paintedBoundsScreenshotPx": rectObject(
-                    x: paintedTopLeft.minX,
-                    y: paintedTopLeft.minY,
-                    width: paintedTopLeft.width,
-                    height: paintedTopLeft.height
-                ),
-                "cropScreenshotPx": rectObject(
-                    x: cropAppKit.minX,
-                    y: cropTopLeftY,
-                    width: cropAppKit.width,
-                    height: cropAppKit.height
-                ),
-                "cropClippedAtScreenEdge": clipped,
-                "verificationKind": "synthetic-composite",
-                "verificationNote": "This image uses the live OverlayView renderer composited into the selected clean screenshot source. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that WindowServer presented the separate overlay window."
-            ]
-
-            return AnnotationVerificationComposite(pngData: pngData, metadata: metadata)
+            return pngData
         }
+
+        guard isWithinResponseBudget(rawPNGBytes: pngData.count) else {
+            throw AnnotationVerificationError.outputTooLarge
+        }
+
+        let cropTopLeftY = CGFloat(imageHeight) - cropAppKit.maxY
+        let clipped = cropAppKit.minX == 0 || cropAppKit.minY == 0
+            || cropAppKit.maxX == CGFloat(imageWidth) || cropAppKit.maxY == CGFloat(imageHeight)
+
+        let metadata: [String: Any] = [
+            "annotationId": annotation.id,
+            "annotationType": annotation.kind.typeName,
+            "screenId": annotation.screenId,
+            "screenBackingPixels": ["width": screen.widthPx, "height": screen.heightPx],
+            "screenPoints": ["width": screen.widthPt, "height": screen.heightPt],
+            "backingScaleFactor": screen.backingScaleFactor,
+            "screenshotPixels": ["width": imageWidth, "height": imageHeight],
+            "scaleToScreenshot": ["x": scaleX, "y": scaleY],
+            "scaleDifferencePercent": relativeDifference * 100,
+            "paintedBoundsScreenshotPx": rectObject(
+                x: paintedTopLeft.minX,
+                y: paintedTopLeft.minY,
+                width: paintedTopLeft.width,
+                height: paintedTopLeft.height
+            ),
+            "cropScreenshotPx": rectObject(
+                x: cropAppKit.minX,
+                y: cropTopLeftY,
+                width: cropAppKit.width,
+                height: cropAppKit.height
+            ),
+            "cropClippedAtScreenEdge": clipped,
+            "verificationKind": "synthetic-composite",
+            "verificationNote": "This image uses the live OverlayView renderer composited into the selected clean screenshot source. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that WindowServer presented the separate overlay window."
+        ]
+
+        return AnnotationVerificationComposite(pngData: pngData, metadata: metadata)
     }
 
     private static func loadScreenshot(path: String) throws -> CGImage {
-        guard path.hasPrefix("/") else { throw AnnotationVerificationError.invalidPath }
-        let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
-        guard url.isFileURL else { throw AnnotationVerificationError.invalidPath }
-
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: url)
-        } catch {
-            throw AnnotationVerificationError.unreadableFile
-        }
-        defer { try? handle.close() }
-
-        var status = stat()
-        guard fstat(handle.fileDescriptor, &status) == 0,
-              (status.st_mode & S_IFMT) == S_IFREG,
-              status.st_size >= 0,
-              UInt64(status.st_size) <= maxInputFileBytes,
-              maxInputFileBytes <= UInt64(Int.max) else {
-            throw AnnotationVerificationError.unreadableFile
-        }
-
         let data: Data
         do {
-            data = try handle.read(upToCount: Int(maxInputFileBytes)) ?? Data()
-            let trailingByte = try handle.read(upToCount: 1) ?? Data()
-            guard trailingByte.isEmpty else { throw AnnotationVerificationError.unreadableFile }
-        } catch let error as AnnotationVerificationError {
-            throw error
+            data = try BoundedLocalFile.read(path: path, maxBytes: maxInputFileBytes)
+        } catch BoundedLocalFileError.invalidPath {
+            throw AnnotationVerificationError.invalidPath
         } catch {
             throw AnnotationVerificationError.unreadableFile
         }
