@@ -206,6 +206,49 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         }
     }
 
+    /// The generation ratchet must reject a STALE read (same file, older
+    /// generation) but must NOT reject a RECREATED file, which legitimately
+    /// restarts at generation 0. Deleting the registry without rebooting used
+    /// to freeze the cached snapshot -- including annotationsSuspended -- on
+    /// stale data for an unbounded number of operations, because generation
+    /// alone cannot tell those two cases apart.
+    func testRecreatedRegistryEpochResetsTheGenerationRatchet() throws {
+        try withTemporaryCoordinator { coordinator, _ in
+            let high = coordinator.testOnlyRecordAndApply(generation: 42, suspended: true,
+                                                          instanceEpoch: "epoch-one")
+            XCTAssertEqual(high.generation, 42)
+            XCTAssertTrue(high.annotationsSuspended)
+
+            // Same file, older generation: still rejected.
+            let stale = coordinator.testOnlyRecordAndApply(generation: 7, suspended: false,
+                                                           instanceEpoch: "epoch-one")
+            XCTAssertEqual(stale.generation, 42, "a stale read of the same file must not regress the cache")
+            XCTAssertTrue(stale.annotationsSuspended)
+
+            // A different file (deleted and recreated) starting over at 0:
+            // must be accepted, or the cache stays frozen on data that no
+            // longer exists anywhere.
+            let recreated = coordinator.testOnlyRecordAndApply(generation: 0, suspended: false,
+                                                               instanceEpoch: "epoch-two")
+            XCTAssertEqual(recreated.generation, 0, "a recreated registry must reset the high-water mark")
+            XCTAssertFalse(recreated.annotationsSuspended,
+                           "the recreated registry holds no leases, so annotations must not stay suspended")
+            XCTAssertEqual(coordinator.snapshot(), recreated)
+        }
+    }
+
+    /// A registry written before `instanceEpoch` existed decodes with nil.
+    /// That must degrade to exactly the old ratchet behaviour rather than
+    /// resetting on every read (which would defeat the ratchet entirely).
+    func testMissingEpochNeverResetsTheRatchet() throws {
+        try withTemporaryCoordinator { coordinator, _ in
+            _ = coordinator.testOnlyRecordAndApplyWithoutEpoch(generation: 20, suspended: true)
+            let stale = coordinator.testOnlyRecordAndApplyWithoutEpoch(generation: 3, suspended: false)
+            XCTAssertEqual(stale.generation, 20, "a nil epoch must not reset the high-water mark")
+            XCTAssertTrue(stale.annotationsSuspended)
+        }
+    }
+
     func testFailureKeepsGenerationHighWaterRejectsOlderStateAndRepairsAtSameGeneration() throws {
         try withTemporaryCoordinator { coordinator, _ in
             let generationTen = coordinator.testOnlyRecordAndApply(generation: 10, suspended: true)

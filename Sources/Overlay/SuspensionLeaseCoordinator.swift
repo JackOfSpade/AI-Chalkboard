@@ -57,6 +57,34 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         /// this registry. Uptime-only comparisons cannot distinguish a reboot
         /// from an old state whose values happen to be small.
         var bootSessionIdentifier: String
+        /// Random identity for THIS registry file, minted whenever a fresh
+        /// state is created (see `init(bootSessionIdentifier:)`).
+        ///
+        /// BUG FIX (the generation ratchet froze permanently on a recreated
+        /// file): `recordState` rejects any read whose generation is below the
+        /// high-water mark, so a stale read cannot roll the cache backwards.
+        /// But deleting the state file WITHOUT rebooting -- a documented
+        /// manual-troubleshooting action -- makes every process start reading
+        /// a brand-new file at generation 0, which is indistinguishable from a
+        /// stale read by generation alone. The ratchet then rejected the real,
+        /// current state indefinitely: `prune` on an empty state reports no
+        /// change, so plain `reconcile()` never rewrites the file, and only
+        /// acquire/release advance the generation, by one each. The cached
+        /// `annotationsSuspended` could therefore stay wrong for an unbounded
+        /// number of operations, and MCP callers kept reading that wrong value.
+        ///
+        /// A differing epoch can only mean the file was recreated, which is
+        /// exactly the signal the generation alone could not carry.
+        ///
+        /// OPTIONAL for backward compatibility: a registry written by a build
+        /// that predates this field decodes with `nil` here. A nil epoch on
+        /// either side is treated as "no evidence of recreation" and never
+        /// resets the ratchet, so an older file degrades to exactly the
+        /// previous behaviour instead of failing closed or resetting
+        /// spuriously. `bootSessionIdentifier` continues to cover the reboot
+        /// case; this covers same-boot recreation, and the two are
+        /// independent.
+        var instanceEpoch: String?
         var generation: UInt64 = 0
         var lastUpdatedUptime: Double = 0
         var leases: [Lease] = []
@@ -68,6 +96,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
 
         init(bootSessionIdentifier: String) {
             self.bootSessionIdentifier = bootSessionIdentifier
+            self.instanceEpoch = UUID().uuidString
         }
     }
 
@@ -129,6 +158,9 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     private let stateLock = NSLock()
     private var lastAppliedGeneration: UInt64 = 0
     private var hasAppliedGeneration = false
+    /// The `instanceEpoch` the high-water mark above belongs to. See
+    /// `PersistedState.instanceEpoch`.
+    private var lastAppliedInstanceEpoch: String?
     private var bootstrapped = false
     private var cachedSnapshot = Snapshot(generation: 0, annotationsSuspended: true,
                                           activeLeaseCount: 0, isBootstrapped: false,
@@ -474,6 +506,17 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
                                 activeLeaseCount: state.leases.count, isBootstrapped: error == nil,
                                 nextExpiryInSeconds: nextExpiry, error: error)
         stateLock.lock()
+        // A changed epoch means this is a DIFFERENT registry file, so the
+        // high-water mark from the previous one carries no meaning and must
+        // not be allowed to reject the new file's genuinely-current state.
+        // Requiring both sides to be non-nil keeps pre-epoch registries on
+        // exactly the old behaviour rather than resetting on missing data.
+        if let observed = state.instanceEpoch,
+           let remembered = lastAppliedInstanceEpoch,
+           observed != remembered {
+            hasAppliedGeneration = false
+            lastAppliedGeneration = 0
+        }
         if hasAppliedGeneration && state.generation < lastAppliedGeneration {
             let current = cachedSnapshot
             stateLock.unlock()
@@ -493,6 +536,9 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
             hasAppliedGeneration = true
             lastAppliedGeneration = state.generation
         }
+        // Track the epoch the mark belongs to, including the first read after
+        // an upgrade (where it was previously nil).
+        if let observed = state.instanceEpoch { lastAppliedInstanceEpoch = observed }
         bootstrapped = error == nil
         cachedSnapshot = snapshot
         stateLock.unlock()
@@ -513,8 +559,28 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     }
 
 #if DEBUG
-    func testOnlyRecordAndApply(generation: UInt64, suspended: Bool) -> Snapshot {
+    /// `instanceEpoch` defaults to a FIXED value so successive calls model
+    /// repeated reads of the SAME registry file -- otherwise each call would
+    /// mint a new epoch, read as a recreated file, and reset the generation
+    /// ratchet the stale-apply tests exist to pin. Pass a different epoch to
+    /// model the file actually being replaced.
+    func testOnlyRecordAndApply(generation: UInt64, suspended: Bool,
+                                instanceEpoch: String = "test-epoch") -> Snapshot {
         var state = PersistedState(bootSessionIdentifier: bootSessionIdentifier ?? "test")
+        state.instanceEpoch = instanceEpoch
+        state.generation = generation
+        if suspended {
+            state.leases = [Lease(token: String(repeating: "A", count: 43), ownerPID: 1,
+                                  ownerInstanceNonce: "test", expiresAtUptime: ProcessInfo.processInfo.systemUptime + 60,
+                                  idempotencyKey: nil)]
+        }
+        return recordAndApply(state, error: nil)
+    }
+
+    /// Models a registry written before `instanceEpoch` existed.
+    func testOnlyRecordAndApplyWithoutEpoch(generation: UInt64, suspended: Bool) -> Snapshot {
+        var state = PersistedState(bootSessionIdentifier: bootSessionIdentifier ?? "test")
+        state.instanceEpoch = nil
         state.generation = generation
         if suspended {
             state.leases = [Lease(token: String(repeating: "A", count: 43), ownerPID: 1,
