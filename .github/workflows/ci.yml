@@ -258,7 +258,7 @@ jobs:
         if: ${{ env.ACT == 'true' }}
         run: |
           set -euo pipefail
-          app=.build/release/AIChalkboard.app
+          app=dist/AIChalkboard.app
           plist="$app/Contents/Info.plist"
           test -x "$app/Contents/MacOS/AIChalkboard"
           test -f "$plist"
@@ -266,3 +266,11 @@ jobs:
           test "$(plutil -extract NSHighResolutionCapable raw -o - "$plist")" = true
           test "$(plutil -extract NSHighResolutionMagnifyAllowed raw -o - "$plist")" = false
           codesign --verify --deep --strict --verbose=2 "$app"
+
+      # SwiftPM owns `.build` and may replace it during a subsequent build.
+      # The configured MCP executable is instead the signed bundle in `dist/`;
+      # prove both that the bundle survives a release rebuild and that the
+      # documentation/harness stay pointed at it.
+      - name: Verify deployed bundle survives SwiftPM rebuild (act-local CI only)
+        if: ${{ env.ACT == 'true' }}
+        run: bash tests/test_deployment_layout.sh

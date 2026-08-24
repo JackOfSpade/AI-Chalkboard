@@ -15,7 +15,12 @@ import time
 import uuid
 import zlib
 
-DEFAULT_BINARY_PATH = "./.build/release/AIChalkboard.app/Contents/MacOS/AIChalkboard"
+# The signed deployable bundle intentionally lives outside SwiftPM's `.build`
+# directory: a later `swift build -c release` is allowed to replace that
+# directory wholesale, but must never make the MCP host's configured command
+# disappear.  `build_app.sh` creates this path after copying the compiled
+# `.build/release/AIChalkboard` source executable into the bundle.
+DEFAULT_BINARY_PATH = "./dist/AIChalkboard.app/Contents/MacOS/AIChalkboard"
 DEFAULT_RESPONSE_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_TIMEOUT_SECONDS = 2.0
 RESUME_CLEANUP_ATTEMPTS = 3

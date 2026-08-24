@@ -162,7 +162,10 @@ the repo as a baseline, and never compared across machines.
 ```bash
 ./build_app.sh
 ```
-Executes release compilation and packages `.build/release/AIChalkboard.app`.
+Executes release compilation and packages `dist/AIChalkboard.app`. The
+deployable bundle deliberately lives outside SwiftPM's `.build` directory, so
+a later `swift build -c release` cannot remove the executable configured for
+your MCP host.
 Local release builds are pinned to the persistent `AI Chalkboard Local Code
 Signing` identity in the login keychain (SHA-1
 `65B98DF43D4BF99750538424213806A962381046`). This keeps the app's designated
@@ -180,7 +183,7 @@ Add AI Chalkboard to `~/Library/Application Support/Claude/claude_desktop_config
 {
   "mcpServers": {
     "ai-chalkboard": {
-      "command": "/Users/jack/Desktop/My Apps/AI-Chalkboard/.build/release/AIChalkboard.app/Contents/MacOS/AIChalkboard",
+      "command": "/Users/jack/Desktop/My Apps/AI-Chalkboard/dist/AIChalkboard.app/Contents/MacOS/AIChalkboard",
       "args": ["--mcp"]
     }
   }

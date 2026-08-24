@@ -5,8 +5,9 @@ echo "Building AI Chalkboard release binary..."
 swift build -c release
 
 BUILD_DIR=".build/release"
+DIST_DIR="dist"
 APP_NAME="AIChalkboard.app"
-APP_DIR="$BUILD_DIR/$APP_NAME"
+APP_DIR="$DIST_DIR/$APP_NAME"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
