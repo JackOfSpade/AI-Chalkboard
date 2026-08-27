@@ -243,7 +243,7 @@ public final class ScreenCaptureProvider {
             return true
         }
         guard let ownExecutable = ownIdentity.executablePath else { return false }
-        return executablePath() == ownExecutable
+        return normalizedExecutablePath(executablePath()) == normalizedExecutablePath(ownExecutable)
     }
 
     static func exclusionScope(for ownIdentity: ScreenCaptureApplicationIdentity) -> ScreenCaptureExclusionScope {
@@ -256,10 +256,10 @@ public final class ScreenCaptureProvider {
 
     private static func currentExecutablePath() -> String? {
         if let executableURL = Bundle.main.executableURL {
-            return executableURL.standardizedFileURL.path
+            return normalizedExecutablePath(executableURL.path)
         }
         guard let executable = CommandLine.arguments.first, !executable.isEmpty else { return nil }
-        return URL(fileURLWithPath: executable).standardizedFileURL.path
+        return normalizedExecutablePath(executable)
     }
 
     private static func executablePath(for processID: pid_t) -> String? {
@@ -267,7 +267,7 @@ public final class ScreenCaptureProvider {
             .executableURL?
             .standardizedFileURL
             .path {
-            return registeredPath
+            return normalizedExecutablePath(registeredPath)
         }
 
         // `SCApplication` has no executable URL.  `proc_pidpath` provides a
@@ -282,6 +282,26 @@ public final class ScreenCaptureProvider {
         guard length > 0 else { return nil }
         let rawPath = String(cString: buffer)
         guard !rawPath.isEmpty else { return nil }
-        return URL(fileURLWithPath: rawPath).standardizedFileURL.path
+        return normalizedExecutablePath(rawPath)
+    }
+
+    /// `CommandLine.arguments` can retain the symlink a development process
+    /// was launched through while `proc_pidpath` reports the resolved binary.
+    /// Compare canonical paths so sibling unbundled overlays are excluded in
+    /// either form; `standardizedFileURL` alone only removes `.`/`..`.
+    private static func normalizedExecutablePath(_ path: String?) -> String? {
+        guard let path, !path.isEmpty else { return nil }
+        let url: URL
+        if path.hasPrefix("/") {
+            url = URL(fileURLWithPath: path)
+        } else {
+            // Development launches commonly expose argv[0] as `./.build/...`.
+            // `fileURLWithPath` does not attach that relative path to the
+            // process working directory, while proc_pidpath always returns an
+            // absolute path; make the two representations comparable.
+            url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(path)
+        }
+        return url.resolvingSymlinksInPath().standardizedFileURL.path
     }
 }

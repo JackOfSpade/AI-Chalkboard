@@ -2,6 +2,7 @@
 import argparse
 import base64
 import itertools
+import math
 import subprocess
 import json
 import os
@@ -47,6 +48,14 @@ _PRESENTATION_POLL_ID_RESERVATION = 1000
 # underscore): tests/mcp_wire_snapshot.py's own diagnostics message reports
 # this same bound, since it shares this same drain.
 STDERR_TAIL_BYTES = 16_000
+
+# Keep the harness aligned with the server's final transport boundary: every
+# MCP response line, including its terminating newline, is capped at 8 MiB in
+# `MCPResponseTransport`. The real server should therefore never approach an
+# unbounded reader buffer, but enforcing the same limit here makes a broken or
+# substituted child fail promptly instead of letting a newline-free stdout
+# flood consume arbitrary harness memory until its request deadline expires.
+MAX_MCP_RESPONSE_BYTES = 8 * 1024 * 1024
 
 # JSON-RPC ids only need to be unique per in-flight request on this
 # synchronous stdio transport (each request's response is read before the
@@ -102,8 +111,8 @@ def parse_args():
         help="maximum time to wait for each MCP response (default: %(default)s)",
     )
     args = parser.parse_args()
-    if args.timeout <= 0:
-        parser.error("--timeout must be greater than zero")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be a finite number greater than zero")
     return args
 
 
@@ -233,19 +242,51 @@ def write_solid_png(path, width, height, rgba=(36, 42, 52, 255)):
 
 
 class MCPLineReader:
-    """Deadline-bound newline framing over a child process's stdout pipe."""
+    """Deadline- and size-bound newline framing over child stdout."""
 
-    def __init__(self, proc):
+    def __init__(self, proc, max_response_bytes=MAX_MCP_RESPONSE_BYTES):
         if proc.stdout is None:
             raise RuntimeError("MCP child was started without a stdout pipe.")
+        if max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be greater than zero")
         self.proc = proc
         self.fd = proc.stdout.fileno()
         self.buffer = bytearray()
+        self.max_response_bytes = max_response_bytes
+
+    def _ensure_buffer_within_transport_limit(self, method):
+        """Rejects any complete or partial buffered line beyond the wire cap.
+
+        A single `os.read` can contain a valid response followed by bytes for
+        the next response. Checking only the line about to be returned would
+        accept that first response while quietly retaining an oversized tail,
+        then let the harness send another request before it discovers the
+        child already violated framing. Scan all complete buffered lines plus
+        the final partial line so a bad tail is reported at the request whose
+        output carried it.
+        """
+        start = 0
+        while True:
+            newline_index = self.buffer.find(b"\n", start)
+            if newline_index < 0:
+                if len(self.buffer) - start >= self.max_response_bytes:
+                    raise RuntimeError(
+                        f"MCP child exceeded the {self.max_response_bytes}-byte "
+                        f"transport limit without a newline while responding to {method}."
+                    )
+                return
+            if newline_index - start + 1 > self.max_response_bytes:
+                raise RuntimeError(
+                    f"MCP child returned a response larger than the "
+                    f"{self.max_response_bytes}-byte transport limit for {method}."
+                )
+            start = newline_index + 1
 
     def read_line(self, method, timeout_seconds):
         deadline = time.monotonic() + timeout_seconds
 
         while True:
+            self._ensure_buffer_within_transport_limit(method)
             newline_index = self.buffer.find(b"\n")
             if newline_index >= 0:
                 line = bytes(self.buffer[:newline_index])

@@ -328,7 +328,7 @@ public final class InstanceLock: @unchecked Sendable {
             return .retainPrimary
         }
 
-        let newFd = open(lockURL.path, O_CREAT | O_RDWR, 0o644)
+        let newFd = openLockFile(at: lockURL.path, createIfMissing: true)
         guard newFd >= 0 else {
             let err = errno
             logRetryAnomalyOnce(
@@ -425,6 +425,26 @@ public final class InstanceLock: @unchecked Sendable {
         logHandler(message, level)
     }
 
+    /// Opens only a path-owned regular file for the advisory lock.
+    ///
+    /// The lock is an election primitive, not a general file lock. Following
+    /// a symlink could silently lock an unrelated file and leave the actual
+    /// lock path undiscoverable to other instances. FIFOs and devices are
+    /// likewise invalid election targets, so reject them before `flock`.
+    private func openLockFile(at path: String, createIfMissing: Bool) -> Int32 {
+        let flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | (createIfMissing ? O_CREAT : 0)
+        let fd = open(path, flags, 0o644)
+        guard fd >= 0 else { return -1 }
+
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+            close(fd)
+            errno = EINVAL
+            return -1
+        }
+        return fd
+    }
+
     private static func testLockURLFromEnvironment() -> URL? {
         guard let raw = ProcessInfo.processInfo.environment["AI_CHALKBOARD_INSTANCE_LOCK_PATH"],
               raw.hasPrefix("/") else { return nil }
@@ -507,8 +527,9 @@ public final class InstanceLock: @unchecked Sendable {
         }
 
         // Raw POSIX open() rather than FileHandle, since flock() needs the
-        // underlying file descriptor directly.
-        let fd = open(lockURL.path, createIfMissing ? (O_CREAT | O_RDWR) : O_RDWR, 0o644)
+        // underlying file descriptor directly. `openLockFile` also rejects a
+        // symlink or non-regular file before it can influence the election.
+        let fd = openLockFile(at: lockURL.path, createIfMissing: createIfMissing)
         guard fd >= 0 else {
             // Capture errno immediately: any Foundation call can clobber it.
             let err = errno

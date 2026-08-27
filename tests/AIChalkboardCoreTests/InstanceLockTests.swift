@@ -66,4 +66,24 @@ final class InstanceLockTests: XCTestCase {
             XCTAssertEqual(failOpenPrimary.revalidatePrimaryLock(), .retainPrimary)
         }
     }
+
+    func testSymlinkLockPathCannotLockItsTarget() throws {
+        try withTemporaryLockFile { lockURL in
+            let targetURL = lockURL.deletingLastPathComponent().appendingPathComponent("unrelated.lock")
+            try Data().write(to: targetURL)
+            try FileManager.default.createSymbolicLink(
+                atPath: lockURL.path,
+                withDestinationPath: targetURL.path
+            )
+
+            // The unsafe path still follows acquire()'s documented fail-open
+            // policy, but it must not acquire an advisory lock on the symlink
+            // target. A normal lock on that target must remain available.
+            let unsafePath = InstanceLock(lockURL: lockURL)
+            XCTAssertTrue(unsafePath.acquire())
+
+            let targetLock = InstanceLock(lockURL: targetURL)
+            XCTAssertTrue(targetLock.acquire(), "instance.lock must not follow and lock an unrelated symlink target")
+        }
+    }
 }

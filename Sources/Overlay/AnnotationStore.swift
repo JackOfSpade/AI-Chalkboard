@@ -162,11 +162,40 @@ public final class AnnotationStore: @unchecked Sendable {
     /// the wall-clock fallback in `hasExpired` decides instead of a NaN
     /// comparison that is false in both directions.
     private static func stampMonotonicDeadline(on annotation: inout Annotation) {
-        guard annotation.expiresAtUptime == nil, let wallDeadline = annotation.expiresAt else { return }
+        // `Annotation` is public/decodable, so an in-process caller can seed
+        // this process-local field with NaN or infinity. Those are not valid
+        // monotonic deadlines; replace them from the wall-clock deadline just
+        // like an absent value rather than letting an invalid value disable
+        // expiry for the life of the annotation.
+        guard annotation.expiresAtUptime?.isFinite != true,
+              let wallDeadline = annotation.expiresAt else { return }
         let remaining = max(0, wallDeadline.timeIntervalSinceNow)
         if remaining.isFinite {
-            annotation.expiresAtUptime = ProcessInfo.processInfo.systemUptime + remaining
+            let deadline = ProcessInfo.processInfo.systemUptime + remaining
+            annotation.expiresAtUptime = deadline.isFinite ? deadline : nil
         }
+    }
+
+    /// Rebuilds a public `Annotation` with the store-selected identity. The
+    /// model deliberately makes `id` immutable, so keeping an update's target
+    /// id requires an explicit copy rather than a post-hoc assignment.
+    private static func preservingIdentity(_ annotation: Annotation, id: String) -> Annotation {
+        Annotation(
+            id: id,
+            screenId: annotation.screenId,
+            kind: annotation.kind,
+            colorHex: annotation.colorHex,
+            label: annotation.label,
+            appId: annotation.appId,
+            appName: annotation.appName,
+            expiresAt: annotation.expiresAt,
+            opacity: annotation.opacity,
+            offsetX: annotation.offsetX,
+            offsetY: annotation.offsetY,
+            zIndex: annotation.zIndex,
+            revision: annotation.revision,
+            createdAt: annotation.createdAt
+        )
     }
 
     /// Appends `annotation`, evicting the oldest stored annotations first if
@@ -338,14 +367,21 @@ public final class AnnotationStore: @unchecked Sendable {
                 return (nil, expired, nil, true)
             }
             let old = annotations[index]
-            // O(1): subtract `old`'s usage and add `replacement`'s, instead of
-            // re-walking the whole store. A rejection below must leave the
+            var storedReplacement = Self.preservingIdentity(replacement, id: id)
+            // O(1): subtract `old`'s usage and add the normalized replacement's
+            // instead of re-walking the whole store. A rejection below must leave the
             // real running total untouched, so this is a projection only.
-            let candidateUsage = usageAfter(removing: [old], adding: [replacement])
+            let candidateUsage = usageAfter(removing: [old], adding: [storedReplacement])
             if let rejection = resourceLimit(for: candidateUsage) {
                 return (nil, expired, rejection, false)
             }
-            var storedReplacement = replacement
+            // The `id` argument selects the existing annotation. A
+            // replacement is a new rendering payload for that stable object,
+            // not an opportunity to change its identity: accepting a different
+            // `replacement.id` made a successful update orphan the id the
+            // caller was just told had been updated. Normalizing before the
+            // budget projection also prevents an unretained replacement id
+            // from incorrectly consuming payload budget.
             // Carry the monotonic deadline across the replacement.  Without
             // this, an updated timed annotation lost `expiresAtUptime`
             // entirely and silently reverted to deciding liveness on the WALL

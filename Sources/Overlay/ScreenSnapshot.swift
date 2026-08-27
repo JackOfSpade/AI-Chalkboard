@@ -81,8 +81,11 @@ public struct ScreenSnapshot {
     public let screens: [ScreenInfo]
 
     /// Resolves a caller-supplied `screen_id` against THIS snapshot.
-    /// Returns nil only when the snapshot contains no screens at all.
-    /// Order: exact id match -> in-bounds integer index -> main screen -> first screen.
+    /// Returns nil when there are no screens or an explicit id/index does not
+    /// resolve against this snapshot.
+    /// Order: omitted/blank -> main screen, otherwise exact id match ->
+    /// in-bounds integer index. An explicit unknown id returns nil rather than
+    /// silently drawing on a different display.
     ///
     /// WHY THE EXACT ID GOES FIRST: `getScreenId` reports a display's real
     /// `CGDirectDisplayID`, and nothing stops that id from being a small
@@ -110,8 +113,11 @@ public struct ScreenSnapshot {
             return screens[idx]
         }
 
-        // Unrecognized id: default to the main screen.
-        return screens.first(where: { $0.isMain }) ?? screens.first
+        // An explicit id is a placement constraint, not a hint. Falling back
+        // here made a stale/typoed display id report success while drawing on
+        // the main display, which is substantially worse than a retryable
+        // error from the draw call.
+        return nil
     }
 }
 

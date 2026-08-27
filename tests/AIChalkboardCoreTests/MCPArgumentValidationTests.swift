@@ -209,7 +209,50 @@ final class MCPArgumentValidationTests: XCTestCase {
         case .success:
             XCTFail("A subnormal screenshot width must not create an infinite scale.")
         case .failure(let message):
-            XCTAssertTrue(message.contains("invalid coordinate transform"))
+            XCTAssertTrue(message.contains("integer pixel count"))
+        }
+    }
+
+    func testScreenshotPixelsRejectFractionalDimensions() {
+        let request = DrawRequest(screen: testScreen())
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": 2048.5,
+            "screenshot_height": 1330
+        ]) {
+        case .success:
+            XCTFail("Pixel dimensions must be integers")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("positive integer pixel count"))
+        }
+    }
+
+    func testScreenshotPixelsAcceptUniformFullDisplayDownsamplingWithRounding() {
+        let request = DrawRequest(screen: testScreen())
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": 2048,
+            "screenshot_height": 1330
+        ]) {
+        case .failure(let message):
+            XCTFail("A uniformly downsampled full-display image should map safely: \(message)")
+        case .success(let transform):
+            XCTAssertEqual(transform.scaleX, 3_024.0 / 2_048.0, accuracy: 1e-12)
+            XCTAssertEqual(transform.scaleY, 1_964.0 / 1_330.0, accuracy: 1e-12)
+        }
+    }
+
+    func testScreenshotPixelsRejectFusionPanelCropInsteadOfStretchingIt() {
+        let request = DrawRequest(screen: testScreen())
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": 2600,
+            "screenshot_height": 490
+        ]) {
+        case .success:
+            XCTFail("A narrow panel crop must not be stretched across the full display")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("cropped or window-only"))
         }
     }
 

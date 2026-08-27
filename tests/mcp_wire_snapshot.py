@@ -85,6 +85,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import math
 import re
 import shutil
 import sys
@@ -333,6 +334,8 @@ def run_capture(binary_path: str, out_path: Path, timeout: float = DEFAULT_TIMEO
     """Launches `binary_path --mcp`, sends every request in
     `_TOP_LEVEL_REQUESTS` + `_TOOL_CALLS` in order, and writes the
     canonicalised result to `out_path`."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise CaptureValidationError("--timeout must be a finite number greater than zero")
     # `spawn_mcp_child` starts a `StderrDrain` (test_mcp_stdio.py) on the
     # child immediately, before any request is sent, and nothing else reads
     # that pipe until the child exits. `MCPServer.handleToolsCall` logs one
@@ -385,10 +388,15 @@ def run_capture(binary_path: str, out_path: Path, timeout: float = DEFAULT_TIMEO
         raise
     finally:
         stdio_harness.terminate_child(proc)
+        # Always join the drain once its child has been reaped. Captures can
+        # be invoked repeatedly by test code or a long-lived automation
+        # process; leaving successful captures' daemon threads to wind down
+        # on their own unnecessarily retains process/pipe objects between
+        # runs. Keep the diagnostic tail only when it is useful.
+        diagnostics = stderr_drain.join_and_get_tail(
+            timeout=stdio_harness.SHUTDOWN_TIMEOUT_SECONDS
+        ).strip()
         if failed:
-            diagnostics = stderr_drain.join_and_get_tail(
-                timeout=stdio_harness.SHUTDOWN_TIMEOUT_SECONDS
-            ).strip()
             if diagnostics:
                 print(f"\nChild stderr (last {stdio_harness.STDERR_TAIL_BYTES} bytes):\n{diagnostics}", file=sys.stderr, flush=True)
         shutil.rmtree(suspension_root, ignore_errors=True)

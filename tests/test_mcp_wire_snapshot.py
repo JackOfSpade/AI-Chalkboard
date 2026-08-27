@@ -287,6 +287,18 @@ class FixtureTableKeysAreUniqueTests(unittest.TestCase):
 
 
 class SelfCheckRejectsUnusableCapturesTests(unittest.TestCase):
+    def test_capture_rejects_invalid_timeout_before_spawning_a_child(self):
+        # Validate at the reusable run_capture boundary, not only a CLI
+        # parser, so programmatic callers cannot accidentally turn a negative
+        # timeout into a confusing immediate child-stdout failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "capture.json"
+            for timeout in (0, -1, float("nan"), float("inf")):
+                with self.subTest(timeout=timeout), self.assertRaisesRegex(
+                    snap.CaptureValidationError, "finite number greater than zero"
+                ):
+                    snap.run_capture("/definitely/not/an/executable", out, timeout=timeout)
+
     def test_empty_dict_is_rejected(self):
         with self.assertRaises(snap.CaptureValidationError):
             snap.validate_capture_shape({}, "empty.json")

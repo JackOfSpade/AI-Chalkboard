@@ -34,6 +34,7 @@ extension MCPServer {
             let payload: [String: Any] = [
                 "screens": screenArray,
                 "coordinateSpace": "AppKit backing pixels: widthPx/heightPx are NSScreen.frame point dimensions multiplied by that same screen's NSScreen.backingScaleFactor. Drawing uses this same scale source.",
+                "drawingFromScreenshot": "Use coordinate_space='screenshot_pixels' and the exact width/height of the uncropped full-display image version you measured, after any client/model resize. Detectable cropped/window aspect mismatches are rejected. A same-aspect crop cannot be distinguished from a downsampled full-display image, so preserve full-display provenance. Never send resized-image coordinates as backing_pixels.",
                 "backingScaleSource": "NSScreen.backingScaleFactor",
                 "captureVisible": captureVisible,
                 "annotationsSuspended": annotationsSuspended,

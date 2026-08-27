@@ -102,9 +102,10 @@ struct DrawRequest {
     /// a separate `getScreenInfo(id:)` lookup) was both a double main-thread
     /// cost and a TOCTOU hazard.
     ///
-    /// The only failure case is the snapshot containing NO screens at all
-    /// (`NSScreen.screens` came back empty -- e.g. during display
-    /// reconfiguration or wake). That used to be silently papered over: the
+    /// Failure means either the snapshot contains no screens at all or the
+    /// caller supplied an explicit id that is not current/in-bounds. An empty
+    /// `NSScreen.screens` can occur during display reconfiguration or wake.
+    /// That used to be silently papered over: the
     /// old `resolveScreenId` invented the synthetic id "0" while a SEPARATE,
     /// independently-empty `getScreenInfo(id:)` lookup found no dimensions
     /// and fell back to hardcoded `1920x1080` -- storing an annotation
@@ -115,9 +116,20 @@ struct DrawRequest {
         if args.keys.contains("screen_id"), !(args["screen_id"] is String) {
             return .failure("screen_id must be a string when supplied.")
         }
+        if let supplied = args["screen_id"] as? String, supplied.count > 128 {
+            return .failure("screen_id must contain at most 128 characters when supplied. Nothing was drawn; call get_screens and use a current display id or in-bounds index.")
+        }
         let snapshot = OverlayWindowController.shared.screenSnapshot()
-        guard let screen = snapshot.resolve(args["screen_id"] as? String) else {
+        guard !snapshot.screens.isEmpty else {
+            Logger.shared.log("Drawing rejected: reason=no_displays", level: "WARN")
             return .failure("No displays are currently available (NSScreen.screens returned empty -- this can happen momentarily during display reconfiguration or wake). Nothing was drawn; retry the call in a moment.")
+        }
+        guard let screen = snapshot.resolve(args["screen_id"] as? String) else {
+            Logger.shared.log(
+                "Drawing rejected: reason=unknown_screen_id availableScreenCount=\(snapshot.screens.count)",
+                level: "WARN"
+            )
+            return .failure("Unknown screen_id. Nothing was drawn; call get_screens and use a current display id or in-bounds index.")
         }
         return .success(DrawRequest(screen: screen))
     }
@@ -163,18 +175,34 @@ struct DrawRequest {
             }
             return .success(CoordinateTransform(scaleX: scaleX, scaleY: scaleY, requiresUnitInterval: true))
         case "screenshot_pixels":
-            for key in ["screenshot_width", "screenshot_height"] where MCPArgument.hasInvalidSuppliedDouble(args, key: key) {
-                return .failure("\(key) must be a finite number greater than 0 for coordinate_space='screenshot_pixels'.")
+            for key in ["screenshot_width", "screenshot_height"] where args.keys.contains(key) && MCPArgument.integer(args[key]) == nil {
+                return .failure("\(key) must be a positive integer pixel count for coordinate_space='screenshot_pixels'.")
             }
-            guard let width = MCPArgument.double(args["screenshot_width"]),
-                  let height = MCPArgument.double(args["screenshot_height"]),
-                  width > 0, height > 0 else {
-                return .failure("coordinate_space='screenshot_pixels' requires screenshot_width and screenshot_height greater than 0.")
+            guard let widthPixels = MCPArgument.integer(args["screenshot_width"]),
+                  let heightPixels = MCPArgument.integer(args["screenshot_height"]),
+                  widthPixels > 0, heightPixels > 0 else {
+                return .failure("coordinate_space='screenshot_pixels' requires positive integer screenshot_width and screenshot_height pixel counts.")
             }
+            let width = Double(widthPixels)
+            let height = Double(heightPixels)
             let scaleX = Double(screen.widthPx) / width
             let scaleY = Double(screen.heightPx) / height
             guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0 else {
                 return .failure("screenshot_width and screenshot_height produce an invalid coordinate transform; use finite dimensions that do not overflow the selected display scale.")
+            }
+            guard ScreenshotGeometry.fullDisplayScale(
+                screenshotWidth: width,
+                screenshotHeight: height,
+                screenWidth: Double(screen.widthPx),
+                screenHeight: Double(screen.heightPx)
+            ) != nil else {
+                let sourceScaleX = width / Double(screen.widthPx)
+                let sourceScaleY = height / Double(screen.heightPx)
+                Logger.shared.log(
+                    "Drawing rejected: reason=unsafe_screenshot_mapping sourceWidth=\(widthPixels) sourceHeight=\(heightPixels) targetScreenId=\(screen.id) targetWidth=\(screen.widthPx) targetHeight=\(screen.heightPx) sourceScaleX=\(sourceScaleX) sourceScaleY=\(sourceScaleY)",
+                    level: "WARN"
+                )
+                return .failure("Unsafe screenshot mapping rejected: source=\(width)x\(height) px, targetScreenId=\(screen.id), target=\(screen.widthPx)x\(screen.heightPx) backing px, sourceToTargetScales=\(sourceScaleX)x\(sourceScaleY). The dimensions do not match within pixel-rounding tolerance. screenshot_pixels requires the exact dimensions of the uncropped full-display image used to measure coordinates; cropped or window-only screenshots cannot be mapped safely.")
             }
             return .success(CoordinateTransform(scaleX: scaleX, scaleY: scaleY))
         default:

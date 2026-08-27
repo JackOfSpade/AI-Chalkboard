@@ -48,8 +48,21 @@ public final class Logger: @unchecked Sendable {
     // synchronous block with no dispatch inside it -- see the call sites.
     private static let stderrLock = NSLock()
 
-    // Capped at 5 MB max per log file (total max disk space: 10 MB with 1 backup)
+    // Rotates at 5 MB per file (roughly 10 MB total with one backup, plus at
+    // most the bounded record that crosses the threshold).
     private let maxFileSizeBytes: UInt64 = 5 * 1024 * 1024
+
+    /// A single caller must not consume the whole retained history or make the
+    /// synchronous stderr write arbitrarily large. The file cap controls total
+    /// retention; this independent cap controls each message payload. The
+    /// timestamp/PID/level framing adds a small fixed number of bytes.
+    static let maxMessageBytes = 16 * 1024
+
+    /// When an over-cap file cannot be rotated, stop appending to that file
+    /// until a later rotation attempt succeeds. stderr logging continues. This
+    /// keeps growth bounded near the nominal 10 MB retention budget even
+    /// when rename/removal permissions are broken for an extended period.
+    private var suppressFileWritesUntilRotationSucceeds = false
 
     // BUG FIX (failed rotation retried forever): tracks when a rotation
     // attempt last failed (e.g. permission denied, stale backup couldn't be
@@ -93,7 +106,7 @@ public final class Logger: @unchecked Sendable {
         log("==================================================")
         log("AI Chalkboard Logger Initialized (PID: \(ProcessInfo.processInfo.processIdentifier))")
         log("Log File: \(logFileURL.path)")
-        log("Log Max Size Cap: 5 MB (Auto-rotating)")
+        log("Log Retention: rotates at 5 MB, keeps one backup, caps messages at 16 KiB, and pauses file writes if rotation fails")
         log("==================================================")
     }
 
@@ -184,7 +197,7 @@ public final class Logger: @unchecked Sendable {
         Logger.stderrLock.lock()
         let timestamp = dateFormatter.string(from: Date())
         let pid = ProcessInfo.processInfo.processIdentifier
-        let line = "[\(timestamp)] [PID: \(pid)] [\(level)] \(message)\n"
+        let line = "[\(timestamp)] [PID: \(pid)] [\(level)] \(Self.boundedMessage(message))\n"
         let data = Logger.writeStderr(line)
         Logger.stderrLock.unlock()
         guard let data = data else { return }
@@ -205,7 +218,8 @@ public final class Logger: @unchecked Sendable {
     // Objective-C exception on failure (e.g. EPIPE), which would terminate
     // this process outright.
     private func writeToFile(_ data: Data) {
-        guard let handle = fileHandle else { return }
+        guard !suppressFileWritesUntilRotationSucceeds,
+              let handle = fileHandle else { return }
         do {
             try handle.write(contentsOf: data)
             // BUG FIX (fsync on every line is ~8x slower and unnecessary):
@@ -311,8 +325,17 @@ public final class Logger: @unchecked Sendable {
     // number to hand over, so we stat the path ourselves.
     private func rotateIfNeeded(currentSize: UInt64?) {
         guard fileHandle != nil else { return }
-        guard let currentSize = currentSize ?? Logger.fileSize(atPath: logFileURL.path),
-              currentSize >= maxFileSizeBytes else { return }
+        guard let currentSize = currentSize ?? Logger.fileSize(atPath: logFileURL.path) else {
+            // If the live path cannot be measured, continuing to append would
+            // make the retention limit unknowable. Keep stderr diagnostics and
+            // retry the file path on a later record.
+            suppressFileWritesUntilRotationSucceeds = true
+            return
+        }
+        guard currentSize >= maxFileSizeBytes else {
+            suppressFileWritesUntilRotationSucceeds = false
+            return
+        }
 
         // BUG FIX (permanent silent rotation failure spins forever): if a
         // previous attempt failed (e.g. the log directory lost write
@@ -325,6 +348,7 @@ public final class Logger: @unchecked Sendable {
         // without outside intervention (e.g. a human fixing permissions).
         if let lastFailure = lastRotationFailure,
            Date().timeIntervalSince(lastFailure) < rotationFailureCooldown {
+            suppressFileWritesUntilRotationSucceeds = true
             return
         }
 
@@ -333,6 +357,7 @@ public final class Logger: @unchecked Sendable {
             // Can't coordinate rotation right now; skip rotating this round
             // rather than risk racing another process. We'll reassess on the
             // next log() call.
+            suppressFileWritesUntilRotationSucceeds = true
             return
         }
         defer { close(lockFd) }
@@ -353,6 +378,7 @@ public final class Logger: @unchecked Sendable {
         // file via the inode self-heal -- or it eventually releases the
         // lock and a later line retries successfully.
         guard flock(lockFd, LOCK_EX | LOCK_NB) == 0 else {
+            suppressFileWritesUntilRotationSucceeds = true
             return
         }
         defer { flock(lockFd, LOCK_UN) }
@@ -367,6 +393,7 @@ public final class Logger: @unchecked Sendable {
             // Someone else already rotated (or the file otherwise shrank);
             // make sure our handle still points at the live file and bail.
             reopenIfRotatedAwayFromUnderUs()
+            suppressFileWritesUntilRotationSucceeds = false
             return
         }
 
@@ -391,6 +418,7 @@ public final class Logger: @unchecked Sendable {
             try fm.moveItem(at: logFileURL, to: backupFileURL)
         } catch {
             lastRotationFailure = Date()
+            suppressFileWritesUntilRotationSucceeds = true
             // Report directly to stderr, never via log(): we're running
             // inside `queue` right now, and log() would queue.async back
             // onto this same serial queue -- at best a pointless bounce,
@@ -404,11 +432,9 @@ public final class Logger: @unchecked Sendable {
             Logger.stderrLock.lock()
             Logger.writeStderr(msg)
             Logger.stderrLock.unlock()
-            // Degraded but alive, never dead: fileHandle is untouched and
-            // still open on the existing (oversized) file, so logging
-            // continues uninterrupted -- just without the size cap enforced
-            // until the underlying problem clears and a later attempt (at
-            // least rotationFailureCooldown seconds from now) succeeds.
+            // The handle remains available for a later retry, but routine file
+            // writes are suppressed meanwhile so this oversized file cannot
+            // grow without bound. stderr remains live for every log record.
             return
         }
 
@@ -419,6 +445,7 @@ public final class Logger: @unchecked Sendable {
         try? fileHandle?.close()
         fileHandle = Logger.openAppendHandle(at: logFileURL)
         lastRotationFailure = nil
+        suppressFileWritesUntilRotationSucceeds = false
 
         if let newHandle = fileHandle {
             let rotationMsg = "[\(dateFormatter.string(from: Date()))] [PID: \(ProcessInfo.processInfo.processIdentifier)] [INFO] Log file rotated: 5 MB limit reached. Oldest logs moved to ai_chalkboard.1.log\n"
@@ -458,7 +485,7 @@ public final class Logger: @unchecked Sendable {
         Logger.stderrLock.lock()
         let timestamp = dateFormatter.string(from: Date())
         let pid = ProcessInfo.processInfo.processIdentifier
-        let line = "[\(timestamp)] [PID: \(pid)] [\(level)] \(message)\n"
+        let line = "[\(timestamp)] [PID: \(pid)] [\(level)] \(Self.boundedMessage(message))\n"
         let data = Logger.writeStderr(line)
         Logger.stderrLock.unlock()
         guard let data = data else { return }
@@ -480,5 +507,24 @@ public final class Logger: @unchecked Sendable {
         var s = stat()
         guard stat(path, &s) == 0 else { return nil }
         return UInt64(s.st_size)
+    }
+
+    /// Returns a valid-Unicode diagnostic message within `maxMessageBytes`.
+    /// Internal so the byte-boundary behavior can be tested without opening a
+    /// real log file in the user's Library directory.
+    static func boundedMessage(_ message: String) -> String {
+        guard message.utf8.count > maxMessageBytes else { return message }
+        let suffix = "... <truncated to \(maxMessageBytes) bytes>"
+        let prefixBudget = max(0, maxMessageBytes - suffix.utf8.count)
+        var used = 0
+        var end = message.startIndex
+        while end < message.endIndex {
+            let next = message.index(after: end)
+            let count = message[end..<next].utf8.count
+            guard used + count <= prefixBudget else { break }
+            used += count
+            end = next
+        }
+        return String(message[..<end]) + suffix
     }
 }

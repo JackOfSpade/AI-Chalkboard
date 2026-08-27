@@ -100,6 +100,17 @@ final class AnnotationStoreTests: XCTestCase {
         XCTAssertLessThanOrEqual(expiry, Date().addingTimeInterval(10.5))
     }
 
+    func testStoreReplacesAnInvalidSuppliedMonotonicDeadline() throws {
+        let store = AnnotationStore()
+        var expiring = annotation(id: "invalid-monotonic-deadline", appId: nil)
+        expiring.expiresAt = Date().addingTimeInterval(60)
+        expiring.expiresAtUptime = .nan
+
+        store.add(expiring)
+
+        XCTAssertTrue(try XCTUnwrap(store.get(id: expiring.id)?.expiresAtUptime).isFinite)
+    }
+
     func testExplicitExpiryTakesPrecedenceOverDurationArgument() throws {
         let store = AnnotationStore()
         let explicitExpiry = Date().addingTimeInterval(30)
@@ -245,6 +256,24 @@ final class AnnotationStoreTests: XCTestCase {
         XCTAssertEqual(retained.offsetX, 10)
         XCTAssertEqual(retained.opacity, 0.8)
         XCTAssertGreaterThan(retained.revision, staleSnapshot.revision)
+    }
+
+    func testUpdatePreservesTheSelectedAnnotationIdentity() throws {
+        let store = AnnotationStore()
+        let initial = annotation(id: "stable-id", appId: nil)
+        store.add(initial)
+
+        let replacement = Annotation(
+            id: "unexpected-replacement-id",
+            screenId: initial.screenId,
+            kind: .text(text: "updated", x: 0, y: 0, fontSize: 12,
+                        textColorHex: "#FFFFFF", backgroundColorHex: nil,
+                        backgroundOpacity: 0, paddingPx: 0, opacity: 1)
+        )
+
+        XCTAssertEqual(store.updateWithOutcome(id: initial.id, with: replacement), .updated)
+        XCTAssertEqual(try XCTUnwrap(store.get(id: initial.id)).kind.typeName, "text")
+        XCTAssertNil(store.get(id: replacement.id))
     }
 
     func testAggregatePayloadBudgetRejectsWithoutEvictingOrInserting() {

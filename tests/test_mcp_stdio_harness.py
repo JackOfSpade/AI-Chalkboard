@@ -71,6 +71,57 @@ class MCPLineReaderTests(unittest.TestCase):
         finally:
             self.stop_child(proc)
 
+    def test_newline_free_stdout_flood_fails_at_the_transport_size_limit(self):
+        # Use a small injected cap so this regression test stays fast while
+        # exercising the same branch the 8 MiB production cap uses.
+        proc = self.start_child("import os, time; os.write(1, b'x' * 16); time.sleep(2)")
+        try:
+            reader = harness.MCPLineReader(proc, max_response_bytes=16)
+            with self.assertRaisesRegex(RuntimeError, "transport limit without a newline"):
+                reader.read_line("tools/list", 0.5)
+        finally:
+            self.stop_child(proc)
+
+    def test_response_at_the_inclusive_transport_limit_is_accepted(self):
+        # The server's budget includes the newline framing byte, so 15 bytes
+        # of JSON-ish payload plus '\\n' is valid under a 16-byte cap.
+        proc = self.start_child("import os, time; os.write(1, b'123456789012345\\n'); time.sleep(2)")
+        try:
+            reader = harness.MCPLineReader(proc, max_response_bytes=16)
+            self.assertEqual(reader.read_line("tools/list", 0.5), "123456789012345")
+        finally:
+            self.stop_child(proc)
+
+    def test_oversized_buffered_tail_is_rejected_before_the_first_response_is_returned(self):
+        # A response can be followed by the start of another stdout line in
+        # the same OS read. The first response must not make the harness send
+        # a new request if the tail has already violated the transport cap.
+        proc = self.start_child(
+            "import os, time; os.write(1, b'{\"id\":1}\\n' + b'x' * 16); time.sleep(2)"
+        )
+        try:
+            reader = harness.MCPLineReader(proc, max_response_bytes=16)
+            with self.assertRaisesRegex(RuntimeError, "transport limit without a newline"):
+                reader.read_line("tools/list", 0.5)
+        finally:
+            self.stop_child(proc)
+
+    def test_nonpositive_response_size_limit_is_rejected_at_construction(self):
+        proc = self.start_child("import time; time.sleep(2)")
+        try:
+            with self.assertRaisesRegex(ValueError, "greater than zero"):
+                harness.MCPLineReader(proc, max_response_bytes=0)
+        finally:
+            self.stop_child(proc)
+
+
+class MCPHarnessHelperTests(unittest.TestCase):
+    def test_nonfinite_cli_timeout_is_rejected(self):
+        with mock.patch.object(sys, "argv", ["test_mcp_stdio.py", "--timeout", "nan"]):
+            with self.assertRaises(SystemExit) as raised:
+                harness.parse_args()
+        self.assertNotEqual(raised.exception.code, 0)
+
     def test_resume_cleanup_retries_timeout_and_error_result(self):
         successful_response = {"result": {"content": []}}
         with mock.patch.object(

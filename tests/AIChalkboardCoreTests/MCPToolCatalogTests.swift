@@ -36,6 +36,7 @@ final class MCPToolCatalogTests: XCTestCase {
             XCTAssertEqual((props["app"] as? [String: Any])?["type"] as? String, "string")
             XCTAssertEqual((props["duration_seconds"] as? [String: Any])?["type"] as? String, "number")
             XCTAssertEqual((props["duration_seconds"] as? [String: Any])?["maximum"] as? Double, DrawingDefaults.maxAnnotationDurationSeconds)
+            XCTAssertEqual((props["screen_id"] as? [String: Any])?["maxLength"] as? Int, 128)
         }
     }
 
@@ -90,11 +91,18 @@ final class MCPToolCatalogTests: XCTestCase {
         let text = properties(try XCTUnwrap(toolsByName["draw_text"]))
         XCTAssertEqual((text["font_size"] as? [String: Any])?["exclusiveMinimum"] as? Int, 0)
         XCTAssertEqual((text["coordinate_space"] as? [String: Any])?["enum"] as? [String], ["backing_pixels", "normalized", "screenshot_pixels"])
+        XCTAssertEqual((text["screenshot_width"] as? [String: Any])?["type"] as? String, "integer")
+        XCTAssertEqual((text["screenshot_width"] as? [String: Any])?["minimum"] as? Int, 1)
+        XCTAssertEqual((text["screenshot_height"] as? [String: Any])?["type"] as? String, "integer")
+        XCTAssertEqual((text["screenshot_height"] as? [String: Any])?["minimum"] as? Int, 1)
         // The catalog's advertised cap must match what MCPToolHandlers
         // actually enforces for draw_text's `text` (DrawingDefaults.maxTextCharacters),
         // so a caller never discovers the real limit only via a rejection.
         XCTAssertEqual((text["text"] as? [String: Any])?["maxLength"] as? Int, DrawingDefaults.maxTextCharacters)
         XCTAssertEqual((properties(try XCTUnwrap(toolsByName["update_annotation"]))["offset_x"] as? [String: Any])?["type"] as? String, "number")
+        let coordinateDescription = (text["coordinate_space"] as? [String: Any])?["description"] as? String ?? ""
+        XCTAssertTrue(coordinateDescription.contains("exact dimensions"))
+        XCTAssertTrue(coordinateDescription.contains("uncropped full-display"))
     }
 
     func testClearAndVerificationSchemasRemainExact() throws {

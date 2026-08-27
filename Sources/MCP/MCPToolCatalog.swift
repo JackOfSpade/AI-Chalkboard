@@ -8,12 +8,12 @@ enum MCPToolCatalog {
     static let appParamDescription = "Optional app to LINK this drawing to: bundle id or display name. It is visible only while that app is frontmost. If omitted, the previous non-Claude app is used. Pass an empty string for GLOBAL visibility."
 
     private static let sharedDrawProperties: [String: Any] = [
-        "screen_id": ["type": "string", "description": "Screen ID/index from get_screens; defaults to main."],
+        "screen_id": ["type": "string", "maxLength": 128, "description": "Current screen ID/index from get_screens; omitted/blank defaults to main, while an unknown explicit value is rejected instead of falling back to another display."],
         "app": ["type": "string", "description": appParamDescription],
         "duration_seconds": ["type": "number", "exclusiveMinimum": 0, "maximum": DrawingDefaults.maxAnnotationDurationSeconds, "description": "Optional lifetime up to \(Int(DrawingDefaults.maxAnnotationDurationSeconds)) seconds; omit to persist until clear/eviction."],
-        "coordinate_space": ["type": "string", "enum": ["backing_pixels", "normalized", "screenshot_pixels"], "description": "Position/geometry space; backing_pixels is the default, normalized is 0...1 of the selected display, and screenshot_pixels requires screenshot_width and screenshot_height. Style dimensions stay in backing pixels."],
-        "screenshot_width": ["type": "number", "exclusiveMinimum": 0, "description": "Source full-display screenshot width when coordinate_space=screenshot_pixels."],
-        "screenshot_height": ["type": "number", "exclusiveMinimum": 0, "description": "Source full-display screenshot height when coordinate_space=screenshot_pixels."],
+        "coordinate_space": ["type": "string", "enum": ["backing_pixels", "normalized", "screenshot_pixels"], "description": "Position/geometry space. When coordinates were measured from a screenshot, use screenshot_pixels with the exact dimensions of that same image version (after any model/client resize). It must be an uncropped full-display image; a detectable crop/window aspect mismatch is rejected because it has no safe display origin. A same-aspect crop is inherently indistinguishable from a downsampled full-display image, so callers remain responsible for full-display provenance. backing_pixels is the default, normalized is 0...1 of the selected display. Style dimensions stay in backing pixels."],
+        "screenshot_width": ["type": "integer", "minimum": 1, "description": "Exact integer pixel width of the uncropped full-display image version used to measure coordinates when coordinate_space=screenshot_pixels; do not use its pre-resize/original width if the measured image was resized."],
+        "screenshot_height": ["type": "integer", "minimum": 1, "description": "Exact integer pixel height of the uncropped full-display image version used to measure coordinates when coordinate_space=screenshot_pixels; do not use its pre-resize/original height if the measured image was resized."],
         "z_index": ["type": "integer", "description": "Paint order; higher values appear above lower values. Default 0; equal values retain creation order."]
     ]
 
@@ -59,7 +59,7 @@ enum MCPToolCatalog {
     static let tools: [[String: Any]] = [
         [
             "name": "get_screens",
-            "description": "Returns displays in the exact backing-pixel coordinate space used by free-draw, plus backing scale and capture-debug state. A screenshot may be independently downsampled; compare its dimensions with widthPx/heightPx.",
+            "description": "Returns current display IDs and exact backing-pixel geometry. Call before drawing. If measuring from an uncropped full-display screenshot, use coordinate_space=screenshot_pixels with that exact measured image version's dimensions; do not copy resized-image coordinates into backing_pixels.",
             "inputSchema": ["type": "object", "properties": [:]]
         ],
         [

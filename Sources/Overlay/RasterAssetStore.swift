@@ -24,7 +24,22 @@ public struct RasterAssetHandle: Equatable, Sendable {
     /// accounting site -- the store's aggregate budget and `draw_batch`'s
     /// per-batch budget -- must measure the SAME thing, so the formula lives
     /// here once instead of being open-coded at each of them.
-    public var decodedByteCount: UInt64 { UInt64(widthPx) * UInt64(heightPx) * 4 }
+    public var decodedByteCount: UInt64 {
+        // `RasterAssetHandle` is public, so callers can construct one without
+        // first passing through `RasterAssetStore.decode(path:)`.  Converting a
+        // negative `Int` to `UInt64` traps, and multiplying extreme (but valid
+        // `Int`) dimensions can overflow too.  Treat invalid dimensions as
+        // zero bytes and saturate impossible image sizes: the store validates
+        // real decoded dimensions before it creates a handle, while this API
+        // remains safe for diagnostics and direct callers.
+        guard widthPx > 0, heightPx > 0 else { return 0 }
+        let width = UInt64(widthPx)
+        let height = UInt64(heightPx)
+        let (pixelCount, pixelOverflow) = width.multipliedReportingOverflow(by: height)
+        guard !pixelOverflow else { return .max }
+        let (byteCount, byteOverflow) = pixelCount.multipliedReportingOverflow(by: 4)
+        return byteOverflow ? .max : byteCount
+    }
 }
 
 public enum RasterAssetStoreError: LocalizedError, Equatable {

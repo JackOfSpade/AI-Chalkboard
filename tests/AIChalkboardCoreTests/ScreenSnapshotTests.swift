@@ -2,8 +2,8 @@ import XCTest
 @testable import AIChalkboardCore
 
 /// `ScreenSnapshot.resolve(_:)` had no coverage at all until the exact-id
-/// precedence bug below was found by inspection. Its resolution order (exact
-/// id -> in-bounds positional index -> main screen -> first screen) is a
+/// precedence bug below was found by inspection. Its resolution order (blank
+/// -> main/first, otherwise exact id -> in-bounds positional index -> nil) is a
 /// contract callers depend on -- `get_screens` hands out ids and every
 /// subsequent `draw_*` call passes one back -- so each step gets a test that
 /// can only pass if that step ran, rather than one that a later fallback
@@ -83,17 +83,16 @@ final class ScreenSnapshotTests: XCTestCase {
         XCTAssertEqual(resolved?.isMain, false)
     }
 
-    /// A number that is neither an id nor a valid position is not silently
-    /// clamped onto an edge screen; it takes the same fallback as any other
-    /// unrecognised id.
-    func testOutOfBoundsNumericIdFallsBackToTheMainScreen() {
+    /// A number that is neither an id nor a valid position must fail rather
+    /// than silently move the drawing to another display.
+    func testOutOfBoundsNumericIdIsRejected() {
         let snapshot = ScreenSnapshot(screens: [
             screen(id: "1", index: 0, isMain: false),
             screen(id: "77", index: 1, isMain: true),
         ])
 
-        XCTAssertEqual(snapshot.resolve("2")?.id, "77")
-        XCTAssertEqual(snapshot.resolve("-1")?.id, "77")
+        XCTAssertNil(snapshot.resolve("2"))
+        XCTAssertNil(snapshot.resolve("-1"))
     }
 
     /// No id supplied at all -- including a string that is only whitespace,
@@ -124,14 +123,14 @@ final class ScreenSnapshotTests: XCTestCase {
         XCTAssertEqual(snapshot.resolve(nil)?.id, "1")
     }
 
-    func testUnrecognizedNonNumericIdFallsBackToTheMainScreen() {
+    func testUnrecognizedNonNumericIdIsRejected() {
         let snapshot = ScreenSnapshot(screens: [
             screen(id: "1", index: 0, isMain: false),
             screen(id: "77", index: 1, isMain: true),
         ])
 
-        XCTAssertEqual(snapshot.resolve("not-a-display")?.id, "77")
-        XCTAssertEqual(snapshot.resolve("77x")?.id, "77")
+        XCTAssertNil(snapshot.resolve("not-a-display"))
+        XCTAssertNil(snapshot.resolve("77x"))
     }
 
     /// The one documented nil case. `NSScreen.screens` really can be

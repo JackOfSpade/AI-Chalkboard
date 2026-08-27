@@ -184,6 +184,16 @@ final class AnnotationVerificationCompositorTests: XCTestCase {
         }
     }
 
+    func testSmallButMaterialScaleMismatchIsRejected() throws {
+        // 198x100 is a 1% discrepancy. The old fixed 2% tolerance and the
+        // first over-broad rounding formula both accepted it, but no uniform
+        // scale rounded to nearest pixels can produce it from 200x100.
+        let source = try png(width: 198, height: 100)
+        XCTAssertThrowsError(try AnnotationVerificationCompositor.composite(annotation: annotation(pathKind()), screen: screen(), screenshotPath: source.path)) { error in
+            guard case AnnotationVerificationError.aspectRatioMismatch = error else { return XCTFail("unexpected error: \(error)") }
+        }
+    }
+
     func testRelativeScreenshotPathIsRejected() {
         XCTAssertThrowsError(try AnnotationVerificationCompositor.composite(annotation: annotation(pathKind()), screen: screen(), screenshotPath: "relative.png")) { error in
             guard case AnnotationVerificationError.invalidPath = error else { return XCTFail("unexpected error: \(error)") }

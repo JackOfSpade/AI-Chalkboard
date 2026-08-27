@@ -168,14 +168,28 @@ public struct Annotation: Identifiable, Codable {
     /// `expiresAt.map { $0 <= now } ?? false` in sixteen places, which is how
     /// the clock-source inconsistency went unnoticed.
     public func hasExpired(now: Date, uptime: Double) -> Bool {
-        if let deadline = expiresAtUptime { return deadline <= uptime }
+        // `expiresAtUptime` is process-local state and is deliberately not
+        // serialized, but it is still publicly mutable for the store. Do not
+        // let a malformed in-memory value (for example `Double.nan` from an
+        // embedding caller) turn a timed annotation into one that can never
+        // expire: comparisons against NaN are always false. A valid wall-clock
+        // deadline remains the safe fallback in that case.
+        if let deadline = expiresAtUptime,
+           deadline.isFinite,
+           uptime.isFinite {
+            return deadline <= uptime
+        }
         return expiresAt.map { $0 <= now } ?? false
     }
 
     /// Seconds until this annotation expires, or nil when it persists.
     /// Monotonic when available, for the same reason as `hasExpired`.
     public func remainingSeconds(now: Date, uptime: Double) -> Double? {
-        if let deadline = expiresAtUptime { return max(0, deadline - uptime) }
+        if let deadline = expiresAtUptime,
+           deadline.isFinite,
+           uptime.isFinite {
+            return max(0, deadline - uptime)
+        }
         guard let expiresAt else { return nil }
         return max(0, expiresAt.timeIntervalSince(now))
     }

@@ -60,6 +60,33 @@ final class ScreenCaptureProviderTests: XCTestCase {
         ))
     }
 
+    func testCaptureExcludesSiblingWhoseExecutablePathDiffersOnlyByPathAlias() {
+        let own = ScreenCaptureApplicationIdentity(
+            processID: 42, bundleIdentifier: nil, executablePath: "/tmp/AIChalkboard/./bin"
+        )
+
+        XCTAssertTrue(ScreenCaptureProvider.shouldExclude(
+            ScreenCaptureApplicationIdentity(
+                processID: 99, bundleIdentifier: nil, executablePath: "/tmp/AIChalkboard/bin"
+            ), for: own
+        ))
+    }
+
+    func testCaptureExcludesSiblingWhenDevelopmentArgvZeroIsRelative() {
+        let own = ScreenCaptureApplicationIdentity(
+            processID: 42, bundleIdentifier: nil, executablePath: "./.build/debug/AIChalkboard"
+        )
+        let candidatePath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/debug/AIChalkboard")
+            .path
+
+        XCTAssertTrue(ScreenCaptureProvider.shouldExclude(
+            ScreenCaptureApplicationIdentity(
+                processID: 99, bundleIdentifier: nil, executablePath: candidatePath
+            ), for: own
+        ))
+    }
+
     func testExclusionScopeReportsEveryEnabledIdentityDimension() {
         let scope = ScreenCaptureProvider.exclusionScope(for: .init(
             processID: 42,

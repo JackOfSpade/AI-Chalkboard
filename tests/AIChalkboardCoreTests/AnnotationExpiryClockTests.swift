@@ -56,6 +56,31 @@ final class AnnotationExpiryClockTests: XCTestCase {
         XCTAssertFalse(live.hasExpired(now: Date(), uptime: uptime))
     }
 
+    func testMalformedMonotonicDeadlineFallsBackToWallClock() {
+        // The store normally stamps a finite uptime deadline, but the model is
+        // public and mutable. A NaN comparison is always false, so trusting it
+        // blindly would make an otherwise expired annotation live forever.
+        let now = Date()
+        let annotation = makeAnnotation(
+            expiresAt: now.addingTimeInterval(-1),
+            expiresAtUptime: .nan
+        )
+
+        XCTAssertTrue(annotation.hasExpired(now: now, uptime: ProcessInfo.processInfo.systemUptime))
+        XCTAssertEqual(annotation.remainingSeconds(now: now, uptime: ProcessInfo.processInfo.systemUptime), 0)
+    }
+
+    func testNonFiniteCallerUptimeFallsBackToWallClock() {
+        let now = Date()
+        let annotation = makeAnnotation(
+            expiresAt: now.addingTimeInterval(-1),
+            expiresAtUptime: ProcessInfo.processInfo.systemUptime + 60
+        )
+
+        XCTAssertTrue(annotation.hasExpired(now: now, uptime: .infinity))
+        XCTAssertEqual(annotation.remainingSeconds(now: now, uptime: .infinity), 0)
+    }
+
     func testPersistentAnnotationNeverExpires() {
         let annotation = makeAnnotation(expiresAt: nil, expiresAtUptime: nil)
         XCTAssertFalse(annotation.hasExpired(now: Date(), uptime: ProcessInfo.processInfo.systemUptime))

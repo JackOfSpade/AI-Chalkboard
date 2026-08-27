@@ -77,8 +77,6 @@ enum AnnotationVerificationCompositor {
     /// transport reserve.  Base64 expands every 3 bytes into 4, hence the
     /// floor-to-a-multiple-of-four calculation.
     static let maxRawPNGBytes = ((maxTransportResponseBytes - maxTransportOverheadBytes) / 4) * 3
-    static let maxRelativeScaleDifference = 0.02
-
     static func composite(
         annotation: Annotation,
         screen: ScreenInfo,
@@ -112,8 +110,12 @@ enum AnnotationVerificationCompositor {
 
         let scaleX = Double(imageWidth) / Double(screen.widthPx)
         let scaleY = Double(imageHeight) / Double(screen.heightPx)
-        let relativeDifference = abs(scaleX - scaleY) / max(scaleX, scaleY)
-        guard relativeDifference <= maxRelativeScaleDifference else {
+        guard let screenshotScale = ScreenshotGeometry.fullDisplayScale(
+            screenshotWidth: Double(imageWidth),
+            screenshotHeight: Double(imageHeight),
+            screenWidth: Double(screen.widthPx),
+            screenHeight: Double(screen.heightPx)
+        ) else {
             throw AnnotationVerificationError.aspectRatioMismatch(scaleX: scaleX, scaleY: scaleY)
         }
 
@@ -257,7 +259,8 @@ enum AnnotationVerificationCompositor {
             "backingScaleFactor": screen.backingScaleFactor,
             "screenshotPixels": ["width": imageWidth, "height": imageHeight],
             "scaleToScreenshot": ["x": scaleX, "y": scaleY],
-            "scaleDifferencePercent": relativeDifference * 100,
+            "scaleDifferencePercent": screenshotScale.relativeDifference * 100,
+            "maximumScaleDifferencePercent": screenshotScale.maximumRelativeDifference * 100,
             "paintedBoundsScreenshotPx": rectObject(
                 x: paintedTopLeft.minX,
                 y: paintedTopLeft.minY,

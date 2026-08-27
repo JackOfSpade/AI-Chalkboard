@@ -80,6 +80,17 @@ struct LineFramer {
             lines.append(lineData)
         }
 
-        return FeedResult(lines: lines, overflow: buffer.count > Self.maxBufferBytes)
+        // Treat an oversized unterminated remainder exactly like an oversized
+        // complete line above: do not let a valid-looking request that arrived
+        // earlier in the same read chunk reach the dispatcher before the
+        // fatal framing violation is observed. Without this branch,
+        // `{"method":"tools/call", ...}\n` followed by more than 4 MiB
+        // without a newline would execute the tool call and only then tear the
+        // transport down. That is surprising at best and unsafe for a chunk
+        // containing a destructive tool call.
+        guard buffer.count <= Self.maxBufferBytes else {
+            return FeedResult(lines: [], overflow: true)
+        }
+        return FeedResult(lines: lines, overflow: false)
     }
 }

@@ -3,6 +3,13 @@ import XCTest
 @testable import AIChalkboardCore
 
 final class RasterAssetStoreTests: XCTestCase {
+    func testHandleByteAccountingNeverTrapsOnInvalidOrExtremePublicDimensions() {
+        XCTAssertEqual(RasterAssetHandle(id: "negative-width", widthPx: -1, heightPx: 10).decodedByteCount, 0)
+        XCTAssertEqual(RasterAssetHandle(id: "zero-height", widthPx: 10, heightPx: 0).decodedByteCount, 0)
+        XCTAssertEqual(RasterAssetHandle(id: "normal", widthPx: 10, heightPx: 20).decodedByteCount, 800)
+        XCTAssertEqual(RasterAssetHandle(id: "extreme", widthPx: .max, heightPx: .max).decodedByteCount, .max)
+    }
+
     private func png(width: Int = 13, height: Int = 7) throws -> URL {
         let rep = try XCTUnwrap(NSBitmapImageRep(
             bitmapDataPlanes: nil,

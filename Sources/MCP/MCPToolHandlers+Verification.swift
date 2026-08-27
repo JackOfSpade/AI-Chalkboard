@@ -174,6 +174,25 @@ extension MCPServer {
             }
             sendImageResult(id: id, metadataText: metadataText, imageData: composite.pngData)
         } catch {
+            // Persist only fixed reason codes and numeric geometry. The
+            // localized error text may contain caller/UI labels or local path
+            // details and must remain in the live MCP response, not on disk.
+            if let verificationError = error as? AnnotationVerificationError {
+                switch verificationError {
+                case .aspectRatioMismatch(let scaleX, let scaleY):
+                    Logger.shared.log(
+                        "Verification rejected: reason=aspect_ratio_mismatch annotationScreenWidth=\(screen.widthPx) annotationScreenHeight=\(screen.heightPx) screenshotScaleX=\(scaleX) screenshotScaleY=\(scaleY)",
+                        level: "WARN"
+                    )
+                case .annotationPaintedNothing(let width, let height):
+                    Logger.shared.log(
+                        "Verification rejected: reason=annotation_painted_nothing screenWidth=\(width) screenHeight=\(height)",
+                        level: "WARN"
+                    )
+                default:
+                    Logger.shared.log("Verification rejected: reason=render_or_input_error", level: "WARN")
+                }
+            }
             sendErrorResult(id: id, text: error.localizedDescription)
         }
     }
