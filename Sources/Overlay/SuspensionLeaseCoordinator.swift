@@ -145,6 +145,18 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     private let lockURL: URL
     private let stateURL: URL
     private let bootSessionIdentifier: String?
+    /// The numeric (`kern.boottime`) identity of the boot `bootSessionIdentifier`
+    /// names, used only to recognise a registry written by the previous build --
+    /// see `isSameBootSession`.
+    ///
+    /// nil when the identity was SUPPLIED by a caller: an injected identity
+    /// names a boot this process cannot measure, so a stored number must not be
+    /// matched against the real machine's boot time on its behalf. That is what
+    /// makes "a registry from a genuinely different boot" expressible in a test
+    /// on a machine whose own boot time happens to sit next to the fixture.
+    // internal: SuspensionLeaseStorage.swift's readState passes this to
+    // isSameBootSession/validateState.
+    let legacyBootSeconds: Double?
     private let instanceNonce: String
     private let mutationSettleHook: (() -> Void)?
     // internal: SuspensionLeaseStorage.swift's writeState calls this
@@ -179,7 +191,13 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         }
         lockURL = self.storageDirectory.appendingPathComponent(Self.lockName)
         stateURL = self.storageDirectory.appendingPathComponent(Self.stateName)
-        self.bootSessionIdentifier = bootSessionIdentifier ?? Self.currentBootSessionIdentifier()
+        if let bootSessionIdentifier {
+            self.bootSessionIdentifier = bootSessionIdentifier
+            self.legacyBootSeconds = nil
+        } else {
+            self.bootSessionIdentifier = Self.currentBootSessionIdentifier()
+            self.legacyBootSeconds = Self.currentBootTimeSeconds()
+        }
         self.instanceNonce = instanceNonce ?? UUID().uuidString.lowercased()
         self.mutationSettleHook = mutationSettleHook
         self.storagePrecommitHook = storagePrecommitHook
@@ -463,7 +481,8 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         var state = read.state
         let now = ProcessInfo.processInfo.systemUptime
         let (value, bodyChanged) = try body(&state, now)
-        try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
+        try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier,
+                               legacyBootSeconds: legacyBootSeconds)
         if bodyChanged || read.needsRewrite {
             state.generation &+= 1
             state.lastUpdatedUptime = now
@@ -500,7 +519,8 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         var state = read.state
         let now = ProcessInfo.processInfo.systemUptime
         let pruned = Self.prune(&state, now: now)
-        try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
+        try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier,
+                               legacyBootSeconds: legacyBootSeconds)
         if pruned || read.needsRewrite {
             state.generation &+= 1
             state.lastUpdatedUptime = now
@@ -681,13 +701,15 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
 
     // internal: SuspensionLeaseStorage.swift's readState calls this after
     // decoding to fail closed on invalid/oversized state.
-    static func validateState(_ state: PersistedState, bootSessionIdentifier: String) throws {
+    static func validateState(_ state: PersistedState, bootSessionIdentifier: String,
+                              legacyBootSeconds: Double?) throws {
         guard state.schemaVersion == 4,
               // Tolerant by design -- see `isSameBootSession`. A stored identity
               // from the previous build's `kern.boottime` scheme still names
               // this boot, and rejecting it here would fail every operation
               // closed instead of letting `readState` decide.
-              isSameBootSession(stored: state.bootSessionIdentifier, current: bootSessionIdentifier),
+              isSameBootSession(stored: state.bootSessionIdentifier, current: bootSessionIdentifier,
+                                legacyBootSeconds: legacyBootSeconds),
               state.leases.count <= maximumActiveLeases,
               state.idempotencyTokens.count <= maximumActiveLeases,
               state.releasedTokens.count <= maximumTombstones,

@@ -669,6 +669,91 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         XCTAssertFalse(released.annotationsSuspended)
     }
 
+    /// The legacy identity is ADOPTED for the rest of the boot, not upgraded in
+    /// place -- a same-boot write preserves whatever identifier the file already
+    /// carries. So the number stays on disk until something genuinely replaces
+    /// the registry, and the question that matters is whether it ever leaves.
+    /// It does: the next reboot takes the replacement path, which stamps the
+    /// running process's own identity. Pins that the tolerant comparison is a
+    /// migration, not a permanent dependence on parsing numbers.
+    func testTheLegacyIdentifierIsReplacedByThisBuildsOwnIdentityAtTheNextReboot() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootHealTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stateURL = directory.appendingPathComponent("annotations-suspension-v3.json")
+
+        func storedIdentifier() throws -> String {
+            let raw = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any])
+            return try XCTUnwrap(raw["bootSessionIdentifier"] as? String)
+        }
+
+        // A registry left by the previous build, for the boot we are in.
+        let legacyIdentifier = try XCTUnwrap(SuspensionLeaseCoordinator.testOnlyLegacyBoottimeIdentifier())
+        let previousBuild = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                       bootSessionIdentifier: legacyIdentifier)
+        XCTAssertTrue(previousBuild.acquireLease(seconds: 60).success)
+        XCTAssertEqual(try storedIdentifier(), legacyIdentifier)
+
+        // This build adopts it and, because a same-boot write keeps the stored
+        // identifier, deliberately leaves the number in place.
+        let updated = SuspensionLeaseCoordinator(storageDirectory: directory)
+        XCTAssertTrue(updated.bootstrapAndReconcile().annotationsSuspended)
+        XCTAssertTrue(updated.acquireLease(seconds: 60).success)
+        XCTAssertEqual(try storedIdentifier(), legacyIdentifier,
+                       "a same-boot write must not churn the stored identity")
+
+        // A reboot replaces the registry, and the replacement carries THIS
+        // build's identity -- so the legacy number does not outlive the boot.
+        let afterReboot = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                     bootSessionIdentifier: "boot-after-restart")
+        XCTAssertFalse(afterReboot.bootstrapAndReconcile().annotationsSuspended)
+        XCTAssertTrue(afterReboot.acquireLease(seconds: 60).success)
+        XCTAssertEqual(try storedIdentifier(), "boot-after-restart",
+                       "the replacement must stamp the running process's own identity")
+    }
+
+    /// The residual worry after making the comparison tolerant: what if the
+    /// stored anchor is EVENTUALLY left behind, by drift larger than the
+    /// tolerance? That must cost exactly one replacement and then settle --
+    /// never the self-sustaining rewrite loop the tolerance exists to prevent.
+    /// Convergence is the real property; the tolerance only makes it rare.
+    func testDriftBeyondToleranceCostsOneReplacementAndThenConverges() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootConvergeTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A stored anchor far enough away that no tolerance can absorb it.
+        let stale = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                               bootSessionIdentifier: "1787827823.287935")
+        XCTAssertTrue(stale.acquireLease(seconds: 60).success)
+
+        // Two peers that agree with each other but not with the stored anchor:
+        // the shape a fleet of Chalkboard processes has after any replacement.
+        let peerA = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                               bootSessionIdentifier: "shared-identity")
+        let peerB = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                               bootSessionIdentifier: "shared-identity")
+
+        // First read replaces the registry once. Assert the replacement really
+        // happened -- without this the test can pass by never taking the path
+        // it is named after, which is exactly how its first version passed.
+        let afterReplacement = peerA.bootstrapAndReconcile()
+        XCTAssertFalse(afterReplacement.annotationsSuspended,
+                       "the stale anchor's lease must not survive the replacement")
+        XCTAssertEqual(afterReplacement.activeLeaseCount, 0)
+        let replaced = afterReplacement.generation
+        // After that, neither peer may write again: reconcile alternated
+        // between them is exactly the loop that used to run at 150 Hz.
+        for _ in 0..<12 {
+            XCTAssertEqual(peerB.reconcile().generation, replaced, "peer B is rewriting the registry")
+            XCTAssertEqual(peerA.reconcile().generation, replaced, "peer A is rewriting the registry")
+        }
+    }
+
     /// The identity itself must be stable when sampled repeatedly, which is the
     /// property the production defect violated.
     func testCurrentBootSessionIdentifierIsStableAcrossSamples() throws {

@@ -289,7 +289,8 @@ extension SuspensionLeaseCoordinator {
             // registry file about to overwrite a different one, so mint its
             // identity now rather than leaving peers unable to tell the
             // replacement apart from the state it replaced.
-            if !Self.isSameBootSession(stored: state.bootSessionIdentifier, current: bootSessionIdentifier) {
+            if !Self.isSameBootSession(stored: state.bootSessionIdentifier, current: bootSessionIdentifier,
+                                       legacyBootSeconds: legacyBootSeconds) {
                 return StateRead(state: PersistedState(bootSessionIdentifier: bootSessionIdentifier,
                                                        instanceEpoch: UUID().uuidString),
                                  needsRewrite: true)
@@ -305,7 +306,8 @@ extension SuspensionLeaseCoordinator {
                           ownerInstanceNonce: $0.ownerInstanceNonce ?? "legacy-\($0.token)",
                           expiresAtUptime: $0.expiresAtUptime, idempotencyKey: $0.idempotencyKey)
                 }
-                try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
+                try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier,
+                                       legacyBootSeconds: legacyBootSeconds)
                 return StateRead(state: state, needsRewrite: true)
             }
             // An EXISTING same-boot file whose optional `instanceEpoch`
@@ -320,10 +322,12 @@ extension SuspensionLeaseCoordinator {
             // it and mints a real UUID.
             if state.instanceEpoch == nil {
                 state.instanceEpoch = UUID().uuidString
-                try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
+                try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier,
+                                       legacyBootSeconds: legacyBootSeconds)
                 return StateRead(state: state, needsRewrite: true)
             }
-            try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
+            try Self.validateState(state, bootSessionIdentifier: bootSessionIdentifier,
+                                       legacyBootSeconds: legacyBootSeconds)
             return StateRead(state: state, needsRewrite: false)
         } catch let error as CoordinatorError { throw error
         } catch { throw CoordinatorError.malformedState }
@@ -403,27 +407,48 @@ extension SuspensionLeaseCoordinator {
     /// so no real reboot can hide inside this window.
     private static let bootSessionDriftTolerance: Double = 2.0
 
-    /// Decides whether a registry's stored boot identity names the boot this
-    /// process is running in.
+    /// Decides whether a registry's stored boot identity names the boot
+    /// `current` names.
     ///
     /// Deliberately NOT plain string equality. A registry written by a build
     /// that identified the boot by `kern.boottime` stores a number, while this
     /// build stores `kern.bootsessionuuid`; comparing those literally would
     /// make a routine app upgrade indistinguishable from a reboot and drop a
-    /// suspension lease that is still live. A stored number is therefore
-    /// compared against this boot's actual boot time, with enough tolerance to
-    /// absorb the clock-discipline drift described above.
+    /// suspension lease that is still live.
+    ///
+    /// `legacyBootSeconds` is the numeric identity of the boot `current` names,
+    /// and is nil when that cannot be known -- see the property of the same
+    /// name. It is a PARAMETER rather than a fresh `kern.boottime` reading
+    /// because reading the clock here silently ignored `current`: a stored
+    /// number was matched against the real machine's boot time even for a
+    /// coordinator that had been handed a different identity entirely. In
+    /// production both describe the same boot so the answer was right, but the
+    /// coupling made reboot behaviour untestable -- a test that injected a
+    /// post-reboot identity was told "same boot" by the live clock, and a
+    /// convergence test written against it passed without exercising the path
+    /// it named. Threading the anchor through keeps the comparison honest
+    /// about which boot it is actually reasoning over.
     // internal: SuspensionLeaseCoordinator.swift's validateState and this
     // file's readState use this instead of `==`.
-    static func isSameBootSession(stored: String, current: String) -> Bool {
+    static func isSameBootSession(stored: String, current: String,
+                                  legacyBootSeconds: Double?) -> Bool {
         if stored == current { return true }
-        guard let storedSeconds = Double(stored), storedSeconds > 0,
-              let bootSeconds = currentBootTimeSeconds() else { return false }
-        return abs(storedSeconds - bootSeconds) <= bootSessionDriftTolerance
+        guard let storedSeconds = Double(stored), storedSeconds > 0 else { return false }
+        // Both sides are boottime-derived: they can be compared directly, which
+        // is the two-old-builds case that produced the original ping-pong.
+        if let currentSeconds = Double(current), currentSeconds > 0 {
+            return abs(storedSeconds - currentSeconds) <= bootSessionDriftTolerance
+        }
+        // `current` is an opaque per-boot identity that carries no time, so only
+        // the boot we actually measured can vouch for the stored number.
+        guard let anchor = legacyBootSeconds else { return false }
+        return abs(storedSeconds - anchor) <= bootSessionDriftTolerance
     }
 
     /// `kern.boottime` as a single fractional-seconds value.
-    private static func currentBootTimeSeconds() -> Double? {
+    // internal: SuspensionLeaseCoordinator.init() captures this as the boot
+    // anchor when it derives its own identity.
+    static func currentBootTimeSeconds() -> Double? {
         var bootTime = timeval()
         var size = MemoryLayout<timeval>.size
         guard sysctlbyname("kern.boottime", &bootTime, &size, nil, 0) == 0,
