@@ -141,6 +141,15 @@ public final class Logger: @unchecked Sendable {
 
         log("==================================================")
         log("AI Chalkboard Logger Initialized (PID: \(ProcessInfo.processInfo.processIdentifier))")
+        // WHICH BUILD IS THIS? The log could not previously answer that, so
+        // confirming that a restarted process had actually picked up a new
+        // bundle meant reading the running image's inode out of `lsof` and
+        // comparing it against the file on disk. The identity was already known
+        // -- `BuildMetadata.buildIdentifier` is reported over MCP in the
+        // initialize response and in get_overlay_state -- it was just missing
+        // from the one artifact a person actually reads when diagnosing.
+        // `source` here means a bare SwiftPM binary rather than a built bundle.
+        log("Build: \(BuildMetadata.productVersion) (\(BuildMetadata.buildIdentifier)) at \(Bundle.main.executableURL?.path ?? "<unknown executable>")")
         log("Log File: \(logFileURL.path)")
         log("Log Retention: rotates at 5 MB, keeps one backup, caps messages at 16 KiB, and pauses file writes if rotation fails")
         log("==================================================")
