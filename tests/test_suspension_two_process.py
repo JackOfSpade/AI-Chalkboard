@@ -279,7 +279,6 @@ print(found ? "true" : "false")
             result = self.call(child, "draw_path", {
                 "path_data": f"M {20 + child * 30} 20 L {80 + child * 30} 80",
                 "stroke_color": "#ff9500", "app": "",
-                "duration_seconds": 45,
             }, 100 + child)
             self.assertFalse(result.get("result", {}).get("isError", False), result)
 

@@ -145,11 +145,21 @@ _TOOL_CALLS: list[tuple[str, str, dict[str, Any]]] = [
         "path_data": "M 10 10 C 20 0 30 20 40 10 Z", "stroke_color": "blue",
         "stroke_width": 4, "stroke_opacity": 0.6, "fill_color": "cyan",
         "fill_opacity": 0.2, "dash": [8, 4], "z_index": 3,
-        "app": "", "duration_seconds": 60,
+        "app": "",
     }),
     ("call_path_normalized_ok", "draw_path", {
         "path_data": "M 0.1 0.2 L 0.8 0.7", "coordinate_space": "normalized",
         "stroke_width": 4, "app": "",
+    }),
+    # `duration_seconds` is a retired parameter that is REJECTED rather than
+    # ignored, so the refusal text is part of the wire contract an agent sees.
+    # It is captured here because several entries in this list silently carried
+    # the parameter after it was retired: what were meant to be the successful
+    # draw_path/draw_text captures were really capturing this error, so the
+    # snapshot compared two error responses and the success coverage they exist
+    # to provide was gone without any test turning red.
+    ("call_path_duration_seconds_rejected", "draw_path", {
+        "path_data": "M 1 1 L 2 2", "app": "", "duration_seconds": 60,
     }),
     ("call_path_screenshot_missing_dimensions", "draw_path", {
         "path_data": "M 10 20 L 40 80", "coordinate_space": "screenshot_pixels", "app": "",
@@ -177,7 +187,7 @@ _TOOL_CALLS: list[tuple[str, str, dict[str, Any]]] = [
     ("call_text_ok", "draw_text", {
         "text": "Fusion", "x": 120, "y": 80, "font_size": 22,
         "color": "white", "background_color": "#202020", "background_opacity": 0.8,
-        "opacity": 0.9, "z_index": 4, "app": "", "duration_seconds": 60,
+        "opacity": 0.9, "z_index": 4, "app": "",
     }),
     ("call_batch_empty", "draw_batch", {"items": []}),
     ("call_batch_unknown_type", "draw_batch", {"items": [{"type": "circle"}], "app": ""}),

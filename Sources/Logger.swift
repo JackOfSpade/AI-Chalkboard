@@ -74,11 +74,47 @@ public final class Logger: @unchecked Sendable {
     private var lastRotationFailure: Date?
     private let rotationFailureCooldown: TimeInterval = 60
 
-    private init() {
-        let fileManager = FileManager.default
-        let logsDir = fileManager.urls(for: .libraryDirectory, in: .userDomainMask).first!
+    /// Where this process writes its log.
+    ///
+    /// Normally `~/Library/Logs/AIChalkboard`, the location a user is asked for
+    /// when reporting a problem.
+    ///
+    /// Two escapes, in priority order:
+    ///
+    /// * `AI_CHALKBOARD_LOG_DIR`, an absolute path -- the same override shape
+    ///   `AI_CHALKBOARD_SUSPENSION_ROOT` already uses for the lease registry.
+    /// * Running under a test harness. Detected by asking whether `XCTestCase`
+    ///   is loaded in this process rather than by sniffing an environment
+    ///   variable: `swift test` exports neither `XCTestConfigurationFilePath`
+    ///   nor `XCTestBundlePath` (verified on this toolchain), so the env-var
+    ///   check alone silently failed to redirect anything. The class lookup is
+    ///   true exactly when a test bundle has been loaded, under both the
+    ///   command-line runner and Xcode. The unit suite exercises real rejection
+    ///   and resolution paths, so it emits genuine WARN records ("Drawing
+    ///   rejected: ... targetScreenId=test-screen", "could not resolve app
+    ///   'Ghost App'"); those were landing in the user's production log,
+    ///   interleaved with real diagnostics and counting toward the 5 MB
+    ///   rotation budget that retains them. Synthetic records must never be
+    ///   able to evict a real one.
+    private static func resolveLogsDirectory(_ fileManager: FileManager) -> URL {
+        let environment = ProcessInfo.processInfo.environment
+        if let raw = environment["AI_CHALKBOARD_LOG_DIR"], raw.hasPrefix("/") {
+            return URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
+        }
+        if NSClassFromString("XCTestCase") != nil
+            || environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil {
+            return fileManager.temporaryDirectory
+                .appendingPathComponent("AIChalkboardTestLogs", isDirectory: true)
+        }
+        return fileManager.urls(for: .libraryDirectory, in: .userDomainMask).first!
             .appendingPathComponent("Logs")
             .appendingPathComponent("AIChalkboard")
+    }
+
+    private init() {
+        let fileManager = FileManager.default
+        let logsDir = Logger.resolveLogsDirectory(fileManager)
 
         try? fileManager.createDirectory(at: logsDir, withIntermediateDirectories: true)
 

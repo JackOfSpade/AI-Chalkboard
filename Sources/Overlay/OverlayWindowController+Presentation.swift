@@ -122,6 +122,7 @@ extension OverlayWindowController {
             if let applied = annotationsSuspensionGeneration, generation < applied {
                 return false
             }
+            let advanced = annotationsSuspensionGeneration != generation
             annotationsSuspensionGeneration = generation
             let changed = annotationsSuspended != suspended
             annotationsSuspended = suspended
@@ -132,9 +133,17 @@ extension OverlayWindowController {
                 refreshViewsNow()
             }
 
+            // A same-value, same-generation reapplication is a self-heal (see
+            // this method's doc comment), not an event: it says nothing a reader
+            // of the log did not already know from the previous line. Logging it
+            // at INFO regardless is what turned the registry ping-pong fixed in
+            // `currentBootSessionIdentifier` into 30,091 identical INFO lines
+            // that rotated the entire real diagnostic history out of a 5 MB log.
+            // Genuine transitions -- and every advance of the durable generation
+            // -- still log at INFO.
             Logger.shared.log(
                 "OverlayWindowController: applied durable annotations suspension generation=\(generation) suspended=\(suspended) on \(overlayWindows.count) overlay window reference(s).",
-                level: "INFO"
+                level: changed || advanced ? "INFO" : "DEBUG"
             )
             return changed
         }

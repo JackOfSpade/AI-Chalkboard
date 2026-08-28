@@ -509,4 +509,121 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         XCTAssertTrue(result.annotationsSuspended)
         XCTAssertNotNil(result.error)
     }
+
+    // MARK: - Boot session identity
+
+    /// `kern.boottime` is DERIVED (wall clock minus uptime), not stored, so its
+    /// microsecond field shifts by a few hundred microseconds every time the
+    /// system clock is disciplined -- while `tv_sec` and the boot itself stay
+    /// put. When the boot identity embedded that microsecond field, two live
+    /// processes that sampled it either side of an NTP adjustment computed
+    /// DIFFERENT identities for the SAME boot, and each read the other's
+    /// registry as "written before the last reboot". The reboot-recovery path
+    /// then replaced it with an empty state -- destroying every live lease --
+    /// and rewrote the file, which broadcast a suspension invalidation, which
+    /// made the peer reconcile, re-detect a foreign identity, and reset it
+    /// straight back. Observed in production as a self-sustaining cross-process
+    /// ping-pong that wrote ~150 registry generations per second and filled the
+    /// entire 5 MB log with one repeated line.
+    func testBootSessionIdentitySurvivesBoottimeMicrosecondDrift() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootDriftTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // The exact pair observed on the reporting machine: same boot second,
+        // 455 microseconds of clock-discipline drift between the two samples.
+        let owner = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                               bootSessionIdentifier: "1787827823.287935")
+        let drifted = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                 bootSessionIdentifier: "1787827823.287480")
+
+        let acquired = owner.acquireLease(seconds: 60)
+        XCTAssertTrue(acquired.success)
+        XCTAssertTrue(acquired.annotationsSuspended)
+        XCTAssertEqual(acquired.activeLeaseCount, 1)
+
+        let peer = drifted.reconcile()
+        XCTAssertTrue(peer.annotationsSuspended,
+                      "a peer whose boottime microseconds drifted must not read a live registry as a prior boot")
+        XCTAssertEqual(peer.activeLeaseCount, 1, "the drifted peer destroyed another process's live lease")
+
+        // ...and the two must converge instead of rewriting the registry at
+        // each other forever. Generations advance only on a real state change.
+        let settled = drifted.reconcile().generation
+        XCTAssertEqual(drifted.reconcile().generation, settled, "the drifted peer keeps rewriting the registry")
+        XCTAssertEqual(owner.reconcile().generation, settled, "the two processes are ping-ponging the registry")
+        XCTAssertEqual(drifted.reconcile().generation, settled)
+        XCTAssertTrue(owner.reconcile().annotationsSuspended)
+    }
+
+    /// A genuinely different boot must still be recovered from -- the drift
+    /// tolerance above must not swallow a real reboot.
+    func testRegistryFromAGenuinelyDifferentBootIsStillReset() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootResetTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let previousBoot = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                      bootSessionIdentifier: "1787827823.287935")
+        XCTAssertTrue(previousBoot.acquireLease(seconds: 600).annotationsSuspended)
+
+        // A reboot moves `kern.boottime` by far more than clock discipline can.
+        let afterReboot = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                     bootSessionIdentifier: "1787913344.100000")
+        let recovered = afterReboot.bootstrapAndReconcile()
+        XCTAssertFalse(recovered.annotationsSuspended,
+                       "a lease from a previous boot must never keep this boot's overlays hidden")
+        XCTAssertEqual(recovered.activeLeaseCount, 0)
+    }
+
+    /// The upgrade path on a machine that is already running: the registry on
+    /// disk was written by the previous build, so it stores a `kern.boottime`
+    /// NUMBER, while this build identifies the boot by `kern.bootsessionuuid`.
+    /// A literal comparison would read that as a reboot on the very first read
+    /// after the update and drop a suspension lease that is still live, so a
+    /// stored number is matched against this boot's actual boot time instead.
+    func testLegacyBoottimeRegistryIsAdoptedByTheUUIDIdentityWithoutAReset() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootUpgradeTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Exactly what the previous build wrote: "<tv_sec>.<tv_usec>" for the
+        // boot this test process is itself running in.
+        let legacyIdentifier = try XCTUnwrap(SuspensionLeaseCoordinator.testOnlyLegacyBoottimeIdentifier())
+        let previousBuild = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                       bootSessionIdentifier: legacyIdentifier)
+        let acquired = previousBuild.acquireLease(seconds: 60)
+        let token = try XCTUnwrap(acquired.leaseToken)
+        XCTAssertTrue(acquired.annotationsSuspended)
+
+        // The updated build takes its identity from `kern.bootsessionuuid`.
+        let updatedBuild = SuspensionLeaseCoordinator(storageDirectory: directory)
+        let afterUpgrade = updatedBuild.bootstrapAndReconcile()
+        XCTAssertTrue(afterUpgrade.annotationsSuspended,
+                      "the update must not read its own boot's registry as a prior boot")
+        XCTAssertEqual(afterUpgrade.activeLeaseCount, 1)
+
+        // The lease stays addressable across the identity change.
+        let released = updatedBuild.releaseLease(token: token)
+        XCTAssertTrue(released.success)
+        XCTAssertFalse(released.alreadyReleased)
+        XCTAssertFalse(released.annotationsSuspended)
+    }
+
+    /// The identity itself must be stable when sampled repeatedly, which is the
+    /// property the production defect violated.
+    func testCurrentBootSessionIdentifierIsStableAcrossSamples() throws {
+        let first = try XCTUnwrap(SuspensionLeaseCoordinator.currentBootSessionIdentifier())
+        XCTAssertFalse(first.isEmpty)
+        for _ in 0..<25 {
+            XCTAssertEqual(SuspensionLeaseCoordinator.currentBootSessionIdentifier(), first,
+                           "the boot identity must not vary between samples within one boot")
+        }
+    }
 }

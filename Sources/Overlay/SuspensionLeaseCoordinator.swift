@@ -670,7 +670,12 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     // internal: SuspensionLeaseStorage.swift's readState calls this after
     // decoding to fail closed on invalid/oversized state.
     static func validateState(_ state: PersistedState, bootSessionIdentifier: String) throws {
-        guard state.schemaVersion == 4, state.bootSessionIdentifier == bootSessionIdentifier,
+        guard state.schemaVersion == 4,
+              // Tolerant by design -- see `isSameBootSession`. A stored identity
+              // from the previous build's `kern.boottime` scheme still names
+              // this boot, and rejecting it here would fail every operation
+              // closed instead of letting `readState` decide.
+              isSameBootSession(stored: state.bootSessionIdentifier, current: bootSessionIdentifier),
               state.leases.count <= maximumActiveLeases,
               state.idempotencyTokens.count <= maximumActiveLeases,
               state.releasedTokens.count <= maximumTombstones,

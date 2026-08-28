@@ -272,7 +272,7 @@ extension SuspensionLeaseCoordinator {
             // registry file about to overwrite a different one, so mint its
             // identity now rather than leaving peers unable to tell the
             // replacement apart from the state it replaced.
-            if state.bootSessionIdentifier != bootSessionIdentifier {
+            if !Self.isSameBootSession(stored: state.bootSessionIdentifier, current: bootSessionIdentifier) {
                 return StateRead(state: PersistedState(bootSessionIdentifier: bootSessionIdentifier,
                                                        instanceEpoch: UUID().uuidString),
                                  needsRewrite: true)
@@ -345,11 +345,95 @@ extension SuspensionLeaseCoordinator {
 
     // internal: SuspensionLeaseCoordinator.init() calls this when no boot
     // session id override is supplied.
+    //
+    /// BUG FIX (a self-sustaining cross-process registry ping-pong that wiped
+    /// live suspension leases and filled the whole log):
+    ///
+    /// This used to return `"\(tv_sec).\(tv_usec)"` from `kern.boottime`. That
+    /// sysctl is not a stored constant -- the kernel DERIVES it as "wall clock
+    /// now minus uptime" -- so every time the system clock is disciplined (NTP,
+    /// `settimeofday`, waking from sleep) the answer moves by a few hundred
+    /// microseconds while the machine has plainly not rebooted. Two Chalkboard
+    /// processes that sampled it either side of such an adjustment therefore
+    /// computed DIFFERENT identities for the SAME boot. Each then read the
+    /// shared registry as one written before the last reboot, took the
+    /// reboot-recovery path in `readState` -- which replaces the state with an
+    /// empty one, DESTROYING every live lease -- and rewrote the file. The
+    /// rewrite broadcast a suspension invalidation, the peer reconciled,
+    /// re-detected a foreign identity, and reset it straight back. Measured in
+    /// production at roughly 150 registry generations per second across three
+    /// processes, which wrote 30,091 identical presentation lines into a 5 MB
+    /// log and rotated the entire real diagnostic history out of existence.
+    /// While it ran, `suspend_annotations` could report success and then have
+    /// its lease silently dropped, bringing the overlays back under a caller
+    /// that had been told the desktop was clear to click.
+    ///
+    /// `kern.bootsessionuuid` is the right primitive: a random identity minted
+    /// once at boot and never recomputed, so it cannot drift by construction.
+    /// The `kern.boottime` reading is kept only as a fallback and, per
+    /// `isSameBootSession`, as the way a registry written by the previous build
+    /// is still recognised as belonging to this boot.
     static func currentBootSessionIdentifier() -> String? {
+        if let uuid = bootSessionUUID(), !uuid.isEmpty { return uuid }
+        guard let seconds = currentBootTimeSeconds() else { return nil }
+        // Seconds only: the microsecond field is exactly the part that drifts.
+        return String(Int64(seconds.rounded()))
+    }
+
+    /// The largest `kern.boottime` movement that is still read as clock
+    /// discipline rather than a reboot. Observed drift is sub-millisecond; a
+    /// machine cannot complete a reboot cycle in anything close to two seconds,
+    /// so no real reboot can hide inside this window.
+    private static let bootSessionDriftTolerance: Double = 2.0
+
+    /// Decides whether a registry's stored boot identity names the boot this
+    /// process is running in.
+    ///
+    /// Deliberately NOT plain string equality. A registry written by a build
+    /// that identified the boot by `kern.boottime` stores a number, while this
+    /// build stores `kern.bootsessionuuid`; comparing those literally would
+    /// make a routine app upgrade indistinguishable from a reboot and drop a
+    /// suspension lease that is still live. A stored number is therefore
+    /// compared against this boot's actual boot time, with enough tolerance to
+    /// absorb the clock-discipline drift described above.
+    // internal: SuspensionLeaseCoordinator.swift's validateState and this
+    // file's readState use this instead of `==`.
+    static func isSameBootSession(stored: String, current: String) -> Bool {
+        if stored == current { return true }
+        guard let storedSeconds = Double(stored), storedSeconds > 0,
+              let bootSeconds = currentBootTimeSeconds() else { return false }
+        return abs(storedSeconds - bootSeconds) <= bootSessionDriftTolerance
+    }
+
+    /// `kern.boottime` as a single fractional-seconds value.
+    private static func currentBootTimeSeconds() -> Double? {
         var bootTime = timeval()
         var size = MemoryLayout<timeval>.size
-        guard sysctlbyname("kern.boottime", &bootTime, &size, nil, 0) == 0, size == MemoryLayout<timeval>.size else { return nil }
+        guard sysctlbyname("kern.boottime", &bootTime, &size, nil, 0) == 0,
+              size == MemoryLayout<timeval>.size else { return nil }
+        return Double(bootTime.tv_sec) + Double(bootTime.tv_usec) / 1_000_000
+    }
+
+#if DEBUG
+    /// The exact identifier shape the previous build persisted, so the upgrade
+    /// path can be tested against a real registry rather than a literal.
+    static func testOnlyLegacyBoottimeIdentifier() -> String? {
+        var bootTime = timeval()
+        var size = MemoryLayout<timeval>.size
+        guard sysctlbyname("kern.boottime", &bootTime, &size, nil, 0) == 0,
+              size == MemoryLayout<timeval>.size else { return nil }
         return "\(bootTime.tv_sec).\(bootTime.tv_usec)"
+    }
+#endif
+
+    /// The kernel's per-boot random identity, as a string. Absent on platforms
+    /// or configurations that do not publish it, hence the optional.
+    private static func bootSessionUUID() -> String? {
+        var size = 0
+        guard sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 0, size <= 256 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("kern.bootsessionuuid", &buffer, &size, nil, 0) == 0 else { return nil }
+        return String(cString: buffer)
     }
 
     // internal: SuspensionLeaseCoordinator.acquireLease() calls this to mint

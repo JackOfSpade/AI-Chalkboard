@@ -604,7 +604,6 @@ def main():
                     "rotation_degrees": 12,
                     "opacity": 0.8,
                     "app": "",
-                    "duration_seconds": 60,
                 }
             }
         }, args.timeout)
@@ -618,7 +617,7 @@ def main():
                 "x": 120, "y": 80, "font_size": 22,
                 "color": "#FFFFFF", "background_color": "#000000",
                 "background_opacity": 0.7, "padding_px": 4, "opacity": 0.9,
-                "app": "", "duration_seconds": 60,
+                "app": "",
             }},
         }, args.timeout)
         text_draw_message = text_res["result"]["content"][0]["text"]
