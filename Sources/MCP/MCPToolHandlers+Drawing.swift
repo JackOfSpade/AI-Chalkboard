@@ -304,12 +304,27 @@ extension MCPServer {
             sendErrorResult(id: id, text: message)
         }
         for (index, item) in rawItems.enumerated() {
+            // A batch item has no independent lifetime -- every item in a
+            // batch shares ONE annotation id and is cleared together -- so
+            // `duration_seconds` was never meaningful here even when
+            // annotations still had durations. It must still be rejected
+            // rather than ignored, and rejected PER ITEM: the top-level check
+            // in `finish` only sees the batch's own arguments, so an item that
+            // carries `duration_seconds` slips past it entirely. Silently
+            // accepting it would leave the caller believing that item cleans
+            // itself up, which is exactly the false belief the top-level
+            // rejection exists to prevent.
+            if let error = DrawRequest.rejectDurationSecondsIfSupplied(args: item) {
+                fail("items[\(index)]: \(error)")
+                return
+            }
             let outcome: DrawOutcome<AnnotationKind>
             switch (item["type"] as? String)?.lowercased() {
             case "path": outcome = makeVectorPathKind(item, coordinateTransform: transform)
             case "image": outcome = loadImageKind(item, coordinateTransform: transform)
             case "text": outcome = makeTextKind(item, coordinateTransform: transform)
-            default: fail("items[\(index)].type must be 'path', 'image', or 'text'."); return
+            case "shape": outcome = makeShapeKind(item, coordinateTransform: transform)
+            default: fail("items[\(index)].type must be 'path', 'image', 'text', or 'shape'."); return
             }
             switch outcome {
             case .failure(let err): fail("items[\(index)]: \(err)"); return
@@ -368,7 +383,7 @@ extension MCPServer {
             return
         }
         guard let current = AnnotationStore.shared.get(id: annotationID) else {
-            sendErrorResult(id: id, text: "Annotation \(annotationID) was not found or has already expired.")
+            sendErrorResult(id: id, text: "Annotation \(annotationID) was not found. It may already have been cleared; call list_annotations for the current set.")
             return
         }
         let patched: Annotation
@@ -382,13 +397,22 @@ extension MCPServer {
         case .updated:
             sendTextResult(id: id, text: "Updated annotation \(annotationID) in place.")
         case .notFound:
-            sendErrorResult(id: id, text: "Annotation \(annotationID) was not found or expired while it was being updated.")
+            sendErrorResult(id: id, text: "Annotation \(annotationID) was not found; it may have been cleared while this update was being prepared.")
         case .stale:
             sendErrorResult(id: id, text: "Annotation \(annotationID) changed while this update was being prepared. It was left unchanged; re-fetch it with list_annotations and retry the patch.")
         case .rejected(.payloadBytes(let limit, let attempted)):
             sendErrorResult(id: id, text: "The update was not applied because retained vector/text payload would become \(attempted) bytes, exceeding the \(limit)-byte session limit. The existing annotation was left unchanged.")
         case .rejected(.primitiveCount(let limit, let attempted)):
             sendErrorResult(id: id, text: "The update was not applied because retained primitive count would become \(attempted), exceeding the \(limit)-primitive session limit. The existing annotation was left unchanged.")
+        case .rejected(.annotationCount(let limit, let attempted)):
+            // `updateWithOutcome` replaces an existing annotation in place, so
+            // the store's total count never actually changes across an
+            // update -- this branch exists only because `AnnotationStoreResourceLimit`
+            // is the one shared type `addWithOutcome` and `updateWithOutcome`
+            // both return, and the count-cap case Swift requires this switch
+            // to handle exhaustively. Worded the same as the others in case a
+            // future change ever makes it reachable.
+            sendErrorResult(id: id, text: "The update was not applied because it would push the store to \(attempted) annotations, exceeding the \(limit)-annotation session limit. The existing annotation was left unchanged.")
         }
     }
 
@@ -437,15 +461,11 @@ extension MCPServer {
         let patched = Annotation(
             id: current.id, screenId: current.screenId, kind: kind, colorHex: current.colorHex,
             label: current.label, appId: current.appId, appName: current.appName,
-            expiresAt: current.expiresAt, opacity: opacity,
+            opacity: opacity,
             offsetX: offsetX, offsetY: offsetY,
             zIndex: MCPArgument.integer(args["z_index"]) ?? current.zIndex,
             createdAt: current.createdAt
         )
-        // Deliberately leaves `expiresAtUptime` nil: `AnnotationStore.updateWithOutcome`
-        // is the single authority on the monotonic deadline, carrying the old one
-        // forward only while the wall deadline is unchanged and otherwise
-        // re-deriving it -- a copy here would always win that `??` and disarm it.
         return .success(patched)
     }
 

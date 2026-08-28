@@ -1,6 +1,16 @@
 import Foundation
 import AppKit
 
+/// The outline traced around an Accessibility element's padded bounds.
+/// `.rect` is the historical, still-default behaviour; `.ellipse` and
+/// `.circle` exist because a lot of real UI controls are round or pill-shaped
+/// (radio buttons, circular icon buttons, dots), and ringing one with a
+/// rectangle draws attention to its bounding box rather than its actual
+/// silhouette.
+private enum HighlightShape: String {
+    case rect, ellipse, circle
+}
+
 private struct HighlightStyle {
     let strokeColor: String
     let strokeWidth: Double
@@ -8,6 +18,7 @@ private struct HighlightStyle {
     let fillColor: String?
     let fillOpacity: Double
     let padding: Double
+    let shape: HighlightShape
 }
 
 /// Renderer-visible alpha includes a color's own RGBA alpha.  Named colors
@@ -63,6 +74,34 @@ extension MCPServer {
             sendErrorResult(id: id, text: "occurrence must be one-based and greater than zero.")
             return
         }
+        // The traversal budgets are caller-settable because the errors they
+        // produce used to be unactionable: the breadth-first walk visits every
+        // element regardless of what is being searched for, so a caller told
+        // to "refine the label or role" had no way to make the SAME lookup
+        // finish. These two arguments are the only things that actually move
+        // that outcome, and they are deliberately raised TOGETHER -- a
+        // measured DaVinci Resolve session walks ~5,200 elements/second, so
+        // the 10,000-node ceiling needs roughly 1.9s and would otherwise trip
+        // the 2.0s default deadline instead of returning a match.
+        if args.keys.contains("max_nodes"), MCPArgument.integer(args["max_nodes"]) == nil {
+            sendErrorResult(id: id, text: "max_nodes must be an integer between 1 and \(AccessibilityElementResolver.absoluteMaxNodes) when supplied.")
+            return
+        }
+        let maxNodes = MCPArgument.integer(args["max_nodes"]) ?? AccessibilityElementResolver.defaultMaxNodes
+        guard maxNodes > 0, maxNodes <= AccessibilityElementResolver.absoluteMaxNodes else {
+            sendErrorResult(id: id, text: "max_nodes must be between 1 and \(AccessibilityElementResolver.absoluteMaxNodes).")
+            return
+        }
+        if MCPArgument.hasInvalidSuppliedDouble(args, key: "timeout_seconds") {
+            sendErrorResult(id: id, text: "timeout_seconds must be a finite number when supplied.")
+            return
+        }
+        let timeoutSeconds = MCPArgument.double(args["timeout_seconds"]) ?? AccessibilityElementResolver.defaultTraversalTimeoutSeconds
+        guard timeoutSeconds >= AccessibilityElementResolver.minTraversalTimeoutSeconds,
+              timeoutSeconds <= AccessibilityElementResolver.maxTraversalTimeoutSeconds else {
+            sendErrorResult(id: id, text: "timeout_seconds must be between \(AccessibilityElementResolver.minTraversalTimeoutSeconds) and \(AccessibilityElementResolver.maxTraversalTimeoutSeconds).")
+            return
+        }
 
         // Validate every local/style argument before resolving a process or
         // touching the Accessibility hierarchy. A malformed highlight must not
@@ -83,7 +122,7 @@ extension MCPServer {
             }
             finishArgs["z_index"] = z
         }
-        if let error = DrawRequest.validateDurationSeconds(args: args) {
+        if let error = DrawRequest.rejectDurationSecondsIfSupplied(args: args) {
             sendErrorResult(id: id, text: error)
             return
         }
@@ -108,7 +147,9 @@ extension MCPServer {
                     label: label,
                     role: args["role"] as? String,
                     matchMode: matchMode,
-                    occurrence: MCPArgument.integer(args["occurrence"])
+                    occurrence: MCPArgument.integer(args["occurrence"]),
+                    maxNodes: maxNodes,
+                    timeoutSeconds: timeoutSeconds
                 ),
                 screens: screens
             )
@@ -219,6 +260,24 @@ extension MCPServer {
         if let key = MCPArgument.firstNonStringSupplied(args, keys: ["stroke_color", "color", "fill_color"]) {
             return .failure("\(key) must be a string when supplied.")
         }
+        // Checked separately from the other string arguments above (rather
+        // than folded into the generic firstNonStringSupplied scan) because
+        // it needs its own wording: an unknown shape and a wrong-typed shape
+        // are different mistakes, and the caller should be told which one it
+        // made -- exactly the same reasoning `match` gets its own check in
+        // handleHighlightElement above.
+        if args.keys.contains("shape"), !(args["shape"] is String) {
+            return .failure("shape must be 'rect', 'ellipse', or 'circle' when supplied.")
+        }
+        let shape: HighlightShape
+        switch (args["shape"] as? String)?.lowercased() ?? "rect" {
+        case "rect": shape = .rect
+        case "ellipse": shape = .ellipse
+        case "circle": shape = .circle
+        default:
+            return .failure("shape must be 'rect', 'ellipse', or 'circle'.")
+        }
+
         let explicitStroke = args["stroke_color"] as? String
         let colorAlias = args["color"] as? String
         if let explicitStroke, let colorAlias, explicitStroke != colorAlias {
@@ -248,7 +307,7 @@ extension MCPServer {
         }
         return .success(HighlightStyle(
             strokeColor: strokeColor, strokeWidth: strokeWidth, strokeOpacity: strokeOpacity,
-            fillColor: fillColor, fillOpacity: fillOpacity, padding: padding
+            fillColor: fillColor, fillOpacity: fillOpacity, padding: padding, shape: shape
         ))
     }
 
@@ -262,7 +321,51 @@ extension MCPServer {
               width > 0, height > 0 else {
             return .failure("Resolved accessibility bounds are not usable for a highlight.")
         }
-        let data = "M \(x) \(y) H \(x + width) V \(y + height) H \(x) Z"
+
+        let data: String
+        switch style.shape {
+        case .rect:
+            // Byte-identical to the pre-`shape` behaviour: an omitted `shape`
+            // must change nothing about what an existing caller gets back.
+            data = "M \(x) \(y) H \(x + width) V \(y + height) H \(x) Z"
+
+        case .ellipse:
+            // Inscribed in the padded bounds -- the ellipse touches the
+            // padded rectangle at the midpoint of each of its four edges.
+            // That is the natural reading of "ellipse around this element":
+            // the padded rectangle already traces the element's outline, so
+            // the tightest ellipse containing it is the one tangent to it.
+            let cx = x + width / 2
+            let cy = y + height / 2
+            let rx = width / 2
+            let ry = height / 2
+            guard [cx, cy, rx, ry].allSatisfy(\.isFinite),
+                  [cx, cy, rx, ry].allSatisfy({ abs($0) <= DrawingDefaults.maxCoordinateMagnitudePx }),
+                  rx > 0, ry > 0 else {
+                return .failure("Resolved accessibility bounds are not usable for a highlight.")
+            }
+            data = ellipsePathData(centerX: cx, centerY: cy, radiusX: rx, radiusY: ry)
+
+        case .circle:
+            // Concentric with the padded bounds, but sized to CIRCUMSCRIBE
+            // them (r = max(width, height)/2) rather than inscribe them (r =
+            // min(width, height)/2). A UI element -- a button, a toolbar
+            // icon -- is usually wider than it is tall; an inscribed circle
+            // would clip its left/right ends, which defeats the entire point
+            // of ringing it. Circumscribing costs a little extra ring
+            // above/below a wide element in exchange for never cutting off
+            // what it is meant to highlight.
+            let cx = x + width / 2
+            let cy = y + height / 2
+            let r = max(width, height) / 2
+            guard [cx, cy, r].allSatisfy(\.isFinite),
+                  [cx, cy, r].allSatisfy({ abs($0) <= DrawingDefaults.maxCoordinateMagnitudePx }),
+                  r > 0 else {
+                return .failure("Resolved accessibility bounds are not usable for a highlight.")
+            }
+            data = ellipsePathData(centerX: cx, centerY: cy, radiusX: r, radiusY: r)
+        }
+
         return .success(.vectorPath(
             data: data,
             strokeColorHex: style.strokeColor,

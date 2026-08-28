@@ -100,15 +100,13 @@ final class AppBehaviorTests: XCTestCase {
         XCTAssertEqual(observedValues, [true, false])
     }
 
-    func testTemporarySuspensionIsIdempotentPresentationStateAndRetainsAnnotationIdentityAndTTL() throws {
+    func testTemporarySuspensionIsIdempotentPresentationStateAndRetainsAnnotationIdentity() throws {
         let controller = OverlayWindowController.shared
         let id = "suspension-retention-\(UUID().uuidString)"
-        let expiry = Date().addingTimeInterval(60)
         let annotation = Annotation(
             id: id,
             screenId: "suspension-test-screen",
-            kind: .vectorPath(data: "M0 0 L1 1", strokeColorHex: nil, strokeWidth: 1, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1),
-            expiresAt: expiry
+            kind: .vectorPath(data: "M0 0 L1 1", strokeColorHex: nil, strokeWidth: 1, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1)
         )
 
         addTeardownBlock {
@@ -128,7 +126,6 @@ final class AppBehaviorTests: XCTestCase {
         let whileSuspended = try XCTUnwrap(AnnotationStore.shared.get(id: id))
         XCTAssertEqual(whileSuspended.id, before.id)
         XCTAssertEqual(whileSuspended.createdAt, before.createdAt)
-        XCTAssertEqual(whileSuspended.expiresAt, before.expiresAt, "suspension must not pause or extend TTL")
 
         XCTAssertTrue(controller.setAnnotationsSuspended(false))
         XCTAssertFalse(controller.isAnnotationsSuspended)

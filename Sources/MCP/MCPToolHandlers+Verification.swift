@@ -77,7 +77,7 @@ extension MCPServer {
             return
         }
         guard let renderSnapshot = AnnotationStore.shared.renderSnapshot(id: annotationId) else {
-            sendErrorResult(id: id, text: "Annotation \(annotationId) was not found or has already expired. Call list_annotations and retry with a live ID.")
+            sendErrorResult(id: id, text: "Annotation \(annotationId) was not found. It may already have been cleared; call list_annotations for a current ID.")
             return
         }
         let annotation = renderSnapshot.annotation
@@ -151,19 +151,6 @@ extension MCPServer {
                 ]
             }
             metadata["storedGeometryCoordinateSemantics"] = storedGeometryCoordinateSemantics(annotation.kind)
-            if let expiresAt = annotation.expiresAt {
-                let formatter = ISO8601DateFormatter()
-                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                metadata["expiresAt"] = formatter.string(from: expiresAt)
-                // Monotonic when available (see Annotation.remainingSeconds);
-                // the RFC 3339 expiresAt above stays wall-clock for the wire.
-                metadata["remainingSeconds"] = annotation.remainingSeconds(
-                    now: Date(), uptime: ProcessInfo.processInfo.systemUptime
-                ) ?? NSNull()
-            } else {
-                metadata["expiresAt"] = NSNull()
-                metadata["remainingSeconds"] = NSNull()
-            }
             guard let metadataText = jsonString(metadata) else {
                 sendErrorResult(id: id, text: "Failed to encode verification metadata.")
                 return

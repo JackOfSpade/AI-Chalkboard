@@ -161,34 +161,38 @@ final class MCPPureHelperTests: XCTestCase {
         XCTAssertNil(MCPArgument.firstNonStringSupplied(["app": ""], keys: ["app"]))
     }
 
-    // MARK: - DrawRequest.validateDurationSeconds
+    // MARK: - DrawRequest.rejectDurationSecondsIfSupplied
+    //
+    // `duration_seconds` is not a tool parameter any more: an annotation
+    // persists until the AI or the user explicitly clears it. The old
+    // `validateDurationSeconds` accepted a supplied value inside (0, cap] and
+    // only rejected the rest; `rejectDurationSecondsIfSupplied` replaces it
+    // and rejects the key's mere PRESENCE, independent of whatever value
+    // accompanies it -- there is no longer a "valid" duration to accept.
 
-    func testDurationOmittedIsValid() {
-        XCTAssertNil(DrawRequest.validateDurationSeconds(args: [:]))
+    func testDurationOmittedIsAccepted() {
+        XCTAssertNil(DrawRequest.rejectDurationSecondsIfSupplied(args: [:]))
     }
 
-    func testPositiveDurationIsValid() {
-        XCTAssertNil(DrawRequest.validateDurationSeconds(args: ["duration_seconds": 3.0]))
+    func testAnySuppliedDurationIsRejectedRegardlessOfValue() {
+        // Formerly-valid values (a plain positive number), formerly-invalid
+        // values (zero, negative, non-numeric), and a boolean all take the
+        // same path now: presence alone is disqualifying.
+        let suppliedValues: [Any] = [3.0, 0, -1, "soon", true]
+        for value in suppliedValues {
+            XCTAssertNotNil(DrawRequest.rejectDurationSecondsIfSupplied(args: ["duration_seconds": value]),
+                             "expected rejection for duration_seconds = \(value)")
+        }
     }
 
-    func testZeroAndNegativeDurationsAreRejected() {
-        XCTAssertNotNil(DrawRequest.validateDurationSeconds(args: ["duration_seconds": 0]))
-        XCTAssertNotNil(DrawRequest.validateDurationSeconds(args: ["duration_seconds": -1]))
-    }
-
-    func testNonNumericDurationIsRejected() {
-        XCTAssertNotNil(DrawRequest.validateDurationSeconds(args: ["duration_seconds": "soon"]))
-        XCTAssertNotNil(DrawRequest.validateDurationSeconds(args: ["duration_seconds": true]))
-    }
-
-    func testDurationBeyondTheSevenDayCapIsRejected() {
-        let overCap = DrawingDefaults.maxAnnotationDurationSeconds + 1
-        XCTAssertNotNil(DrawRequest.validateDurationSeconds(args: ["duration_seconds": overCap]))
-    }
-
-    func testDurationExactlyAtTheCapIsAccepted() {
-        let atCap = DrawingDefaults.maxAnnotationDurationSeconds
-        XCTAssertNil(DrawRequest.validateDurationSeconds(args: ["duration_seconds": atCap]))
+    func testRejectionMessageNamesTheParameterAndHowToClearInstead() throws {
+        // Errors in this codebase are full sentences aimed at an AI caller
+        // naming the parameter and saying what was not done; this pins that
+        // the rejection text actually does so, not just that it is non-nil.
+        let message = try XCTUnwrap(DrawRequest.rejectDurationSecondsIfSupplied(args: ["duration_seconds": 5]))
+        XCTAssertTrue(message.contains("duration_seconds"), "expected the parameter to be named in: \(message)")
+        XCTAssertTrue(message.contains("Nothing was drawn"), "expected what was NOT done in: \(message)")
+        XCTAssertTrue(message.contains("clear"), "expected the alternative (clear) in: \(message)")
     }
 
     // MARK: - linkageSuffix
@@ -287,4 +291,36 @@ final class MCPPureHelperTests: XCTestCase {
             intrinsicWidth: 512, intrinsicHeight: 512, transform: normalized4K
         ))
     }
+
+    // MARK: - duration_seconds is rejected per batch ITEM, not only per call
+
+    /// A batch item has no independent lifetime -- every item shares one
+    /// annotation id -- so `duration_seconds` never meant anything there. The
+    /// top-level check in `finish` only sees the BATCH's own arguments, so an
+    /// item carrying `duration_seconds` slipped past it entirely and was
+    /// silently ignored: the drawing was created and stored permanently while
+    /// the caller believed that item would clean itself up. That is exactly
+    /// the false belief the top-level rejection exists to prevent.
+    func testRejectDurationSecondsFiresForABatchItemsOwnArguments() throws {
+        let item: [String: Any] = ["type": "path", "path_data": "M 0 0 L 100 100", "duration_seconds": 30]
+        let error = try XCTUnwrap(DrawRequest.rejectDurationSecondsIfSupplied(args: item),
+                                  "an item-level duration_seconds must be rejected, not ignored")
+        XCTAssertTrue(error.contains("duration_seconds is no longer supported"), "got: \(error)")
+        XCTAssertTrue(error.contains("clear"), "the message must point the caller at clear: \(error)")
+    }
+
+    func testRejectDurationSecondsPassesWhenTheKeyIsAbsent() {
+        let item: [String: Any] = ["type": "path", "path_data": "M 0 0 L 100 100"]
+        XCTAssertNil(DrawRequest.rejectDurationSecondsIfSupplied(args: item))
+    }
+
+    /// Presence alone is the trigger -- a null or malformed value must not
+    /// slip through as "not really supplied".
+    func testRejectDurationSecondsTriggersOnPresenceRegardlessOfValue() {
+        for value: Any in [0, -1, "abc", NSNull(), 3.5] {
+            XCTAssertNotNil(DrawRequest.rejectDurationSecondsIfSupplied(args: ["duration_seconds": value]),
+                            "presence of duration_seconds must be rejected for value \(value)")
+        }
+    }
+
 }

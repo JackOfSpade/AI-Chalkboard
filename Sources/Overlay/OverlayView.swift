@@ -139,9 +139,9 @@ public final class OverlayView: NSView {
     ) {
         let scale = scaleFactor > 0 ? scaleFactor : 1.0
         let viewHeight = canvasSize.height
-        // Snapshot every raster before beginning a frame.  Clearing or expiry
-        // can release the store's ownership concurrently, but this lease owns
-        // strong image references through the entire recursive draw.
+        // Snapshot every raster before beginning a frame.  A concurrent
+        // clear can release the store's ownership mid-draw, but this lease
+        // owns strong image references through the entire recursive draw.
         let assetIDs = annotations.flatMap { $0.kind.rasterAssetIds }
         let rasterLease = suppliedRasterLease ?? RasterAssetStore.shared.lease(ids: assetIDs)
 

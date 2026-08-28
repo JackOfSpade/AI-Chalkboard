@@ -43,9 +43,11 @@ public final class OverlayWindowController: NSObject {
     var overlayViews: [OverlayView] = []
 
     /// MAIN-THREAD-ONLY. Suspension is deliberately presentation state, not
-    /// store state: annotations, their stable IDs, creation dates, and TTLs
-    /// remain untouched so resume can make the exact still-live set visible
-    /// again. Every mutation goes through `setAnnotationsSuspended(_:)`, which
+    /// store state: annotations, their stable IDs, and creation dates remain
+    /// untouched so resume can make the exact same set visible again.
+    /// (Annotations have no lifetime to preserve any more -- they persist
+    /// until something explicitly clears them -- so suspension can no longer
+    /// hide one for longer than it was going to live.) Every mutation goes through `setAnnotationsSuspended(_:)`, which
     /// synchronously hops to AppKit's main thread before acknowledging an MCP
     /// request or a broadcast.
     // Fail closed until `SuspensionLeaseCoordinator.bootstrapAndReconcile()`

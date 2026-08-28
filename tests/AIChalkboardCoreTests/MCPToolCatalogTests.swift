@@ -18,7 +18,7 @@ final class MCPToolCatalogTests: XCTestCase {
 
     func testToolNamesAndOrderAreExactlyTheFreeDrawSurface() {
         XCTAssertEqual(MCPToolCatalog.tools.map { $0["name"] as? String }, [
-            "get_screens", "get_overlay_state", "get_accessibility_status", "draw_path", "draw_image", "draw_text", "highlight_element", "draw_batch", "update_annotation", "suspend_annotations", "resume_annotations", "clear", "list_annotations",
+            "get_screens", "get_overlay_state", "get_accessibility_status", "draw_path", "draw_shape", "draw_image", "draw_text", "highlight_element", "draw_batch", "update_annotation", "suspend_annotations", "resume_annotations", "clear", "list_annotations",
             "verify_annotation", "verify_presentation", "get_active_app", "set_capture_visible"
         ])
     }
@@ -31,11 +31,9 @@ final class MCPToolCatalogTests: XCTestCase {
     }
 
     func testEveryFreeDrawToolExposesSharedLifecycleProperties() {
-        for name in ["draw_path", "draw_image", "draw_text", "draw_batch"] {
+        for name in ["draw_path", "draw_shape", "draw_image", "draw_text", "draw_batch"] {
             let props = properties(try! XCTUnwrap(toolsByName[name]))
             XCTAssertEqual((props["app"] as? [String: Any])?["type"] as? String, "string")
-            XCTAssertEqual((props["duration_seconds"] as? [String: Any])?["type"] as? String, "number")
-            XCTAssertEqual((props["duration_seconds"] as? [String: Any])?["maximum"] as? Double, DrawingDefaults.maxAnnotationDurationSeconds)
             XCTAssertEqual((props["screen_id"] as? [String: Any])?["maxLength"] as? Int, 128)
         }
     }
@@ -46,6 +44,7 @@ final class MCPToolCatalogTests: XCTestCase {
             "get_overlay_state": nil,
             "get_accessibility_status": nil,
             "draw_path": ["path_data"],
+            "draw_shape": ["shape"],
             "draw_image": ["image_path", "x", "y"],
             "draw_text": ["text", "x", "y", "font_size"],
             "highlight_element": ["label"],
@@ -74,6 +73,40 @@ final class MCPToolCatalogTests: XCTestCase {
         let dash = try XCTUnwrap(props["dash"] as? [String: Any])
         XCTAssertEqual(dash["maxItems"] as? Int, DrawingDefaults.maxDashElements)
         XCTAssertEqual(((dash["items"] as? [String: Any])?["exclusiveMinimum"]) as? Int, 0)
+    }
+
+    func testShapeSchemaReusesPathStylingButExcludesPathDataAndExposesShapeGeometry() throws {
+        let props = properties(try XCTUnwrap(toolsByName["draw_shape"]))
+        // draw_shape always computes and overwrites its own path from the
+        // shape geometry, so advertising path_data as a real, honored
+        // parameter would be misleading -- see MCPToolCatalog's
+        // pathStyleProperties doc comment.
+        XCTAssertNil(props["path_data"], "path_data must not be advertised on draw_shape")
+        // Styling is still the same shared path styling every draw_path
+        // caller gets.
+        XCTAssertEqual((props["stroke_width"] as? [String: Any])?["minimum"] as? Int, 0)
+        XCTAssertEqual((props["fill_rule"] as? [String: Any])?["enum"] as? [String], ["nonzero", "evenodd"])
+        XCTAssertEqual((props["dash"] as? [String: Any])?["maxItems"] as? Int, DrawingDefaults.maxDashElements)
+        // Shape geometry.
+        XCTAssertEqual((props["shape"] as? [String: Any])?["enum"] as? [String], ["circle", "ellipse", "rect"])
+        XCTAssertEqual((props["radius"] as? [String: Any])?["exclusiveMinimum"] as? Int, 0)
+        XCTAssertEqual((props["radius_x"] as? [String: Any])?["exclusiveMinimum"] as? Int, 0)
+        XCTAssertEqual((props["radius_y"] as? [String: Any])?["exclusiveMinimum"] as? Int, 0)
+        XCTAssertEqual((props["width"] as? [String: Any])?["exclusiveMinimum"] as? Int, 0)
+        XCTAssertEqual((props["height"] as? [String: Any])?["exclusiveMinimum"] as? Int, 0)
+        XCTAssertEqual((props["center_x"] as? [String: Any])?["type"] as? String, "number")
+        XCTAssertEqual((props["center_y"] as? [String: Any])?["type"] as? String, "number")
+        XCTAssertEqual((props["x"] as? [String: Any])?["type"] as? String, "number")
+        XCTAssertEqual((props["y"] as? [String: Any])?["type"] as? String, "number")
+
+        // draw_batch's per-item schema must accept the same shape geometry
+        // AND list "shape" as a valid item type, so a batch item can
+        // actually select shape: "shape".
+        let batchItemsArray = try XCTUnwrap(properties(try XCTUnwrap(toolsByName["draw_batch"]))["items"] as? [String: Any])
+        let batchItemSchema = try XCTUnwrap(batchItemsArray["items"] as? [String: Any])
+        let itemProperties = batchItemSchema["properties"] as? [String: Any] ?? [:]
+        XCTAssertEqual((itemProperties["shape"] as? [String: Any])?["enum"] as? [String], ["circle", "ellipse", "rect"])
+        XCTAssertEqual((itemProperties["type"] as? [String: Any])?["enum"] as? [String], ["path", "image", "text", "shape"])
     }
 
     func testImageAndBatchSchemasProtectGeometryAndBatchSize() throws {
@@ -188,5 +221,112 @@ final class MCPToolCatalogTests: XCTestCase {
             operation: "acquire", operationSucceeded: false,
             annotationsSuspended: true, peerPresentationSettled: false
         ))
+    }
+
+    // MARK: - draw_batch's flat per-item schema
+
+    /// `draw_batch` publishes ONE flat property object covering every item
+    /// type, built by a last-writer-wins merge. Four keys are claimed by more
+    /// than one type, so that merge silently published a single type's wording
+    /// as the whole truth -- adding shape properties made `x` read "rect
+    /// only", which tells a model that an `image` or `text` item must not send
+    /// `x` when both actually require it. Pin that every shared key names each
+    /// item type that uses it, so a future item type cannot quietly narrow one
+    /// of these descriptions again.
+    func testBatchItemSharedPropertyDescriptionsNameEveryClaimingItemType() throws {
+        let contributors = MCPToolCatalog.batchItemSharedKeyContributors
+        // Derived, not hand-listed. The first version of this guard enumerated
+        // x/y/width/height by hand and silently missed `opacity`, which image
+        // and text both claim -- so an image item's opacity was documented as
+        // "Text opacity; default 1." Deriving the set means a NEW collision
+        // introduced by a future item type fails here instead of shipping a
+        // schema that misdescribes somebody's required field.
+        XCTAssertFalse(contributors.isEmpty, "expected at least one shared batch-item key")
+        XCTAssertNotNil(contributors["opacity"], "opacity is claimed by image and text and must be treated as shared")
+        for (key, claimingTypes) in contributors {
+            let property = try XCTUnwrap(MCPToolCatalog.batchItemProperties[key] as? [String: Any],
+                                         "draw_batch item schema is missing '\(key)'")
+            let description = try XCTUnwrap(property["description"] as? String,
+                                            "draw_batch item property '\(key)' has no description")
+            for type in claimingTypes {
+                XCTAssertTrue(description.contains(type),
+                              "draw_batch item '\(key)' is claimed by \(claimingTypes) but its description never mentions '\(type)': \(description)")
+            }
+        }
+    }
+
+    /// The image-opacity regression specifically: a fully transparent image is
+    /// REJECTED by the loader, so publishing text's wording for image items
+    /// hid a real constraint from the caller.
+    func testBatchItemOpacityDescriptionCoversImageRejectionAndTextSemantics() throws {
+        let property = try XCTUnwrap(MCPToolCatalog.batchItemProperties["opacity"] as? [String: Any])
+        let description = try XCTUnwrap(property["description"] as? String)
+        XCTAssertTrue(description.contains("image"))
+        XCTAssertTrue(description.contains("text"))
+        XCTAssertTrue(description.localizedCaseInsensitiveContains("transparent"),
+                      "image items reject a fully transparent raster; the shared description must say so")
+        XCTAssertNotEqual(description, "Text opacity; default 1.")
+    }
+
+    func testBatchItemSchemaCarriesEveryItemTypesOwnKeys() {
+        for key in ["path_data", "image_path", "text", "font_size", "shape", "center_x", "center_y", "radius", "radius_x", "radius_y"] {
+            XCTAssertNotNil(MCPToolCatalog.batchItemProperties[key],
+                            "draw_batch item schema lost '\(key)' in the property merge")
+        }
+        let type = MCPToolCatalog.batchItemProperties["type"] as? [String: Any]
+        XCTAssertEqual(type?["enum"] as? [String], ["path", "image", "text", "shape"])
+    }
+
+    // MARK: - duration_seconds removal (annotations never expire)
+    //
+    // Three OTHER timers legitimately remain in this codebase and are
+    // explicitly out of scope for this change: suspend_annotations /
+    // resume_annotations' click-workaround lease (1-60s, "expires
+    // automatically" if not released, with a 120-second cleanup tombstone)
+    // and set_capture_visible's five-minute debug-mode auto-revert. Neither
+    // one hides or deletes an ANNOTATION -- the lease only orders overlay
+    // windows out and back, and the capture flag only toggles a debug
+    // filter -- so their tool descriptions are deliberately excluded from
+    // the wording check below, which is only about annotation lifetime.
+    private static let toolsWithUnrelatedExpiryWording: Set<String> = [
+        "suspend_annotations", "resume_annotations", "set_capture_visible"
+    ]
+
+    /// `duration_seconds` was deleted from the tool surface entirely: an
+    /// annotation now persists until the AI or the user explicitly clears it
+    /// (see `Annotation`'s type comment). This walks every tool's schema --
+    /// including `draw_batch`'s flat per-item properties, which are built by
+    /// their own separate `merged(...)` call and so could silently keep a
+    /// stale copy even after every top-level draw_* tool lost its own -- and
+    /// asserts the key is gone everywhere, not just in the couple of spots a
+    /// manual check would think to look.
+    func testNoToolAdvertisesDurationSecondsAnywhereInItsSchema() {
+        for tool in MCPToolCatalog.tools {
+            let name = tool["name"] as? String ?? "<unnamed>"
+            XCTAssertNil(properties(tool)["duration_seconds"], "\(name) must not advertise duration_seconds")
+        }
+        XCTAssertNil(MCPToolCatalog.batchItemProperties["duration_seconds"],
+                     "draw_batch's per-item schema must not advertise duration_seconds")
+    }
+
+    /// No tool description may still describe annotations as something that
+    /// auto-clears, expires, or carries a TTL -- that mechanism was deleted
+    /// from the store, so wording implying it survives would be a lie to the
+    /// caller about what actually happens to their drawing.
+    func testNoToolDescriptionStillAdvertisesAnnotationAutoClearOrTTLWording() {
+        let forbiddenSubstrings = ["duration_seconds", "auto-clear", "TTL"]
+        for tool in MCPToolCatalog.tools {
+            let name = tool["name"] as? String ?? "<unnamed>"
+            guard !Self.toolsWithUnrelatedExpiryWording.contains(name) else { continue }
+            let description = tool["description"] as? String ?? ""
+            for term in forbiddenSubstrings {
+                XCTAssertFalse(description.localizedCaseInsensitiveContains(term),
+                               "\(name)'s description still mentions '\(term)': \(description)")
+            }
+            // Catches expire/expires/expiry/expired in one check rather than
+            // hand-listing every inflection.
+            XCTAssertFalse(description.localizedCaseInsensitiveContains("expir"),
+                           "\(name)'s description still mentions annotation expiry: \(description)")
+        }
     }
 }

@@ -121,15 +121,6 @@ extension MCPServer {
         }
 
         var entries: [[String: Any]] = []
-        let expiryFormatter = ISO8601DateFormatter()
-        expiryFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        // One (now, uptime) pair for the whole page. `remainingSeconds` mixes a
-        // wall clock with the monotonic one (see Annotation.remainingSeconds),
-        // so re-reading systemUptime inside the per-annotation closure paired
-        // up to 100 monotonic readings with this single wall-clock instant and
-        // let entries in ONE response disagree about when "now" was.
-        let now = Date()
-        let uptime = ProcessInfo.processInfo.systemUptime
         let start = min(requestedOffset, annotations.count)
         let requestedEnd = min(annotations.count, start + requestedLimit)
 
@@ -159,15 +150,6 @@ extension MCPServer {
             )
             object["wouldBeVisibleWithoutSuspension"] = visibility.wouldBeVisibleWithoutSuspension
             object["isVisibleNow"] = visibility.isVisibleNow
-            if let expiresAt = annotation.expiresAt {
-                object["expiresAt"] = expiryFormatter.string(from: expiresAt)
-                object["remainingSeconds"] = annotation.remainingSeconds(
-                    now: now, uptime: uptime
-                ) ?? NSNull()
-            } else {
-                object["expiresAt"] = NSNull()
-                object["remainingSeconds"] = NSNull()
-            }
             guard let fullEntryText = jsonString(object) else { return nil }
             guard fullEntryText.lengthOfBytes(using: .utf8) <= DrawingDefaults.maxAnnotationListEntryBytes else {
                 let geometry = object.removeValue(forKey: "kind")
@@ -200,7 +182,7 @@ extension MCPServer {
                 "nextOffset": hasMore ? nextOffset : NSNull(),
                 "truncated": hasMore,
                 "annotations": page,
-                "note": "With captureVisible=false, an annotation is drawn only when scope='global' or its appId equals activeApp.bundleId. With captureVisible=true, every annotation is drawn for capture-debug placement checks. When annotationsSuspended=true, every retained annotation has isVisibleNow=false because all overlay windows are ordered out; wouldBeVisibleWithoutSuspension reports its normal filter result. External capture filters still decide whether the overlay is included. expiresAt is RFC 3339 and remainingSeconds are null for persistent annotations. list_annotations is paged (offset/limit); oversized individual geometry is summarized so this response remains bounded."
+                "note": "With captureVisible=false, an annotation is drawn only when scope='global' or its appId equals activeApp.bundleId. With captureVisible=true, every annotation is drawn for capture-debug placement checks. When annotationsSuspended=true, every retained annotation has isVisibleNow=false because all overlay windows are ordered out; wouldBeVisibleWithoutSuspension reports its normal filter result. External capture filters still decide whether the overlay is included. Annotations persist until explicitly cleared (by annotation_id, by app, or scope='all'); there is no TTL. list_annotations is paged (offset/limit); oversized individual geometry is summarized so this response remains bounded."
             ]
         }
 

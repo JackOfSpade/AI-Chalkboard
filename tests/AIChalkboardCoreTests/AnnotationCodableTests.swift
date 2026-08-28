@@ -78,12 +78,6 @@ final class AnnotationCodableTests: XCTestCase {
         XCTAssertEqual(decoded.offsetY, original.offsetY, file: file, line: line)
         XCTAssertEqual(decoded.zIndex, original.zIndex, file: file, line: line)
         XCTAssertEqual(decoded.revision, 0, "store revision is intentionally not part of MCP's annotation wire shape", file: file, line: line)
-        if let expectedExpiry = original.expiresAt {
-            XCTAssertEqual(try XCTUnwrap(decoded.expiresAt, file: file, line: line).timeIntervalSince1970,
-                           expectedExpiry.timeIntervalSince1970, accuracy: 0.001, file: file, line: line)
-        } else {
-            XCTAssertNil(decoded.expiresAt, file: file, line: line)
-        }
         assertKindsEqual(decoded.kind, original.kind, file: file, line: line)
     }
 
@@ -107,7 +101,6 @@ final class AnnotationCodableTests: XCTestCase {
                 label: index.isMultiple(of: 2) ? "annotation-\(index)" : nil,
                 appId: index.isMultiple(of: 2) ? "com.example.app" : nil,
                 appName: index.isMultiple(of: 2) ? "Example" : nil,
-                expiresAt: index.isMultiple(of: 2) ? Date().addingTimeInterval(60) : nil,
                 opacity: 0.8, offsetX: 3, offsetY: 4, zIndex: index
             ))
         }
@@ -140,6 +133,19 @@ final class AnnotationCodableTests: XCTestCase {
         XCTAssertEqual((try XCTUnwrap(imageKind["image"] as? [String: Any]))["assetId"] as? String, "asset-2")
         let nestedKind = try XCTUnwrap(items[1]["kind"] as? [String: Any])
         XCTAssertNotNil(nestedKind["batch"] as? [String: Any])
+    }
+
+    /// Annotations now persist until the AI or the user explicitly clears
+    /// them (see `Annotation`'s type comment) -- there is no expiry deadline
+    /// left to carry, on the wire or anywhere else. `Annotation.init` has no
+    /// `expiresAt` parameter any more, so this only needs to confirm the
+    /// KEY itself is gone from the encoded JSON, guarding against a future
+    /// change quietly reintroducing it under `CodingKeys` without a matching
+    /// stored property.
+    func testWireShapeNoLongerCarriesAnExpiryField() throws {
+        let json = try wireJSON(for: Annotation(screenId: "1", kind: path()))
+        XCTAssertNil(json["expiresAt"], "an annotation persists until explicitly cleared; there is no expiry to encode")
+        XCTAssertNil(json["expiresAtUptime"], "the deleted monotonic deadline must not reappear on the wire")
     }
 
     private func wireJSON(for annotation: Annotation) throws -> [String: Any] {

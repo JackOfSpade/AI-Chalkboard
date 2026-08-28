@@ -1,17 +1,20 @@
 import Foundation
 
-/// Static MCP catalog. Drawing uses three universal primitives: arbitrary SVG
-/// paths, caller-rendered raster images, and first-class system text. There
-/// are no canned circles/arrows/boxes/grids; agents construct those (and
-/// anything more complex) from the same free-draw surface.
+/// Static MCP catalog. Drawing is built on three universal primitives --
+/// arbitrary SVG paths, caller-rendered raster images, and first-class system
+/// text -- plus draw_shape, a thin geometric convenience over the path
+/// primitive for the one case (a circle/ellipse/rect specified by centre and
+/// radius) common enough, and error-prone enough to hand-assemble as raw arc
+/// commands, to be worth a dedicated tool. Anything more complex --
+/// arrows, callouts, handwriting, grids -- still goes directly through
+/// path_data; there is no canned tool for those.
 enum MCPToolCatalog {
     static let appParamDescription = "Optional app to LINK this drawing to: bundle id or display name. It is visible only while that app is frontmost. If omitted, the previous non-Claude app is used. Pass an empty string for GLOBAL visibility."
 
     private static let sharedDrawProperties: [String: Any] = [
         "screen_id": ["type": "string", "maxLength": 128, "description": "Current screen ID/index from get_screens; omitted/blank defaults to main, while an unknown explicit value is rejected instead of falling back to another display."],
         "app": ["type": "string", "description": appParamDescription],
-        "duration_seconds": ["type": "number", "exclusiveMinimum": 0, "maximum": DrawingDefaults.maxAnnotationDurationSeconds, "description": "Optional lifetime up to \(Int(DrawingDefaults.maxAnnotationDurationSeconds)) seconds; omit to persist until clear/eviction."],
-        "coordinate_space": ["type": "string", "enum": ["backing_pixels", "normalized", "screenshot_pixels"], "description": "Position/geometry space. When coordinates were measured from a screenshot, use screenshot_pixels with the exact dimensions of that same image version (after any model/client resize). It must be an uncropped full-display image; a detectable crop/window aspect mismatch is rejected because it has no safe display origin. A same-aspect crop is inherently indistinguishable from a downsampled full-display image, so callers remain responsible for full-display provenance. backing_pixels is the default, normalized is 0...1 of the selected display. Style dimensions stay in backing pixels."],
+        "coordinate_space": ["type": "string", "enum": ["backing_pixels", "normalized", "screenshot_pixels"], "description": "Position/geometry space. When coordinates were measured from a screenshot, use screenshot_pixels with the exact dimensions of that same image version (after any model/client resize). It must be an uncropped full-display image; a detectable crop/window aspect mismatch is rejected because it has no safe display origin. A same-aspect crop is inherently indistinguishable from a downsampled full-display image, so callers remain responsible for full-display provenance. backing_pixels is the default, normalized is 0...1 of the selected display. NOTE for normalized specifically: unlike screenshot_pixels it carries no evidence of WHICH display it was measured against, so nothing can detect a mismatch on your behalf -- pass screen_id explicitly whenever you measured a display other than the main one. Style dimensions stay in backing pixels."],
         "screenshot_width": ["type": "integer", "minimum": 1, "description": "Exact integer pixel width of the uncropped full-display image version used to measure coordinates when coordinate_space=screenshot_pixels; do not use its pre-resize/original width if the measured image was resized."],
         "screenshot_height": ["type": "integer", "minimum": 1, "description": "Exact integer pixel height of the uncropped full-display image version used to measure coordinates when coordinate_space=screenshot_pixels; do not use its pre-resize/original height if the measured image was resized."],
         "z_index": ["type": "integer", "description": "Paint order; higher values appear above lower values. Default 0; equal values retain creation order."]
@@ -50,11 +53,111 @@ enum MCPToolCatalog {
         "opacity": ["type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Text opacity; default 1."]
     ]
 
+    private static let shapeProperties: [String: Any] = [
+        "shape": ["type": "string", "enum": ["circle", "ellipse", "rect"], "description": "Which shape to draw. circle requires center_x/center_y/radius; ellipse requires center_x/center_y/radius_x/radius_y; rect requires width/height plus EITHER x/y (top-left corner) OR center_x/center_y (centre) -- supplying both position forms, or neither, is rejected."],
+        "center_x": ["type": "number", "description": "Centre X in the selected coordinate_space. Required for circle/ellipse; for rect it is an alternative to x/y (top-left corner) -- supply one position pair, not both."],
+        "center_y": ["type": "number", "description": "Centre Y in the selected coordinate_space. Required for circle/ellipse; for rect it is an alternative to x/y (top-left corner) -- supply one position pair, not both."],
+        "radius": ["type": "number", "exclusiveMinimum": 0, "description": "circle only: radius in the selected coordinate_space. Radius is scaled per axis, not as a point, so under coordinate_space='normalized' on a non-square display a single radius yields an ELLIPSE whose radius is that fraction of each axis; under backing_pixels/screenshot_pixels it stays a true circle."],
+        "radius_x": ["type": "number", "exclusiveMinimum": 0, "description": "ellipse only: X radius in the selected coordinate_space."],
+        "radius_y": ["type": "number", "exclusiveMinimum": 0, "description": "ellipse only: Y radius in the selected coordinate_space."],
+        "width": ["type": "number", "exclusiveMinimum": 0, "description": "rect only: width in the selected coordinate_space."],
+        "height": ["type": "number", "exclusiveMinimum": 0, "description": "rect only: height in the selected coordinate_space."],
+        "x": ["type": "number", "description": "rect only: top-left X in the selected coordinate_space; alternative to center_x/center_y (supply one position pair, not both)."],
+        "y": ["type": "number", "description": "rect only: top-left Y in the selected coordinate_space; alternative to center_x/center_y (supply one position pair, not both)."]
+    ]
+
+    /// `draw_shape` reuses `pathProperties` for its stroke/fill/opacity/dash/
+    /// fill_rule styling -- every one of those arguments passes straight
+    /// through to the same vector renderer draw_path uses. `path_data` itself
+    /// is deliberately excluded: draw_shape always computes its own path from
+    /// `shape`'s geometry, so advertising `path_data` as a usable parameter
+    /// here would imply a caller-supplied path is honoured when it is in fact
+    /// always overwritten.
+    private static let pathStyleProperties: [String: Any] = {
+        var properties = pathProperties
+        properties.removeValue(forKey: "path_data")
+        return properties
+    }()
+
     private static func merged(_ dictionaries: [[String: Any]]) -> [String: Any] {
         dictionaries.reduce(into: [:]) { result, dictionary in
             for (key, value) in dictionary { result[key] = value }
         }
     }
+
+    /// `draw_batch`'s per-item schema, where EVERY item type's properties
+    /// share one flat object because JSON Schema cannot express "these fields
+    /// depend on `type`" without a oneOf the MCP clients here do not reliably
+    /// honour.
+    ///
+    /// WHY THIS EXISTS RATHER THAN A BARE `merged([...])`: `merged` is
+    /// last-writer-wins, and four keys are claimed by more than one item type
+    /// -- `x`/`y` by image, text, AND rect shapes; `width`/`height` by image
+    /// AND rect shapes. A bare merge therefore silently published ONE type's
+    /// wording as if it were the whole story. That is not cosmetic: adding
+    /// `shapeProperties` to this merge made the batch schema describe `x` as
+    /// "rect only", which tells a model that an `image` or `text` batch item
+    /// must not pass `x` -- when both in fact REQUIRE it. A schema that
+    /// misdescribes a required coordinate is precisely the kind of thing that
+    /// puts a drawing in the wrong place, which is the bug class this tool
+    /// exists to eliminate.
+    ///
+    /// So the shared keys are rewritten here, after the merge, with wording
+    /// that names each item type that uses them. `MCPToolCatalogTests` pins
+    /// that: if a future item type claims one of these keys, the test fails
+    /// rather than letting the description quietly narrow again.
+    /// The four per-item property dictionaries, paired with the `type` value
+    /// each one belongs to, so the collision set below can be DERIVED rather
+    /// than hand-listed. Hand-listing it was itself the bug: the first
+    /// version of this guard enumerated x/y/width/height and silently missed
+    /// `opacity`, which image and text both claim.
+    private static let batchItemContributors: [(type: String, properties: [String: Any])] = [
+        ("path", pathProperties), ("image", imageProperties),
+        ("text", textProperties), ("shape", shapeProperties)
+    ]
+
+    /// Every key claimed by more than one item type, together with the types
+    /// claiming it -- computed from the dictionaries themselves, so adding a
+    /// property to any of them cannot quietly create an undescribed collision.
+    /// `MCPToolCatalogTests` asserts each of these keys' published description
+    /// names every type listed here, which fails the build for a new collision
+    /// nobody wrote a union description for.
+    static let batchItemSharedKeyContributors: [String: [String]] = {
+        var claims: [String: [String]] = [:]
+        for (type, properties) in batchItemContributors {
+            for key in properties.keys { claims[key, default: []].append(type) }
+        }
+        return claims.filter { $0.value.count > 1 }.mapValues { $0.sorted() }
+    }()
+
+    static var batchItemSharedKeys: [String] { batchItemSharedKeyContributors.keys.sorted() }
+
+    /// `draw_batch` publishes ONE flat property object covering every item
+    /// type, because JSON Schema cannot express "these fields depend on
+    /// `type`" without a oneOf the MCP clients here do not reliably honour.
+    ///
+    /// WHY THIS EXISTS RATHER THAN A BARE `merged([...])`: `merged` is
+    /// last-writer-wins, so for every key in `batchItemSharedKeyContributors`
+    /// a bare merge publishes ONE type's wording as if it were the whole
+    /// story. That is not cosmetic -- it is a schema that misdescribes a
+    /// required field, which is exactly how a drawing ends up in the wrong
+    /// place or omitted. Adding shape properties made `x` read "rect only",
+    /// telling a model that an `image` or `text` item must not send `x` when
+    /// both require it; `opacity` separately read "Text opacity" for image
+    /// items, whose opacity has different semantics (a fully transparent
+    /// image is rejected outright). Each shared key is therefore rewritten
+    /// below with wording that names every type that uses it.
+    static let batchItemProperties: [String: Any] = {
+        var properties = merged(batchItemContributors.map(\.properties) + [
+            ["type": ["type": "string", "enum": ["path", "image", "text", "shape"]]]
+        ])
+        properties["x"] = ["type": "number", "description": "image/text items: top-left X in the selected coordinate_space (required). shape items with shape='rect': top-left X, as the alternative to center_x/center_y -- supply one position pair, not both. Unused by path items, whose coordinates live inside path_data."]
+        properties["y"] = ["type": "number", "description": "image/text items: top-left Y in the selected coordinate_space (required). shape items with shape='rect': top-left Y, as the alternative to center_x/center_y -- supply one position pair, not both. Unused by path items, whose coordinates live inside path_data."]
+        properties["width"] = ["type": "number", "exclusiveMinimum": 0, "description": "image items: optional output width in the selected coordinate_space; omit one dimension and it is derived from the raster's true pixel aspect ratio in backing pixels, and omit both for intrinsic backing-pixel size. shape items with shape='rect': required width in the selected coordinate_space."]
+        properties["height"] = ["type": "number", "exclusiveMinimum": 0, "description": "image items: optional output height in the selected coordinate_space; omitting it derives the height from width and the raster's true pixel aspect ratio. shape items with shape='rect': required height in the selected coordinate_space."]
+        properties["opacity"] = ["type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Overall opacity of this item; default 1. image items: a fully transparent image is rejected outright, because it can neither be shown nor verified. text items: applies to the glyphs and compounds with background_opacity for the label's backing rectangle."]
+        return properties
+    }()
 
     static let tools: [[String: Any]] = [
         [
@@ -76,11 +179,20 @@ enum MCPToolCatalog {
         ],
         [
             "name": "draw_path",
-            "description": "The vector free-draw primitive. Renders arbitrary SVG path geometry with independent stroke, fill, opacity, dash, and fill rule. Construct circles, arrows, boxes, callouts, handwriting, diagrams, and complex shapes through path_data; no canned shape tools exist.",
+            "description": "The vector free-draw primitive. Renders arbitrary SVG path geometry with independent stroke, fill, opacity, dash, and fill rule. Construct arrows, callouts, handwriting, diagrams, and arbitrary complex shapes through path_data. For a plain circle, ellipse, or rectangle, prefer draw_shape's center/radius parameters over hand-written arc commands -- every hand-written arc is a chance to mis-center it.",
             "inputSchema": [
                 "type": "object",
                 "properties": merged([sharedDrawProperties, pathProperties]),
                 "required": ["path_data"]
+            ]
+        ],
+        [
+            "name": "draw_shape",
+            "description": "Draws a circle, ellipse, or rectangle by centre and radius (or corner), instead of hand-assembling draw_path's raw SVG arc commands. Emits the identical closed-path vector geometry draw_path would, with the same stroke/fill/opacity/dash/fill_rule styling. See shape for the required fields per shape.",
+            "inputSchema": [
+                "type": "object",
+                "properties": merged([sharedDrawProperties, pathStyleProperties, shapeProperties]),
+                "required": ["shape"]
             ]
         ],
         [
@@ -103,13 +215,16 @@ enum MCPToolCatalog {
         ],
         [
             "name": "highlight_element",
-            "description": "Finds one running app's Accessibility element by label and draws a rectangular vector highlight around its live bounds. Matching is exact by default; ambiguous labels are rejected unless occurrence is supplied. The resolved frame is anchored at creation time, not continuously tracked as the UI moves.",
+            "description": "Finds one running app's Accessibility element by label and draws a vector highlight around its live bounds -- rect (default), ellipse, or circle; see shape. Matching is exact by default; ambiguous labels are rejected unless occurrence is supplied. The resolved frame is anchored at creation time, not continuously tracked as the UI moves.",
             "inputSchema": ["type": "object", "properties": [
                 "label": ["type": "string", "minLength": 1, "maxLength": DrawingDefaults.maxHighlightLabelCharacters, "description": "Accessibility title, description, or value to match."],
                 "app": ["type": "string", "description": "Running target app bundle id or display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."],
                 "role": ["type": "string", "description": "Optional raw Accessibility role, for example AXButton."],
                 "match": ["type": "string", "enum": ["exact", "contains"], "description": "Label matching mode; exact is the default."],
                 "occurrence": ["type": "integer", "minimum": 1, "description": "One-based candidate index, required when a label is ambiguous."],
+                "max_nodes": ["type": "integer", "minimum": 1, "maximum": AccessibilityElementResolver.absoluteMaxNodes, "description": "Accessibility elements to visit before giving up; default \(AccessibilityElementResolver.defaultMaxNodes). The search is breadth-first and visits every element regardless of label/role, so this -- not a narrower query -- is what makes a large hierarchy reachable. Raise it together with timeout_seconds."],
+                "timeout_seconds": ["type": "number", "minimum": AccessibilityElementResolver.minTraversalTimeoutSeconds, "maximum": AccessibilityElementResolver.maxTraversalTimeoutSeconds, "description": "Wall-clock budget for the whole traversal; default \(AccessibilityElementResolver.defaultTraversalTimeoutSeconds). A large app walks roughly 5,000 elements per second, so raising max_nodes without raising this just trades a node-cap error for a timeout."],
+                "shape": ["type": "string", "enum": ["rect", "ellipse", "circle"], "description": "Highlight outline shape; default rect. ellipse is inscribed in the padded bounds (tangent to all four padded edges). circle is concentric with the padded bounds but sized to CIRCUMSCRIBE them (radius = max(width,height)/2) rather than inscribe them, so it rings a wide element -- most buttons and icons are wider than tall -- without clipping its ends."],
                 "padding_px": ["type": "number", "minimum": 0, "description": "Outward rectangle padding in backing pixels; default 8."],
                 "stroke_color": ["type": "string", "description": "Rectangle stroke color; color is accepted as an alias. Defaults to orange."],
                 "color": ["type": "string", "description": "Alias for stroke_color; do not supply conflicting values."],
@@ -117,14 +232,13 @@ enum MCPToolCatalog {
                 "stroke_opacity": ["type": "number", "minimum": 0, "maximum": 1, "description": "Stroke opacity; default 1."],
                 "fill_color": ["type": "string", "description": "Optional rectangle fill color."],
                 "fill_opacity": ["type": "number", "minimum": 0, "maximum": 1, "description": "Fill opacity; default 0.15 when fill_color is supplied."],
-                "duration_seconds": ["type": "number", "exclusiveMinimum": 0, "maximum": DrawingDefaults.maxAnnotationDurationSeconds],
                 "z": ["type": "integer", "description": "Paint order; higher values appear above lower values. Alias for z_index."],
                 "z_index": ["type": "integer", "description": "Paint order alias; do not supply a conflicting z value."]
             ], "required": ["label"]]
         ],
         [
             "name": "draw_batch",
-            "description": "Atomically adds 1–100 mixed free-draw path/image/text primitives under one annotation ID (maximum \(DrawingDefaults.maxRasterImagesPerBatch) raster items / \(DrawingDefaults.maxRasterDecodedBytesPerBatch / (1_024 * 1_024)) MiB decoded raster data). All items appear, verify, expire, and clear together; if any item is invalid, nothing is added.",
+            "description": "Atomically adds 1–100 mixed free-draw path/image/text/shape primitives under one annotation ID (maximum \(DrawingDefaults.maxRasterImagesPerBatch) raster items / \(DrawingDefaults.maxRasterDecodedBytesPerBatch / (1_024 * 1_024)) MiB decoded raster data). All items appear, verify, and clear together; if any item is invalid, nothing is added.",
             "inputSchema": [
                 "type": "object",
                 "properties": merged([sharedDrawProperties, [
@@ -132,7 +246,7 @@ enum MCPToolCatalog {
                         "type": "array", "minItems": 1, "maxItems": DrawingDefaults.maxBatchItems,
                         "items": [
                             "type": "object",
-                            "properties": merged([pathProperties, imageProperties, textProperties, ["type": ["type": "string", "enum": ["path", "image", "text"]]]]),
+                            "properties": batchItemProperties,
                             "required": ["type"]
                         ]
                     ]
@@ -159,7 +273,7 @@ enum MCPToolCatalog {
         ],
         [
             "name": "suspend_annotations",
-            "description": "Acquires a short-lived suspension lease, ordering AI Chalkboard overlays out without clearing annotations, IDs, or running TTLs. lease_seconds is 1...60 (default 15). Save the returned secret leaseToken and pass exactly it to resume_annotations. An optional fresh lowercase canonical UUID idempotency_key makes a retry from the same MCP server process instance return the same active lease. It is secret; reuse from another instance is rejected without revealing another lease token. clickSafeAtObservation is true only for the current live generation after bounded peer presentation settlement. This is a temporary click workaround, not true simultaneous highlight-and-click.",
+            "description": "Acquires a short-lived suspension lease, ordering AI Chalkboard overlays out without clearing annotations or IDs. lease_seconds is 1...60 (default 15). Save the returned secret leaseToken and pass exactly it to resume_annotations. An optional fresh lowercase canonical UUID idempotency_key makes a retry from the same MCP server process instance return the same active lease. It is secret; reuse from another instance is rejected without revealing another lease token. clickSafeAtObservation is true only for the current live generation after bounded peer presentation settlement. This is a temporary click workaround, not true simultaneous highlight-and-click.",
             "inputSchema": ["type": "object", "properties": [
                 "lease_seconds": ["type": "integer", "minimum": 1, "maximum": 60, "description": "Lease lifetime in seconds; default 15. It expires automatically if not released."],
                 "idempotency_key": ["type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "description": "Optional fresh lowercase canonical UUID capability, scoped to its creator MCP server process instance while active. Retry only from that instance; reuse elsewhere errors without returning a token. Do not log or reuse it across callers." ]
@@ -183,7 +297,7 @@ enum MCPToolCatalog {
         ],
         [
             "name": "list_annotations",
-            "description": "Lists a bounded page of live drawings with IDs, geometry (or an explicit oversized-geometry summary), app linkage, visibility, expiresAt, and remainingSeconds. Use nextOffset to page.",
+            "description": "Lists a bounded page of live drawings with IDs, geometry (or an explicit oversized-geometry summary), app linkage, and visibility. Use nextOffset to page.",
             "inputSchema": ["type": "object", "properties": [
                 "offset": ["type": "integer", "minimum": 0, "description": "Zero-based page offset; default 0."],
                 "limit": ["type": "integer", "minimum": 1, "maximum": DrawingDefaults.maxAnnotationListPageItems, "description": "Maximum entries to return; default and maximum \(DrawingDefaults.maxAnnotationListPageItems)."]

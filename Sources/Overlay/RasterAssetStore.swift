@@ -101,8 +101,8 @@ public final class RasterAssetStore: @unchecked Sendable {
     }
 
     /// A strong, immutable snapshot of one or more decoded assets.  Holding a
-    /// lease keeps pixels alive even if the owning annotation is cleared or
-    /// expires on another thread while a renderer/verifier is using them.
+    /// lease keeps pixels alive even if the owning annotation is cleared on
+    /// another thread while a renderer/verifier is using them.
     ///
     /// The lease deliberately exposes only images by opaque id; source paths
     /// and store mutation remain unavailable to rendering code.

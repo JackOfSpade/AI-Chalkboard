@@ -15,21 +15,45 @@ enum DrawOutcome<Success> {
 
 /// The shared pipeline behind every `draw_*` MCP tool.
 ///
-/// The universal vector/raster/batch tools share screen resolution, lifetime,
-/// app linking, storage, and success reporting. This type performs that
-/// pipeline once; each handler contributes only its media parsing and kind.
+/// The universal vector/raster/batch tools share screen resolution, app
+/// linking, storage, and success reporting. This type performs that pipeline
+/// once; each handler contributes only its media parsing and kind.
 ///
 /// Split into two steps -- `resolveScreen(args:)`, then `finish(...)` -- ON
 /// PURPOSE, matching the original per-tool ordering exactly: screen
 /// resolution (and therefore coordinate normalization) has to happen BEFORE
 /// a tool can validate its own geometry in physical pixels, but
-/// color/duration/app-link resolution happens AFTER that geometry is
+/// color/app-link resolution happens AFTER that geometry is
 /// validated -- so a caller that sent both malformed geometry AND an
 /// ambiguous `app` still sees the geometry error first, exactly as the
 /// original hand-written bodies did (they parsed and validated geometry
 /// completely before ever calling `resolveTargetApp`).
 struct DrawRequest {
     let screen: ScreenInfo
+
+    /// Every display present in the snapshot `screen` was chosen from.
+    ///
+    /// Retained purely so `coordinateTransform` can tell a UNIQUE
+    /// screenshot-to-display mapping apart from an AMBIGUOUS one: a
+    /// `screenshot_pixels` call carries the dimensions of one specific
+    /// display's image, and on a desktop with two identically-sized monitors
+    /// those dimensions fit both. See that method's ambiguity guard.
+    let candidateScreens: [ScreenInfo]
+
+    /// False ONLY when `screen` came from the "no `screen_id` supplied, so
+    /// use the main display" default in `ScreenSnapshot.resolve`.
+    ///
+    /// True when the caller named a display, and true for the default
+    /// `init` used by `handleHighlightElement`, whose display is not a
+    /// default at all -- it is derived from the Accessibility frame's own
+    /// position, so it is already the one display the geometry can belong to.
+    let screenIsDetermined: Bool
+
+    init(screen: ScreenInfo, candidateScreens: [ScreenInfo]? = nil, screenIsDetermined: Bool = true) {
+        self.screen = screen
+        self.candidateScreens = candidateScreens ?? [screen]
+        self.screenIsDetermined = screenIsDetermined
+    }
 
     struct CoordinateTransform {
         let scaleX: Double
@@ -131,7 +155,15 @@ struct DrawRequest {
             )
             return .failure("Unknown screen_id. Nothing was drawn; call get_screens and use a current display id or in-bounds index.")
         }
-        return .success(DrawRequest(screen: screen))
+        let suppliedScreenId = (args["screen_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .success(DrawRequest(
+            screen: screen,
+            candidateScreens: snapshot.screens,
+            // `ScreenSnapshot.resolve` treats an omitted OR blank id as "use
+            // the main display". That is a fallback, not a caller decision,
+            // and `coordinateTransform` needs to know the difference.
+            screenIsDetermined: !(suppliedScreenId?.isEmpty ?? true)
+        ))
     }
 
     /// `resolveScreen(args:)` followed immediately by `coordinateTransform(args:)`
@@ -190,6 +222,18 @@ struct DrawRequest {
             guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0 else {
                 return .failure("screenshot_width and screenshot_height produce an invalid coordinate transform; use finite dimensions that do not overflow the selected display scale.")
             }
+            // Which of the CURRENTLY CONNECTED displays could this image
+            // actually be a full-display screenshot of? Computed once and
+            // used by both guards below.
+            let accepting = candidateScreens.filter {
+                ScreenshotGeometry.fullDisplayScale(
+                    screenshotWidth: width,
+                    screenshotHeight: height,
+                    screenWidth: Double($0.widthPx),
+                    screenHeight: Double($0.heightPx)
+                ) != nil
+            }
+
             guard ScreenshotGeometry.fullDisplayScale(
                 screenshotWidth: width,
                 screenshotHeight: height,
@@ -202,7 +246,46 @@ struct DrawRequest {
                     "Drawing rejected: reason=unsafe_screenshot_mapping sourceWidth=\(widthPixels) sourceHeight=\(heightPixels) targetScreenId=\(screen.id) targetWidth=\(screen.widthPx) targetHeight=\(screen.heightPx) sourceScaleX=\(sourceScaleX) sourceScaleY=\(sourceScaleY)",
                     level: "WARN"
                 )
-                return .failure("Unsafe screenshot mapping rejected: source=\(width)x\(height) px, targetScreenId=\(screen.id), target=\(screen.widthPx)x\(screen.heightPx) backing px, sourceToTargetScales=\(sourceScaleX)x\(sourceScaleY). The dimensions do not match within pixel-rounding tolerance. screenshot_pixels requires the exact dimensions of the uncropped full-display image used to measure coordinates; cropped or window-only screenshots cannot be mapped safely.")
+                // Naming the display(s) these dimensions DO fit turns the
+                // commonest multi-monitor mistake -- screenshotting the
+                // secondary display and forgetting screen_id, so the request
+                // is measured against the main one -- from a dead end into a
+                // one-argument correction. Deliberately a hint, not an
+                // automatic redirect: silently drawing on a display the
+                // caller never named is the very failure the ambiguity guard
+                // below exists to prevent.
+                let hint = accepting.isEmpty
+                    ? ""
+                    : " These dimensions DO match connected display(s) \(accepting.map(\.id).joined(separator: ", ")); pass screen_id if the screenshot came from one of those."
+                return .failure("Unsafe screenshot mapping rejected: source=\(width)x\(height) px, targetScreenId=\(screen.id), target=\(screen.widthPx)x\(screen.heightPx) backing px, sourceToTargetScales=\(sourceScaleX)x\(sourceScaleY). The dimensions do not match within pixel-rounding tolerance. screenshot_pixels requires the exact dimensions of the uncropped full-display image used to measure coordinates; cropped or window-only screenshots cannot be mapped safely.\(hint)")
+            }
+
+            // A screenshot is inherently the image of ONE display, but its
+            // dimensions do not identify which one when several displays are
+            // the same size -- the dual identical-monitor setup is standard
+            // in exactly the editing suites this tool is used in. With no
+            // `screen_id`, `ScreenSnapshot.resolve` silently returns the MAIN
+            // display, so an agent that screenshotted the secondary monitor,
+            // measured a control on it, and omitted `screen_id` got a
+            // successful-looking result with its annotation drawn at the same
+            // coordinates on the WRONG PHYSICAL MONITOR -- the scale guard
+            // above cannot catch it, because identical dimensions map
+            // perfectly to either display.
+            //
+            // Refuse to guess, listing the candidates, exactly as
+            // `resolveTargetApp` does for an ambiguous `app` and as the
+            // Accessibility resolver does for an ambiguous label. One extra
+            // round trip beats a silently misplaced annotation.
+            //
+            // Only the DEFAULTED case is ambiguous: an explicit `screen_id`
+            // is already the caller's answer to this question, and a single
+            // accepting display leaves nothing to choose between.
+            if !screenIsDetermined, accepting.count > 1 {
+                Logger.shared.log(
+                    "Drawing rejected: reason=ambiguous_screenshot_display sourceWidth=\(widthPixels) sourceHeight=\(heightPixels) acceptingScreenCount=\(accepting.count) defaultedScreenId=\(screen.id)",
+                    level: "WARN"
+                )
+                return .failure("Ambiguous screenshot mapping rejected: source=\(width)x\(height) px matches \(accepting.count) connected displays (ids: \(accepting.map(\.id).joined(separator: ", "))) and no screen_id was supplied, so the annotation would have silently defaulted to display \(screen.id). A screenshot is the image of one specific display and its dimensions cannot say which. Nothing was drawn; retry with screen_id naming the display the screenshot was taken from.")
             }
             return .success(CoordinateTransform(scaleX: scaleX, scaleY: scaleY))
         default:
@@ -210,35 +293,40 @@ struct DrawRequest {
         }
     }
 
-    /// Validates a `duration_seconds` argument the same way `finish(...)`
-    /// does, without resolving it to a value. `handleHighlightElement`
-    /// deliberately re-runs this exact check before it ever resolves a
-    /// process or touches the Accessibility hierarchy (see that handler's own
-    /// comment on why: a malformed highlight must not trigger a TCC prompt or
-    /// cross-process AX IPC merely to fail later at `finish`). That early
-    /// front-loaded rejection is the deliberate part; the validation logic
-    /// itself was a literal copy, so it lives here once and both call sites
-    /// share it.
-    static func validateDurationSeconds(args: [String: Any]) -> String? {
-        if args.keys.contains("duration_seconds"),
-           MCPArgument.hasInvalidSuppliedDouble(args, key: "duration_seconds") {
-            return "duration_seconds must be a finite number greater than 0 when supplied."
-        }
-        if let requestedDuration = MCPArgument.double(args["duration_seconds"]),
-           (requestedDuration <= 0 || requestedDuration > DrawingDefaults.maxAnnotationDurationSeconds) {
-            return "duration_seconds must be greater than 0 and no more than \(Int(DrawingDefaults.maxAnnotationDurationSeconds)) seconds when supplied; omit it for a persistent annotation."
-        }
-        return nil
+    /// `duration_seconds` is not a tool parameter any more: an annotation now
+    /// persists until the AI or the user explicitly clears it (see
+    /// `ClearScope`'s doc comment for the user-initiated half of that). A
+    /// caller that still supplies `duration_seconds` at all -- any value,
+    /// valid-looking or not -- is REJECTED outright rather than having the
+    /// argument silently dropped.
+    ///
+    /// WHY REJECT RATHER THAN IGNORE: an agent that passes `duration_seconds`
+    /// believes its drawing will clean itself up. Silently ignoring the
+    /// argument would leave that agent's drawings on the user's screen
+    /// forever while it believed otherwise, which is exactly the clutter
+    /// this tool must not create. A loud rejection retrains the caller on the
+    /// first call. This also matches this repo's standing preference for
+    /// rejecting over silently doing something different from what was
+    /// asked.
+    ///
+    /// `handleHighlightElement` deliberately re-runs this exact check before
+    /// it ever resolves a process or touches the Accessibility hierarchy (see
+    /// that handler's own comment on why: a rejected argument must not
+    /// trigger a TCC prompt or cross-process AX IPC merely to fail later at
+    /// `finish`). The check itself lives here once and both call sites share
+    /// it.
+    static func rejectDurationSecondsIfSupplied(args: [String: Any]) -> String? {
+        guard args.keys.contains("duration_seconds") else { return nil }
+        return "duration_seconds is no longer supported: annotations now persist until they are explicitly cleared. Nothing was drawn; remove duration_seconds and call clear (by annotation_id, by app, or scope='all') when you are done with the drawing."
     }
 
     /// Reads the arguments every draw tool shares beyond geometry
-    /// (`color`/`duration_seconds`/`app`), resolves the per-app link, builds
-    /// and stores the `Annotation`, and returns the worded success text -- or
-    /// propagates `resolveTargetApp`'s error text unchanged.
+    /// (`color`/`app`), resolves the per-app link, builds and stores the
+    /// `Annotation`, and returns the worded success text -- or propagates
+    /// `resolveTargetApp`'s error text unchanged.
     func finish(
         args: [String: Any],
         defaultColor: String,
-        defaultDuration: Double? = nil,
         label: String?,
         defaultsToGlobal: Bool,
         kind: AnnotationKind,
@@ -250,11 +338,9 @@ struct DrawRequest {
             return .failure("color must be a string when supplied.")
         }
         let colorHex = args["color"] as? String ?? defaultColor
-        if let error = DrawRequest.validateDurationSeconds(args: args) {
+        if let error = DrawRequest.rejectDurationSecondsIfSupplied(args: args) {
             return .failure(error)
         }
-        let requestedDuration = MCPArgument.double(args["duration_seconds"])
-        let duration = requestedDuration ?? defaultDuration
 
         if args.keys.contains("z_index"), MCPArgument.integer(args["z_index"]) == nil {
             return .failure("z_index must be an integer when supplied.")
@@ -288,30 +374,18 @@ struct DrawRequest {
             appName: appName,
             zIndex: zIndex
         )
-        let addResult = AnnotationStore.shared.addWithOutcome(annotation, durationSeconds: duration)
-        let evicted: Int
-        switch addResult {
-        case .added(let count):
-            evicted = count
+        switch AnnotationStore.shared.addWithOutcome(annotation) {
+        case .added:
             onAnnotationCreated?(annotation)
         case .rejected(.payloadBytes(let limit, let attempted)):
             return .failure("The annotation was not stored because retained vector/text payload would become \(attempted) bytes, exceeding the \(limit)-byte session limit. Clear old annotations or use smaller geometry.")
         case .rejected(.primitiveCount(let limit, let attempted)):
             return .failure("The annotation was not stored because retained primitive count would become \(attempted), exceeding the \(limit)-primitive session limit. Clear old annotations or use a smaller batch.")
+        case .rejected(.annotationCount(let limit, let attempted)):
+            return .failure("The annotation was not stored because the store would hold \(attempted) annotations, exceeding the \(limit)-annotation session limit. Clear annotations you no longer need and retry.")
         }
 
-        var text = "Created \(noun) annotation: \(annotation.id)\(MCPServer.shared.linkageSuffix(appId: appId, appName: appName))"
-        if evicted > 0 {
-            // AnnotationStore.add's eviction count is a return value
-            // specifically so this can surface here instead of only in a log
-            // line -- a runaway session (never passing duration_seconds,
-            // never calling clear) should be visible from the tool result
-            // itself, not just from a log file the user is unlikely to open.
-            // When `evicted == 0` (the overwhelmingly common case) this
-            // branch is skipped entirely, so the message stays byte-identical
-            // to what this tool returned before eviction reporting existed.
-            text += " Note: \(evicted) older annotation(s) were dropped to stay under the \(DrawingDefaults.maxStoredAnnotations)-annotation limit -- call clear if you no longer need the old ones."
-        }
+        let text = "Created \(noun) annotation: \(annotation.id)\(MCPServer.shared.linkageSuffix(appId: appId, appName: appName))"
         return .success(text)
     }
 }

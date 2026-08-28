@@ -5,8 +5,11 @@ import XCTest
 /// `AnnotationStore` exists specifically to be safe across the MCP server's
 /// background read queue and the AppKit main thread, but had no concurrency
 /// test at all. These tests hammer it with concurrent mutations via
-/// `DispatchQueue.concurrentPerform` and separately pin down the new
-/// eviction cap (`DrawingDefaults.maxStoredAnnotations`).
+/// `DispatchQueue.concurrentPerform` and separately pin down the count-cap
+/// REJECTION (`DrawingDefaults.maxStoredAnnotations`) -- an insertion that
+/// would push the store past the cap is now refused outright rather than
+/// evicting older annotations to make room for it; see
+/// `AnnotationStore.addWithOutcome`'s doc comment for why.
 final class AnnotationStoreConcurrencyTests: XCTestCase {
     private func annotation(id: String) -> Annotation {
         Annotation(id: id, screenId: "1", kind: .vectorPath(data: "M0 0 L10 10", strokeColorHex: nil, strokeWidth: 2, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1))
@@ -16,7 +19,7 @@ final class AnnotationStoreConcurrencyTests: XCTestCase {
     /// every other one from concurrent tasks that also call `getAll()` in the
     /// same wave, and asserts the store lands on a consistent final count
     /// with no crash. Kept well under `DrawingDefaults.maxStoredAnnotations`
-    /// so eviction (covered separately below) cannot interfere.
+    /// so the count-cap rejection (covered separately below) cannot interfere.
     func testConcurrentAddRemoveAndGetAllProduceAConsistentFinalCountWithoutCrashing() {
         let store = AnnotationStore()
         let addCount = 1000
@@ -40,42 +43,64 @@ final class AnnotationStoreConcurrencyTests: XCTestCase {
         XCTAssertEqual(Set(store.getAll().map(\.id)), expectedSurvivors)
     }
 
-    func testEvictionCapDropsOldestFirstReturnsEvictedCountAndKeepsNewest() {
+    /// CONTRAST WITH THE DELETED BEHAVIOUR: this cap used to evict the
+    /// oldest stored annotations to make room once it was full, so a caller
+    /// that kept drawing past the cap would silently lose its earliest work
+    /// -- a second, silent way (alongside the deleted TTL/expiry mechanism)
+    /// for a drawing to vanish without the AI or the user asking for it. It
+    /// now REJECTS the new insertion outright and changes nothing already
+    /// stored: no annotation is evicted, trimmed, or reordered to make room.
+    func testCountCapRejectsOnceFullAndLeavesExactlyTheFirstAnnotationsAddedInPlace() {
         let store = AnnotationStore()
         let capacity = DrawingDefaults.maxStoredAnnotations
         let overflowBy = 50
-        let totalToAdd = capacity + overflowBy
 
-        var totalEvicted = 0
-        for i in 0..<totalToAdd {
-            totalEvicted += store.add(annotation(id: "a-\(i)"))
+        for i in 0..<capacity {
+            guard case .added = store.addWithOutcome(annotation(id: "a-\(i)")) else {
+                return XCTFail("annotation a-\(i) should still fit under the cap")
+            }
         }
 
-        XCTAssertEqual(totalEvicted, overflowBy)
+        for i in capacity..<(capacity + overflowBy) {
+            let outcome = store.addWithOutcome(annotation(id: "a-\(i)"))
+            guard case .rejected(.annotationCount(let limit, let attempted)) = outcome else {
+                return XCTFail("expected an annotationCount rejection for a-\(i), got \(outcome)")
+            }
+            XCTAssertEqual(limit, capacity)
+            // The store never actually grows past capacity, so every
+            // rejected attempt reports the same one-past-the-cap number --
+            // there is no accumulating overflow to report.
+            XCTAssertEqual(attempted, capacity + 1)
+        }
 
         let remainingIds = store.getAll().map(\.id)
-        XCTAssertEqual(remainingIds.count, capacity)
-        XCTAssertEqual(remainingIds, (overflowBy..<totalToAdd).map { "a-\($0)" },
-                       "eviction must drop the oldest entries first and keep the newest, in order")
+        XCTAssertEqual(remainingIds.count, capacity, "the store's count must not have changed across every rejected insertion")
+        XCTAssertEqual(remainingIds, (0..<capacity).map { "a-\($0)" },
+                       "a rejection cap keeps EXACTLY what was already stored -- no eviction, no truncation, no reordering")
     }
 
-    /// Cap eviction is one of the paths that must decrement the running
-    /// resource total for every evicted annotation, not just the live
-    /// insertion path. `retainedResourceUsage` (the incrementally maintained
-    /// total) must land on exactly what `fullRecomputeResourceUsageForTesting()`
-    /// (an independent from-scratch walk) reports once eviction has settled.
-    func testRunningResourceUsageMatchesFullRecomputeAfterEvictionPastCap() {
+    /// Rejections at the count cap must leave the running resource total
+    /// exactly where it was before the rejected attempt, matching the same
+    /// leave-everything-unchanged guarantee the payload-bytes and
+    /// primitive-count caps already had (see `AnnotationStoreTests`'s
+    /// `testRejectedAddLeavesRunningResourceUsageExactlyUnchanged`), now
+    /// extended to the count cap.
+    func testRunningResourceUsageIsUnchangedByRejectionsPastTheCountCap() {
         let store = AnnotationStore()
         let capacity = DrawingDefaults.maxStoredAnnotations
         let overflowBy = 25
-        let totalToAdd = capacity + overflowBy
 
-        for i in 0..<totalToAdd {
+        for i in 0..<capacity {
+            store.add(annotation(id: "u-\(i)"))
+        }
+        let usageAtCapacity = store.retainedResourceUsage
+
+        for i in capacity..<(capacity + overflowBy) {
             store.add(annotation(id: "u-\(i)"))
         }
 
         XCTAssertEqual(store.getAll().count, capacity)
-        XCTAssertEqual(store.retainedResourceUsage.primitiveCount, capacity)
+        XCTAssertEqual(store.retainedResourceUsage, usageAtCapacity)
         XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
     }
 

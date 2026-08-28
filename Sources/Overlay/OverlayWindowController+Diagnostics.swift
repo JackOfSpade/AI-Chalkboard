@@ -39,8 +39,14 @@ extension OverlayWindowController {
     /// painted pixel was not occluded or filtered from somebody else's capture.
     func presentationStatus(for annotationId: String) -> PresentationStatus {
         let suspendedWithoutAnnotation = isAnnotationsSuspended
-        guard let annotation = AnnotationStore.shared.get(id: annotationId),
-              !annotation.hasExpired(now: Date(), uptime: ProcessInfo.processInfo.systemUptime) else {
+        // A stored annotation is unconditionally live. This used to also
+        // screen out an annotation whose duration had elapsed but whose
+        // removal had not yet run, because a `get` could hand back something
+        // already logically gone. Annotations no longer have a lifetime at
+        // all -- they persist until `clear`/`remove` deletes them -- so
+        // presence in the store IS liveness, and there is no longer any
+        // window in which those two can disagree.
+        guard let annotation = AnnotationStore.shared.get(id: annotationId) else {
             let input = PresentationReadinessInput(
                 annotationExists: false,
                 annotationIsInCurrentVisibleSet: false,
@@ -84,7 +90,7 @@ extension OverlayWindowController {
                 windowServerEntryInOnScreenList: nil,
                 presentationReady: false,
                 failureReasons: failures,
-                note: "The annotation was not found or has expired; no live overlay window can be expected for it."
+                note: "The annotation was not found; it was cleared, or the id is wrong. No live overlay window can be expected for it."
             )
         }
 

@@ -11,11 +11,12 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 - **Click-Through Input Transparency**: Built with `window.ignoresMouseEvents = true`. The overlay window never consumes mouse clicks, drags, or keystrokes. It is also ordered fully off screen (not just left transparent) on any screen with nothing currently visible to paint, so a tool that determines click ownership by walking the on-screen window list — rather than by routing a real click and letting the window server honor `ignoresMouseEvents` — never finds AI Chalkboard occupying a screen it isn't actively annotating. For dispatchers that still reject any visible overlay, `suspend_annotations` temporarily orders the overlay out without clearing its annotations; call `resume_annotations` after the click.
 - **Multi-Monitor Aware**: Automatically spawns transparent overlay windows across all connected displays and adjusts when display configurations change.
 - **First-Class Text and Free Drawing**: `draw_text` renders normal UI labels directly. `draw_path` accepts arbitrary SVG geometry, `draw_image` places caller-rendered raster art, and `draw_batch` combines primitives atomically. This keeps shapes unrestricted without making ordinary text a PNG-generation chore.
-- **Coordinate-Space Inputs**: `draw_path`, `draw_image`, `draw_text`, and `draw_batch` accept top-left-origin `backing_pixels` (the default), `normalized` 0…1, or `screenshot_pixels` coordinates. When geometry is measured from an image, use `screenshot_pixels` with the exact dimensions of that same uncropped full-display image version after any client/model resize. Detectable cropped/window aspect mismatches are rejected instead of being silently stretched across a display. A crop with the display's exact aspect ratio is mathematically indistinguishable from a downsampled full-display image, so callers must preserve full-display provenance. SVG paths retain source coordinates plus their backing-pixel scale; text/image positions are stored in backing pixels. Stroke, font, padding, and other style dimensions always remain backing pixels. `backingScaleFactor` reflects the active macOS display mode, not the panel's marketing label.
-- **Element-Anchored Highlighting**: `highlight_element` can locate a named accessible UI element (for example, a button titled “Fusion”) and highlight its resolved bounds. `get_accessibility_status` reports whether macOS Accessibility access is available before a call depends on it.
+- **Centre-and-Radius Shapes**: `draw_shape` (and `draw_batch`'s `type: "shape"` items) draw a circle, ellipse, or rectangle from a centre and radius (or a rect's corner), instead of the caller hand-writing `draw_path`'s raw SVG arc commands. The app computes the closed path itself — including the two-arc construction a full ellipse needs, since a single SVG arc command cannot close on itself — because every hand-written arc was a chance to mis-center it, which is how measured placement error was actually entering. `draw_path` remains the tool for anything the centre/radius model doesn't cover: arrows, callouts, handwriting, and other freeform geometry.
+- **Coordinate-Space Inputs**: `draw_path`, `draw_shape`, `draw_image`, `draw_text`, and `draw_batch` accept top-left-origin `backing_pixels` (the default), `normalized` 0…1, or `screenshot_pixels` coordinates. When geometry is measured from an image, use `screenshot_pixels` with the exact dimensions of that same uncropped full-display image version after any client/model resize. Detectable cropped/window aspect mismatches are rejected instead of being silently stretched across a display. A crop with the display's exact aspect ratio is mathematically indistinguishable from a downsampled full-display image, so callers must preserve full-display provenance. SVG paths retain source coordinates plus their backing-pixel scale; text/image positions are stored in backing pixels. Stroke, font, padding, and other style dimensions always remain backing pixels. `draw_shape` is the one exception to "coordinates and lengths transform the same way": its centres (`center_x`/`center_y`, or a rect's `x`/`y` corner) go through the same position transform as every other tool, but its lengths (`radius`, `radius_x`, `radius_y`, `width`, `height`) are scaled per axis instead — so a `circle` requested under `normalized` on a non-square display resolves to an ellipse in backing pixels, by design, because one radius fraction is not the same physical distance on both axes. `backingScaleFactor` reflects the active macOS display mode, not the panel's marketing label.
+- **Element-Anchored Highlighting**: `highlight_element` can locate a named accessible UI element (for example, a button titled “Fusion”) and highlight its resolved bounds as a rectangle (default), ellipse, or circle via `shape` — round and pill-shaped controls (radio buttons, circular icon buttons) get a ring around their actual silhouette instead of just their bounding box. `get_accessibility_status` reports whether macOS Accessibility access is available before a call depends on it.
 - **Stable In-Place Adjustment**: `update_annotation` moves or restyles an existing annotation without minting a new ID, preserving the ID used by verification and clear operations. Explicit `z_index` controls ordering between annotations; later batch items remain on top of earlier items within that batch.
-- **Leased Suspension for Click Workflows**: `suspend_annotations` acquires a 1–60-second (15-second default) lease and orders overlay windows out while retaining annotations, IDs, and running TTLs. Keep its `leaseToken` secret and release exactly that token with `resume_annotations`; overlapping callers cannot accidentally resume one another’s overlays. An optional canonical UUID idempotency key makes safe retries return the same active lease only from its creator MCP server process instance. Generate a fresh random UUID and treat it as secret too; reuse from another instance is rejected and never reveals the other lease token. The result only says `clickSafeAtObservation: true` after bounded WindowServer observation and a final durable read confirm that exact live generation and its peer presentation are settled. This is point-in-time evidence, not raw-framebuffer/occlusion proof and not true simultaneous highlight-and-click support.
-- **Auto-Clear Duration**: Optional `duration_seconds` parameter on all drawing tools (e.g. `duration_seconds: 3.0`) causes drawing annotations to automatically disappear after N seconds to keep the screen uncluttered. Durations are bounded to seven days; omit the field for persistence.
+- **Leased Suspension for Click Workflows**: `suspend_annotations` acquires a 1–60-second (15-second default) lease and orders overlay windows out while retaining annotations and IDs. Keep its `leaseToken` secret and release exactly that token with `resume_annotations`; overlapping callers cannot accidentally resume one another’s overlays. An optional canonical UUID idempotency key makes safe retries return the same active lease only from its creator MCP server process instance. Generate a fresh random UUID and treat it as secret too; reuse from another instance is rejected and never reveals the other lease token. The result only says `clickSafeAtObservation: true` after bounded WindowServer observation and a final durable read confirm that exact live generation and its peer presentation are settled. This is point-in-time evidence, not raw-framebuffer/occlusion proof and not true simultaneous highlight-and-click support.
+- **Persists Until Explicitly Cleared**: A drawing has no lifetime and no timeout. It stays on screen until something explicitly clears it — the AI calling `clear` (by `annotation_id`, by `app`, or `scope="all"`), or the user clicking the menu-bar "Clear Annotations for Current App + Global" (⌘K) or "Clear Everything (All Apps)". `duration_seconds` is not a tool parameter any more: supplying it on any drawing tool is REJECTED outright rather than silently ignored, so a caller cannot come away believing a drawing will clean itself up. This guarantee holds only for the life of the MCP server process — annotations are held in server memory, not written to disk, so they do not survive that process restarting or quitting.
 - **Closed-Loop Verification**: `verify_annotation` proves free-draw placement against a clean UI screenshot using the exact live renderer. `verify_presentation` separately checks the retained AppKit window/view, WindowServer on-screen registration, and bounded alignment with the annotation's target display so agents can detect most presentation failures without asking a human to eyeball the display.
 - **Bounded Diagnostics**: Coordinate/verification rejections and lifecycle/presentation events are timestamped in UTC and written to stderr plus `~/Library/Logs/AIChalkboard/ai_chalkboard.log`. Message payloads are capped at 16 KiB; the log rotates at 5 MiB and keeps one backup (each file can exceed the threshold only by a bounded final record). If size measurement or rotation cannot complete, file writes pause while stderr continues, so a persistent filesystem error cannot create an infinitely growing log. Rejection records use fixed reason codes and numeric geometry rather than persisting caller text, UI labels, or local asset paths.
 - **Capture Debug Request**: `set_capture_visible(true)` asks compatible capture paths to include the overlay and renders all annotations for placement checks. Capture programs retain their own app/window filters, so inclusion is not guaranteed; `.none` is also not a privacy boundary on modern macOS. Two safety nets guard against forgetting to turn it back off: it auto-reverts to `false` after 5 minutes with no renewal, and the menu-bar icon tints orange for as long as it's on.
@@ -29,17 +30,18 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 | --- | --- | --- |
 | `get_screens` | `none` | Returns display IDs, physical pixel resolutions, backing scale factors, point dimensions, coordinate-space guidance, and the top-level `annotationsSuspended` presentation state. |
 | `get_overlay_state` | `none` | Reports overlay visibility, click-through state, and top-level `annotationsSuspended` for click dispatchers that can honor it. |
-| `draw_path` | `path_data`, `stroke_color?`, `stroke_width?`, `stroke_opacity?`, `fill_color?`, `fill_opacity?`, `fill_rule?`, `dash?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?`, `duration_seconds?` | Draws arbitrary SVG path data. Supports absolute/relative `M L H V C S Q T A Z`, curves, arcs, fills, dashes, and independent stroke/fill opacity. |
-| `draw_image` | `image_path`, `x`, `y`, `width?`, `height?`, `rotation_degrees?`, `opacity?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?`, `duration_seconds?` | Decodes arbitrary PNG/JPEG/HEIC/TIFF art into memory once and places it with alpha, scaling, rotation, and a selected coordinate space. |
-| `draw_text` | `text`, `x`, `y`, `font_size`, `color?`, `background_color?`, `background_opacity?`, `padding_px?`, `opacity?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?`, `duration_seconds?` | Renders a text label at a top-left position without requiring an intermediate raster image. `font_size` is required. |
-| `draw_batch` | `items`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `screen_id?`, `app?`, `duration_seconds?`, `z_index?` | Atomically adds up to 100 mixed path/image/text primitives under one annotation ID, with a 16-image / 128 MiB decoded-raster sublimit. |
-| `highlight_element` | `label`, `app?`, `role?`, `match?`, `occurrence?`, `padding_px?`, `stroke_color?`/`color?`, `stroke_width?`, `stroke_opacity?`, `fill_color?`, `fill_opacity?`, `duration_seconds?`, `z?`/`z_index?` | Resolves one element in a running app's Accessibility hierarchy and draws a normal vector rectangle around its bounds. Exact matching is the default; ambiguous results require a one-based occurrence. |
+| `draw_path` | `path_data`, `stroke_color?`, `stroke_width?`, `stroke_opacity?`, `fill_color?`, `fill_opacity?`, `fill_rule?`, `dash?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?` | Draws arbitrary SVG path data. Supports absolute/relative `M L H V C S Q T A Z`, curves, arcs, fills, dashes, and independent stroke/fill opacity. |
+| `draw_shape` | `shape`, `center_x?`, `center_y?`, `radius?`, `radius_x?`, `radius_y?`, `width?`, `height?`, `x?`, `y?`, `stroke_color?`, `stroke_width?`, `stroke_opacity?`, `fill_color?`, `fill_opacity?`, `fill_rule?`, `dash?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?` | Draws a circle, ellipse, or rectangle from a centre and radius (or a rect's corner), instead of hand-written `draw_path` arc commands; emits the same closed-path vector geometry `draw_path` would, with the same styling. `shape=circle` requires `center_x`/`center_y`/`radius`; `ellipse` requires `center_x`/`center_y`/`radius_x`/`radius_y`; `rect` requires `width`/`height` plus exactly one of `x`/`y` (corner) or `center_x`/`center_y` (centre) — both or neither is rejected. |
+| `draw_image` | `image_path`, `x`, `y`, `width?`, `height?`, `rotation_degrees?`, `opacity?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?` | Decodes arbitrary PNG/JPEG/HEIC/TIFF art into memory once and places it with alpha, scaling, rotation, and a selected coordinate space. |
+| `draw_text` | `text`, `x`, `y`, `font_size`, `color?`, `background_color?`, `background_opacity?`, `padding_px?`, `opacity?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?` | Renders a text label at a top-left position without requiring an intermediate raster image. `font_size` is required. |
+| `draw_batch` | `items`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `screen_id?`, `app?`, `z_index?` | Atomically adds up to 100 mixed path/image/text/shape primitives under one annotation ID, with a 16-image / 128 MiB decoded-raster sublimit. Each item's `type` is `path`, `image`, `text`, or `shape`; `shape` items take the same fields as `draw_shape`. |
+| `highlight_element` | `label`, `app?`, `role?`, `match?`, `occurrence?`, `max_nodes?`, `timeout_seconds?`, `shape?`, `padding_px?`, `stroke_color?`/`color?`, `stroke_width?`, `stroke_opacity?`, `fill_color?`, `fill_opacity?`, `z?`/`z_index?` | Resolves one element in a running app's Accessibility hierarchy and draws a vector highlight around its bounds — rectangle (default), ellipse, or circle via `shape`. Exact matching is the default; ambiguous results require a one-based occurrence. `max_nodes` (default 3,000, ceiling 10,000) and `timeout_seconds` (default 2.0, ceiling 10.0) bound the traversal that finds it. |
 | `get_accessibility_status` | `request_permission?` | Reports macOS Accessibility authorization. `request_permission` defaults to false; set it true only to explicitly ask macOS to show its permission prompt. |
 | `update_annotation` | `annotation_id`, `offset_x?`, `offset_y?`, `opacity?`, `z_index?`, kind-specific style fields | Moves or restyles an annotation in place. Its ID and creation identity remain stable. |
 | `suspend_annotations` | `lease_seconds?`, `idempotency_key?` | Acquires a short-lived suspension lease and returns secret `leaseToken`. `lease_seconds` is integer 1–60 (default 15); `idempotency_key` is an optional secret lowercase canonical UUID for retries from the same MCP server process instance. Reuse elsewhere errors without revealing a token. Only act on `clickSafeAtObservation: true`. |
 | `resume_annotations` | `lease_token` | Releases exactly one returned secret `leaseToken`. If another lease remains, the result succeeds only when `peerPresentationSettled=true`; otherwise the token is released but the result is an error. With no remaining lease, the result records a linearized snapshot/restoration request, not global convergence proof. Tombstone cleanup lasts 120 seconds. |
 | `clear` | `annotation_id?`, `scope?`, `app?` | Clears one exact ID when supplied. Otherwise pass `app` to target that app plus globals; omission preserves fallback-app behavior. Use `scope="all"` (without `app`) to clear every app. |
-| `list_annotations` | `offset?`, `limit?` | Returns a bounded page of active annotations, including RFC 3339 `expiresAt`, live `remainingSeconds` TTL metadata, and top-level `annotationsSuspended`. Follow `nextOffset` to page; huge geometry is explicitly summarized instead of producing an oversized MCP response. |
+| `list_annotations` | `offset?`, `limit?` | Returns a bounded page of active annotations, which persist until explicitly cleared (there is no TTL to report), plus top-level `annotationsSuspended`. Follow `nextOffset` to page; huge geometry is explicitly summarized instead of producing an oversized MCP response. |
 | `verify_annotation` | `annotation_id`, `screenshot_path?` or `capture_source="chalkboard"`, `request_permission?`, `padding_px?` | Returns a PNG crop composited with the exact live renderer. Exactly one screenshot source is required; `request_permission` is valid only for Chalkboard capture and defaults to false. |
 | `verify_presentation` | `annotation_id` | Checks AppKit drawable state plus WindowServer all/on-screen registration and target-display bounds. Catches missing/hidden/detached/transparent/wrong-level/frame/display windows; does not claim raw-framebuffer proof. |
 | `get_active_app` | `none` | Returns raw/current frontmost app state, the fallback app targeted by untagged drawing calls, and local `annotationsSuspended` presentation state. |
@@ -57,9 +59,9 @@ reporting success and drawing nothing useful:
 | SVG path data ≤ 200,000 characters | Path data is parsed once per distinct path string (see `SVGPathCache`) and repainted every frame; the bound permits detailed art without allowing one persistent path to monopolize the overlay thread, and it bounds the parse cache's budget. |
 | Full SVG command validation | Malformed/non-finite path geometry, invalid arc flags, opacity outside 0…1, and non-positive dash lengths are rejected before anything is stored. |
 | Raster input ≤ 50 MB / 20 MP / 16,384 px per axis | Files are opened once, validated from that descriptor, read into a bounded immutable snapshot, and decoded into memory; paths are never retained or returned. Unsupported/vector/multi-frame files are rejected. |
-| At most 256 raster assets / 512 MiB decoded raster memory per process | Per-image limits alone do not prevent an aggregate image bomb. Clearing, expiry, rollback, and eviction release the store's ownership; active render leases keep in-flight frames deterministic. |
+| At most 256 raster assets / 512 MiB decoded raster memory per process | Per-image limits alone do not prevent an aggregate image bomb. Clearing, update replacement, and batch-validation rollback release the store's ownership; active render leases keep in-flight frames deterministic. |
 | Batch size 1…100, with at most 16 rasters / 128 MiB decoded raster data | A batch validates and loads completely before storage; any invalid component releases temporary raster assets and adds nothing. Vector-only batches retain the broader 100-item freedom. |
-| At most 2,000 stored annotations per process | Drawings persist until cleared unless they have a duration, so the oldest are evicted past the cap and their raster memory is released. |
+| At most 2,000 stored annotations per process | Drawings persist until cleared, so a session that never calls `clear` grows the store without bound. Once full, an insertion that would exceed the cap is REJECTED outright rather than silently evicting the oldest annotation to make room — silent eviction was a second way (alongside the timeout this store no longer has) for a drawing to vanish without the AI or the user asking for it. Call `clear` to make room. |
 | 16 MiB retained vector/text payload and 10,000 retained primitives | Aggregate limits prevent many individually-valid paths/text/batches from exhausting memory or repaint time. A rejected draw/update leaves existing annotations intact. |
 | 8 MiB serialized MCP response | Verification reserves JSON/base64 overhead, `list_annotations` is paged, and every final response is capped. Oversized geometry is summarized rather than emitting an unbounded line. |
 | A draw call with no displays available is an error | Previously the annotation was stored against a synthetic screen id that no overlay window ever matches — permanently invisible, reported as success. |
@@ -75,6 +77,65 @@ should check `get_accessibility_status` (using `request_permission=true` only
 when an explicit system prompt is wanted) and handle denied, unavailable, missing,
 or ambiguous elements as normal tool errors. Accessibility geometry is converted
 to the selected display's backing-pixel coordinate space before it is drawn.
+
+`highlight_element` lookup failures split into two measured, differently-actionable
+cases rather than one blanket "not found." First, a control can simply not be
+exposed to Accessibility at all — against a live DaVinci Resolve, `highlight_element`
+against Resolve's Fusion Inspector tab strip returned "no accessibility element
+matched" on 12 of 12 attempts — meaning element anchoring is not possible for that
+control, and the caller should fall back to screenshot-measured coordinates plus
+`verify_annotation` rather than retrying the same lookup. Second, a busy application
+can fail to answer an Accessibility attribute request within the messaging timeout
+even though the element genuinely IS exposed — the same measurement against Resolve
+saw this on 1 of 12 attempts, on a label ("Tracking") that otherwise resolved cleanly
+every other time — and that case is now reported as its own distinct, retryable
+error instead of being folded into "this app has no Accessibility metadata"; retry
+the lookup rather than concluding the UI is unreachable. When a lookup finds no
+match at all, its error also names a bounded, de-duplicated sample of the labels
+the app's Accessibility tree DOES expose (up to 64 collected, ranked toward labels
+related to the failed query, up to 8 previewed), so a caller can re-target with a
+corrected label or role instead of guessing screen coordinates. None of this changes
+what is and is not proven elsewhere in this section: a successful match still only
+proves that Accessibility reported a frame, not that the frame is unoccluded or
+pixel-accurate.
+
+An element that matches the label but publishes no usable screen frame (no
+AXPosition/AXSize — typically an off-screen, menu, or otherwise non-drawable
+element) is no longer treated as a match at all: `highlight_element` exists to
+draw a shape around an element's bounds, and an element with no bounds has nothing
+to draw around, so it can never be selected, pad an ambiguity list, or consume an
+`occurrence` slot. `occurrence` therefore numbers only the highlightable matches —
+the Nth element that matches the label AND has a usable frame — not the Nth element
+that merely matches the label. When some matches are skipped this way,
+`occurrenceOutOfRange` reports how many highlightable matches were actually
+available and separately notes the frameless count, so a caller who can see more
+matching labels on screen than the error's count understands why the rest were
+unusable rather than assuming a miscount. A label that matches only frameless
+elements is reported distinctly from a plain "no match" — the error names how many
+elements matched but had nothing to draw around — since the label genuinely was
+found on the element; retry with a different label or role, or fall back to
+screenshot-measured coordinates confirmed with `verify_annotation`.
+
+`highlight_element`'s traversal is also bounded by the sheer size of the hierarchy
+it walks, and for some applications that size is the whole story regardless of how
+precisely the query is written. Against a live DaVinci Resolve, the published
+Accessibility tree exceeds 60,000 elements and took over 11 seconds to walk without
+completing, at a measured rate of roughly 5,200 elements/second — well past the
+3,000-element / 2.0-second default budget, and past even the 10,000-element /
+10.0-second ceiling. Three consequences follow from that, stated plainly rather
+than implied. First, the search is breadth-first and visits every element
+regardless of its label or role, so a narrower query does NOT make a large tree
+reachable — only `max_nodes`, `timeout_seconds`, and `occurrence` change how much
+of the tree the walk actually needs to cover. Second, without `occurrence` the walk
+deliberately continues past a match to prove the label is unambiguous, so a match
+found early in the walk is still lost if the walk later exhausts its budget;
+supplying `occurrence` (e.g. `occurrence: 1`) returns the first highlightable match
+immediately once it is found, and is the practical approach for a large
+application — measured at 0.01–1.3s against Resolve's tree, versus a 4.2s
+budget failure with no `occurrence` supplied against that same tree. Third, for an
+application whose tree exceeds every allowed budget, element anchoring is simply
+not available — the supported path is screenshot-measured coordinates confirmed
+with `verify_annotation`, the same fallback named throughout this section.
 
 Chalkboard-side capture avoids depending on another computer-use tool's
 per-application screenshot grant, but it still needs macOS Screen Recording
@@ -117,8 +178,10 @@ or expired token is deliberately successful cleanup only during the bounded
 The result names the bounded
 cooperating-process/window-observation scope and is deliberately honest: it is
 not raw-framebuffer or occlusion proof, and a process/window created after the
-observation can change the state. Suspension keeps IDs and does not pause or
-extend TTLs, so an annotation may expire while hidden. It is a compatibility
+observation can change the state. Suspension keeps every annotation and its ID
+exactly as they were; since annotations have no lifetime to pause or extend,
+hiding them for the lease's duration cannot make one vanish out from under it.
+It is a compatibility
 workaround, not true concurrent highlight-and-click support: keeping a
 highlight visible during the click still requires the computer-use dispatcher
 to honor `ignoresMouseEvents`.
@@ -196,7 +259,7 @@ Add AI Chalkboard to `~/Library/Application Support/Claude/claude_desktop_config
 ## Why This Setup is Ideal for Claude Cowork
 
 1. **Physical-Pixel Coordinates**: When a screenshot represents the full display pixel grid, SVG and raster coordinates correspond directly to backing pixels. App/window-filtered computer-use captures may omit the overlay even when capture debug mode is enabled.
-2. **Auto-Disappearing Annotations**: By passing `duration_seconds: 3`, Claude can highlight buttons or input fields briefly while explaining steps to the user without cluttering the screen.
+2. **No Cleanup Guesswork**: Claude never has to pick a duration hoping it outlasts (or doesn't outlive) the explanation it's giving. It draws, explains at whatever pace the user needs, and calls `clear` when the annotation has served its purpose — nothing times out from under it, and nothing lingers because Claude forgot a duration was still counting down.
 3. **Zero Input Disruption**: User can continue typing or clicking underneath while Claude draws highlights.
 
 ---

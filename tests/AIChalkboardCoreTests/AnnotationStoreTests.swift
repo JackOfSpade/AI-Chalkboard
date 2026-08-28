@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import AIChalkboardCore
 
@@ -9,6 +10,44 @@ final class AnnotationStoreTests: XCTestCase {
             kind: .vectorPath(data: "M0 0 L10 10", strokeColorHex: nil, strokeWidth: 2, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1),
             appId: appId,
             appName: appId
+        )
+    }
+
+    /// A minimal decodable PNG on disk, for annotations whose kind owns a
+    /// raster asset. Mirrors `RasterAssetStoreTests`' fixture -- see that
+    /// file for why an in-memory `NSBitmapImageRep` round-tripped through a
+    /// temp file is the simplest true "loadable raster" this test suite has.
+    private func png(width: Int = 13, height: Int = 7) throws -> URL {
+        let rep = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: width,
+            pixelsHigh: height,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bitmapFormat: [],
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ai-chalkboard-store-raster-\(UUID().uuidString).png")
+        try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: url)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
+    /// A raster-backed annotation loaded into the SHARED `RasterAssetStore`
+    /// (the same instance `AnnotationStore.releaseRasterAssets` releases
+    /// into), so a test can assert the asset is gone after the annotation is.
+    private func rasterBackedAnnotation(id: String, screen: String = "1") throws -> Annotation {
+        let source = try png()
+        let asset = try RasterAssetStore.shared.load(path: source.path)
+        return Annotation(
+            id: id,
+            screenId: screen,
+            kind: .image(assetId: asset.id, x: 0, y: 0, width: 13, height: 7, rotationDegrees: 0, opacity: 1)
         )
     }
 
@@ -42,89 +81,53 @@ final class AnnotationStoreTests: XCTestCase {
         XCTAssertEqual(store.getAll().map(\.id), ["first", "target"])
     }
 
-    func testExpiredAnnotationIsExcludedFromLaterClearCount() {
+    // MARK: - Annotations persist until explicitly cleared (no more expiry)
+    //
+    // This store used to hold a TTL/expiry mechanism (`Annotation.expiresAt`
+    // / `expiresAtUptime`, `AnnotationStore.sweepExpiredLocked`, and an
+    // `asyncAfter` removal timer per timed annotation) that silently removed
+    // an annotation once its deadline passed. The product decision is that
+    // an annotation now persists until the AI or the user explicitly clears
+    // it -- there is no duration argument left to accept, and nothing sweeps
+    // a read path for "expired" entries any more. The tests below pin the
+    // REPLACEMENT guarantee: an annotation added with no expiry-like
+    // mechanism at all stays exactly where it was put, through every read
+    // path that used to perform that sweep, until something explicitly
+    // removes it.
+
+    func testAnnotationSurvivesEveryReadPathThatUsedToSweepExpiredEntries() {
         let store = AnnotationStore()
-        store.add(annotation(id: "expiring-global", appId: nil), durationSeconds: 0.01)
-        store.add(annotation(id: "live-finder", appId: "com.apple.finder"))
+        store.add(annotation(id: "persistent", appId: nil))
 
-        let expiryProcessed = expectation(description: "main-queue expiration processed")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            expiryProcessed.fulfill()
-        }
-        wait(for: [expiryProcessed], timeout: 1.0)
+        // A real deadline-based sweep would have reaped this by now; the
+        // sleep exists only to make that contrast concrete for a reader of
+        // this test, not because any code here still races a clock.
+        Thread.sleep(forTimeInterval: 0.05)
 
-        XCTAssertEqual(store.getAll().map(\.id), ["live-finder"])
-        XCTAssertEqual(store.clearVisible(forApp: "com.apple.finder"), 1)
+        // Every one of these methods routed through `withLiveAnnotations` /
+        // `sweepExpiredLocked` before this change, so each one was a
+        // separate opportunity for a "expired" annotation to silently
+        // disappear. All must still report it.
+        XCTAssertEqual(store.get(id: "persistent")?.id, "persistent")
+        XCTAssertEqual(store.getAll().map(\.id), ["persistent"])
+        XCTAssertEqual(store.getForScreen("1").map(\.id), ["persistent"])
+        XCTAssertEqual(store.getForScreen("1", visibleForApp: nil).map(\.id), ["persistent"])
+        XCTAssertTrue(store.hasVisibleAnnotations(forScreenId: "1", visibleForApp: nil))
+        XCTAssertNotNil(store.renderSnapshot(id: "persistent"))
+    }
+
+    func testOnlyAnExplicitRemoveOrClearEverTakesAnAnnotationOutOfTheStore() {
+        let store = AnnotationStore()
+        store.add(annotation(id: "still-here", appId: nil))
+        Thread.sleep(forTimeInterval: 0.05)
+
+        // Nothing but an explicit mutation changes the count -- in
+        // particular, plain reads (already exercised above) are not
+        // mutations, and there is no background timer left to race.
+        XCTAssertEqual(store.getAll().count, 1)
+
+        XCTAssertTrue(store.remove(id: "still-here"), "an explicit remove is still how an annotation goes away")
         XCTAssertTrue(store.getAll().isEmpty)
-    }
-
-    func testReadsEnforceExpiryEvenWhenScheduledMainQueueRemovalHasNotRun() {
-        let store = AnnotationStore()
-        store.add(annotation(id: "expired-without-timer", appId: nil), durationSeconds: 0.01)
-
-        // This test runs on the main thread, deliberately preventing the
-        // asyncAfter removal from firing before the deadline passes.
-        Thread.sleep(forTimeInterval: 0.03)
-
-        XCTAssertNil(store.get(id: "expired-without-timer"))
-        XCTAssertTrue(store.getAll().isEmpty)
-        XCTAssertTrue(store.getForScreen("1").isEmpty)
-        XCTAssertTrue(store.getForScreen("1", visibleForApp: nil).isEmpty)
-    }
-
-    func testMutationsNeverCountExpiredAnnotationsAsLiveRemovals() {
-        let store = AnnotationStore()
-        store.add(annotation(id: "expired", appId: nil), durationSeconds: 0.01)
-        Thread.sleep(forTimeInterval: 0.03)
-
-        XCTAssertFalse(store.remove(id: "expired"))
-
-        store.add(annotation(id: "expired-again", appId: nil), durationSeconds: 0.01)
-        Thread.sleep(forTimeInterval: 0.03)
-        XCTAssertEqual(store.clearVisible(forApp: nil), 0)
-
-        store.add(annotation(id: "expired-all", appId: nil), durationSeconds: 0.01)
-        Thread.sleep(forTimeInterval: 0.03)
-        XCTAssertEqual(store.clearAll(), 0)
-    }
-
-    func testDurationIsRecordedAsAnAbsoluteExpiryBeforeRemoval() throws {
-        let store = AnnotationStore()
-        let before = Date().addingTimeInterval(9.5)
-
-        store.add(annotation(id: "temporary", appId: nil), durationSeconds: 10)
-
-        let stored = try XCTUnwrap(store.getAll().first)
-        let expiry = try XCTUnwrap(stored.expiresAt)
-        XCTAssertGreaterThanOrEqual(expiry, before)
-        XCTAssertLessThanOrEqual(expiry, Date().addingTimeInterval(10.5))
-    }
-
-    func testStoreReplacesAnInvalidSuppliedMonotonicDeadline() throws {
-        let store = AnnotationStore()
-        var expiring = annotation(id: "invalid-monotonic-deadline", appId: nil)
-        expiring.expiresAt = Date().addingTimeInterval(60)
-        expiring.expiresAtUptime = .nan
-
-        store.add(expiring)
-
-        XCTAssertTrue(try XCTUnwrap(store.get(id: expiring.id)?.expiresAtUptime).isFinite)
-    }
-
-    func testExplicitExpiryTakesPrecedenceOverDurationArgument() throws {
-        let store = AnnotationStore()
-        let explicitExpiry = Date().addingTimeInterval(30)
-        let expiring = Annotation(
-            id: "explicit-expiry",
-            screenId: "1",
-            kind: .vectorPath(data: "M0 0 L10 10", strokeColorHex: nil, strokeWidth: 2, strokeOpacity: 1, fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1),
-            expiresAt: explicitExpiry
-        )
-
-        store.add(expiring, durationSeconds: 300)
-
-        let storedExpiry = try XCTUnwrap(store.getAll().first?.expiresAt)
-        XCTAssertEqual(storedExpiry.timeIntervalSince1970, explicitExpiry.timeIntervalSince1970, accuracy: 0.001)
     }
 
     func testClearVisibleWithNoAppRemovesGlobalsOnly() {
@@ -210,7 +213,7 @@ final class AnnotationStoreTests: XCTestCase {
 
         let changed = Annotation(
             id: first.id, screenId: first.screenId, kind: first.kind, colorHex: first.colorHex,
-            label: first.label, appId: first.appId, appName: first.appName, expiresAt: first.expiresAt,
+            label: first.label, appId: first.appId, appName: first.appName,
             opacity: 0.5, offsetX: 10, offsetY: 20, zIndex: 2, createdAt: first.createdAt
         )
         XCTAssertTrue(store.update(id: first.id, with: changed))
@@ -233,7 +236,7 @@ final class AnnotationStoreTests: XCTestCase {
             id: firstSnapshot.id, screenId: firstSnapshot.screenId, kind: firstSnapshot.kind,
             colorHex: firstSnapshot.colorHex, label: firstSnapshot.label,
             appId: firstSnapshot.appId, appName: firstSnapshot.appName,
-            expiresAt: firstSnapshot.expiresAt, opacity: 0.8, offsetX: 10, offsetY: 0,
+            opacity: 0.8, offsetX: 10, offsetY: 0,
             zIndex: firstSnapshot.zIndex, createdAt: firstSnapshot.createdAt
         )
         XCTAssertEqual(
@@ -245,7 +248,7 @@ final class AnnotationStoreTests: XCTestCase {
             id: staleSnapshot.id, screenId: staleSnapshot.screenId, kind: staleSnapshot.kind,
             colorHex: staleSnapshot.colorHex, label: staleSnapshot.label,
             appId: staleSnapshot.appId, appName: staleSnapshot.appName,
-            expiresAt: staleSnapshot.expiresAt, opacity: 0.4, offsetX: 99, offsetY: 0,
+            opacity: 0.4, offsetX: 99, offsetY: 0,
             zIndex: staleSnapshot.zIndex, createdAt: staleSnapshot.createdAt
         )
         XCTAssertEqual(
@@ -478,20 +481,6 @@ final class AnnotationStoreTests: XCTestCase {
         XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
     }
 
-    func testRunningResourceUsageMatchesFullRecomputeAfterExpiry() {
-        let store = AnnotationStore()
-        store.add(annotation(id: "expiring", appId: nil), durationSeconds: 0.01)
-        store.add(annotation(id: "persisting", appId: "com.apple.finder"))
-
-        Thread.sleep(forTimeInterval: 0.03)
-
-        // A plain read triggers the expiry sweep as a side effect.
-        XCTAssertEqual(store.getAll().map(\.id), ["persisting"])
-
-        XCTAssertEqual(store.retainedResourceUsage.primitiveCount, 1)
-        XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
-    }
-
     /// One annotation with EVERY top-level optional string field populated and
     /// one with all of them nil.
     ///
@@ -579,5 +568,101 @@ final class AnnotationStoreTests: XCTestCase {
         XCTAssertEqual(store.updateWithOutcome(id: "post-clear", with: replacement), .updated)
 
         XCTAssertEqual(store.retainedResourceUsage, store.fullRecomputeResourceUsageForTesting())
+    }
+
+    // MARK: - clearAll / clearVisible still remove annotations and release raster assets
+    //
+    // Deleting the expiry mechanism did not touch raster ownership: an
+    // `.image`-kind (or batch containing one) annotation still leases a
+    // decoded bitmap out of `RasterAssetStore.shared` for as long as it is
+    // stored, and `AnnotationStore.releaseRasterAssets` still must run on
+    // every path that actually removes an annotation. These tests follow the
+    // same before/after `RasterAssetStore.shared.image(id:)` pattern
+    // `RasterAssetStoreTests.testAnnotationRenderSnapshotClosesLookupToClearRace`
+    // already uses for `remove(id:)`, extended to the two clear methods.
+
+    func testClearAllRemovesAnnotationsAndReleasesTheirRasterAssets() throws {
+        let store = AnnotationStore()
+        let raster = try rasterBackedAnnotation(id: "raster-global")
+        guard case .image(let assetId, _, _, _, _, _, _) = raster.kind else {
+            return XCTFail("fixture must be an image-kind annotation")
+        }
+        store.add(raster)
+        store.add(annotation(id: "vector-global", appId: nil))
+        XCTAssertNotNil(RasterAssetStore.shared.image(id: assetId), "sanity: the asset must be loaded before clearAll")
+
+        XCTAssertEqual(store.clearAll(), 2)
+
+        XCTAssertTrue(store.getAll().isEmpty)
+        XCTAssertNil(RasterAssetStore.shared.image(id: assetId),
+                     "clearAll must release raster assets owned by every annotation it removes")
+    }
+
+    func testClearVisibleRemovesMatchingAnnotationsAndReleasesOnlyTheirRasterAssets() throws {
+        let store = AnnotationStore()
+        let clearedRaster = try rasterBackedAnnotation(id: "cleared-raster")
+        guard case .image(let clearedAssetId, _, _, _, _, _, _) = clearedRaster.kind else {
+            return XCTFail("fixture must be an image-kind annotation")
+        }
+        let clearedForFinder = Annotation(
+            id: clearedRaster.id, screenId: clearedRaster.screenId, kind: clearedRaster.kind,
+            appId: "com.apple.finder", appName: "Finder"
+        )
+        let survivingRaster = try rasterBackedAnnotation(id: "surviving-raster")
+        guard case .image(let survivingAssetId, _, _, _, _, _, _) = survivingRaster.kind else {
+            return XCTFail("fixture must be an image-kind annotation")
+        }
+        let survivingForTerminal = Annotation(
+            id: survivingRaster.id, screenId: survivingRaster.screenId, kind: survivingRaster.kind,
+            appId: "com.apple.Terminal", appName: "Terminal"
+        )
+
+        store.add(clearedForFinder)
+        store.add(survivingForTerminal)
+
+        XCTAssertEqual(store.clearVisible(forApp: "com.apple.finder"), 1)
+
+        XCTAssertEqual(store.getAll().map(\.id), ["surviving-raster"])
+        XCTAssertNil(RasterAssetStore.shared.image(id: clearedAssetId),
+                     "clearVisible must release the raster asset of the annotation it actually removed")
+        XCTAssertNotNil(RasterAssetStore.shared.image(id: survivingAssetId),
+                        "clearVisible must NOT release a raster asset still owned by a surviving annotation")
+
+        // Clean up the surviving asset so this test does not leak into the
+        // shared store's accounting for any test that runs after it.
+        _ = store.clearAll()
+        XCTAssertNil(RasterAssetStore.shared.image(id: survivingAssetId))
+    }
+
+    // MARK: - Count cap rejects rather than evicts (new guarantee)
+
+    /// Old behaviour (now deleted): once the store held
+    /// `DrawingDefaults.maxStoredAnnotations`, the OLDEST annotation was
+    /// silently evicted to make room for a new insertion -- a second, silent
+    /// way for a drawing to disappear, alongside the deleted TTL/expiry
+    /// mechanism. It now REJECTS the new insertion outright and changes
+    /// nothing already stored. `AnnotationStoreConcurrencyTests` exercises
+    /// this across the full cap and every rejected attempt past it; this
+    /// pins the same guarantee with the two assertions that matter most: the
+    /// specific rejection reason, and that the store's count and existing
+    /// contents did not move.
+    func testCountCapRejectsInsteadOfEvictingAndLeavesPriorAnnotationsIntact() {
+        let store = AnnotationStore()
+        for i in 0..<DrawingDefaults.maxStoredAnnotations {
+            store.add(annotation(id: "cap-\(i)", appId: nil))
+        }
+        let idsBeforeRejectedAttempt = store.getAll().map(\.id)
+        XCTAssertEqual(idsBeforeRejectedAttempt.count, DrawingDefaults.maxStoredAnnotations)
+
+        let outcome = store.addWithOutcome(annotation(id: "one-too-many", appId: nil))
+        guard case .rejected(.annotationCount(let limit, let attempted)) = outcome else {
+            return XCTFail("expected an annotationCount rejection, got \(outcome)")
+        }
+        XCTAssertEqual(limit, DrawingDefaults.maxStoredAnnotations)
+        XCTAssertEqual(attempted, DrawingDefaults.maxStoredAnnotations + 1)
+
+        XCTAssertEqual(store.getAll().map(\.id), idsBeforeRejectedAttempt,
+                       "a rejected insertion must not change the store's count OR evict any existing annotation")
+        XCTAssertNil(store.get(id: "one-too-many"), "the rejected annotation must not have been stored")
     }
 }

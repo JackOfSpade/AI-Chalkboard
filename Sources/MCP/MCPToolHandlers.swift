@@ -42,7 +42,7 @@ extension MCPServer {
                     ? "Capture-debug mode is ON: overlay windows request sharingType=.readOnly and render every annotation. A capture tool may still omit these windows through its own app/window filter. Call set_capture_visible(false) to restore normal filtering."
                     : "Capture-debug mode is OFF (default): overlay windows request legacy sharingType=.none and render only annotations visible for the active app. This is not a security guarantee; modern capture tools control their own inclusion filters.",
                 "suspensionNote": annotationsSuspended
-                    ? "Annotations are suspended: all overlay windows are ordered out while store entries and TTLs are retained. Release the exact suspension lease token with resume_annotations to restore normal presentation once no other lease remains."
+                    ? "Annotations are suspended: all overlay windows are ordered out while store entries are retained. Release the exact suspension lease token with resume_annotations to restore normal presentation once no other lease remains."
                     : "Annotations are not suspended. suspend_annotations is available as a temporary click-workaround, not simultaneous visual click-through."
             ]
             guard let text = jsonString(payload) else {
@@ -59,7 +59,7 @@ extension MCPServer {
             if !leaseSnapshot.isBootstrapped {
                 suspensionNote = "Annotations are hidden because the shared suspension registry is unavailable, not because this process holds a valid lease. activeLeaseCount is not authoritative in this fail-closed state; do not click or attempt token cleanup until suspensionRegistryBootstrapped=true."
             } else if annotationsSuspended {
-                suspensionNote = "Annotations are suspended: Chalkboard has ordered every overlay window in this process out, while retaining annotation store entries and TTLs. Each overlays[].isOnScreen value is this process's AppKit state only; it is not proof that a sibling process is also off screen. For a click workaround, use a live suspension lease whose suspend_annotations result says clickSafeAtObservation=true."
+                suspensionNote = "Annotations are suspended: Chalkboard has ordered every overlay window in this process out, while retaining annotation store entries. Each overlays[].isOnScreen value is this process's AppKit state only; it is not proof that a sibling process is also off screen. For a click workaround, use a live suspension lease whose suspend_annotations result says clickSafeAtObservation=true."
             } else {
                 suspensionNote = "ignoresMouseEvents and overlays[].isOnScreen are this process's live AppKit state. They do not prove sibling-process state, raw framebuffer pixels, or occlusion. macOS WindowServer metadata does not expose ignoresMouseEvents, so a click dispatcher that blocks merely because an overlay window is present must explicitly consult and honor this state. suspend_annotations is a fallback workaround, not true simultaneous click-through."
             }
@@ -129,6 +129,9 @@ extension MCPServer {
             case .success(let message):
                 sendTextResult(id: id, text: message)
             }
+
+        case "draw_shape":
+            handleDrawShape(id: id, args: args)
 
         case "draw_image":
             handleDrawImage(id: id, args: args)
@@ -251,7 +254,7 @@ extension MCPServer {
                 }
                 let removed = AnnotationStore.shared.clearVisible(forApp: activeId)
                 let target = activeName ?? activeId ?? "<global annotations only>"
-                let zeroNote = removed == 0 ? " No matching live annotations were present; check list_annotations for expiry or app linkage." : ""
+                let zeroNote = removed == 0 ? " No matching annotations were present; check list_annotations for app linkage." : ""
                 sendTextResult(id: id, text: "Cleared \(removed) annotation(s) for target \(target) [targetSource=\(targetSource), appId=\(activeId ?? "null")] (target-app annotations plus global ones). Annotations linked to other apps were left in place.\(zeroNote)")
             }
 

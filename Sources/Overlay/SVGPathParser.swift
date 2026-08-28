@@ -412,6 +412,28 @@ enum SVGPathParser {
                 }
                 cubic(control1: control1, control2: control2, to: destination, command: 97)
             }
+
+            // `cubic(...)` records `control2` as the reflectable control point
+            // for a following S/s, which is right for a real C/c/S/s command
+            // and WRONG here: the control points above are an internal Bézier
+            // approximation of an arc, not something the caller wrote, and SVG
+            // says a smooth-curveto reflects only after an actual cubic
+            // command. The degenerate branch at the top of this method already
+            // nils both control points for exactly that reason; leaving the
+            // non-degenerate path holding a stale one contradicted that same
+            // stated invariant.
+            //
+            // Nothing observes the difference TODAY -- the S/s reflection at
+            // the `case 83, 115` branch is gated on `previousCommand == 99 ||
+            // previousCommand == 115`, and every segment above passes
+            // `command: 97`, so the stale value is unreachable. That gate is
+            // the only thing masking it, which is precisely why the state is
+            // cleared here rather than left to depend on it: a future edit that
+            // widens that condition would otherwise silently start reflecting
+            // a synthesized arc control point and quietly deform the first
+            // curve after every arc.
+            previousCubicControl = nil
+            previousQuadControl = nil
         }
 
         private func angle(from lhs: CGPoint, to rhs: CGPoint) -> Double {

@@ -36,23 +36,32 @@ public struct AnnotationStoreResourceUsage: Equatable, Sendable {
 }
 
 /// The exact retained-resource constraint that rejected a candidate mutation.
-/// This is intentionally distinct from a missing annotation or count-cap
-/// eviction so MCP callers can give an actionable error without guessing.
+/// This is intentionally distinct from "no annotation with this id" so MCP
+/// callers can give an actionable error without guessing which failure mode
+/// produced it.
 public enum AnnotationStoreResourceLimit: Equatable, Sendable {
     case payloadBytes(limit: Int, attempted: Int)
     case primitiveCount(limit: Int, attempted: Int)
+    /// Inserting would exceed `DrawingDefaults.maxStoredAnnotations`. Unlike
+    /// the other two cases, this one is about COUNT, not aggregate payload
+    /// size -- an insertion can be rejected here while both the byte and
+    /// primitive budgets still have room to spare.
+    case annotationCount(limit: Int, attempted: Int)
 }
 
-/// Outcome for insertion.  Existing count-cap behavior remains an accepted
-/// insertion with an eviction count; resource exhaustion is never represented
-/// as a successful insertion with a misleading zero eviction count.
+/// Outcome for insertion.  An insertion either succeeds outright or is
+/// rejected outright -- see `AnnotationStore.addWithOutcome`'s doc comment
+/// for why the count cap (`DrawingDefaults.maxStoredAnnotations`) now
+/// rejects a candidate insertion instead of evicting older annotations to
+/// make room for it, exactly like the two aggregate-resource caps already
+/// did.
 public enum AnnotationStoreAddResult: Equatable, Sendable {
-    case added(evicted: Int)
+    case added
     case rejected(AnnotationStoreResourceLimit)
 }
 
 /// Outcome for replacement.  Keeping `notFound` distinct from `rejected`
-/// lets the update handler retain its current race/expiry message while also
+/// lets the update handler retain its current no-such-id message while also
 /// reporting an aggregate-resource failure accurately.
 public enum AnnotationStoreUpdateResult: Equatable, Sendable {
     case updated
@@ -110,70 +119,11 @@ public final class AnnotationStore: @unchecked Sendable {
         return body()
     }
 
-    /// Returns a snapshot containing only annotations whose absolute deadline
-    /// has not elapsed. Expiry timers are an optimization for repaint latency,
-    /// never the authority for whether an annotation is live: the main queue
-    /// may be busy for an arbitrary amount of time.
-    private func withLiveAnnotations<T>(_ body: ([Annotation]) -> T) -> T {
-        let now = Date()
-        let uptime = ProcessInfo.processInfo.systemUptime
-        var expired: [Annotation] = []
-        let result = withLock {
-            defer { assertResourceUsageConsistent() }
-            expired = sweepExpiredLocked(now: now, uptime: uptime)
-            return body(annotations)
-        }
-
-        if !expired.isEmpty {
-            releaseRasterAssets(in: expired)
-            notifyChange()
-        }
-        return result
-    }
-
-    /// Removes every expired annotation from `annotations` and decrements
-    /// the running resource total to match, so the two never fall out of
-    /// sync with each other. Must be called with `lock` held; the caller is
-    /// responsible for releasing raster assets for the returned annotations
-    /// AFTER the lock is released (see `releaseRasterAssets`'s doc comment).
-    private func sweepExpiredLocked(now: Date, uptime: TimeInterval) -> [Annotation] {
-        let expired = annotations.filter { $0.hasExpired(now: now, uptime: uptime) }
-        guard !expired.isEmpty else { return [] }
-        annotations.removeAll { $0.hasExpired(now: now, uptime: uptime) }
-        for annotation in expired {
-            trackRemoved(annotation)
-        }
-        return expired
-    }
-
-    /// Derives `expiresAtUptime` from `expiresAt` when the monotonic twin is
-    /// missing, using the remaining wall-clock interval AT THIS MOMENT, so
-    /// liveness decisions stay off the wall clock no matter which way the
-    /// deadline arrived (see `Annotation.expiresAtUptime`). Anything already
-    /// past due pins to now rather than going negative.
-    ///
-    /// Shared by `addWithOutcome` and `updateWithOutcome` rather than
-    /// open-coded in each: the update path silently omitted this stamping,
-    /// which quietly reverted an updated timed annotation to wall-clock
-    /// liveness while its un-updated twin kept the monotonic deadline. One
-    /// implementation makes that divergence unrepresentable.
-    ///
-    /// A non-finite remaining interval leaves the monotonic deadline nil, so
-    /// the wall-clock fallback in `hasExpired` decides instead of a NaN
-    /// comparison that is false in both directions.
-    private static func stampMonotonicDeadline(on annotation: inout Annotation) {
-        // `Annotation` is public/decodable, so an in-process caller can seed
-        // this process-local field with NaN or infinity. Those are not valid
-        // monotonic deadlines; replace them from the wall-clock deadline just
-        // like an absent value rather than letting an invalid value disable
-        // expiry for the life of the annotation.
-        guard annotation.expiresAtUptime?.isFinite != true,
-              let wallDeadline = annotation.expiresAt else { return }
-        let remaining = max(0, wallDeadline.timeIntervalSinceNow)
-        if remaining.isFinite {
-            let deadline = ProcessInfo.processInfo.systemUptime + remaining
-            annotation.expiresAtUptime = deadline.isFinite ? deadline : nil
-        }
+    /// Runs `body` with `lock` held and returns its result. Every read-only
+    /// accessor below routes through here -- mutating methods call `withLock`
+    /// directly -- purely to name that shared read shape in one place.
+    private func withAnnotations<T>(_ body: ([Annotation]) -> T) -> T {
+        withLock { body(annotations) }
     }
 
     /// Rebuilds a public `Annotation` with the store-selected identity. The
@@ -188,7 +138,6 @@ public final class AnnotationStore: @unchecked Sendable {
             label: annotation.label,
             appId: annotation.appId,
             appName: annotation.appName,
-            expiresAt: annotation.expiresAt,
             opacity: annotation.opacity,
             offsetX: annotation.offsetX,
             offsetY: annotation.offsetY,
@@ -198,146 +147,106 @@ public final class AnnotationStore: @unchecked Sendable {
         )
     }
 
-    /// Appends `annotation`, evicting the oldest stored annotations first if
-    /// doing so would exceed `DrawingDefaults.maxStoredAnnotations`.
+    /// Appends `annotation`, subject to `AnnotationStore`'s resource caps --
+    /// including the count cap `DrawingDefaults.maxStoredAnnotations` -- via
+    /// `addWithOutcome`.
     ///
-    /// Returns the number of annotations evicted to enforce that cap (0 in
-    /// the normal case) so the MCP layer can report it back to the caller.
+    /// Returns whether the annotation was actually stored. `false` means the
+    /// insertion was rejected outright and nothing changed: no annotation was
+    /// evicted, trimmed, or otherwise sacrificed to make room. See
+    /// `addWithOutcome`'s doc comment for why a full store now refuses new
+    /// work instead of making room for it.
     ///
-    /// WHY THE CAP EXISTS: free-draw annotations may deliberately persist
-    /// until explicitly cleared -- that is
-    /// documented design intent (see `ClearScope`'s doc comment) and this
-    /// change does not touch it -- but this is a long-lived background
-    /// server, so a caller that never passes `duration_seconds` and never
-    /// calls `clear` grows this store without bound, and every repaint's
-    /// O(n) filter (`getForScreen`) gets steadily more expensive as it does.
-    /// Eviction is reported rather than silent -- logged at WARN and handed
-    /// back as a return value -- specifically so a runaway caller is visible
-    /// instead of just slowly degrading.
+    /// Compatibility wrapper for callers that only need a stored/not-stored
+    /// answer. New MCP paths must use `addWithOutcome`, whose
+    /// `AnnotationStoreResourceLimit` return value carries the specific
+    /// reason so a caller can build an actionable error message.
     @discardableResult
-    public func add(_ annotation: Annotation, durationSeconds: Double? = nil) -> Int {
-        switch addWithOutcome(annotation, durationSeconds: durationSeconds) {
-        case .added(let evicted): return evicted
-        case .rejected:
-            // Compatibility wrapper for the original integer-returning API.
-            // New MCP paths must use `addWithOutcome` so rejection cannot be
-            // mistaken for a successful no-eviction insertion.
-            return 0
+    public func add(_ annotation: Annotation) -> Bool {
+        switch addWithOutcome(annotation) {
+        case .added: return true
+        case .rejected: return false
         }
     }
 
-    /// Atomically inserts an annotation subject to both the existing count
-    /// cap and aggregate vector/text retention caps.  On resource rejection,
-    /// no live annotation is inserted, replaced, or evicted.  Expired items
-    /// may still be reaped as normal lifecycle cleanup.
+    /// Atomically inserts an annotation subject to the count cap
+    /// (`DrawingDefaults.maxStoredAnnotations`) and the aggregate vector/text
+    /// retention caps (`maxRetainedAnnotationPayloadBytes` /
+    /// `maxRetainedAnnotationPrimitives`). All three are rejection caps: on
+    /// any of them, nothing is inserted, and nothing already stored is
+    /// evicted, trimmed, or otherwise removed to make room.
+    ///
+    /// WHY REJECTION AND NOT EVICTION: this store used to evict the oldest
+    /// annotations to stay under the count cap once it was full -- a second,
+    /// silent way (alongside the now-deleted TTL/expiry mechanism) for a
+    /// drawing to vanish without the AI or the user asking for it. The
+    /// product decision is that an annotation stays until the AI or the user
+    /// explicitly clears it (see `ClearScope`'s doc comment for the
+    /// user-initiated half of that). A bounded store that refuses new work
+    /// once it is full is honest about its own limit; one that quietly drops
+    /// old work to make room for new work is not. Rejecting here also matches
+    /// the behavior the payload-bytes and primitive-count caps already had,
+    /// which is the inconsistency this resolves.
     @discardableResult
-    public func addWithOutcome(_ annotation: Annotation, durationSeconds: Double? = nil) -> AnnotationStoreAddResult {
+    public func addWithOutcome(_ annotation: Annotation) -> AnnotationStoreAddResult {
         var storedAnnotation = annotation
-        if storedAnnotation.expiresAt == nil,
-           let duration = durationSeconds,
-           duration > 0 {
-            // The MCP layer rejects excessive durations. This defensive cap
-            // protects direct/in-process callers too, before Date and
-            // DispatchTime receive a finite-but-overflowing interval.
-            let bounded = min(duration, DrawingDefaults.maxAnnotationDurationSeconds)
-            storedAnnotation.expiresAt = Date().addingTimeInterval(bounded)
-            storedAnnotation.expiresAtUptime = ProcessInfo.processInfo.systemUptime + bounded
-        }
-        // A caller may also supply `expiresAt` directly (no durationSeconds).
-        Self.stampMonotonicDeadline(on: &storedAnnotation)
 
-        let now = Date()
-        let uptime = ProcessInfo.processInfo.systemUptime
-        var expiredAnnotations: [Annotation] = []
-        let mutation: (evicted: [Annotation], rejection: AnnotationStoreResourceLimit?) = withLock {
+        let rejection: AnnotationStoreResourceLimit? = withLock {
             defer { assertResourceUsageConsistent() }
-            expiredAnnotations = sweepExpiredLocked(now: now, uptime: uptime)
-            // Everything down to the rejection check is a PROJECTION over the
-            // untouched `annotations`: what would this insertion (plus any cap
-            // eviction that comes with it) cost? The array itself is only
-            // mutated once the projection has cleared the caps, which is what
-            // makes a rejection leave both the array and the running total
-            // exactly as they were. Building a full copy of `annotations` to
-            // ask that question was an O(n) copy per insertion -- precisely
-            // the per-mutation walk the running totals exist to avoid.
-            let overflow = annotations.count + 1 - DrawingDefaults.maxStoredAnnotations
-            let evicted = overflow > 0 ? Array(annotations.prefix(overflow)) : []
-            // O(evicted.count + 1), not a full re-walk of `annotations`:
-            // project what the running total would become, WITHOUT mutating
-            // the real running total yet.
-            let candidateUsage = usageAfter(removing: evicted, adding: [storedAnnotation])
-            if let rejection = resourceLimit(for: candidateUsage) {
-                return ([], rejection)
+            // Checked before the aggregate-resource caps below so a caller
+            // who is already at the ceiling gets the specific "too many
+            // annotations" reason rather than a payload/primitive rejection
+            // that happens to also be true.
+            let attemptedCount = annotations.count + 1
+            if attemptedCount > DrawingDefaults.maxStoredAnnotations {
+                return .annotationCount(limit: DrawingDefaults.maxStoredAnnotations, attempted: attemptedCount)
             }
-            if overflow > 0 { annotations.removeFirst(overflow) }
+            // O(1), not a full re-walk of `annotations`: project what the
+            // running total would become, WITHOUT mutating the real running
+            // total yet, so a rejection below leaves it exactly as it was.
+            let candidateUsage = usageAfter(removing: [], adding: [storedAnnotation])
+            if let limit = resourceLimit(for: candidateUsage) {
+                return limit
+            }
             storedAnnotation.revision = nextRevision()
             annotations.append(storedAnnotation)
-            for evictedAnnotation in evicted {
-                trackRemoved(evictedAnnotation)
-            }
             trackAdded(storedAnnotation)
-            return (evicted, nil)
+            return nil
         }
-        releaseRasterAssets(in: expiredAnnotations + mutation.evicted)
 
-        if let rejection = mutation.rejection {
-            if !expiredAnnotations.isEmpty { notifyChange() }
+        if let rejection {
             return .rejected(rejection)
-        }
-        let evicted = mutation.evicted.count
-
-        if evicted > 0 {
-            Logger.shared.log(
-                "AnnotationStore: exceeded maxStoredAnnotations cap (\(DrawingDefaults.maxStoredAnnotations)); evicted \(evicted) oldest annotation(s) to stay under it.",
-                level: "WARN"
-            )
         }
 
         notifyChange()
-
-        if let remaining = storedAnnotation.remainingSeconds(
-            now: Date(), uptime: ProcessInfo.processInfo.systemUptime
-        ) {
-            if remaining.isFinite, remaining <= DrawingDefaults.maxAnnotationDurationSeconds {
-                DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
-                    _ = self?.remove(id: storedAnnotation.id)
-                }
-            }
-        }
-
-        return .added(evicted: evicted)
+        return .added
     }
 
     public func remove(id: String) -> Bool {
-        let now = Date()
-        let uptime = ProcessInfo.processInfo.systemUptime
-        let result: (removedLive: [Annotation], expired: [Annotation]) = withLock {
+        let removedAnnotations: [Annotation] = withLock {
             defer { assertResourceUsageConsistent() }
-            // Sweep expiry first so the id-match below can never double-count
-            // (or double-decrement) an annotation that is both expired and a
-            // match for `id`.
-            let expired = sweepExpiredLocked(now: now, uptime: uptime)
-            let removedLive = annotations.filter { $0.id == id }
-            if !removedLive.isEmpty {
+            let matches = annotations.filter { $0.id == id }
+            if !matches.isEmpty {
                 annotations.removeAll { $0.id == id }
-                for annotation in removedLive {
+                for annotation in matches {
                     trackRemoved(annotation)
                 }
             }
-            return (removedLive, expired)
+            return matches
         }
-        releaseRasterAssets(in: result.expired + result.removedLive)
-        let removed = !result.removedLive.isEmpty
-        if removed || !result.expired.isEmpty {
+        releaseRasterAssets(in: removedAnnotations)
+        let removed = !removedAnnotations.isEmpty
+        if removed {
             notifyChange()
         }
         return removed
     }
 
-    /// Replaces one live annotation at its existing array slot.  Retaining the
-    /// slot is what makes equal-z annotations stable after a restyle.  The MCP
-    /// layer validates/builds the complete replacement before calling this, so
-    /// a failed validation cannot leave a partially edited annotation behind.
+    /// Replaces one existing annotation at its existing array slot.  Retaining
+    /// the slot is what makes equal-z annotations stable after a restyle.  The
+    /// MCP layer validates/builds the complete replacement before calling
+    /// this, so a failed validation cannot leave a partially edited
+    /// annotation behind.
     @discardableResult
     public func update(id: String, with replacement: Annotation) -> Bool {
         if case .updated = updateWithOutcome(id: id, with: replacement) {
@@ -346,25 +255,23 @@ public final class AnnotationStore: @unchecked Sendable {
         return false
     }
 
-    /// Atomically replaces a live annotation only when the replacement still
-    /// fits the aggregate retained-resource budgets.  A rejected replacement
-    /// leaves the old annotation (and all of its raster ownership) intact.
+    /// Atomically replaces an existing annotation only when the replacement
+    /// still fits the aggregate retained-resource budgets.  A rejected
+    /// replacement leaves the old annotation (and all of its raster
+    /// ownership) intact.
     @discardableResult
     public func updateWithOutcome(
         id: String,
         with replacement: Annotation,
         expectedRevision: UInt64? = nil
     ) -> AnnotationStoreUpdateResult {
-        let now = Date()
-        let uptime = ProcessInfo.processInfo.systemUptime
-        let result: (old: Annotation?, expired: [Annotation], rejection: AnnotationStoreResourceLimit?, stale: Bool) = withLock {
+        let result: (old: Annotation?, rejection: AnnotationStoreResourceLimit?, stale: Bool) = withLock {
             defer { assertResourceUsageConsistent() }
-            let expired = sweepExpiredLocked(now: now, uptime: uptime)
             guard let index = annotations.firstIndex(where: { $0.id == id }) else {
-                return (nil, expired, nil, false)
+                return (nil, nil, false)
             }
             guard expectedRevision == nil || annotations[index].revision == expectedRevision else {
-                return (nil, expired, nil, true)
+                return (nil, nil, true)
             }
             let old = annotations[index]
             var storedReplacement = Self.preservingIdentity(replacement, id: id)
@@ -373,7 +280,7 @@ public final class AnnotationStore: @unchecked Sendable {
             // real running total untouched, so this is a projection only.
             let candidateUsage = usageAfter(removing: [old], adding: [storedReplacement])
             if let rejection = resourceLimit(for: candidateUsage) {
-                return (nil, expired, rejection, false)
+                return (nil, rejection, false)
             }
             // The `id` argument selects the existing annotation. A
             // replacement is a new rendering payload for that stable object,
@@ -382,37 +289,16 @@ public final class AnnotationStore: @unchecked Sendable {
             // caller was just told had been updated. Normalizing before the
             // budget projection also prevents an unretained replacement id
             // from incorrectly consuming payload budget.
-            // Carry the monotonic deadline across the replacement.  Without
-            // this, an updated timed annotation lost `expiresAtUptime`
-            // entirely and silently reverted to deciding liveness on the WALL
-            // clock (see `Annotation.expiresAtUptime`): a laptop asleep for
-            // longer than the duration would make the updated annotation
-            // vanish on wake while an un-updated twin survived.
-            //
-            // The carry-forward is conditioned on the wall-clock deadline
-            // being unchanged, because that is the only case where `old`'s
-            // monotonic stamp still describes the same instant. A replacement
-            // that MOVES the deadline (or drops it, making the annotation
-            // persistent again) must not inherit the previous one -- it falls
-            // through to `stampMonotonicDeadline`, which re-derives from the
-            // replacement's own `expiresAt`, or leaves it nil when there is
-            // none.
-            storedReplacement.expiresAtUptime = replacement.expiresAtUptime
-                ?? (replacement.expiresAt == old.expiresAt ? old.expiresAtUptime : nil)
-            Self.stampMonotonicDeadline(on: &storedReplacement)
             storedReplacement.revision = nextRevision()
             annotations[index] = storedReplacement
             trackRemoved(old)
             trackAdded(storedReplacement)
-            return (old, expired, nil, false)
+            return (old, nil, false)
         }
-        releaseRasterAssets(in: result.expired)
         if let rejection = result.rejection {
-            if !result.expired.isEmpty { notifyChange() }
             return .rejected(rejection)
         }
         if result.stale {
-            if !result.expired.isEmpty { notifyChange() }
             return .stale
         }
         if let old = result.old {
@@ -423,15 +309,12 @@ public final class AnnotationStore: @unchecked Sendable {
             notifyChange()
             return .updated
         }
-        if !result.expired.isEmpty { notifyChange() }
         return .notFound
     }
 
     @discardableResult
     public func clearAll() -> Int {
-        let now = Date()
-        let uptime = ProcessInfo.processInfo.systemUptime
-        let result: (live: [Annotation], expired: [Annotation]) = withLock {
+        let removedAnnotations: [Annotation] = withLock {
             defer { assertResourceUsageConsistent() }
             let removed = annotations
             annotations.removeAll()
@@ -439,14 +322,11 @@ public final class AnnotationStore: @unchecked Sendable {
             // no need to subtract usage annotation-by-annotation.
             runningPayloadBytes = 0
             runningPrimitiveCount = 0
-            return (
-                removed.filter { !($0.hasExpired(now: now, uptime: uptime)) },
-                removed.filter { $0.hasExpired(now: now, uptime: uptime) }
-            )
+            return removed
         }
-        releaseRasterAssets(in: result.expired + result.live)
-        let removed = result.live.count
-        if removed > 0 || !result.expired.isEmpty {
+        releaseRasterAssets(in: removedAnnotations)
+        let removed = removedAnnotations.count
+        if removed > 0 {
             notifyChange()
         }
         return removed
@@ -465,45 +345,39 @@ public final class AnnotationStore: @unchecked Sendable {
     /// Returns the number of annotations removed, for the tool/menu log line.
     @discardableResult
     public func clearVisible(forApp activeAppId: String?) -> Int {
-        let now = Date()
-        let uptime = ProcessInfo.processInfo.systemUptime
-        let result: (removedLive: [Annotation], expired: [Annotation]) = withLock {
+        let removedAnnotations: [Annotation] = withLock {
             defer { assertResourceUsageConsistent() }
-            // Sweep expiry first so the visibility filter below never needs
-            // its own "and not expired" clause -- nothing expired survives
-            // in `annotations` past this point.
-            let expired = sweepExpiredLocked(now: now, uptime: uptime)
-            let removedLive = annotations.filter { annotation in
+            let matches = annotations.filter { annotation in
                 annotation.appId == nil || annotation.appId == activeAppId
             }
-            if !removedLive.isEmpty {
+            if !matches.isEmpty {
                 annotations.removeAll { annotation in
                     annotation.appId == nil || annotation.appId == activeAppId
                 }
-                for annotation in removedLive {
+                for annotation in matches {
                     trackRemoved(annotation)
                 }
             }
-            return (removedLive, expired)
+            return matches
         }
-        releaseRasterAssets(in: result.expired + result.removedLive)
-        let removed = result.removedLive.count
-        if removed > 0 || !result.expired.isEmpty {
+        releaseRasterAssets(in: removedAnnotations)
+        let removed = removedAnnotations.count
+        if removed > 0 {
             notifyChange()
         }
         return removed
     }
 
     public func getAll() -> [Annotation] {
-        return withLiveAnnotations { $0 }
+        return withAnnotations { $0 }
     }
 
     /// Exact snapshot lookup used by verification and targeted diagnostics.
     /// Returning a value copy lets a compositor finish deterministically even
-    /// if the annotation expires on the main queue while its image is being
+    /// if the annotation is removed on the main queue while its image is being
     /// encoded.
     public func get(id: String) -> Annotation? {
-        return withLiveAnnotations { $0.first(where: { $0.id == id }) }
+        return withAnnotations { $0.first(where: { $0.id == id }) }
     }
 
     /// Atomically snapshots an annotation and leases all raster pixels it
@@ -512,8 +386,8 @@ public final class AnnotationStore: @unchecked Sendable {
     /// acquiring the raster lease while the lock is held closes the lookup →
     /// compositor handoff race without introducing a lock-order cycle.
     func renderSnapshot(id: String) -> (annotation: Annotation, rasterLease: RasterAssetStore.Lease)? {
-        withLiveAnnotations { liveAnnotations in
-            guard let annotation = liveAnnotations.first(where: { $0.id == id }) else { return nil }
+        withAnnotations { storedAnnotations in
+            guard let annotation = storedAnnotations.first(where: { $0.id == id }) else { return nil }
             let lease = RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
             return (annotation, lease)
         }
@@ -528,7 +402,7 @@ public final class AnnotationStore: @unchecked Sendable {
     /// overlay from drawing them even on compatible capture paths. Normal
     /// painting uses `getForScreen(_:visibleForApp:)`.
     public func getForScreen(_ screenId: String) -> [Annotation] {
-        return withLiveAnnotations { ordered($0.filter { $0.screenId == screenId }) }
+        return withAnnotations { ordered($0.filter { $0.screenId == screenId }) }
     }
 
     /// The single definition of "this annotation is visible on `screenId`
@@ -558,7 +432,7 @@ public final class AnnotationStore: @unchecked Sendable {
     /// genuinely on screen this instant, whereas the fallback is a guess about
     /// what the user *meant* when they asked Claude to draw.
     public func getForScreen(_ screenId: String, visibleForApp activeAppId: String?) -> [Annotation] {
-        return withLiveAnnotations {
+        return withAnnotations {
             ordered($0.filter { Self.isVisible($0, onScreen: screenId, forApp: activeAppId) })
         }
     }
@@ -575,8 +449,8 @@ public final class AnnotationStore: @unchecked Sendable {
     /// `OverlayView.draw(_:)` rebuilt the identical array. `contains(where:)`
     /// short-circuits on the first match and allocates nothing.
     public func hasVisibleAnnotations(forScreenId screenId: String, visibleForApp activeAppId: String?) -> Bool {
-        return withLiveAnnotations { liveAnnotations in
-            liveAnnotations.contains { Self.isVisible($0, onScreen: screenId, forApp: activeAppId) }
+        return withAnnotations { storedAnnotations in
+            storedAnnotations.contains { Self.isVisible($0, onScreen: screenId, forApp: activeAppId) }
         }
     }
 
@@ -622,22 +496,19 @@ public final class AnnotationStore: @unchecked Sendable {
         }
     }
 
-    /// Reports the live aggregate resource usage for diagnostics/tests.  The
-    /// same expiry authority as every read is used, so the result never counts
-    /// an annotation merely waiting for its main-queue expiry callback.
+    /// Reports the aggregate resource usage for diagnostics/tests.
     ///
-    /// Reads the incrementally maintained running total (after sweeping
-    /// expiry) rather than re-walking every stored annotation -- see the
-    /// running-total doc comment on `runningPayloadBytes` for why that is
-    /// safe to trust.
+    /// Reads the incrementally maintained running total rather than
+    /// re-walking every stored annotation -- see the running-total doc
+    /// comment on `runningPayloadBytes` for why that is safe to trust.
     public var retainedResourceUsage: AnnotationStoreResourceUsage {
-        withLiveAnnotations { _ in
+        withAnnotations { _ in
             AnnotationStoreResourceUsage(payloadBytes: runningPayloadBytes, primitiveCount: runningPrimitiveCount)
         }
     }
 
     /// Test-only verification hook: an independent full recompute over the
-    /// live annotations, exposed (internal, not `public`) purely so
+    /// stored annotations, exposed (internal, not `public`) purely so
     /// `@testable`-importing tests can assert the incrementally maintained
     /// running total never drifts from a true from-scratch recompute --
     /// without duplicating the byte/primitive-counting logic in the test
@@ -647,7 +518,7 @@ public final class AnnotationStore: @unchecked Sendable {
     /// builds; it does not replace that check, which remains the mandatory
     /// safety net for catching a missed `trackAdded`/`trackRemoved` call.
     func fullRecomputeResourceUsageForTesting() -> AnnotationStoreResourceUsage {
-        withLiveAnnotations { Self.resourceUsage(of: $0) }
+        withAnnotations { Self.resourceUsage(of: $0) }
     }
 
     /// Thresholds a precomputed usage snapshot against the aggregate
@@ -706,11 +577,10 @@ public final class AnnotationStore: @unchecked Sendable {
     /// Removes `annotation`'s resource usage from the running total.  Must
     /// be called with `lock` held, exactly once per annotation actually
     /// removed from `annotations` -- every removal/replacement path
-    /// (`remove`, `clearVisible`, the expiry sweep in `sweepExpiredLocked`,
-    /// cap eviction and rejection-safe replace in `addWithOutcome`/
-    /// `updateWithOutcome`) must call this so the running total never drifts.
-    /// `clearAll` is the one exception: it resets both counters to 0 directly
-    /// since nothing survives it.
+    /// (`remove`, `clearVisible`, the replace in `updateWithOutcome`) must
+    /// call this so the running total never drifts. `clearAll` is the one
+    /// exception: it resets both counters to 0 directly since nothing
+    /// survives it.
     private func trackRemoved(_ annotation: Annotation) {
         let usage = Self.resourceUsage(of: annotation)
         runningPayloadBytes = Self.saturatedSubtract(runningPayloadBytes, usage.payloadBytes)
@@ -718,7 +588,7 @@ public final class AnnotationStore: @unchecked Sendable {
     }
 
     /// Debug-only invariant: the incrementally maintained running total must
-    /// always equal a full recompute over the live `annotations`.  This is
+    /// always equal a full recompute over the stored `annotations`.  This is
     /// the tripwire for a missed `trackAdded`/`trackRemoved` call on any
     /// mutation path -- a silent drift here would slowly make the store
     /// reject perfectly valid draws (or under-count a caller that is

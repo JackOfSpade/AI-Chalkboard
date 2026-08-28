@@ -34,11 +34,6 @@ enum DrawingDefaults {
     static let maxCoordinateMagnitudePx = 10_000_000.0
     static let maxRotationDegrees = 360_000.0
 
-    /// A bounded timer horizon prevents finite but absurd duration values from
-    /// overflowing Date/DispatchTime conversion. Seven days remains ample for
-    /// intentional temporary annotations; omit duration for persistence.
-    static let maxAnnotationDurationSeconds = 7 * 24 * 60 * 60.0
-
     /// `draw_path`'s line thickness, in physical pixels.
     static let pathStrokeWidthPx: Double = 3.5
 
@@ -83,13 +78,15 @@ enum DrawingDefaults {
     /// Largest number of annotations one process will hold at once.
     ///
     /// Free-draw tools deliberately allow annotations to persist until
-    /// explicitly cleared (see `AnnotationStore`'s type comment), and this
-    /// is a long-lived background server, so "the caller never passed
-    /// `duration_seconds` and never called `clear`" grows the store without
-    /// bound and makes every repaint's O(n) filter steadily more expensive.
-    /// The cap is far above any plausible real session; hitting it means
-    /// something is wrong, so eviction is logged loudly and reported back in
-    /// the tool result rather than done silently.
+    /// explicitly cleared (see `AnnotationStore`'s type comment and
+    /// `ClearScope`'s doc comment), and this is a long-lived background
+    /// server, so a caller that keeps drawing and never calls `clear` grows
+    /// the store without bound and makes every repaint's O(n) filter
+    /// (`getForScreen`) steadily more expensive. The cap is far above any
+    /// plausible real session; hitting it means something is wrong, so an
+    /// insertion that would exceed it is rejected outright -- see
+    /// `AnnotationStore.addWithOutcome` -- rather than silently evicting
+    /// older annotations to make room for it.
     static let maxStoredAnnotations = 2_000
 
     /// Bounds the UTF-8 payload retained by persistent vector/text drawings.
