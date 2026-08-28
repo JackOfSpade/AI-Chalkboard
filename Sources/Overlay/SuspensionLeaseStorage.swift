@@ -48,10 +48,27 @@ extension SuspensionLeaseCoordinator {
     enum CoordinatorError: LocalizedError {
         case unavailable(String)
         case malformedState
+        /// The caller asked for something the registry refused -- an
+        /// idempotency key owned by another process, a lease budget already
+        /// spent, a token this boot never issued. The registry was read
+        /// successfully and NOTHING was written, so the durable state is
+        /// exactly as trustworthy after the refusal as before it.
+        ///
+        /// Distinct from `.unavailable` because the two demand opposite
+        /// reactions, and conflating them was a real defect: every one of these
+        /// refusals reached `mutate`'s catch, which fails closed -- it ordered
+        /// every overlay in the refusing process off screen, logged "suspension
+        /// registry unavailable" about a registry that was perfectly healthy,
+        /// and cleared `bootstrapped`. So an agent that released an already-
+        /// stale token, or reused a peer's idempotency key, blanked the user's
+        /// annotations until the next reconcile tick swept them back. Hiding
+        /// the drawing is the safe answer to "I do not know the state"; it is
+        /// the wrong answer to "your argument was bad".
+        case rejected(String)
 
         var errorDescription: String? {
             switch self {
-            case .unavailable(let message): return message
+            case .unavailable(let message), .rejected(let message): return message
             case .malformedState:
                 return "AI Chalkboard's suspension lease registry is invalid or exceeds its safety limits; annotations remain hidden until it is repaired."
             }

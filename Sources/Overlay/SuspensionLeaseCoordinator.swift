@@ -201,12 +201,12 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
                 // that created it. Returning another process's bearer token
                 // would turn a retry key into a second release capability.
                 guard lease.ownerInstanceNonce == instanceNonce else {
-                    throw CoordinatorError.unavailable("That idempotency_key is already active in another Chalkboard process; choose a new key rather than exposing its lease token.")
+                    throw CoordinatorError.rejected("That idempotency_key is already active in another Chalkboard process; choose a new key rather than exposing its lease token.")
                 }
                 return MutationOutcome(token: lease.token, reused: true, alreadyReleased: false, changed: false)
             }
             guard state.leases.count < Self.maximumActiveLeases else {
-                throw CoordinatorError.unavailable("Too many active annotation suspension leases; release an existing lease before acquiring another.")
+                throw CoordinatorError.rejected("Too many active annotation suspension leases; release an existing lease before acquiring another.")
             }
             let token = Self.makeToken()
             state.leases.append(Lease(token: token,
@@ -236,7 +236,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
             if state.releasedTokens[token] != nil {
                 return MutationOutcome(token: token, reused: false, alreadyReleased: true, changed: false)
             }
-            throw CoordinatorError.unavailable("Unknown suspension lease token. It was not issued by this current Chalkboard boot session.")
+            throw CoordinatorError.rejected("Unknown suspension lease token. It was not issued by this current Chalkboard boot session.")
         }
     }
 
@@ -408,10 +408,22 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
                                    visibleOwnerPIDs: observation.visibleOwnerPIDs,
                                    visibleWindowNumbers: observation.visibleWindowNumbers,
                                    discoveryErrors: discoveryErrors)
+        } catch let error as CoordinatorError {
+            // A REFUSAL is not a failure of the registry: it was read cleanly
+            // and nothing was written, so the presentation this process is
+            // already showing remains correct. Returning the error without
+            // touching the overlays is the whole point of `.rejected` -- see
+            // its doc comment for the defect this avoids.
+            if case .rejected(let message) = error {
+                return failedOperation(message)
+            }
+            // Anything else -- a failed write, revalidation, or final durable
+            // recheck -- means we cannot honestly preserve a visible
+            // presentation decision. Order every local overlay out before
+            // returning the error.
+            _ = installFailure(error.localizedDescription)
+            return failedOperation(error.localizedDescription)
         } catch {
-            // A failed write, revalidation, or final durable recheck means we
-            // cannot honestly preserve a visible presentation decision. Order
-            // every local overlay out before returning the error.
             _ = installFailure(error.localizedDescription)
             return failedOperation(error.localizedDescription)
         }

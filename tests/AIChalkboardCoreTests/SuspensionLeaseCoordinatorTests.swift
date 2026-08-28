@@ -510,6 +510,59 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         XCTAssertNotNil(result.error)
     }
 
+    // MARK: - Refusals are not registry failures
+
+    /// A refused ARGUMENT must not be reported as a broken REGISTRY.
+    ///
+    /// Every refusal inside a mutation used to throw `.unavailable`, which
+    /// landed in the fail-closed catch: the process ordered its overlays off
+    /// screen, logged "suspension registry unavailable" about a registry it had
+    /// just read successfully, and dropped `isBootstrapped`. Releasing an
+    /// already-stale token -- an ordinary, expected thing for an agent to do --
+    /// therefore blanked the user's annotations until a reconcile tick swept
+    /// them back. Caught in the two-process integration log, where a
+    /// deliberately-rejected cross-process idempotency key produced an ERROR
+    /// line in an otherwise passing run.
+    func testRefusedArgumentsDoNotFailTheRegistryClosed() throws {
+        try withTemporaryCoordinator { coordinator, _ in
+            XCTAssertFalse(coordinator.bootstrapAndReconcile().annotationsSuspended)
+            let live = coordinator.acquireLease(seconds: 60)
+            let liveToken = try XCTUnwrap(live.leaseToken)
+            XCTAssertTrue(live.annotationsSuspended)
+
+            // An unknown token is a bad argument, not a broken registry.
+            let unknown = coordinator.releaseLease(token: String(repeating: "B", count: 43))
+            XCTAssertFalse(unknown.success)
+            XCTAssertNotNil(unknown.error)
+            XCTAssertTrue(unknown.annotationsSuspended,
+                          "the live lease still owns the presentation after an unrelated refusal")
+            XCTAssertEqual(unknown.activeLeaseCount, 1, "a refusal must not report the registry as empty")
+
+            let afterRefusal = coordinator.snapshot()
+            XCTAssertTrue(afterRefusal.isBootstrapped,
+                          "a refused argument must not mark the registry unbootstrapped")
+            XCTAssertNil(afterRefusal.error, "a refusal is not a registry error")
+            XCTAssertEqual(afterRefusal.activeLeaseCount, 1)
+
+            // The real lease is untouched and still releasable.
+            let released = coordinator.releaseLease(token: liveToken)
+            XCTAssertTrue(released.success)
+            XCTAssertFalse(released.alreadyReleased)
+            XCTAssertFalse(released.annotationsSuspended)
+        }
+    }
+
+    /// The counterpart: a genuine storage failure must STILL fail closed.
+    func testGenuineRegistryFailureStillFailsClosed() throws {
+        try withTemporaryCoordinator { coordinator, _ in
+            XCTAssertFalse(coordinator.bootstrapAndReconcile().annotationsSuspended)
+            let failed = coordinator.testOnlyInstallFailure("simulated storage failure")
+            XCTAssertTrue(failed.annotationsSuspended, "an unknown state must hide the overlays")
+            XCTAssertFalse(failed.isBootstrapped)
+            XCTAssertNotNil(failed.error)
+        }
+    }
+
     // MARK: - Boot session identity
 
     /// `kern.boottime` is DERIVED (wall clock minus uptime), not stored, so its
