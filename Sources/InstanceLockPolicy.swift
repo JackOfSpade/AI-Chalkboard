@@ -436,10 +436,70 @@ public class InstanceLockPolicy<Primitive: FileLockPrimitive>: @unchecked Sendab
     /// an inconclusive identity check must never be read as proof of a
     /// match. See `FileLockPrimitive`'s doc comment on identity being
     /// best-effort on some platforms.
+    /// Compares a locked handle against whatever currently sits at the path it
+    /// was opened through, KEEPING both identities so a caller can say why they
+    /// differed.
+    ///
+    /// The detail is not decoration. This comparison failing is the signal that
+    /// the lock file was deleted or replaced under a live holder, and the
+    /// resulting WARN is rare, fires only when the election is already behaving
+    /// strangely, and is the sole record of what actually happened. The
+    /// pre-consolidation macOS code logged both `(st_dev, st_ino)` pairs and
+    /// whether each lookup succeeded, for exactly that reason; returning a bare
+    /// `Bool` here would have quietly thrown that away for both platforms.
+    private struct IdentityComparison {
+        let matches: Bool
+        /// Both sides rendered for a log line, e.g.
+        /// `handle=dev/ino 16777232/1234 path=dev/ino 16777232/5678`, or with
+        /// `<missing>` / `<error: ...>` where a lookup did not return one.
+        let detail: String
+    }
+
+    private func compareIdentities(_ handle: Primitive.Handle, path: String) -> IdentityComparison {
+        let handleLookup = Primitive.identity(ofOpenHandle: handle)
+        let pathLookup = Primitive.identity(atPath: path)
+
+        let handleDescription: String
+        var handleIdentity: Primitive.Identity?
+        switch handleLookup {
+        case .found(let identity):
+            handleIdentity = identity
+            handleDescription = identity.description
+        case .error(let description):
+            handleDescription = "<error: \(description)>"
+        }
+
+        let pathDescription: String
+        var pathIdentity: Primitive.Identity?
+        switch pathLookup {
+        case .found(let identity):
+            pathIdentity = identity
+            pathDescription = identity.description
+        case .missing:
+            pathDescription = "<missing>"
+        case .error(let description):
+            pathDescription = "<error: \(description)>"
+        }
+
+        // An unreadable identity on EITHER side is treated as a non-match,
+        // exactly as the pre-consolidation code did on both platforms: the
+        // point of this check is to PROVE the locked object is still the file
+        // at the path, and a lookup that failed proves nothing.
+        let matches: Bool
+        if let handleIdentity, let pathIdentity {
+            matches = handleIdentity == pathIdentity
+        } else {
+            matches = false
+        }
+
+        return IdentityComparison(
+            matches: matches,
+            detail: "handle=\(handleDescription) path=\(pathDescription)"
+        )
+    }
+
     private func identitiesMatch(_ handle: Primitive.Handle, path: String) -> Bool {
-        guard case .found(let handleIdentity) = Primitive.identity(ofOpenHandle: handle),
-              case .found(let pathIdentity) = Primitive.identity(atPath: path) else { return false }
-        return handleIdentity == pathIdentity
+        compareIdentities(handle, path: path).matches
     }
 
     private func logRetryAnomalyOnce(key: String, message: String) {
@@ -563,18 +623,21 @@ public class InstanceLockPolicy<Primitive: FileLockPrimitive>: @unchecked Sendab
             // meaningless. Only the retry path needs it (at t=0 there is no
             // incumbent to duplicate, and failing there would leave nobody
             // with a menu).
-            if verifyIdentity, !identitiesMatch(handle, path: lockURL.path) {
+            let identityComparison = verifyIdentity
+                ? compareIdentities(handle, path: lockURL.path)
+                : nil
+            if let identityComparison, !identityComparison.matches {
                 // Deliberately leaves `lockFileHandle` at nil: this
                 // process did NOT become the lock holder, so a later
                 // `retryAcquire()` must go through the whole probe again
                 // rather than short-circuiting on a held handle.
                 Primitive.releaseAndClose(handle)
                 if logContention {
-                    log("InstanceLock: won a lock at \(lockURL.path) but the locked handle is NOT the file at that path any more -- the lock file was deleted or replaced, so this win proves nothing about the incumbent primary, which may still be alive and owning the status item. Declining the promotion and continuing to poll.", level: "WARN")
+                    log("InstanceLock: won a lock at \(lockURL.path) but the locked handle is NOT the file at that path any more (\(identityComparison.detail)) -- the lock file was deleted or replaced, so this win proves nothing about the incumbent primary, which may still be alive and owning the status item. Declining the promotion and continuing to poll.", level: "WARN")
                 } else {
                     logRetryAnomalyOnce(
                         key: "retry-identity-mismatch",
-                        message: "InstanceLock: a retry locked a handle that no longer matches \(lockURL.path). Declining promotion; repeats are suppressed until the outcome changes."
+                        message: "InstanceLock: a retry locked a handle that no longer matches \(lockURL.path) (\(identityComparison.detail)). Declining promotion; repeats are suppressed until the outcome changes."
                     )
                 }
                 return .secondary

@@ -28,7 +28,16 @@ public protocol FileLockPrimitive {
     /// Two identities being equal is this primitive's answer to "is this the
     /// same underlying file", used to detect the lock path being deleted and
     /// replaced out from under a live holder.
-    associatedtype Identity: Equatable
+    ///
+    /// `CustomStringConvertible` is REQUIRED, not a convenience: the identity
+    /// values are what make the "won a lock but the handle is no longer the
+    /// file at that path" diagnostic actionable. That message is rare and
+    /// fires exactly when the election is behaving strangely, so whoever reads
+    /// it needs the two concrete identities that failed to match, not just the
+    /// news that they differed. The shared policy cannot format them itself
+    /// without naming a platform type, so each conformance renders its own
+    /// (`dev/ino 16777232/1234`, `volume 3735928559 file index 0:5678`).
+    associatedtype Identity: Equatable & CustomStringConvertible
 
     /// Opens the lock file at `path` for exclusive-locking use, REJECTING a
     /// symlink/reparse-point target and anything that is not an ordinary
@@ -108,7 +117,7 @@ public enum LockAttempt {
 }
 
 /// The result of asking a primitive for the identity of an OPEN handle.
-public enum HandleIdentityLookup<Identity: Equatable> {
+public enum HandleIdentityLookup<Identity: Equatable & CustomStringConvertible> {
     case found(Identity)
     /// Inspecting the handle failed. Carries an already-formatted,
     /// platform-native description; see `LockOpenOutcome.failed`. Every
@@ -120,7 +129,7 @@ public enum HandleIdentityLookup<Identity: Equatable> {
 /// The result of asking a primitive for the identity of whatever currently
 /// sits at a PATH. See `FileLockPrimitive.identity(atPath:)` for why this is
 /// three-way rather than a plain optional.
-public enum PathIdentityLookup<Identity: Equatable> {
+public enum PathIdentityLookup<Identity: Equatable & CustomStringConvertible> {
     case found(Identity)
     case missing
     case error(String)

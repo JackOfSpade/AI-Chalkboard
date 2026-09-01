@@ -215,6 +215,24 @@ jobs:
           python3 -m py_compile tests/mcp_wire_snapshot.py tests/test_mcp_wire_snapshot.py
           python3 -m unittest tests/test_mcp_wire_snapshot.py
 
+      - name: Cross-platform protocol conformance (both platforms, no SDK needed)
+        # The macOS/Windows split is a set of small protocols with one conformance
+        # per platform. Whoever is editing this repo can usually only COMPILE ONE OF
+        # THE TWO, so adding or renaming a protocol requirement breaks the other
+        # platform's conformance silently until somebody builds there -- the single
+        # most likely way this architecture regresses.
+        #
+        # This check is pure Python: no Swift toolchain, no platform SDK, so it runs
+        # here on ubuntu and covers BOTH platforms at once, including the one the
+        # author could not build. It is deliberately in this job rather than the
+        # macOS/Windows build jobs for that reason.
+        #
+        # It is structural, not a type check (see the script's docstring) -- it
+        # supplements the real per-platform builds below, never replaces them.
+        run: |
+          python3 -m py_compile tests/check_platform_conformance.py
+          python3 tests/check_platform_conformance.py
+
       - name: Swift test target path casing
         # The repository's established directory is lowercase `tests/`. This catches
         # a manifest/new-file case mismatch that case-insensitive macOS volumes hide.
