@@ -772,7 +772,11 @@ private extension AnnotationVerificationError {
         switch windowsDecodeError {
         case .invalidArgument:
             // Should not happen: `path` was already validated by
-            // `BoundedLocalFile.read` immediately above this call.
+            // `BoundedLocalFile.read` immediately above this call, and an
+            // oversized decoded image is reported separately as
+            // `.imageTooLarge` below (CHALK_ERR_IMAGE_TOO_LARGE), not folded
+            // into CHALK_ERR_INVALID_ARGUMENT -- so nothing on this call's
+            // own path should be able to produce `.invalidArgument` here.
             self = .invalidPath
         case .fileNotFound:
             self = .unreadableFile
@@ -780,6 +784,8 @@ private extension AnnotationVerificationError {
             self = .unsupportedFormatOnSystem
         case .decodeFailed:
             self = .unsupportedImage
+        case .imageTooLarge:
+            self = .imageTooLarge
         case .wicInitFailed, .outOfMemory, .unknown:
             self = .decodingUnavailable
         }

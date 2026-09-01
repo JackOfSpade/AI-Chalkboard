@@ -409,7 +409,6 @@ extension OverlayWindowController {
         annotationsSuspended = false
 
         for (screenId, window) in presentationWindows {
-            let hasContent = hasCurrentlyVisibleAnnotations(forScreenId: screenId)
             // Painting is a rendering concern, not a presentation one (see
             // `AnnotationRenderer`/`DrawingContext`), so it is deliberately
             // NOT one of `OverlayPresentationBackend`'s four operations --
@@ -418,7 +417,28 @@ extension OverlayWindowController {
             // paints synchronously, with no AppKit-style deferred draw pass)
             // never shows a stale frame for an instant between becoming
             // visible and being repainted.
-            presentPixels(window: window, screenId: screenId, isVisible: hasContent)
+            //
+            // `presentPixels` now OWNS the "is there anything to paint"
+            // decision and reports it back via its return value, rather than
+            // the caller deciding it beforehand and handing that decision
+            // down as a separate `isVisible` flag. That used to let Windows'
+            // conformance re-derive its own answer independently -- two
+            // separate `AnnotationStore` reads (this loop's visibility check,
+            // then `presentPixels`' own fetch), not one, with no lock spanning
+            // both (`AnnotationStore` takes/releases its lock per call, and
+            // mutators like `clearAll()` are reachable directly off the MCP
+            // dispatch queue with no UI-thread marshalling -- see
+            // `MCPToolHandlers.swift`). A concurrent clear landing in that gap
+            // could make the second read come back empty right after this
+            // loop had already committed to `orderOnScreen()`, and Windows has
+            // no deferred-draw pass to paper over it: `presentPixels`
+            // bailing out left `presentationBits` showing whatever the PRIOR
+            // `UpdateLayeredWindow` call had composited -- a stale-pixel
+            // flash. Each platform's `presentPixels` now reads the store (or,
+            // on macOS, the cheap emptiness check) exactly once per screen and
+            // that single read answers both questions, so the two decisions
+            // can no longer observe different states of the store.
+            let hasContent = presentPixels(window: window, screenId: screenId)
             if hasContent {
                 window.orderOnScreen()
             } else {
@@ -433,6 +453,16 @@ extension OverlayWindowController {
         // absent overlay when *every* process-local window is fully ordered
         // off screen. Do this before consulting per-app/capture filters:
         // suspension is an absolute presentation override.
+        //
+        // Deliberately calls the ORIGINAL `isVisible:`-gated `presentPixels`
+        // overload (always with `isVisible: false`), not the single-read
+        // overload `refreshViewsNow(under:)` uses above: this path always
+        // hides every window, so it must never trigger a real paint (a
+        // Windows `repaint()` here would be pure wasted GDI/raster work
+        // behind a window we are about to hide, and would defeat the "an
+        // invisible window is never repainted just by suspend/resume" claim
+        // this overload's own doc comment makes) -- it exists only to keep
+        // macOS's paired `OverlayView` marked dirty while hiding.
         for (screenId, window) in presentationWindows {
             presentPixels(window: window, screenId: screenId, isVisible: false)
             window.orderOffScreen()
@@ -507,6 +537,28 @@ extension OverlayWindowController {
         if let index = overlayWindows.firstIndex(where: { $0 === window }) {
             overlayViews[index].needsDisplay = true
         }
+    }
+
+    /// Single-read variant used by `refreshViewsNow(under:)`'s hot loop
+    /// (the `isVisible:`-gated overload above remains solely for
+    /// `orderAllWindowsOffScreen()`, which never needs a visibility answer
+    /// back). See the Windows conformance's identically-named overload for
+    /// the TOCTOU this pairing exists to close on THAT platform; macOS's
+    /// deferred `OverlayView.draw(_:)` pass already re-fetches its own
+    /// annotations fresh whenever AppKit actually services the dirtied view,
+    /// so there is no equivalent race here to close -- this is simply the
+    /// existing cheap `hasCurrentlyVisibleAnnotations` check plus the same
+    /// unconditional dirty-mark the other overload already performs, just
+    /// relocated so the caller no longer has to compute the visibility
+    /// answer itself before calling in. Costs exactly the one
+    /// `AnnotationStore` read `refreshViewsNow(under:)` already made before
+    /// this overload existed -- no new read, no behaviour change.
+    private func presentPixels(window: NSWindow, screenId: String) -> Bool {
+        let hasContent = hasCurrentlyVisibleAnnotations(forScreenId: screenId)
+        if let index = overlayWindows.firstIndex(where: { $0 === window }) {
+            overlayViews[index].needsDisplay = true
+        }
+        return hasContent
     }
 
     /// Invalidates any pending auto-revert timer and, if `visible` is true,
@@ -607,6 +659,53 @@ extension OverlayWindowController {
         window.repaint(annotations: annotations) { assetId in
             rasterLease.image(id: assetId)
         }
+    }
+
+    /// Single-read variant used by `refreshViewsNow(under:)`'s hot loop.
+    /// Reads the store EXACTLY ONCE per screen and reports that same read's
+    /// emptiness back to the caller for the on/off-screen ordering decision,
+    /// instead of the `isVisible:`-gated overload above's split design --
+    /// where the caller independently decided visibility (via
+    /// `hasCurrentlyVisibleAnnotations`) and THEN this hook re-queried
+    /// `currentlyVisibleAnnotations` a second time to actually paint.
+    ///
+    /// That split was a real TOCTOU: `AnnotationStore` takes and releases its
+    /// lock separately per call (see `withLock`), not once across both reads,
+    /// and its mutators (`clearAll()`/`clearVisible()`/...) are reachable
+    /// directly from the MCP dispatch queue with no UI-thread marshalling on
+    /// the writer side (`MCPToolHandlers.swift` calls them straight through;
+    /// `AnnotationStore.notifyChange()` only SCHEDULES a later repaint, it
+    /// does not block the mutator on one already in flight). A concurrent
+    /// clear/mutation landing between this hook's two reads could make the
+    /// second one come back empty right after the caller had already decided
+    /// (from the first read) to order the window ON screen -- and unlike
+    /// macOS's deferred `OverlayView.draw(_:)` pass, there is nothing that
+    /// repaints Windows again later to correct it: `repaint()`/`present()`
+    /// are the only things that ever touch `presentationBits`, so a skipped
+    /// repaint left the layered window showing whatever the PRIOR
+    /// `UpdateLayeredWindow` call had composited, and `orderOnScreen()`
+    /// (`SetWindowPos`+`SWP_SHOWWINDOW`) does not repaint -- it only reveals
+    /// the existing surface. This is a realistic race, not a hypothetical
+    /// one: this process's own multi-instance broadcast architecture means
+    /// Claude Desktop runs two `AIChalkboard --mcp` processes per config
+    /// entry, giving a concrete source of a genuinely concurrent
+    /// `AnnotationStore` mutation from a different process/thread while this
+    /// process's UI thread is mid-repaint.
+    ///
+    /// Reading once and threading that single result into both decisions
+    /// makes the race unrepresentable: there is no second read left to
+    /// disagree with the first.
+    private func presentPixels(window: WindowsOverlayWindow, screenId: String) -> Bool {
+        let annotations = currentlyVisibleAnnotations(forScreenId: screenId)
+        guard !annotations.isEmpty else { return false }
+        // See the `isVisible:`-gated overload's identical comment: this
+        // lease lives here because there is no `OverlayView` on Windows.
+        let assetIDs = annotations.flatMap { $0.kind.rasterAssetIds }
+        let rasterLease = RasterAssetStore.shared.lease(ids: assetIDs)
+        window.repaint(annotations: annotations) { assetId in
+            rasterLease.image(id: assetId)
+        }
+        return true
     }
 
     /// Invalidates any pending auto-revert work item and, if `visible` is

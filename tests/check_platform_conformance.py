@@ -116,7 +116,17 @@ def labels(paramstr):
 
 
 def protocol_requirements(path, name):
-    """Requirements declared in `protocol name { ... }`."""
+    """Requirements declared in `protocol name { ... }`.
+
+    Returns `(reqs, (start, end))`, where `start`/`end` are an INCLUSIVE
+    index range into this file's own `logical_lines()` sequence spanning the
+    protocol declaration block (the `protocol Name {` line through its
+    closing `}`). `members_in_region()` uses that range as `exclude_range`
+    to skip the requirement declarations themselves when the same file is
+    also scanned as a conformance path -- see that function's doc comment
+    for why this matters. Returns `None` (both here and for the range) when
+    the protocol cannot be found, exactly as before.
+    """
     raw = (ROOT / path).read_text(encoding="utf-8", errors="replace").splitlines()
     text = [t for (t, _) in logical_lines(raw)]
     start = None
@@ -127,8 +137,10 @@ def protocol_requirements(path, name):
     if start is None:
         return None
     depth = 0
+    end = start
     reqs = {"funcs": set(), "vars": set(), "assoc": set()}
-    for line in text[start:]:
+    for i in range(start, len(text)):
+        line = text[i]
         depth += line.count("{") - line.count("}")
         if depth > 0:
             m = FUNC_RE.match(line)
@@ -141,20 +153,54 @@ def protocol_requirements(path, name):
             if m:
                 reqs["assoc"].add(m.group(1))
         if depth <= 0 and line.count("}"):
+            end = i
             break
-    return reqs
+    return reqs, (start, end)
 
 
-def members_in_region(paths, want_platform):
-    """Every func/var/typealias declared in the given platform's regions."""
+def members_in_region(paths, want_platform, protocol_file=None, exclude_range=None):
+    """Every func/var/typealias declared in the given platform's regions.
+
+    `protocol_file` / `exclude_range` (an inclusive (start, end) index pair
+    into that file's OWN `logical_lines()` sequence, from
+    `protocol_requirements()`) let the caller skip a protocol's own
+    declaration block when scanning the file that declares it.
+
+    WHY THIS PARAMETER EXISTS -- do not remove it or "simplify" it away.
+    Several protocols here (`OverlayPresentationBackend`,
+    `LeaseStorageBackend`) are declared in the SAME file as one or both
+    platforms' real conformances -- the 6a98779 hoist colocated them on
+    purpose, and their protocol block sits in the file's SHARED region
+    (before any `#if os(...)`). Before this parameter existed, this
+    function's `plat is None` branch counted every line in that shared
+    region toward BOTH platforms unconditionally, which includes the
+    protocol's OWN requirement declarations -- `func orderOnScreen()` inside
+    `protocol OverlayPresentationBackend { ... }` matches `FUNC_RE` exactly
+    like a real implementation would. That made the whole check pass
+    VACUOUSLY for exactly these two protocols: a real platform conformance
+    could be renamed, deleted, or simply never written, and the protocol's
+    own declaration would silently supply the "satisfying member" this
+    checker was looking for, on every run, forever. Confirmed by
+    reproduction: renaming `WindowsOverlayWindow`'s real `orderOnScreen()`
+    conformance in a scratch copy of the tree still printed a clean
+    0-missing result for `OverlayPresentationBackend win` before this fix,
+    because the protocol's own declaration in
+    `OverlayWindowController+Presentation.swift` (one of that protocol's own
+    `conf_paths`) was still there to match against. `exclude_range` closes
+    that hole by skipping the requirement-declaration lines themselves,
+    ONLY within the file that declares them -- every other file, and every
+    real conformance extension in the SAME file (which sits below the first
+    `#if`, outside this range), is scanned exactly as before.
+    """
     funcs, varnames, types = set(), set(), set()
     for path in paths:
         f = ROOT / path
         if not f.exists():
             continue
         plat = None  # None = shared
+        skip_this_file = path == protocol_file
         raw = f.read_text(encoding="utf-8", errors="replace").splitlines()
-        for line, _ in logical_lines(raw):
+        for idx, (line, _) in enumerate(logical_lines(raw)):
             s = line.strip()
             if s.startswith("#if os(macOS)"):
                 plat = "mac"
@@ -164,6 +210,15 @@ def members_in_region(paths, want_platform):
                 continue
             if s.startswith("#endif"):
                 plat = None
+                continue
+            # Skip the protocol's own requirement-declaration lines when
+            # scanning the file that declares it -- see this function's doc
+            # comment. Checked AFTER the #if/#endif tracking above (so
+            # `plat` stays correct even if a future protocol block somehow
+            # straddled one, which none does today) but BEFORE the
+            # shared-code fallthrough below, which is exactly the branch
+            # that used to swallow these lines as false matches.
+            if skip_this_file and exclude_range is not None and exclude_range[0] <= idx <= exclude_range[1]:
                 continue
             # shared code counts for both platforms
             if plat is not None and plat != want_platform:
@@ -184,14 +239,15 @@ failures = []
 print(f"{'protocol':<28} {'platform':<8} {'reqs':>5} {'missing':>8}")
 print("-" * 56)
 for pname, (decl, conf_paths) in PROTOCOLS.items():
-    reqs = protocol_requirements(decl, pname)
-    if reqs is None:
+    result = protocol_requirements(decl, pname)
+    if result is None:
         print(f"{pname:<28} COULD NOT PARSE")
         failures.append((pname, "unparsed", "protocol not found"))
         continue
+    reqs, protocol_range = result
     total = len(reqs["funcs"]) + len(reqs["vars"]) + len(reqs["assoc"])
     for plat in ("mac", "win"):
-        funcs, varnames, types = members_in_region(conf_paths, plat)
+        funcs, varnames, types = members_in_region(conf_paths, plat, protocol_file=decl, exclude_range=protocol_range)
         missing = []
         inferred = []
         for fname, labs in reqs["funcs"]:

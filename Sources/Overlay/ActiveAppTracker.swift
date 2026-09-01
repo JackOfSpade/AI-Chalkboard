@@ -1354,7 +1354,17 @@ public final class ActiveAppTracker {
         let ownPid = GetCurrentProcessId()
 
         var windowsByPid: [DWORD: WindowAggregate] = [:]
-        withUnsafeMutablePointer(to: &windowsByPid) { ptr in
+        // `EnumWindows`' own BOOL return -- distinct from the per-window
+        // callback's `Bool`, which only ever returns `true` below (this scan
+        // never asks to stop early) -- is `false` only when enumeration
+        // itself could not run at all (e.g. the process is out of desktop
+        // heap, or another low-level USER32 failure). That is a real,
+        // actionable failure this call used to discard silently: unlike a
+        // callback-requested stop, it means `windowsByPid` was never
+        // populated, and `resolve()` would then just see an empty candidate
+        // list with no clue why -- exactly the kind of failure
+        // `CreateToolhelp32Snapshot` below already logs instead of eating.
+        let enumerationSucceeded: Bool = withUnsafeMutablePointer(to: &windowsByPid) { ptr in
             EnumWindows({ hwnd, lParam in
                 guard let hwnd = hwnd else { return true }
                 guard IsWindowVisible(hwnd) else { return true }
@@ -1380,6 +1390,9 @@ public final class ActiveAppTracker {
                 aggregatesPtr.pointee[pid] = aggregate
                 return true
             }, LPARAM(Int(bitPattern: ptr)))
+        }
+        if !enumerationSucceeded {
+            Logger.shared.log("ActiveAppTracker: EnumWindows failed (GetLastError=\(GetLastError())); resolve() will see an incomplete (possibly empty) candidate list this call.", level: "WARN")
         }
 
         guard !windowsByPid.isEmpty else { return [] }

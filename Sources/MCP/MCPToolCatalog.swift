@@ -32,6 +32,10 @@ enum MCPToolCatalog {
     /// the drawing tools' visibility linkage there is no meaningful "global"
     /// value to accept.
     static let highlightAppParamDescription = "Running target app bundle id or display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."
+
+    static let captureRequestPermissionDescription = "For capture_source=chalkboard only: explicitly request Screen Recording permission if absent; default false."
+
+    static let presentationCheckDescription = "Checks the retained overlay/view pair and WindowServer registration/on-screen state for one drawing, including bounded WindowServer-display-bounds alignment. presentationReady catches missing, hidden, detached, transparent, wrong-level/frame/display, or unregistered windows. It is drawable-state evidence, not raw framebuffer or occlusion proof."
     #elseif os(Windows)
     /// Windows has no bundle-identifier concept; `ActiveAppTracker` identifies
     /// an application by its executable name, matched case-insensitively.
@@ -50,6 +54,17 @@ enum MCPToolCatalog {
     /// See the macOS counterpart: `highlight_element` resolves this to a live
     /// process, so "global" is not a valid value here either.
     static let highlightAppParamDescription = "Running target app executable name (for example \"chrome.exe\", matched case-insensitively) or window/display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."
+
+    /// Windows has no capture-permission model to request: any process that
+    /// can run code in this session can already capture the screen (see
+    /// ScreenCaptureProvider's Windows permissionStatus() doc comment).
+    static let captureRequestPermissionDescription = "For capture_source=chalkboard only: accepted for cross-platform compatibility but has NO EFFECT on Windows, which has no screen-capture permission to request; default false."
+
+    /// Windows twin of the macOS description: there is no WindowServer here,
+    /// only this process's own Win32 window state plus DWM's cloaking flag
+    /// (see OverlayWindowController+Diagnostics.swift's Windows
+    /// presentationStatus() note for the same "WEAKER THAN macOS" caveat).
+    static let presentationCheckDescription = "Checks the retained overlay window's own Win32 state (IsWindow/IsWindowVisible/GetWindowRect/extended style) plus DWM's cloaking flag for one drawing, including bounded display-bounds alignment. presentationReady catches missing, hidden, detached, transparent, or wrong-level/frame/display windows. This is single-source evidence from this process's own window state, not a compositor-maintained record the way macOS's WindowServer check is, and it is not raw framebuffer or occlusion proof."
     #endif
 
     private static let sharedDrawProperties: [String: Any] = [
@@ -351,13 +366,13 @@ enum MCPToolCatalog {
                 "annotation_id": ["type": "string"],
                 "screenshot_path": ["type": "string", "description": "Absolute path to a clean uncropped full-display raster screenshot."],
                 "capture_source": ["type": "string", "enum": ["chalkboard"], "description": "Use Chalkboard's in-memory \(captureBackendName) capture. Required when screenshot_path is omitted."],
-                "request_permission": ["type": "boolean", "description": "For capture_source=chalkboard only: explicitly request Screen Recording permission if absent; default false."],
+                "request_permission": ["type": "boolean", "description": captureRequestPermissionDescription],
                 "padding_px": ["type": "number", "minimum": 0, "maximum": AnnotationVerificationCompositor.maxPaddingPx]
             ], "required": ["annotation_id"]]
         ],
         [
             "name": "verify_presentation",
-            "description": "Checks the retained overlay/view pair and WindowServer registration/on-screen state for one drawing, including bounded WindowServer-display-bounds alignment. presentationReady catches missing, hidden, detached, transparent, wrong-level/frame/display, or unregistered windows. It is drawable-state evidence, not raw framebuffer or occlusion proof.",
+            "description": presentationCheckDescription,
             "inputSchema": ["type": "object", "properties": ["annotation_id": ["type": "string"]], "required": ["annotation_id"]]
         ],
         [

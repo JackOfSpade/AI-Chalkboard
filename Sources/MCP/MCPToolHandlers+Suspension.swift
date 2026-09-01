@@ -1,5 +1,17 @@
 import Foundation
 
+/// The compositor/window-state authority `sendSuspensionLeaseResult` cites as
+/// evidence below. Named per platform for the same reason as
+/// MCPToolCatalog's split prose: this note reaches the MCP caller, and
+/// WindowServer does not exist on Windows, which instead samples this
+/// process's own Win32 window state plus DWM's cloaking flag (see
+/// SuspensionQuiescence's Windows branch).
+#if os(macOS)
+private let quiescenceObservationSource = "WindowServer"
+#elseif os(Windows)
+private let quiescenceObservationSource = "Win32/DWM window-state"
+#endif
+
 /// Pure policy for the MCP `isError` bit. A release can durably remove its
 /// token yet still be unsafe to report as successful when another lease keeps
 /// suspension active and peer presentation did not settle off screen.
@@ -123,11 +135,11 @@ extension MCPServer {
             note = error
         } else if operation == "acquire" {
             note = clickSafeAtObservation
-                ? "A suspension lease is active and two consecutive conservative WindowServer samples observed no candidate AI Chalkboard overlay windows. This is point-in-time click-workaround evidence only; it is not raw-framebuffer or occlusion proof. Release this exact leaseToken promptly."
-                : "A suspension lease is active, but conservative WindowServer observation was not quiescent. Do not click through yet; retry or let the short lease expire."
+                ? "A suspension lease is active and two consecutive conservative \(quiescenceObservationSource) samples observed no candidate AI Chalkboard overlay windows. This is point-in-time click-workaround evidence only; it is not raw-framebuffer or occlusion proof. Release this exact leaseToken promptly."
+                : "A suspension lease is active, but conservative \(quiescenceObservationSource) observation was not quiescent. Do not click through yet; retry or let the short lease expire."
         } else {
             if releaseWithRemainingLeaseUnsettled {
-                note = "This lease was durably released, but another active lease remains and bounded WindowServer observation did not confirm that every discovered Chalkboard overlay settled off screen. Treat this response as an error and do not click through yet."
+                note = "This lease was durably released, but another active lease remains and bounded \(quiescenceObservationSource) observation did not confirm that every discovered Chalkboard overlay settled off screen. Treat this response as an error and do not click through yet."
             } else if result.annotationsSuspended {
                 note = "This lease was released. Another active lease keeps overlays suspended, and bounded observation confirmed the current generation was settled off screen at response time."
             } else {
@@ -160,7 +172,7 @@ extension MCPServer {
             "discoveryErrors": evidence.discoveryErrors,
             "discoveryErrorsTruncated": evidence.discoveryErrorsTruncated,
             "evidenceTruncated": result.candidatePIDsTruncated || evidence.anyTruncated,
-            "limitation": "WindowServer metadata is not raw-framebuffer or occlusion proof. A future process/window can appear after this bounded observation; true visible-highlight-while-clicking still requires the click dispatcher to honor ignoresMouseEvents.",
+            "limitation": "\(quiescenceObservationSource) metadata is not raw-framebuffer or occlusion proof. A future process/window can appear after this bounded observation; true visible-highlight-while-clicking still requires the click dispatcher to honor ignoresMouseEvents.",
             "note": note
         ]
         if let token = result.leaseToken { payload["leaseToken"] = token }

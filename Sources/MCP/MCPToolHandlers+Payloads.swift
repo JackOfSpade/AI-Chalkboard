@@ -1,5 +1,18 @@
 import Foundation
 
+/// What `get_active_app`'s `rawFrontmost` field was actually read from, named
+/// per platform.
+///
+/// Same reasoning as `MCPToolCatalog`'s platform-split prose: these strings are
+/// consumed by an AI agent reasoning about how to call the tools, so naming an
+/// API the running platform does not have is a correctness problem rather than
+/// a wording nit.
+#if os(macOS)
+private let rawFrontmostSource = "NSWorkspace"
+#elseif os(Windows)
+private let rawFrontmostSource = "GetForegroundWindow/QueryFullProcessImageNameW"
+#endif
+
 extension MCPServer {
     // MARK: - Diagnostic payload builders
 
@@ -284,7 +297,12 @@ extension MCPServer {
             ] as [String: Any],
             "captureVisible": OverlayWindowController.shared.isCaptureVisible,
             "annotationsSuspended": OverlayWindowController.shared.isAnnotationsSuspended,
-            "note": "'frontmost' is the app whose app-linked annotations would normally be eligible to appear. When annotationsSuspended=true, this process has intentionally ordered its overlay windows out, so no retained annotation is on screen from this process even if it matches frontmost. 'fallback' is what an untagged draw_* call links to: the last app that was frontmost excluding AI Chalkboard and Claude -- because when you receive a draw request, Claude's own window is frontmost, so tagging the true frontmost app would link every annotation to Claude and it would never show over the app the user meant. 'rawFrontmost' is the unfiltered NSWorkspace value, for debugging only. A null fallback means an untagged draw becomes GLOBAL."
+            // `rawFrontmostSource` is platform-split for the same reason the
+            // tool catalog's prose is: this note is read by an AI agent, and
+            // naming `NSWorkspace` to a Windows caller describes an API that
+            // does not exist there. The Windows tracker reads the foreground
+            // window's owning process instead.
+            "note": "'frontmost' is the app whose app-linked annotations would normally be eligible to appear. When annotationsSuspended=true, this process has intentionally ordered its overlay windows out, so no retained annotation is on screen from this process even if it matches frontmost. 'fallback' is what an untagged draw_* call links to: the last app that was frontmost excluding AI Chalkboard and Claude -- because when you receive a draw request, Claude's own window is frontmost, so tagging the true frontmost app would link every annotation to Claude and it would never show over the app the user meant. 'rawFrontmost' is the unfiltered \(rawFrontmostSource) value, for debugging only. A null fallback means an untagged draw becomes GLOBAL."
         ]
 
         guard let text = jsonString(payload) else {

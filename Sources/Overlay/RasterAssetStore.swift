@@ -499,7 +499,11 @@ public final class RasterAssetStore: @unchecked Sendable {
 }
 
 #if os(Windows)
-private extension RasterAssetStoreError {
+// `internal`, not `private`: `RasterAssetStoreTests` (in the
+// `AIChalkboardCoreTests` target, via `@testable import`) calls
+// `init(windowsDecodeError:)` directly to pin the `.imageTooLarge` mapping
+// without needing to decode a genuinely 16,384px+ fixture image.
+extension RasterAssetStoreError {
     /// Maps a `WindowsRasterImage.decode(path:)` failure to the closest
     /// honest `RasterAssetStoreError`. `.decodeFailed` maps to
     /// `.unsupportedImage` deliberately, not approximately: macOS's own
@@ -514,7 +518,11 @@ private extension RasterAssetStoreError {
         case .invalidArgument:
             // Should not happen: `path` was already validated as an absolute
             // Windows path by `BoundedLocalFile.read` immediately above this
-            // call. Kept mapped to `.invalidPath` rather than `.unknown` so a
+            // call, and an oversized decoded image is reported separately as
+            // `.imageTooLarge` below (CHALK_ERR_IMAGE_TOO_LARGE), not folded
+            // into CHALK_ERR_INVALID_ARGUMENT -- so nothing on this call's
+            // own path should be able to produce `.invalidArgument` here.
+            // Kept mapped to `.invalidPath` rather than `.unknown` so a
             // latent bug here still surfaces an actionable message instead of
             // a bare status number.
             self = .invalidPath
@@ -524,6 +532,8 @@ private extension RasterAssetStoreError {
             self = .unsupportedFormatOnSystem
         case .decodeFailed:
             self = .unsupportedImage
+        case .imageTooLarge:
+            self = .imageTooLarge
         case .wicInitFailed, .outOfMemory, .unknown:
             self = .decodingUnavailable
         }

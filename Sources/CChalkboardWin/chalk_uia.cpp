@@ -326,6 +326,67 @@ int32_t CreateAutomationClient(DWORD timeoutMs, ComPtr<IUIAutomation>* outAutoma
 }
 
 // ---------------------------------------------------------------------
+// Outstanding-worker cap
+// ---------------------------------------------------------------------
+//
+// The threading-model comment at the top of this file explains why a
+// worker stuck inside a truly hung UIA provider call is deliberately
+// LEAKED rather than terminated -- TerminateThread mid-COM-call would
+// corrupt the process's COM/CRT state worse than a leaked thread does.
+// That design choice means a single local process that owns a top-level
+// window and simply never pumps its message queue again (no special
+// coding required -- Sleep() in the message loop is enough) turns every
+// call this file makes against that pid into one more permanently-blocked
+// worker thread. Verified empirically: IUIAutomation2's ConnectionTimeout/
+// TransactionTimeout (set in CreateAutomationClient) does NOT reliably
+// bound this -- against a plain non-pumping window the underlying COM call
+// can still hang past the RPC timeout, so the "residual risk" the
+// threading-model comment calls an edge case is in practice the common
+// case for this trivial attack. Worse, CHALK_ERR_UIA_RETRYABLE_TIMEOUT's
+// own contract tells callers a timeout is "usually worth a retry", so the
+// natural response to the failure is the one that multiplies it: repeated
+// calls (whether an MCP agent following that advice, or a hostile caller
+// doing it deliberately) leak one more thread each time, with nothing in
+// this file previously capping how many could accumulate.
+//
+// We cannot stop an individual leak once a worker is committed to a hung
+// COM call -- that is the whole point of the leak-don't-terminate design.
+// What we CAN do is bound how many such leaks are allowed to accumulate
+// before we refuse to create more. Every worker this file spawns (both
+// FindElementThreadProc and SampleNamesThreadProc share one cap, since
+// both are exposed to the identical hung-provider scenario) reserves a
+// slot here before the OS thread is created and releases it right before
+// the worker function returns -- so a slot stays held for exactly as long
+// as that thread is alive, including for however long it stays genuinely
+// stuck. Once kMaxOutstandingUiaWorkers slots are held, new calls fail
+// immediately with the dedicated, explicitly non-retryable
+// CHALK_ERR_UIA_TOO_MANY_PENDING instead of spawning yet another thread --
+// this is what actually bounds worst-case leaked threads, independent of
+// retry count or how many distinct targets a caller tries.
+constexpr int kMaxOutstandingUiaWorkers = 24;
+std::atomic<int> g_outstandingUiaWorkers{0};
+
+// Reserves one of the kMaxOutstandingUiaWorkers slots above (a try-acquire,
+// not a blocking wait -- callers that fail to acquire must fail fast, not
+// queue, or a burst of calls against a hung target would just serialize
+// into the same unbounded pending pile this cap exists to prevent). Must
+// be paired with exactly one ReleaseUiaWorkerSlot() call: either here
+// inline (if the thread never actually starts) or at the top of the
+// worker's own thread proc once its Run*Worker call returns.
+bool TryAcquireUiaWorkerSlot() {
+    int prev = g_outstandingUiaWorkers.fetch_add(1, std::memory_order_acq_rel);
+    if (prev >= kMaxOutstandingUiaWorkers) {
+        g_outstandingUiaWorkers.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
+    }
+    return true;
+}
+
+void ReleaseUiaWorkerSlot() {
+    g_outstandingUiaWorkers.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+// ---------------------------------------------------------------------
 // chalk_uia_find_element
 // ---------------------------------------------------------------------
 
@@ -568,6 +629,12 @@ void RunFindElementWorker(FindElementRequest* req) {
 unsigned __stdcall FindElementThreadProc(void* argRaw) {
     auto* req = static_cast<FindElementRequest*>(argRaw);
     RunFindElementWorker(req);
+    // The worker's UIA call has returned (this line is never reached at all
+    // for a worker genuinely stuck in a hung COM call -- see the
+    // outstanding-worker-cap comment above), so release its slot before the
+    // ownership handshake below. This keeps the cap counting threads that
+    // are still actually alive/stuck, not bookkeeping in the handshake.
+    ReleaseUiaWorkerSlot();
     // See the ownership-handshake comment at the top of the file.
     if (req->disposition.exchange(kWorkerFinished, std::memory_order_acq_rel) == kCallerAbandoned) {
         delete req;
@@ -726,6 +793,11 @@ void RunSampleNamesWorker(SampleNamesRequest* req) {
 unsigned __stdcall SampleNamesThreadProc(void* argRaw) {
     auto* req = static_cast<SampleNamesRequest*>(argRaw);
     RunSampleNamesWorker(req);
+    // See the matching comment in FindElementThreadProc: this shares the
+    // same outstanding-worker cap because it is exposed to the identical
+    // hung-provider scenario (ElementFromHandle/get_CurrentName/
+    // GetFirstChildElement calls that can block forever).
+    ReleaseUiaWorkerSlot();
     if (req->disposition.exchange(kWorkerFinished, std::memory_order_acq_rel) == kCallerAbandoned) {
         delete req;
     }
@@ -745,8 +817,20 @@ int32_t chalk_uia_find_element(uint32_t process_id, const uint16_t* name, int32_
                                                   out_frameless_count);
     if (validation != CHALK_OK) return validation;
 
+    // See the outstanding-worker-cap comment above FindElementRequest: fail
+    // fast, before even allocating a request, once too many prior workers
+    // are still outstanding (most likely stuck in a hung provider we have
+    // no way to cancel) -- this is what actually bounds worst-case leaked
+    // threads.
+    if (!TryAcquireUiaWorkerSlot()) {
+        return CHALK_ERR_UIA_TOO_MANY_PENDING;
+    }
+
     auto* req = new (std::nothrow) FindElementRequest();
-    if (!req) return CHALK_ERR_OUT_OF_MEMORY;
+    if (!req) {
+        ReleaseUiaWorkerSlot();
+        return CHALK_ERR_OUT_OF_MEMORY;
+    }
     req->process_id = static_cast<DWORD>(process_id);
     req->name = Utf16ToWString(name);
     req->match_mode = match_mode;
@@ -757,6 +841,8 @@ int32_t chalk_uia_find_element(uint32_t process_id, const uint16_t* name, int32_
     HANDLE hThread = reinterpret_cast<HANDLE>(
         _beginthreadex(nullptr, 0, FindElementThreadProc, req, 0, nullptr));
     if (!hThread) {
+        ReleaseUiaWorkerSlot(); // thread never started; it will never reach
+                                 // ReleaseUiaWorkerSlot() itself.
         delete req; // thread never started; ownership never left this thread.
         return CHALK_ERR_INTERNAL;
     }
@@ -793,14 +879,27 @@ int32_t chalk_uia_sample_names(uint32_t process_id, int32_t max_names, uint16_t*
         return CHALK_ERR_INVALID_ARGUMENT;
     }
 
+    // Shares chalk_uia_find_element's outstanding-worker cap -- see that
+    // comment above FindElementRequest. This is the one case where this
+    // "never fails merely because the tree is large" diagnostic scan can
+    // report a hard failure: the problem here is never the tree, it is a
+    // saturated worker pool.
+    if (!TryAcquireUiaWorkerSlot()) {
+        return CHALK_ERR_UIA_TOO_MANY_PENDING;
+    }
+
     auto* req = new (std::nothrow) SampleNamesRequest();
-    if (!req) return CHALK_ERR_OUT_OF_MEMORY;
+    if (!req) {
+        ReleaseUiaWorkerSlot();
+        return CHALK_ERR_OUT_OF_MEMORY;
+    }
     req->process_id = static_cast<DWORD>(process_id);
     req->max_names = max_names;
 
     HANDLE hThread = reinterpret_cast<HANDLE>(
         _beginthreadex(nullptr, 0, SampleNamesThreadProc, req, 0, nullptr));
     if (!hThread) {
+        ReleaseUiaWorkerSlot();
         delete req;
         return CHALK_ERR_INTERNAL;
     }

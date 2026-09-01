@@ -40,6 +40,14 @@ enum WindowsRasterImageError: Error, Equatable {
     /// format, but could not decode pixel data from it (corrupt/truncated
     /// file).
     case decodeFailed
+    /// `CHALK_ERR_IMAGE_TOO_LARGE`: WIC successfully decoded the file's
+    /// pixel dimensions, but they exceed the shim's safety bound (16,384px
+    /// per axis, or 20,000,000px total -- see the check's comment in
+    /// chalk_image.cpp). The path and every argument to the call were fine;
+    /// it is the image's own content that is too large. Kept distinct from
+    /// `.invalidArgument` on purpose -- see that code's doc comment above,
+    /// and `CHALK_ERR_IMAGE_TOO_LARGE` in chalkboard_win.h.
+    case imageTooLarge
     /// `CHALK_ERR_WIC_INIT_FAILED`: the WIC imaging factory itself could not
     /// be created -- not specific to this one file; no image can decode
     /// right now.
@@ -110,7 +118,11 @@ public final class WindowsRasterImage: RasterImageHandle {
     }
 }
 
-private extension WindowsRasterImageError {
+// `internal`, not `private`: `RasterAssetStoreTests` (in the
+// `AIChalkboardCoreTests` target, via `@testable import`) calls
+// `init(shimStatus:)` directly to pin the -206 -> `.imageTooLarge` mapping
+// without needing to decode a genuinely 16,384px+ fixture image.
+extension WindowsRasterImageError {
     /// Maps a `chalk_image_decode_file` status to the matching case, using
     /// the literal numeric values chalkboard_win.h documents (see
     /// `GDIPlusDrawingContext`'s path-op-code comment for why this file
@@ -122,6 +134,7 @@ private extension WindowsRasterImageError {
         case -201: self = .fileNotFound
         case -203: self = .unsupportedFormat
         case -202: self = .decodeFailed
+        case -206: self = .imageTooLarge
         case -200: self = .wicInitFailed
         case -2: self = .outOfMemory
         default: self = .unknown(shimStatus)

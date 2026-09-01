@@ -238,7 +238,32 @@ final class WindowsOverlayWindow {
         // thread, so this only guards against a future call site that drops
         // the last reference without going through `close()` first.
         if !closed {
-            close()
+            // Do NOT call `close()` (or otherwise touch `self`) here: Win32
+            // ties window ownership to the thread that created it, so
+            // `DestroyWindow` must run on `WindowsUIThread` (see that type's
+            // doc comment) -- calling `close()` inline, as this used to,
+            // silently LEAKED the HWND (`_ = DestroyWindow(hwnd)` discards
+            // its failure) on any thread other than WindowsUIThread, even
+            // though `DeleteObject`/`DeleteDC` are more thread-tolerant and
+            // likely still succeeded. That made this "backstop" not actually
+            // work for the exact scenario its own doc comment above says it
+            // exists to guard against. Copy the native handles out (never
+            // capture `self` -- it is mid-deallocation, and a strong capture
+            // in an escaping closure would resurrect a partially-torn-down
+            // instance across the thread hop) and finish teardown on the UI
+            // thread instead.
+            let hwndToDestroy = hwnd
+            let dcToDelete = presentationDC
+            let bitmapToDelete = presentationBitmap
+            let previousToRestore = previousBitmap
+            WindowsUIThread.shared.async {
+                if let previousToRestore {
+                    _ = SelectObject(dcToDelete, previousToRestore)
+                }
+                _ = DeleteObject(bitmapToDelete)
+                _ = DeleteDC(dcToDelete)
+                _ = DestroyWindow(hwndToDestroy)
+            }
         }
     }
 

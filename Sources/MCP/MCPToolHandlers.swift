@@ -77,9 +77,29 @@ extension MCPServer {
             if !leaseSnapshot.isBootstrapped {
                 suspensionNote = "Annotations are hidden because the shared suspension registry is unavailable, not because this process holds a valid lease. activeLeaseCount is not authoritative in this fail-closed state; do not click or attempt token cleanup until suspensionRegistryBootstrapped=true."
             } else if annotationsSuspended {
+                // PLATFORM-ACCURATE PROSE, same reasoning as the
+                // coordinateSpaceNote block above: overlays[].isOnScreen is
+                // sourced from AppKit on macOS but from this process's own
+                // Win32 window state (IsWindowVisible) on Windows.
+                #if os(macOS)
                 suspensionNote = "Annotations are suspended: Chalkboard has ordered every overlay window in this process out, while retaining annotation store entries. Each overlays[].isOnScreen value is this process's AppKit state only; it is not proof that a sibling process is also off screen. For a click workaround, use a live suspension lease whose suspend_annotations result says clickSafeAtObservation=true."
+                #elseif os(Windows)
+                suspensionNote = "Annotations are suspended: Chalkboard has ordered every overlay window in this process out, while retaining annotation store entries. Each overlays[].isOnScreen value is this process's Win32 window-visibility state (IsWindowVisible) only; it is not proof that a sibling process is also off screen. For a click workaround, use a live suspension lease whose suspend_annotations result says clickSafeAtObservation=true."
+                #endif
             } else {
+                // ignoresMouseEvents itself is read very differently per
+                // platform: AppKit exposes NSWindow.ignoresMouseEvents as a
+                // live, mutable per-window property, while this app bakes
+                // WS_EX_TRANSPARENT into every Windows overlay window once at
+                // creation and never re-queries it (see
+                // OverlayWindowController+Diagnostics.swift's
+                // overlayInputPolicySnapshot() Windows branch), so it is
+                // reported here as a constant, not a live read.
+                #if os(macOS)
                 suspensionNote = "ignoresMouseEvents and overlays[].isOnScreen are this process's live AppKit state. They do not prove sibling-process state, raw framebuffer pixels, or occlusion. macOS WindowServer metadata does not expose ignoresMouseEvents, so a click dispatcher that blocks merely because an overlay window is present must explicitly consult and honor this state. suspend_annotations is a fallback workaround, not true simultaneous click-through."
+                #elseif os(Windows)
+                suspensionNote = "overlays[].isOnScreen is this process's live Win32 window-visibility state (IsWindowVisible). ignoresMouseEvents is always true here: WS_EX_TRANSPARENT is baked into every overlay window at creation and never queried live, unlike macOS's mutable NSWindow.ignoresMouseEvents. Neither value proves sibling-process state, raw framebuffer pixels, or occlusion, so a click dispatcher that blocks merely because an overlay window is present must explicitly consult and honor this state. suspend_annotations is a fallback workaround, not true simultaneous click-through."
+                #endif
             }
             guard let overlayJSON = jsonObject(overlays) as? [Any] else {
                 sendErrorResult(id: id, text: "Failed to encode overlay input state.")
@@ -211,7 +231,14 @@ extension MCPServer {
             let appArgument: String?
             if args.keys.contains("app") {
                 guard let value = args["app"] as? String else {
+                    // Same platform-noun reasoning as resolveTargetApp's own
+                    // guard in DrawRequest.swift: a Windows caller has no
+                    // bundle id to supply.
+                    #if os(macOS)
                     sendErrorResult(id: id, text: "Invalid clear request: 'app' must be a string bundle id/display name, or an empty string for global annotations only.")
+                    #elseif os(Windows)
+                    sendErrorResult(id: id, text: "Invalid clear request: 'app' must be a string executable name/display name, or an empty string for global annotations only.")
+                    #endif
                     return
                 }
                 appArgument = value

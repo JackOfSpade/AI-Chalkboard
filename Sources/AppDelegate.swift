@@ -582,6 +582,40 @@ public final class AppDelegate: AppHostUI {
 
         InstanceBroadcast.shared.registerObservers()
 
+        // Wires InstanceBroadcast's "a Windows lifecycle owner should perform
+        // graceful shutdown" hook (see that property's doc comment) to this
+        // class's own termination choke point, mirroring the macOS branch's
+        // QUIT-broadcast handler (`AppDelegate.markInternalTermination` then
+        // `NSApp.terminate(nil)`, InstanceBroadcast.swift's
+        // `handleQuitAllBroadcast`).
+        //
+        // MUST mark internal termination BEFORE calling AppHost.terminate():
+        // this closure runs as a result of a QUIT broadcast this process (or
+        // a sibling) already fanned out to everyone, so `requestTermination()`
+        // must NOT treat it as a fresh user quit and re-broadcast a second
+        // QUIT -- exactly the loop `AppLifecycleCoordinator.evaluateTermination()`'s
+        // own doc comment calls out.
+        //
+        // THREADING: `onQuitRequested` is invoked from `InstanceBroadcast`'s
+        // `handleQuitAllBroadcast`, which itself runs inside `MainThread.async`
+        // -- on Windows that is `WindowsUIThread`, the OverlayWindowController's
+        // dedicated Win32 thread, NOT this class's own UI thread (the
+        // process's message-loop thread captured in `mainThreadId` above).
+        // Both `markInternalTermination` (unsynchronized, UI-thread-only per
+        // its own doc comment) and tray/window teardown are THIS class's
+        // UI-thread-only state, so both calls are routed through
+        // `AppHost.runOnMain`, which hops to this class's real UI thread via
+        // `runOnUIThread(_:)` -- the same pattern MCPServer's transport-
+        // failure path already uses for the identical "background thread
+        // wants to mark-internal-then-terminate" shape. Do not call either
+        // function directly from this closure without that hop.
+        InstanceBroadcast.shared.onQuitRequested = { reason in
+            AppHost.runOnMain {
+                AppDelegate.markInternalTermination(reason: reason)
+                AppHost.terminate()
+            }
+        }
+
         ActiveAppTracker.shared.start()
 
         let suspensionBootstrap = SuspensionLeaseCoordinator.shared.bootstrapAndReconcile()
@@ -591,8 +625,24 @@ public final class AppDelegate: AppHostUI {
         lifecycle.startSuspensionLeaseReconciliation()
 
         OverlayWindowController.shared.setup()
+        // THREADING: `onCaptureVisibleChanged` fires from `setCaptureVisible`,
+        // which (per OverlayWindowController+Presentation.swift) runs its
+        // entire body -- this callback included -- inside `MainThread.sync`,
+        // i.e. on `WindowsUIThread`, not this class's own UI thread. Every
+        // stored property `applyCaptureIndicator` touches (`trayIconAdded`,
+        // `trayWindow`) is documented UI-THREAD-ONLY above, and
+        // `trayIconAdded` is independently written from this class's real UI
+        // thread by `installPrimaryUI()`/`tearDownTrayIcon()`. Without this
+        // hop, a broadcast-triggered or MCP-triggered capture-visibility
+        // change (both arrive on other threads -- see the callers listed in
+        // OverlayWindowController+Presentation.swift) races those writes and
+        // calls `Shell_NotifyIconW` off its owning thread. Route through
+        // `runOnUIThread` before touching any of it, matching the
+        // `onQuitRequested` wiring just above.
         OverlayWindowController.shared.onCaptureVisibleChanged = { [weak self] visible in
-            self?.applyCaptureIndicator(visible: visible)
+            self?.runOnUIThread {
+                self?.applyCaptureIndicator(visible: visible)
+            }
         }
 
         MCPServer.shared.start()
@@ -654,16 +704,15 @@ public final class AppDelegate: AppHostUI {
             // genuine user-quit path today, the tray menu's "Quit AI
             // Chalkboard" (`quitApp()` below), deliberately does NOT call
             // `terminate()` directly -- it posts a QUIT broadcast, exactly
-            // like the macOS status menu's `quitApp()`, and expects the
-            // broadcast's own receive handler to call
-            // `markInternalTermination(reason:)` before ever reaching here
-            // (see `quitApp()`'s doc comment; `InstanceBroadcast` has no
-            // Windows implementation yet, which is a tracked gap, not a
-            // design choice made here). Fail safe rather than silently
-            // skipping the fan-out that gap would otherwise cause: broadcast
-            // anyway, mirroring the macOS class's Dock/Cmd-Q branch, so an
-            // unanticipated caller still takes sibling instances down with
-            // it instead of stranding them.
+            // like the macOS status menu's `quitApp()`, and the broadcast's
+            // own receive handler loops back into `markInternalTermination(
+            // reason:)` + `AppHost.terminate()` via `InstanceBroadcast.shared
+            // .onQuitRequested`, wired in `launch()` above, before ever
+            // reaching here. Fail safe rather than assuming that wiring
+            // always fires: broadcast anyway, mirroring the macOS class's
+            // Dock/Cmd-Q branch, so an unanticipated caller (or a future
+            // regression that unwires `onQuitRequested`) still takes sibling
+            // instances down with it instead of stranding them.
             Logger.shared.log("requestTermination: reached with no internal-termination flag set; broadcasting QUIT before terminating (see doc comment on this method).", level: "WARN")
             InstanceBroadcast.shared.postQuitAll(scopedToLaunchMode: true)
         } else {
@@ -1094,8 +1143,9 @@ public final class AppDelegate: AppHostUI {
 
     /// Posts a QUIT broadcast rather than terminating locally, exactly like
     /// the macOS status menu's `quitApp()` -- see `requestTermination()`'s
-    /// doc comment above for how the broadcast is expected to loop back into
-    /// an actual termination once `InstanceBroadcast` has a Windows port.
+    /// doc comment above, and `InstanceBroadcast.shared.onQuitRequested`'s
+    /// wiring in `launch()`, for how the broadcast loops back into an actual
+    /// graceful termination of this process too.
     private func quitApp() {
         InstanceBroadcast.shared.postQuitAll()
     }

@@ -130,6 +130,18 @@ enum ChalkErrorCode : int32_t {
     // The ChalkImage handle passed in is null or does not refer to a live
     // decoded image.
     CHALK_ERR_INVALID_IMAGE = -205,
+    // chalk_image_decode_file successfully decoded pixel dimensions from the
+    // file, but they exceed the safety bound this shim enforces (16,384px on
+    // either axis, or 20,000,000px total -- see the check's own comment in
+    // chalk_image.cpp) before that decode's stride/buffer arithmetic runs.
+    // Distinct from CHALK_ERR_INVALID_ARGUMENT on purpose: the file and its
+    // path are both entirely valid, the caller-supplied *arguments* to this
+    // call are fine -- it is the image's own decoded content that is too
+    // large, exactly the same condition RasterAssetStore.validate(width:
+    // height:) rejects on the Swift side for a macOS-decoded image. Folding
+    // this back into CHALK_ERR_INVALID_ARGUMENT would make a perfectly good
+    // absolute path get reported to the caller as malformed, which is wrong.
+    CHALK_ERR_IMAGE_TOO_LARGE = -206,
 
     // --- UI Automation (section 3) ---
     // The UI Automation COM service could not be reached at all (CoCreate of
@@ -176,6 +188,17 @@ enum ChalkErrorCode : int32_t {
     // `process_id` does not name a currently-running process, or the
     // process has no root automation element (e.g. it has no windows yet).
     CHALK_ERR_UIA_INVALID_PROCESS = -308,
+    // This shim already has its cap's worth of UIA worker threads
+    // outstanding (see kMaxOutstandingUiaWorkers in chalk_uia.cpp) -- most
+    // of them likely permanently stuck inside a hung UI Automation provider
+    // call that classic UI Automation gives this shim no way to cancel (see
+    // the threading-model comment at the top of chalk_uia.cpp). NOT
+    // RETRYABLE, unlike CHALK_ERR_UIA_RETRYABLE_TIMEOUT: retrying -- with
+    // the same or a different process_id -- only adds another stuck thread
+    // on top of an already-saturated pool. Callers should treat this as a
+    // hard failure (fall back to screen coordinates, or surface that UI
+    // Automation is currently wedged) rather than something worth retrying.
+    CHALK_ERR_UIA_TOO_MANY_PENDING = -309,
 
     // --- capture (section 4) ---
     // BitBlt (or the GDI calls around it: CreateCompatibleDC/Bitmap,
@@ -449,8 +472,13 @@ int32_t chalk_rt_draw_image(ChalkRenderTarget target, ChalkImage image,
 // release with chalk_image_destroy. On failure, `*out_image` is left
 // unchanged (do not assume it is set to NULL).
 // Errors: CHALK_ERR_INVALID_ARGUMENT (null path/out_image/out_width/
-// out_height), CHALK_ERR_FILE_NOT_FOUND, CHALK_ERR_UNSUPPORTED_FORMAT,
-// CHALK_ERR_DECODE_FAILED, CHALK_ERR_WIC_INIT_FAILED, CHALK_ERR_OUT_OF_MEMORY.
+// out_height), CHALK_ERR_IMAGE_TOO_LARGE (the decoded image exceeds
+// 16,384px on either axis or 20,000,000px total -- the same bound
+// RasterAssetStore enforces on the Swift side, applied here too as defense
+// in depth before this function's own stride/buffer arithmetic runs -- see
+// the comment at that check in chalk_image.cpp), CHALK_ERR_FILE_NOT_FOUND,
+// CHALK_ERR_UNSUPPORTED_FORMAT, CHALK_ERR_DECODE_FAILED,
+// CHALK_ERR_WIC_INIT_FAILED, CHALK_ERR_OUT_OF_MEMORY.
 int32_t chalk_image_decode_file(const uint16_t* path, ChalkImage* out_image,
                                  int32_t* out_width, int32_t* out_height);
 
@@ -539,7 +567,7 @@ enum ChalkUiaMatchMode : int32_t {
 // CHALK_ERR_UIA_ACCESS_DENIED, CHALK_ERR_UIA_NO_MATCH,
 // CHALK_ERR_UIA_NO_USABLE_BOUNDS, CHALK_ERR_UIA_AMBIGUOUS,
 // CHALK_ERR_UIA_OCCURRENCE_OUT_OF_RANGE, CHALK_ERR_UIA_RETRYABLE_TIMEOUT,
-// CHALK_ERR_UIA_NODE_BUDGET_EXHAUSTED.
+// CHALK_ERR_UIA_NODE_BUDGET_EXHAUSTED, CHALK_ERR_UIA_TOO_MANY_PENDING.
 int32_t chalk_uia_find_element(uint32_t process_id, const uint16_t* name,
                                 int32_t match_mode, int32_t occurrence,
                                 int32_t max_nodes, double timeout_seconds,
@@ -565,7 +593,12 @@ int32_t chalk_uia_find_element(uint32_t process_id, const uint16_t* name,
 // partially writes a name past `buffer_len`).
 // Errors: CHALK_ERR_INVALID_ARGUMENT (max_names <= 0; buffer_len < 0; null
 // out_buffer when buffer_len > 0; null out_count), CHALK_ERR_UIA_INVALID_PROCESS,
-// CHALK_ERR_UIA_UNAVAILABLE, CHALK_ERR_UIA_ACCESS_DENIED.
+// CHALK_ERR_UIA_UNAVAILABLE, CHALK_ERR_UIA_ACCESS_DENIED,
+// CHALK_ERR_UIA_TOO_MANY_PENDING (this call shares chalk_uia_find_element's
+// outstanding-worker-thread cap -- see that code's doc comment; this is the
+// one case where this "never fails merely because the tree is large"
+// diagnostic scan CAN report a hard failure, because it is not the tree
+// that is the problem).
 int32_t chalk_uia_sample_names(uint32_t process_id, int32_t max_names,
                                 uint16_t* out_buffer, int32_t buffer_len,
                                 int32_t* out_count);

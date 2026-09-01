@@ -155,7 +155,21 @@ public enum PosixFileLockPrimitive: FileLockPrimitive {
 /// `InstanceLockPolicy`'s header comment). Declares no initializer of its
 /// own, so it automatically inherits both of `InstanceLockPolicy`'s
 /// designated initializers unchanged.
-public final class InstanceLock: InstanceLockPolicy<PosixFileLockPrimitive> {
+/// `@unchecked Sendable` is restated here for the SAME reason, and with the
+/// same justification, as the Windows `InstanceLock` further down this file --
+/// see that declaration's comment, which deliberately documents BOTH platforms'
+/// call sites rather than just its own. Swift treats `@unchecked` as a
+/// per-declaration audit marker that does not propagate from
+/// `InstanceLockPolicy` down to a subclass, so each concrete class must restate
+/// it.
+///
+/// Restated on this macOS class too even though the warning that prompted it
+/// was only observable on a Windows build (this branch never compiles there):
+/// the soundness argument is symmetric -- every mutating entry point runs on
+/// the AppKit main thread, via `applicationDidFinishLaunching` and
+/// `AppLifecycleCoordinator`'s `RunLoop.main` timers -- so leaving it off would
+/// just defer an identical warning to whoever next builds on a Mac.
+public final class InstanceLock: InstanceLockPolicy<PosixFileLockPrimitive>, @unchecked Sendable {
     public static let shared = InstanceLock()
 }
 
@@ -423,7 +437,44 @@ public enum Win32FileLockPrimitive: FileLockPrimitive {
 /// `InstanceLockPolicy`'s header comment). Declares no initializer of its
 /// own, so it automatically inherits both of `InstanceLockPolicy`'s
 /// designated initializers unchanged.
-public final class InstanceLock: InstanceLockPolicy<Win32FileLockPrimitive> {
+// Swift requires an `@unchecked Sendable` conformance to be restated on
+// every subclass, even though `InstanceLockPolicy` already declares it --
+// unlike an ordinary protocol, `@unchecked` is a per-declaration audit
+// marker, not something that silently propagates down a class hierarchy.
+// Restating it here (rather than silencing the warning some other way) is
+// the correct call: it is TRUE, for the same reason `InstanceLockPolicy`
+// documents it as sound for itself, and for one further reason specific to
+// this concrete subclass.
+//
+// This class's whole mutable state (`lockFileHandle`, `acquired`,
+// `consecutiveMissingLockFilePolls`, `lastRetryAnomaly`, all declared on
+// `InstanceLockPolicy`) is genuinely unsynchronized -- there is no lock, no
+// `os_unfair_lock`/`SRWLOCK`, no actor isolation anywhere in this type or its
+// superclass. `@unchecked Sendable` is sound here NOT because concurrent
+// access is safe, but because it never happens: every mutating entry point
+// (`acquire()`, `retryAcquire()`, `revalidatePrimaryLock()`) is called only
+// from this process's single UI/message-loop thread, by construction:
+//   * macOS: `AppDelegate.applicationDidFinishLaunching` calls `acquire()`
+//     directly (main thread), and `retryAcquire()`/`revalidatePrimaryLock()`
+//     run only from `AppLifecycleCoordinator`'s repeating timers, which
+//     `AppDelegate.scheduleRepeatingCallback` arms via `Timer` on
+//     `RunLoop.main`.
+//   * Windows: `AppDelegate.launch()` calls `acquire()` directly, on the
+//     thread it captures as `Self.mainThreadId` at the top of that same
+//     method, and `retryAcquire()`/`revalidatePrimaryLock()` again run only
+//     from `AppLifecycleCoordinator`'s timers, which
+//     `AppDelegate.scheduleRepeatingCallback` arms via `SetTimer`/`WM_TIMER`
+//     on that identical thread.
+// `InstanceLock.shared`'s lazy `static let` initialization itself is
+// separately thread-safe (Swift guarantees a `static let` initializer runs
+// exactly once even under concurrent first access), so the ONLY way this
+// type's mutable state could actually race is if some future call site
+// invoked `acquire()`/`retryAcquire()`/`revalidatePrimaryLock()` off that one
+// thread -- at which point this conformance would stop being sound and
+// would need to gain real synchronization (or move to an actor), not just
+// keep this comment. If you are adding such a call site, stop and add a lock
+// first.
+public final class InstanceLock: InstanceLockPolicy<Win32FileLockPrimitive>, @unchecked Sendable {
     public static let shared = InstanceLock()
 }
 #endif

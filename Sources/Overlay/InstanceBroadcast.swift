@@ -25,6 +25,24 @@ import WinSDK
 // anything with a larger blast radius (file paths, shell arguments, anything
 // that mutates disk); that would need a real authenticated transport (e.g. a
 // sandbox-scoped XPC service with a code-signing requirement on the peer).
+//
+// setCaptureVisible RIDES THIS SAME UNAUTHENTICATED CHANNEL AND HAS A
+// DIFFERENT, LARGER BLAST RADIUS THAN CLEAR/QUIT -- read before assuming the
+// reasoning above covers it. Unlike clear/quit, which only affect this app's
+// own on-screen output, a `true` broadcast changes what OTHER processes on
+// this machine (screen recorders, video-call screen sharing) can see of this
+// app's overlay windows -- any co-session process can flip that on with no
+// consent from the user who set it to off. This is accepted, not fixed, for
+// two reasons: (1) `MCPToolHandlers.swift`'s own capture-debug-OFF note
+// already discloses this mechanism is "not a security guarantee" and that
+// "modern capture tools control their own inclusion filters" -- i.e. this
+// channel was never claimed to be a privacy guarantee anywhere a caller can
+// see, on either platform; (2) narrowing it to "no larger than clear/quit"
+// would require rejecting this broadcast from this shared, unauthenticated
+// channel entirely, which is a real option but a product decision, not a
+// bug fix -- flag it to whoever owns that tradeoff rather than silently
+// tightening behavior here. Do not read the "no larger than clear/quit"
+// sentence above as covering setCaptureVisible; it does not.
 extension Notification.Name {
     /// "Every AI Chalkboard process: wipe your AnnotationStore and repaint."
     ///
@@ -685,21 +703,6 @@ private struct WindowsBroadcastEnvelope: Codable {
     let generation: String?
 }
 
-/// Heap box carrying one JSON payload through the async, non-reentrant
-/// self-delivery path (`InstanceBroadcast.deliverLocally`). `PostMessageW`
-/// cannot carry `WM_COPYDATA`'s pointer-to-caller's-stack payload safely
-/// (the sender may have already returned by the time the message is
-/// dequeued), so self-delivery uses a private `WM_APP`-range message whose
-/// `LPARAM` is a retained pointer to one of these boxes instead; the pump
-/// thread takes ownership (`takeRetainedValue()`) when it dequeues the
-/// message. File-scope (not nested in `InstanceBroadcast`) purely so the
-/// free-function `WNDPROC` below -- which cannot capture `self` -- can name
-/// it directly.
-private final class WindowsLocalBroadcastPayload {
-    let json: String
-    init(_ json: String) { self.json = json }
-}
-
 /// The `WNDPROC` for `InstanceBroadcast`'s Windows message-only broadcast
 /// window. Must be a capture-free, file-scope function (or the Swift
 /// compiler cannot treat it as the `@convention(c)` function pointer
@@ -722,7 +725,18 @@ private func chalkboardBroadcastWndProc(_ hWnd: HWND?, _ uMsg: UINT, _ wParam: W
             return 0
         }
         let cds = structPtr.assumingMemoryBound(to: COPYDATASTRUCT.self).pointee
-        guard let dataPtr = cds.lpData else { return 0 }
+        // CEILING BEFORE ALLOCATING: `cbData` is a sender-controlled `DWORD`
+        // with no upper bound from the OS. WM_COPYDATA marshaling means the
+        // sender must genuinely own that many bytes for the copy to succeed
+        // (this is not an out-of-bounds READ risk), but a hostile local
+        // sender can allocate one large buffer once and then cheaply repeat
+        // `SendMessageTimeoutW` calls referencing it, forcing a matching
+        // large `Data(bytes:count:)` allocation+copy in THIS process on
+        // every call -- a real, if low-severity, memory-churn DoS. No
+        // legitimate `WindowsBroadcastEnvelope` this file ever sends comes
+        // close to a few KB, so reject anything past a generous ceiling
+        // before touching `dataPtr` at all.
+        guard cds.cbData <= InstanceBroadcast.maxCopyDataBytes, let dataPtr = cds.lpData else { return 0 }
         let payload = Data(bytes: dataPtr, count: Int(cds.cbData))
         guard let json = String(data: payload, encoding: .utf8) else { return 0 }
         InstanceBroadcast.windowsInstance(for: hWnd)?.dispatchIncoming(json: json)
@@ -734,18 +748,31 @@ private func chalkboardBroadcastWndProc(_ hWnd: HWND?, _ uMsg: UINT, _ wParam: W
         return 1
 
     case InstanceBroadcast.localDeliveryMessage:
-        guard let hWnd,
-              let boxPtr = UnsafeRawPointer(bitPattern: UInt(bitPattern: Int(lParam))) else {
-            return 0
-        }
-        // `takeRetainedValue()`, not `takeUnretainedValue()`: this consumes
-        // the +1 retain `InstanceBroadcast.deliverLocally` created when it
-        // posted the message, so the box is released exactly once, here,
-        // when the pump thread actually dequeues it -- never on the posting
-        // thread, which is the whole point of routing self-delivery through
-        // `PostMessageW` instead of calling the handler inline.
-        let box = Unmanaged<WindowsLocalBroadcastPayload>.fromOpaque(boxPtr).takeRetainedValue()
-        InstanceBroadcast.windowsInstance(for: hWnd)?.dispatchIncoming(json: box.json)
+        // SECURITY: `LPARAM` on an ordinary `WM_APP`-range message is NOT
+        // OS-marshaled the way `WM_COPYDATA`'s pointer is -- it is just an
+        // integer, and this message is receivable from ANY co-session
+        // process, not only this one (an `HWND_MESSAGE` window is invisible
+        // to the taskbar/Alt-Tab/top-level `EnumWindows`, but it is still an
+        // ordinary, discoverable, addressable window on this desktop -- see
+        // this file's "SESSION SCOPING" doc comment -- and UIPI only blocks a
+        // LOWER-integrity sender from reaching a HIGHER-integrity window, not
+        // between two ordinary medium-integrity processes). This case used
+        // to treat `lParam` as a retained Swift object pointer
+        // (`Unmanaged<...>.fromOpaque(...).takeRetainedValue()`); ANY nonzero
+        // `LPARAM` "succeeds" at that call whether or not it names real
+        // mapped memory, and releasing whatever ARC finds at an
+        // attacker-chosen address is a genuine type-confusion / memory-
+        // corruption primitive, not a hypothetical one. `lParam` here is
+        // therefore only ever an opaque token into
+        // `InstanceBroadcast.pendingLocalDeliveries` -- see
+        // `deliverLocally`/`consumeLocalDelivery` -- which resolves it
+        // through a lock-guarded dictionary instead of dereferencing it, and
+        // silently no-ops on a token that was never issued (already
+        // consumed, or simply fabricated by another process). Never go back
+        // to carrying a raw pointer across this boundary.
+        guard let hWnd else { return 0 }
+        let token = UInt64(bitPattern: Int64(lParam))
+        InstanceBroadcast.windowsInstance(for: hWnd)?.consumeLocalDelivery(token: token)
         return 0
 
     default:
@@ -807,11 +834,14 @@ private func chalkboardBroadcastWndProc(_ hWnd: HWND?, _ uMsg: UINT, _ wParam: W
 /// make every post block until this process's own handler finished running
 /// -- exactly the reentrant-looking, "did not return first" behaviour macOS
 /// explicitly avoids. So self-delivery is special-cased: `deliverLocally`
-/// posts (never sends) a private `WM_APP`-range message carrying a small
-/// heap-allocated payload box, which the pump thread only picks up on its
-/// own next loop iteration -- genuinely asynchronous, and never reentrant
-/// with respect to the calling thread, the same as `postNotificationName`
-/// returning before the local observer fires ~2ms later on macOS.
+/// posts (never sends) a private `WM_APP`-range message whose `LPARAM` is an
+/// opaque token into `pendingLocalDeliveries` (a lock-guarded dictionary
+/// keyed by a monotonic `UInt64`, NOT a retained pointer -- see that
+/// property's doc comment for why), which the pump thread only looks up and
+/// consumes on its own next loop iteration -- genuinely asynchronous, and
+/// never reentrant with respect to the calling thread, the same as
+/// `postNotificationName` returning before the local observer fires ~2ms
+/// later on macOS.
 ///
 /// LAUNCH-MODE SCOPING is identical in spirit to the macOS branch -- and, now
 /// that both branches are consolidated onto shared policy, literally the
@@ -866,17 +896,45 @@ public final class InstanceBroadcast: BroadcastTransport {
     // remaining visible to that function.
     fileprivate static let localDeliveryMessage: UINT = UINT(WM_APP) + 1
 
-    // THREADING: `hwnd`/`isRegistered`/`isQuitting` are read and written from
-    // multiple threads by construction -- the pump thread that owns the
-    // message-only window, whatever thread calls `postX`, and the 1s
-    // watchdog's background queue -- unlike the macOS branch, which can get
-    // away with "everything is main-thread-only" because AppKit and
-    // DistributedNotificationCenter delivery are both main-thread affairs
-    // here. `stateLock` guards exactly these three fields.
+    /// Ceiling on `WM_COPYDATA.cbData` a receiver will act on -- see
+    /// `chalkboardBroadcastWndProc`'s `WM_COPYDATA` case for why this exists
+    /// (a memory-churn DoS, not an out-of-bounds read). No real
+    /// `WindowsBroadcastEnvelope` this file ever encodes gets remotely close
+    /// to this; it exists purely to bound a hostile sender's request, not to
+    /// accommodate any legitimate payload growth.
+    fileprivate static let maxCopyDataBytes: DWORD = 16 * 1024
+
+    // THREADING: `hwnd`/`isRegistered`/`isQuitting`/`pendingLocalDeliveries`/
+    // `nextLocalDeliveryToken` are read and written from multiple threads by
+    // construction -- the pump thread that owns the message-only window,
+    // whatever thread calls `postX`, and the 1s watchdog's background queue
+    // -- unlike the macOS branch, which can get away with "everything is
+    // main-thread-only" because AppKit and DistributedNotificationCenter
+    // delivery are both main-thread affairs here. `stateLock` guards exactly
+    // these five fields.
     private let stateLock = NSLock()
     private var hwnd: HWND?
     private var isRegistered = false
     private var isQuitting = false
+
+    /// Payloads queued by `deliverLocally` and not yet consumed by
+    /// `consumeLocalDelivery`. `WM_APP`-range `LPARAM`s are not OS-marshaled
+    /// (unlike `WM_COPYDATA`) and this message is receivable from ANY
+    /// co-session process (see `chalkboardBroadcastWndProc`'s
+    /// `localDeliveryMessage` case for the full threat), so the `LPARAM`
+    /// this class posts is only ever a lookup key into this dictionary --
+    /// never a pointer an attacker-forged `LPARAM` could get dereferenced or
+    /// ARC-released. Entries normally live for microseconds (posted, then
+    /// consumed on the pump thread's very next loop iteration); a token that
+    /// is posted but whose `PostMessageW` call fails is removed immediately
+    /// by `deliverLocally` rather than left to accumulate.
+    private var pendingLocalDeliveries: [UInt64: String] = [:]
+
+    /// Monotonic source for `pendingLocalDeliveries` keys. `UInt64` is wide
+    /// enough that wraparound is not a practical concern for a process-
+    /// lifetime counter incremented once per broadcast this process ever
+    /// posts.
+    private var nextLocalDeliveryToken: UInt64 = 0
 
     /// Signalled once the pump thread has either created its broadcast
     /// window (success) or given up (failure, already logged). `register
@@ -1120,43 +1178,114 @@ public final class InstanceBroadcast: BroadcastTransport {
 
         deliverLocally(json)
 
-        for sibling in discoverSiblingWindows() {
+        // TOTAL WALL-CLOCK BUDGET across ALL siblings, on top of
+        // `sendCopyData`'s own per-window ~2s `SMTO_ABORTIFHUNG` ceiling.
+        // `sendCopyData` is sequential and synchronous on the calling
+        // thread (WM_COPYDATA cannot be posted or safely parallelized here
+        // -- see `sendCopyData`'s own doc comment), so without a total
+        // ceiling, N discovered sibling windows -- whether a legitimately
+        // large multi-instance fan-out or, before the identity check in
+        // `discoverSiblingWindows()` above, a squatted/message-pump-starved
+        // set -- would multiply a single Clear/Quit/SetCaptureVisible action
+        // into up to N * 2s of blocking on whatever thread called `postX`.
+        let siblings = discoverSiblingWindows()
+        let deadline = DispatchTime.now() + Self.maxTotalSiblingSendDuration
+        for (index, sibling) in siblings.enumerated() {
+            guard DispatchTime.now() < deadline else {
+                Logger.shared.log("InstanceBroadcast: aborting sibling broadcast fan-out after exceeding its total time budget (\(index)/\(siblings.count) sibling window(s) contacted); the rest did not receive this broadcast.", level: "WARN")
+                break
+            }
             sendCopyData(json, to: sibling)
         }
     }
 
+    /// Ceiling on the TOTAL time `post(_:)` spends walking
+    /// `discoverSiblingWindows()`'s results, independent of how many
+    /// siblings were found -- see `post(_:)`'s doc comment for why this
+    /// exists on top of `sendCopyData`'s own per-window timeout.
+    private static let maxTotalSiblingSendDuration: DispatchTimeInterval = .seconds(5)
+
     /// The async, non-reentrant self-delivery path described in this class's
-    /// doc comment: posts (never sends) a private message carrying a
-    /// retained pointer to a heap-allocated payload box, which the pump
-    /// thread decodes and releases when it actually dequeues the message.
+    /// doc comment: posts (never sends) a private message whose `LPARAM` is
+    /// an opaque token looked up in `pendingLocalDeliveries`, which the pump
+    /// thread resolves and removes when it actually dequeues the message --
+    /// see `pendingLocalDeliveries`'s doc comment for why this is a lookup
+    /// key and not a pointer.
     private func deliverLocally(_ json: String) {
         stateLock.lock()
         let target = hwnd
+        let token = nextLocalDeliveryToken
+        nextLocalDeliveryToken &+= 1
+        pendingLocalDeliveries[token] = json
         stateLock.unlock()
 
         guard let target else {
             Logger.shared.log("InstanceBroadcast: cannot deliver a broadcast to this process -- no broadcast window exists (registerObservers() was not called, or failed). This process will not see its own action take effect.", level: "ERROR")
+            stateLock.lock()
+            pendingLocalDeliveries.removeValue(forKey: token)
+            stateLock.unlock()
             return
         }
 
-        let box = WindowsLocalBroadcastPayload(json)
-        let boxPointer = Unmanaged.passRetained(box).toOpaque()
-        let lparam = LPARAM(bitPattern: UInt64(UInt(bitPattern: boxPointer)))
+        let lparam = LPARAM(bitPattern: token)
         guard PostMessageW(target, Self.localDeliveryMessage, 0, lparam) else {
-            // Nobody will ever dequeue this box -- release it here rather
-            // than leaking it, and log loudly: this specifically means the
-            // poster will not see its own Clear/Quit/etc. take effect.
-            Unmanaged<WindowsLocalBroadcastPayload>.fromOpaque(boxPointer).release()
+            // Nobody will ever dequeue this entry -- remove it here rather
+            // than leaving it in the dictionary forever, and log loudly:
+            // this specifically means the poster will not see its own
+            // Clear/Quit/etc. take effect.
+            stateLock.lock()
+            pendingLocalDeliveries.removeValue(forKey: token)
+            stateLock.unlock()
             Logger.shared.log("InstanceBroadcast: PostMessageW failed to queue a local self-delivery (Win32 error \(GetLastError())).", level: "ERROR")
             return
         }
     }
 
+    /// Looks up and removes the payload `deliverLocally` queued under
+    /// `token`, then dispatches it -- the consuming half of the token scheme
+    /// described in `pendingLocalDeliveries`'s doc comment. Called from
+    /// `chalkboardBroadcastWndProc`'s `localDeliveryMessage` case with
+    /// whatever `LPARAM` arrived, which -- unlike a `WM_COPYDATA` pointer --
+    /// is NOT OS-verified and may have been sent by any co-session process
+    /// (see that case's doc comment for the full threat this defends
+    /// against). A token this dictionary does not recognize -- already
+    /// consumed, or simply fabricated by another process -- is a SILENT,
+    /// SAFE no-op: there is nothing to dereference, so there is nothing for
+    /// a hostile or stale token to corrupt.
+    fileprivate func consumeLocalDelivery(token: UInt64) {
+        stateLock.lock()
+        let json = pendingLocalDeliveries.removeValue(forKey: token)
+        stateLock.unlock()
+
+        guard let json else { return }
+        dispatchIncoming(json: json)
+    }
+
     /// Walks every `HWND_MESSAGE` child window registered under this
     /// process's own well-known broadcast class, EXCLUDING this process's
-    /// own window (self-delivery goes through `deliverLocally` instead) and
-    /// any window whose owning process is not in this same Windows session
-    /// (see this class's "SESSION SCOPING" doc comment above).
+    /// own window (self-delivery goes through `deliverLocally` instead), any
+    /// window whose owning process is not in this same Windows session (see
+    /// this class's "SESSION SCOPING" doc comment above), and -- see WINDOW-
+    /// CLASS IDENTITY below -- any window whose owning process is not
+    /// actually running this same executable.
+    ///
+    /// WINDOW-CLASS IDENTITY: `RegisterClassExW`'s `(hInstance, name)`
+    /// scoping is per-PROCESS, not exclusive across processes -- any other
+    /// local process can register a window under this exact class name and
+    /// create its own `HWND_MESSAGE` windows, so `FindWindowExW` above can
+    /// return a window this app did not create. Before trusting such a
+    /// window as a real sibling AI Chalkboard instance -- which means
+    /// SENDING it this broadcast's JSON payload (appId/appName included) and
+    /// letting one unresponsive window eat up to 2s of this thread's time in
+    /// `sendCopyData` -- resolve its owning PID's image path
+    /// (`QueryFullProcessImageNameW`, the same technique
+    /// `SuspensionQuiescence.swift`'s `processImagePath(pid:)` already uses
+    /// for an analogous same-executable check) and require it to match this
+    /// process's own (`ownExecutablePath`). A squatted window belonging to
+    /// an unrelated executable is silently excluded, not merely deprioritized
+    /// -- this is the identity check that closes the class-name-squatting
+    /// gap the session check alone leaves open (session scoping proves "same
+    /// login session", not "same app").
     private func discoverSiblingWindows() -> [HWND] {
         stateLock.lock()
         let selfWindow = hwnd
@@ -1165,6 +1294,15 @@ public final class InstanceBroadcast: BroadcastTransport {
         var ourSessionId: DWORD = 0
         guard ProcessIdToSessionId(GetCurrentProcessId(), &ourSessionId) else {
             Logger.shared.log("InstanceBroadcast: ProcessIdToSessionId failed for this process (Win32 error \(GetLastError())); cannot safely confirm sibling discovery is scoped to this session, so no siblings will be contacted this round.", level: "ERROR")
+            return []
+        }
+
+        guard let ownExecutablePath = Self.ownExecutablePath else {
+            // Cannot prove ANY discovered window is running our own
+            // executable -- fail closed (no siblings contacted) rather than
+            // silently falling back to trusting class-name + session alone,
+            // which is exactly the gap this check exists to close.
+            Logger.shared.log("InstanceBroadcast: could not determine this process's own executable path; cannot safely verify sibling window identity, so no siblings will be contacted this round.", level: "ERROR")
             return []
         }
 
@@ -1182,10 +1320,43 @@ public final class InstanceBroadcast: BroadcastTransport {
             _ = GetWindowThreadProcessId(found, &ownerPID)
             var ownerSessionId: DWORD = 0
             guard ProcessIdToSessionId(ownerPID, &ownerSessionId), ownerSessionId == ourSessionId else { continue }
+            // A PID whose image path cannot be resolved (different user, an
+            // elevated process from a standard-integrity caller) is skipped,
+            // never treated as a match -- fail closed, mirroring
+            // SuspensionQuiescence.swift's identical same-executable scan.
+            guard Self.executablePath(ofProcess: ownerPID) == ownExecutablePath else { continue }
 
             siblings.append(found)
         }
         return siblings
+    }
+
+    /// This process's own image path, resolved once (Windows paths are
+    /// stable for a running process) and compared case-insensitively against
+    /// `executablePath(ofProcess:)`'s result -- see `discoverSiblingWindows()`'s
+    /// "WINDOW-CLASS IDENTITY" doc comment for why this comparison exists.
+    /// `nil` only when `GetModuleFileNameW` itself fails, which
+    /// `discoverSiblingWindows()` treats as fail-closed (no siblings
+    /// contacted), not as "skip the check."
+    private static let ownExecutablePath: String? = {
+        var buffer = [UInt16](repeating: 0, count: 1024)
+        let length = GetModuleFileNameW(nil, &buffer, DWORD(buffer.count))
+        guard length > 0 else { return nil }
+        return String(decoding: buffer[0..<Int(length)], as: UTF16.self).lowercased()
+    }()
+
+    /// Resolves `pid`'s own image path for the identity comparison above.
+    /// `PROCESS_QUERY_LIMITED_INFORMATION` is the same minimal access right
+    /// `SuspensionQuiescence.swift` already uses for this query; a process
+    /// this account cannot open at all returns `nil`, which the caller
+    /// treats as "does not match" (excluded), never as a match.
+    private static func executablePath(ofProcess pid: DWORD) -> String? {
+        guard let handle = OpenProcess(DWORD(PROCESS_QUERY_LIMITED_INFORMATION), false, pid) else { return nil }
+        defer { CloseHandle(handle) }
+        var buffer = [UInt16](repeating: 0, count: 1024)
+        var size = DWORD(buffer.count)
+        guard QueryFullProcessImageNameW(handle, 0, &buffer, &size) else { return nil }
+        return String(decoding: buffer[0..<Int(size)], as: UTF16.self).lowercased()
     }
 
     /// Sends one already-encoded payload to one sibling window.

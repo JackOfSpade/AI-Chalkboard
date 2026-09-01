@@ -260,8 +260,55 @@ int32_t chalk_image_decode_file(const uint16_t* path, ChalkImage* out_image,
         return CHALK_ERR_DECODE_FAILED;
     }
 
-    const UINT stride = width * 4;
-    const size_t bufSize = static_cast<size_t>(stride) * static_cast<size_t>(height);
+    // Bound the decoded dimensions BEFORE any stride/buffer arithmetic below
+    // narrows them to UINT/size_t. This is NOT a fix for a known-exploitable
+    // hole: WIC's own validation is believed to already reject a file that
+    // declares dimensions large enough to make `width * 4` wrap (an outside
+    // report to this effect was checked with a standalone harness feeding
+    // WIC crafted PNG/BMP headers declaring width 1,073,741,825 -- chosen so
+    // width*4 wraps to 4 in 32-bit arithmetic -- and WIC rejected both at
+    // CreateDecoderFromFilename, with CopyPixels independently validating
+    // the caller's stride/buffer against the real dimensions on top of
+    // that). But WIC's internal validation is not part of any contract this
+    // project controls, and could differ across Windows versions or with
+    // third-party codecs installed (HEIF Image Extensions, camera-RAW
+    // codecs). This check makes the C++ layer self-consistent with the
+    // limits chalkboard_win.h already documents for decoded raster input --
+    // 16,384 px per axis, 20,000,000 px total -- which today are ALSO
+    // enforced on the Swift side, in RasterAssetStore.validate(width:height:),
+    // AFTER this function has already fully decoded the image. The bound
+    // (and the stride/bufSize it gates) is computed in uint64_t so the
+    // check itself cannot wrap the way the plain 32-bit arithmetic below
+    // could.
+    //
+    // Returns CHALK_ERR_IMAGE_TOO_LARGE here, NOT CHALK_ERR_INVALID_ARGUMENT:
+    // the path and every argument to this call are perfectly valid, it is
+    // the file's own decoded pixel dimensions that exceed the bound. Using
+    // CHALK_ERR_INVALID_ARGUMENT would make WindowsRasterImage map this to
+    // `.invalidArgument`, and RasterAssetStore in turn map THAT to
+    // `.invalidPath` -- telling a caller with a perfectly good absolute path
+    // to a too-large image that their *path* is malformed. See
+    // CHALK_ERR_IMAGE_TOO_LARGE's doc comment in chalkboard_win.h.
+    constexpr uint64_t kMaxDecodedDimension = 16384;
+    constexpr uint64_t kMaxDecodedPixels = 20000000;
+    const uint64_t width64 = width;
+    const uint64_t height64 = height;
+    if (width64 > kMaxDecodedDimension || height64 > kMaxDecodedDimension ||
+        width64 * height64 > kMaxDecodedPixels) {
+        converter->Release();
+        frame->Release();
+        decoder->Release();
+        factory->Release();
+        return CHALK_ERR_IMAGE_TOO_LARGE;
+    }
+
+    // Safe to narrow now: width/height are each bounded by kMaxDecodedDimension
+    // above, so stride (width * 4) fits UINT and bufSize (stride * height)
+    // fits size_t on both 32- and 64-bit builds.
+    const uint64_t stride64 = width64 * 4;
+    const uint64_t bufSize64 = stride64 * height64;
+    const UINT stride = static_cast<UINT>(stride64);
+    const size_t bufSize = static_cast<size_t>(bufSize64);
     uint8_t* pixels = static_cast<uint8_t*>(malloc(bufSize));
     if (!pixels) {
         converter->Release();

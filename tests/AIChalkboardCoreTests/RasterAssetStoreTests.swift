@@ -177,6 +177,36 @@ final class RasterAssetStoreTests: XCTestCase {
         }
     }
 
+    #if os(Windows)
+    /// Regression test for the shim-level bound in
+    /// `chalk_image_decode_file` (chalk_image.cpp), which rejects a decoded
+    /// image wider/taller than 16,384px or larger than 20,000,000px total --
+    /// a hard-coded limit inside the C++ shim itself, independent of (and
+    /// checked BEFORE) `RasterAssetStore`'s own configurable
+    /// `maxDecodedPixels` exercised by
+    /// `testRejectsDecodedImageAboveConfiguredPixelLimit` above. Actually
+    /// decoding a real >=16,384px-per-axis image in a unit test is
+    /// impractical (WIC would have to fully materialize a multi-hundred-
+    /// megabyte-plus pixel buffer just to exercise one status code), so this
+    /// pins the mapping directly instead of faking a pass:
+    ///   CHALK_ERR_IMAGE_TOO_LARGE (-206, chalkboard_win.h)
+    ///     -> WindowsRasterImageError.imageTooLarge (WindowsRasterImage.swift)
+    ///     -> RasterAssetStoreError.imageTooLarge (RasterAssetStore.swift)
+    /// This is exactly the bug this test guards against: before the fix,
+    /// chalk_image.cpp returned the generic CHALK_ERR_INVALID_ARGUMENT for
+    /// this condition, which this same mapping chain turned into
+    /// `.invalidPath` -- telling a caller with a perfectly good absolute
+    /// path to an oversized image that their *path* was malformed.
+    func testOversizedImageShimStatusMapsToImageTooLargeNotInvalidPath() {
+        let shimError = WindowsRasterImageError(shimStatus: -206)
+        XCTAssertEqual(shimError, .imageTooLarge)
+
+        let storeError = RasterAssetStoreError(windowsDecodeError: shimError)
+        XCTAssertEqual(storeError, .imageTooLarge)
+        XCTAssertNotEqual(storeError, .invalidPath)
+    }
+    #endif
+
     func testConcurrentLookupsAndCleanupRemainConsistent() throws {
         let source = try png()
         let store = RasterAssetStore()

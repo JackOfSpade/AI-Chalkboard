@@ -78,25 +78,38 @@ final class WindowsUIThread {
     /// return immediately.
     func start() {
         startCondition.lock()
-        guard !didStart else {
+        if !didStart {
+            didStart = true
             startCondition.unlock()
-            return
-        }
-        didStart = true
-        startCondition.unlock()
 
-        let thread = Thread { [weak self] in
-            self?.runLoop()
-        }
-        thread.name = "AIChalkboard.OverlayUIThread"
-        // Foundation's Thread defaults to a real (non-background) QoS-ish
-        // priority already; called out explicitly here because this thread
-        // owns every overlay window's paint / UpdateLayeredWindow path, and
-        // getting starved behind unrelated background work would show up as
-        // visibly laggy annotations.
-        thread.start()
+            let thread = Thread { [weak self] in
+                self?.runLoop()
+            }
+            thread.name = "AIChalkboard.OverlayUIThread"
+            // Foundation's Thread defaults to a real (non-background) QoS-ish
+            // priority already; called out explicitly here because this thread
+            // owns every overlay window's paint / UpdateLayeredWindow path, and
+            // getting starved behind unrelated background work would show up as
+            // visibly laggy annotations.
+            thread.start()
 
-        startCondition.lock()
+            startCondition.lock()
+        }
+        // EVERY caller waits here for the thread to actually publish its id
+        // -- not just the one that won the race to flip `didStart` above.
+        // This used to `return` immediately from the `guard !didStart`
+        // branch for a concurrent second caller, before `_win32ThreadId` was
+        // published: that caller (and anything it went on to call, since
+        // `async`/`sync` call `start()` too, but it is already a no-op once
+        // `didStart` is true) could race ahead and post/wait against
+        // `win32ThreadId == 0`. `PostThreadMessageW` against thread id 0
+        // fails (a real Win32 thread id is never 0), and that failure used
+        // to be silently discarded (see `async(_:)`), so the posted work
+        // could be stranded with nothing left to ever drain it and wake a
+        // `sync` caller's `done.wait()` -- a genuine, if narrow, hang.
+        // Falling through to this same wait loop for every caller closes
+        // that gap: `start()` now genuinely does not return until the
+        // thread is ready, regardless of who set `didStart`.
         while _win32ThreadId == 0 {
             startCondition.wait()
         }
@@ -116,7 +129,20 @@ final class WindowsUIThread {
 
         startCondition.lock()
         _win32ThreadId = GetCurrentThreadId()
-        startCondition.signal()
+        // `broadcast()`, NOT `signal()`: `start()` now parks EVERY concurrent
+        // first-time caller in the `while _win32ThreadId == 0 { wait() }`
+        // loop above (see its comment), not just the one that happened to
+        // set `didStart`. `signal()` wakes at most ONE waiter per call, and
+        // this fires exactly once, ever -- with N callers racing into
+        // `start()` before this thread exists (e.g. many concurrent
+        // `AnnotationStore` mutations, each independently reaching
+        // `WindowsUIThread.shared.async` via `MainThread.enqueue`), a plain
+        // `signal()` here wakes exactly one of them and strands the other
+        // N-1 in `wait()` forever -- a real, observed deadlock (reproduced
+        // by `AnnotationStoreConcurrencyTests`' 1000-way concurrent `add`).
+        // `broadcast()` wakes every waiter, who each re-check the loop
+        // condition and proceed once `_win32ThreadId` is visible.
+        startCondition.broadcast()
         startCondition.unlock()
 
         var msg = MSG()
@@ -169,7 +195,20 @@ final class WindowsUIThread {
         queueLock.lock()
         pendingWork.append(work)
         queueLock.unlock()
-        _ = PostThreadMessageW(win32ThreadId, Self.drainMessage, 0, 0)
+        // `start()` (above) guarantees `win32ThreadId` is already published
+        // and nonzero by this point, so a failure here is NOT the historical
+        // "posted before the thread existed" race -- it means the dedicated
+        // UI thread itself is gone, or otherwise unable to receive messages.
+        // Silently discarding this (as this used to) left `work` stranded in
+        // `pendingWork` with nothing to drain it: `drainPendingWork()` only
+        // runs when a `drainMessage` is actually delivered, and it drains the
+        // WHOLE queue, so a stranded item would previously self-heal only by
+        // coincidence, if some unrelated LATER post happened to succeed. Log
+        // instead so a genuine failure is visible rather than a silent stall.
+        let posted = PostThreadMessageW(win32ThreadId, Self.drainMessage, 0, 0)
+        if !posted {
+            Logger.shared.log("WindowsUIThread: PostThreadMessageW failed (GetLastError=\(GetLastError())) posting to win32ThreadId=\(win32ThreadId); queued work may be stranded until a later post succeeds.", level: "ERROR")
+        }
     }
 
     /// Runs `work` on the UI thread and blocks until it finishes, unless the

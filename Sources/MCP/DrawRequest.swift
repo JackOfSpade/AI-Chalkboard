@@ -1,5 +1,22 @@
 import Foundation
 
+/// PLATFORM-ACCURATE NOUNS for the error strings below. These strings reach
+/// the MCP caller (an AI agent deciding how to retry a rejected draw call),
+/// so describing macOS's bundle-identifier/NSScreen model to a Windows
+/// caller is a correctness problem, not a wording nit -- same reasoning as
+/// MCPToolCatalog's platform-split prose. Windows identifies a running app
+/// by executable name (see ActiveAppTracker's Windows branch) and enumerates
+/// displays with EnumDisplayMonitors/GetMonitorInfoW, not NSScreen.
+#if os(macOS)
+private let displayEnumerationSource = "NSScreen.screens"
+private let appIdentifierNoun = "bundle id"
+private let appIdentifierPassExample = "a bundle identifier such as 'com.apple.Terminal'"
+#elseif os(Windows)
+private let displayEnumerationSource = "EnumDisplayMonitors"
+private let appIdentifierNoun = "executable name"
+private let appIdentifierPassExample = "an executable name such as \"Resolve.exe\" -- matched case-insensitively"
+#endif
+
 /// A tiny two-case outcome carrying either a value or a plain-text error
 /// message.
 ///
@@ -146,7 +163,7 @@ struct DrawRequest {
         let snapshot = OverlayWindowController.shared.screenSnapshot()
         guard !snapshot.screens.isEmpty else {
             Logger.shared.log("Drawing rejected: reason=no_displays", level: "WARN")
-            return .failure("No displays are currently available (NSScreen.screens returned empty -- this can happen momentarily during display reconfiguration or wake). Nothing was drawn; retry the call in a moment.")
+            return .failure("No displays are currently available (\(displayEnumerationSource) returned empty -- this can happen momentarily during display reconfiguration or wake). Nothing was drawn; retry the call in a moment.")
         }
         guard let screen = snapshot.resolve(args["screen_id"] as? String) else {
             Logger.shared.log(
@@ -436,7 +453,7 @@ extension MCPServer {
         appName: inout String?
     ) -> String? {
         if args.keys.contains("app"), !(args["app"] is String) {
-            return "app must be a string bundle id/display name, or an empty string for global visibility."
+            return "app must be a string \(appIdentifierNoun)/display name, or an empty string for global visibility."
         }
         guard let raw = (args["app"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) else {
             if defaultsToGlobal {
@@ -472,7 +489,7 @@ extension MCPServer {
             let shown = matches.prefix(8).map { "'\($0.name)' [\($0.bundleId)]" }.joined(separator: ", ")
             let more = matches.count > 8 ? " (and \(matches.count - 8) more)" : ""
             log("resolveTargetApp: '\(raw)' is ambiguous across \(matches.count) running applications; refusing to guess. Nothing was drawn.")
-            return "App '\(raw)' is AMBIGUOUS -- it matches \(matches.count) running applications: \(shown)\(more). Nothing was drawn, because picking one arbitrarily would link the annotation to an app you did not mean. Retry with the exact bundle id or the app's full display name from that list."
+            return "App '\(raw)' is AMBIGUOUS -- it matches \(matches.count) running applications: \(shown)\(more). Nothing was drawn, because picking one arbitrarily would link the annotation to an app you did not mean. Retry with the exact \(appIdentifierNoun) or the app's full display name from that list."
 
         case .notFound:
             // Uses the same conservative complete-ID rule as ActiveAppTracker,
@@ -484,7 +501,7 @@ extension MCPServer {
                 return nil
             }
 
-            return "Could not resolve app '\(raw)'. Only RUNNING applications can be looked up by display name. Call get_active_app to see the current/fallback app, or pass a bundle identifier such as 'com.apple.Terminal' (accepted even if the app is not running yet)."
+            return "Could not resolve app '\(raw)'. Only RUNNING applications can be looked up by display name. Call get_active_app to see the current/fallback app, or pass \(appIdentifierPassExample) (accepted even if the app is not running yet)."
         }
     }
 
