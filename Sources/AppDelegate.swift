@@ -3,7 +3,7 @@ import Foundation
 #if os(macOS)
 import AppKit
 
-public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, AppHostUI {
     private var statusItem: NSStatusItem?
 
     /// "Clear Annotations for <App>" -- retained because its title is rewritten
@@ -16,41 +16,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     /// instance's broadcast, neither of which goes through this menu).
     private var captureVisibleItem: NSMenuItem?
 
-    /// Re-election poll, installed ONLY in a process that lost the initial
-    /// `InstanceLock` election. Invalidated the moment this process is
-    /// promoted to primary. See `startPrimaryElectionRetry()`.
-    private var primaryElectionTimer: Timer?
-
-    /// Lock-integrity poll, installed ONLY in the process that owns the status
-    /// item. The mirror image of `primaryElectionTimer`: that one asks "has the
-    /// primary slot come free?", this one asks "do I still hold it?".
-    /// See `startPrimaryLockWatchdog()`.
-    private var primaryLockWatchdog: Timer?
-
-    /// Reconciles the durable suspension lease registry often enough that an
-    /// abandoned short lease restores retained annotations promptly. The
-    /// registry uses monotonic uptime; this timer is merely a wake-up, never a
-    /// clock source.
-    private var suspensionLeaseReconcileTimer: Timer?
-
-    /// How often a secondary re-tests whether the primary slot has come free.
-    /// Cheap (one `open` + one non-blocking `flock` + one `close`) and the
-    /// contention case is not logged, so a few seconds is a good trade between
-    /// "user notices the menu bar icon is gone" and pointless wakeups.
-    private static let primaryElectionRetryInterval: TimeInterval = 3.0
-
-    /// True once a shutdown that is NOT a user asking this app to quit has
-    /// begun -- i.e. a lifecycle shutdown: the QUIT broadcast handler (a
-    /// sibling already told everyone to quit), MCP stdin EOF (this process's
-    /// own client hung up), or a POSIX signal (SIGTERM/SIGINT/SIGHUP aimed at
-    /// this PID). `applicationShouldTerminate` reads it to decide whether it
-    /// must fan the quit out to sibling instances; see that method and
-    /// `markInternalTermination(reason:)`.
+    /// Owns this process's entire platform-neutral lifecycle policy: primary
+    /// election/promotion, the primary-lock watchdog, suspension-lease
+    /// reconciliation, and the internal-vs-user termination distinction. See
+    /// `AppLifecycleCoordinator` and this class's `AppHostUI` conformance
+    /// below for the platform half of that split.
     ///
-    /// Unsynchronized on purpose: every reader and writer is on the main
-    /// thread (AppKit termination is main-thread-only, and all three internal
-    /// paths hop to main before calling `NSApp.terminate`).
-    private var isInternalTermination = false
+    /// `lazy`, not assigned in an initializer: this class has none of its own
+    /// (it relies on `NSObject`'s implicit one), and `AppLifecycleCoordinator
+    /// .init(host:)` needs a fully-initialized `self` to hand over as its
+    /// weak host reference -- a `lazy` stored property's initializer runs on
+    /// first access, well after `NSObject.init` has completed, so this is
+    /// safe where assigning it inside an `init` body would not be.
+    private lazy var lifecycle = AppLifecycleCoordinator(host: self)
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         if LaunchMode.isMCPMode {
@@ -106,19 +84,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         if let error = suspensionBootstrap.error {
             Logger.shared.log("Suspension lease bootstrap failed; overlays remain ordered out: \(error)", level: "ERROR")
         }
-        startSuspensionLeaseReconciliation()
+        lifecycle.startSuspensionLeaseReconciliation()
 
         // The overlay is the entire reason the MCP server exists (it's what
         // draw_path/draw_image/draw_batch actually render into), so it must be set up in
         // BOTH modes, never skipped.
         OverlayWindowController.shared.setup()
 
-        // Assigned unconditionally (not inside `setupStatusMenu()`) so a
+        // Assigned unconditionally (not inside `installPrimaryUI()`) so a
         // process that starts as secondary and is later promoted to primary
-        // (see `startPrimaryElectionRetry`) does not need this re-wired at
-        // promotion time -- `applyCaptureIndicator` already no-ops until
-        // `statusItem` exists. Single-closure property: see its doc comment
-        // on why this must stay one slot, not a list.
+        // (see `lifecycle.startPrimaryElectionRetry()`) does not need this
+        // re-wired at promotion time -- `applyCaptureIndicator` already
+        // no-ops until `statusItem` exists. Single-closure property: see its
+        // doc comment on why this must stay one slot, not a list.
         OverlayWindowController.shared.onCaptureVisibleChanged = { [weak self] visible in
             self?.applyCaptureIndicator(visible: visible)
         }
@@ -130,7 +108,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         // instance this menu becomes the ONLY remaining way to quit the app or clear
         // annotations manually -- it must still be installed here, not removed.
         if InstanceLock.shared.acquire() {
-            setupStatusMenu()
+            lifecycle.becamePrimary()
         } else {
             // CRITICAL: a secondary instance must NOT exit and must NOT skip the
             // overlay/MCP setup above -- those already ran unconditionally. Claude
@@ -142,112 +120,35 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
             Logger.shared.log("Another AI Chalkboard instance already owns the status-bar item; skipping menu bar setup in this process. MCP server and overlay continue running normally here.", level: "INFO")
 
             // ...but losing the election must not be PERMANENT. Start polling
-            // for the primary slot to come free. See startPrimaryElectionRetry.
-            startPrimaryElectionRetry()
+            // for the primary slot to come free. See AppLifecycleCoordinator
+            // .startPrimaryElectionRetry().
+            lifecycle.startPrimaryElectionRetry()
         }
 
         MCPServer.shared.log("AI Chalkboard background agent initialized.")
     }
 
-    private func startSuspensionLeaseReconciliation() {
-        guard suspensionLeaseReconcileTimer == nil else { return }
-        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] timer in
-            guard self != nil else { timer.invalidate(); return }
-            _ = SuspensionLeaseCoordinator.shared.reconcile()
-        }
+    // MARK: - AppHostUI: repeating-timer scheduling
+    //
+    // `Timer` on the main run loop in `.common` modes rather than the
+    // `.default`-only `Timer.scheduledTimer`: `.common` keeps firing while a
+    // menu is tracking or a window is being live-resized -- required for the
+    // primary-lock watchdog and election-retry poll `AppLifecycleCoordinator`
+    // drives through this, both of which must keep ticking through exactly
+    // that kind of main-run-loop activity.
+
+    public func scheduleRepeatingCallback(interval: TimeInterval, _ callback: @escaping () -> Void) -> CancellableTimer {
+        let timer = Timer(timeInterval: interval, repeats: true) { _ in callback() }
         RunLoop.main.add(timer, forMode: .common)
-        suspensionLeaseReconcileTimer = timer
+        return NSTimerCancellable(timer)
     }
 
-    // MARK: - Primary re-election (secondary instances only)
-
-    /// Polls `InstanceLock.retryAcquire()` until this process wins the primary
-    /// slot, then installs the status-bar menu.
-    ///
-    /// WHY: without this a secondary is stranded the moment the primary dies by
-    /// any path other than the menu's Quit (crash, `kill`, Claude Desktop
-    /// closing only that one pipe). The kernel releases the dead primary's
-    /// flock, but nothing here ever re-tested it, so the survivor kept its
-    /// t=0 answer forever and was left with NO control surface at all:
-    /// `.accessory` policy means no Dock icon in MCP mode, it never installed a
-    /// status item, and the floating Clear/Quit window that used to be the
-    /// fallback (it simply became the frontmost clickable panel when the
-    /// primary's disappeared) was deleted as redundant with the menu bar.
-    /// Its `AnnotationStore` meanwhile may still be full, so the user is left
-    /// staring at stale annotations on every screen with no way to clear them
-    /// and no way to quit the invisible process painting them.
-    private func startPrimaryElectionRetry() {
-        // `Timer` on the main run loop in `.common` modes rather than the
-        // `.default`-only `Timer.scheduledTimer`: `.common` keeps firing while
-        // a menu is tracking or a window is being live-resized. The block runs
-        // on the main thread, which `setupStatusMenu()` requires.
-        let timer = Timer(timeInterval: Self.primaryElectionRetryInterval, repeats: true) { [weak self] timer in
-            guard let self = self else {
-                timer.invalidate()
-                return
-            }
-
-            // retryAcquire() (unlike acquire()) does not consult the cached
-            // t=0 answer, and on success it keeps the lock descriptor open for
-            // the rest of this process's life -- exactly like an
-            // originally-primary instance.
-            guard InstanceLock.shared.retryAcquire() else { return }
-
-            timer.invalidate()
-            self.primaryElectionTimer = nil
-
-            Logger.shared.log("Promoted to PRIMARY instance: the previous primary released the instance lock (it exited, crashed or was killed). Installing the status-bar menu so this process regains a user-facing way to clear annotations and quit.", level: "INFO")
-            self.setupStatusMenu()
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        primaryElectionTimer = timer
-
-        Logger.shared.log("Secondary instance: polling every \(Self.primaryElectionRetryInterval)s to take over as primary if the current primary dies (otherwise this process would be left with no status item, no Dock icon and no window).", level: "INFO")
-    }
-
-    /// Polls `InstanceLock.revalidatePrimaryLock()` in whichever process owns
-    /// the status item, so a lock file that gets deleted underneath a LIVE
-    /// primary is recreated within one tick.
-    ///
-    /// WHY THE PRIMARY NEEDS ITS OWN POLL: `flock` lives on an open file
-    /// description, not on a path. If `instance.lock` is deleted -- an
-    /// uninstaller, "clear app data", a user cleaning out Application Support --
-    /// this process keeps a valid lock on an inode with no name, and nothing on
-    /// disk connects it to the lock path any more. A secondary polling that path
-    /// cannot see this process at all: it is looking at a file that no longer
-    /// exists. Only the process that owns the lock can restore that link, which
-    /// is why the repair cannot live in `retryAcquire()` on the secondary side.
-    /// Measured before this existed: deleting the lock file promoted the
-    /// secondary within 3s and produced two permanent menu-bar icons.
-    ///
-    /// Runs at the same interval as the election retry and costs two `stat`
-    /// calls a tick, doing real work only on mismatch. It is never invalidated:
-    /// unlike the election poll it has no terminal state -- the invariant it
-    /// maintains has to hold for as long as this process is primary.
-    private func startPrimaryLockWatchdog() {
-        guard primaryLockWatchdog == nil else { return }
-
-        let timer = Timer(timeInterval: Self.primaryElectionRetryInterval, repeats: true) { [weak self] timer in
-            guard let self = self else {
-                timer.invalidate()
-                return
-            }
-            guard InstanceLock.shared.revalidatePrimaryLock() == .relinquishToPathOwner else { return }
-
-            // Another process repaired and locked the path before this orphaned
-            // primary could. It now owns the only trustworthy election result;
-            // remove our UI rather than leave two permanent status items.
-            timer.invalidate()
-            self.primaryLockWatchdog = nil
-            if let statusItem = self.statusItem {
-                NSStatusBar.system.removeStatusItem(statusItem)
-                self.statusItem = nil
-            }
-            Logger.shared.log("Demoted from PRIMARY instance: another process owns the repaired instance lock. Removed this process's status-bar item and resumed secondary election polling.", level: "WARN")
-            self.startPrimaryElectionRetry()
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        primaryLockWatchdog = timer
+    /// The `CancellableTimer` handle `scheduleRepeatingCallback(interval:_:)`
+    /// returns: a thin wrapper around `Timer.invalidate()`.
+    private final class NSTimerCancellable: CancellableTimer {
+        private let timer: Timer
+        init(_ timer: Timer) { self.timer = timer }
+        func cancel() { timer.invalidate() }
     }
 
     // MARK: - Termination
@@ -255,22 +156,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     /// Marks the shutdown now beginning as INTERNAL / lifecycle-driven, so
     /// `applicationShouldTerminate` does not treat it as "the user asked to
     /// quit the app" and does not fan a QUIT broadcast out to siblings.
-    ///
-    /// Call immediately before `NSApp.terminate(nil)` from every path that is
-    /// not a user quit:
-    ///   * the QUIT-broadcast handler (a sibling already told everyone),
-    ///   * MCP stdin EOF (only THIS process's client pipe closed),
-    ///   * the SIGTERM/SIGINT/SIGHUP handlers (this PID was signalled).
-    ///
-    /// Main thread only -- all of those callers already hop to main, and the
-    /// flag it sets is unsynchronized.
+    /// Forwards to `AppLifecycleCoordinator.markInternalTermination(reason:)`
+    /// -- see that method's doc comment for the full contract (call sites,
+    /// threading) this preserves unchanged.
     public static func markInternalTermination(reason: String) {
         guard let delegate = NSApp.delegate as? AppDelegate else {
             Logger.shared.log("markInternalTermination(\(reason)): no AppDelegate available; termination will be treated as user-initiated.", level: "WARN")
             return
         }
-        delegate.isInternalTermination = true
-        Logger.shared.log("Internal termination path: \(reason). This process will terminate WITHOUT broadcasting quit to sibling instances.", level: "INFO")
+        delegate.lifecycle.markInternalTermination(reason: reason)
     }
 
     /// The single choke point through which every `NSApp.terminate` in this
@@ -288,11 +182,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     /// An INTERNAL quit must NOT: a closed MCP pipe, a signal aimed at this
     /// PID, or a broadcast we are already obeying all concern this process
     /// alone (or have already been fanned out by whoever posted them).
+    /// `lifecycle.evaluateTermination()` is the shared policy that decides
+    /// which of those two this is -- see its doc comment.
     public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if isInternalTermination {
+        if lifecycle.evaluateTermination() {
+            Logger.shared.log("User-initiated Dock/Cmd-Q quit. Broadcasting a launch-mode-scoped QUIT, then terminating this process.", level: "INFO")
+            InstanceBroadcast.shared.postQuitAll(scopedToLaunchMode: true)
+        } else {
             // Lifecycle shutdown -- already accounted for by whoever set the
-            // flag. Return immediately: the signal handlers and the stdin-EOF
-            // path must not be delayed or second-guessed here.
+            // flag. Nothing further to do: the signal handlers and the
+            // stdin-EOF path must not be delayed or second-guessed here.
             //
             // This line is also the only runtime evidence that AppKit really
             // dispatches to this method (it is an @objc protocol requirement
@@ -300,19 +199,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
             // Objective-C runtime, quitting would silently stop broadcasting
             // and BUG 3 would come back unnoticed). Keep it.
             Logger.shared.log("applicationShouldTerminate: internal/lifecycle shutdown already flagged; terminating this process only, no quit broadcast.", level: "INFO")
-            return .terminateNow
         }
 
-        // Set before posting so the broadcast we are about to send cannot come
-        // back around into a second post via this same method.
-        isInternalTermination = true
-
-        Logger.shared.log("User-initiated Dock/Cmd-Q quit. Broadcasting a launch-mode-scoped QUIT, then terminating this process.", level: "INFO")
-        InstanceBroadcast.shared.postQuitAll(scopedToLaunchMode: true)
-
-        // Safe to terminate right away: postNotificationName hands the message
-        // to the session's distnoted daemon before it returns, so the fan-out
-        // to siblings does not depend on this process still being alive.
+        // Safe to terminate right away: postNotificationName (when it runs,
+        // above) hands the message to the session's distnoted daemon before
+        // it returns, so the fan-out to siblings does not depend on this
+        // process still being alive.
         return .terminateNow
     }
 
@@ -333,14 +225,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         Logger.shared.log("applicationWillTerminate: AI Chalkboard shutting down cleanly.", level: "INFO")
     }
 
-    private func setupStatusMenu() {
-        // Owning the status item and owning the instance lock are the same role,
-        // so the lock-integrity poll starts here rather than at either call
-        // site: both paths into primary (winning at t=0, and being promoted by
-        // the election retry) come through this method, and starting it here is
-        // what keeps them from drifting apart. Idempotent.
-        startPrimaryLockWatchdog()
+    // MARK: - AppHostUI: primary UI install/remove
+    //
+    // `AppLifecycleCoordinator.becamePrimary()` is what calls
+    // `installPrimaryUI()` -- and starts the lock-integrity watchdog -- from
+    // BOTH paths into primary (winning at t=0, and being promoted by the
+    // election retry), which is what keeps "owns the status item" and "runs
+    // the watchdog" from drifting apart. See that method's doc comment.
 
+    public func installPrimaryUI() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
         if let button = statusItem?.button {
@@ -356,11 +249,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
 
         // Picks up whatever capture-debug state is already live -- relevant
         // when THIS process is promoted to primary mid-session (see
-        // `startPrimaryElectionRetry`) rather than starting as primary with
-        // the mode already off.
+        // `AppLifecycleCoordinator.startPrimaryElectionRetry()`) rather than
+        // starting as primary with the mode already off.
         applyCaptureIndicator(visible: OverlayWindowController.shared.isCaptureVisible)
 
         statusItem?.menu = makeStatusMenu()
+    }
+
+    /// Called only by `AppLifecycleCoordinator`'s lock watchdog, when this
+    /// process must relinquish the primary role to another process that now
+    /// owns the repaired lock -- see that method's doc comment.
+    public func removePrimaryUI() {
+        if let statusItem = statusItem {
+            NSStatusBar.system.removeStatusItem(statusItem)
+            self.statusItem = nil
+        }
     }
 
     /// Tints the menu-bar icon and updates its tooltip so capture-debug mode
@@ -535,62 +438,39 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
 #elseif os(Windows)
 import WinSDK
 
-// MARK: - Windows lifecycle policy shared with the macOS class above
-//
-// The macOS `AppDelegate` above must not be touched by this port (its
-// election-retry/lock-watchdog/reconcile intervals and its
-// internal-termination-flag semantics are working, verified behavior). The
-// values below restate that SAME policy for the Windows class further down
-// this file, rather than duplicating the reasoning silently -- see each
-// constant's use site for how it plays the identical role its macOS
-// namesake plays on the class above. A true shared type both platforms
-// drive is left as follow-up work once the Windows port has landed
-// end-to-end and the macOS class can be safely re-verified alongside a
-// change to use it; see this file's Windows header comment for why that
-// unification is not attempted here.
-enum AppLifecyclePolicy {
-    /// Matches the macOS class's `primaryElectionRetryInterval`, and is also
-    /// reused for the primary-lock-watchdog cadence exactly as that class
-    /// reuses the same constant for both timers. Typed `UInt32` directly
-    /// (rather than `TimeInterval`, which the macOS constant uses) because
-    /// this is consumed only by `SetTimer`'s millisecond `UINT` parameter.
-    static let primaryElectionRetryIntervalMs: UInt32 = 3000
-    /// Matches the macOS class's `startSuspensionLeaseReconciliation`
-    /// literal (`timeInterval: 0.5`).
-    static let suspensionLeaseReconcileIntervalMs: UInt32 = 500
-}
-
 /// Windows counterpart of the macOS `AppDelegate` class above. Same file, a
-/// sibling `#elseif os(Windows)` branch rather than a separate type
-/// implementing a shared protocol -- there is no Windows analogue of
-/// `NSApplicationDelegate` to conform to, and Swift on Windows has no
-/// Objective-C runtime, so there is also no `@objc`/`#selector` target-action
-/// dispatch available for a menu or a notification observer the way the
-/// macOS class uses both. Every `@objc` method and `NSMenuDelegate` callback
-/// on the macOS class becomes a plain Swift closure or WndProc `case` below.
+/// sibling `#elseif os(Windows)` branch rather than a separate type -- there
+/// is no Windows analogue of `NSApplicationDelegate` to conform to, and
+/// Swift on Windows has no Objective-C runtime, so there is also no
+/// `@objc`/`#selector` target-action dispatch available for a menu or a
+/// notification observer the way the macOS class uses both. Every `@objc`
+/// method and `NSMenuDelegate` callback on the macOS class becomes a plain
+/// Swift closure or WndProc `case` below.
 ///
-/// OWNS THE SAME FIVE RESPONSIBILITIES the macOS class's header comment
-/// lists: activation policy (a documented no-op here -- see `launch()`),
-/// the tray icon (the Windows analogue of the status-bar item, and, in MCP
-/// mode, the ONLY user-facing control surface), the primary-election retry
-/// timer, the primary-lock watchdog, the suspension-lease reconcile timer,
-/// and the internal-vs-user termination distinction that decides whether to
-/// broadcast QUIT to siblings. Every one of those five is gated to the
-/// primary instance / shared across instances the exact same way the macOS
-/// class gates them -- see each method's doc comment for the one-line
-/// pointer back to its macOS twin rather than re-deriving the reasoning.
+/// The entire primary-election/lock-watchdog/suspension-reconcile/
+/// internal-termination policy that USED to be restated here, one field and
+/// method at a time, now lives ONCE in `AppLifecycleCoordinator` (see
+/// AppLifecycleCoordinator.swift) -- a literal extraction of the macOS
+/// class's own pre-consolidation implementation. This class's job is now
+/// only the PLATFORM PRIMITIVE that policy drives through the shared
+/// `AppHostUI` protocol: the tray icon and its four menu commands, the
+/// capture-debug visual indicator, activation policy (a documented no-op
+/// here -- see `launch()`), and repeating-timer scheduling (`SetTimer`/
+/// `WM_TIMER` on this UI thread, in place of the macOS conformance's
+/// `Timer`/`RunLoop.main`). See each `AppHostUI` conformance method below
+/// for the one-line pointer back to its macOS twin rather than re-deriving
+/// the reasoning.
 ///
 /// THREADING: every stored property below is UI-THREAD-ONLY, where "the UI
 /// thread" means the single thread in Launcher/main.swift's Windows branch
 /// that runs `GetMessageW`/`DispatchMessageW` -- the Windows analogue of "the
-/// main thread" the macOS class's doc comments refer to throughout. Timers
-/// are Win32 `SetTimer`/`WM_TIMER` (delivered through that same message
-/// pump) rather than `Timer`/`RunLoop.main`, and any call arriving from a
-/// different thread (the `SetConsoleCtrlHandler` callback in
+/// main thread" the macOS class's doc comments refer to throughout. Any call
+/// arriving from a different thread (the `SetConsoleCtrlHandler` callback in
 /// Launcher/main.swift is the one real example today) is marshaled onto the
 /// UI thread via `runOnUIThread(_:)` before touching any of this state --
-/// see that method's doc comment.
-public final class AppDelegate {
+/// see that method's doc comment. `AppLifecycleCoordinator` carries the same
+/// UI-thread-only requirement -- see its own THREADING note.
+public final class AppDelegate: AppHostUI {
     /// The Windows analogue of `NSApp.delegate as? AppDelegate`: there is no
     /// `NSApplication` singleton to hang a delegate reference off on
     /// Windows, so Launcher/main.swift assigns this the moment it
@@ -649,20 +529,26 @@ public final class AppDelegate {
         UnsafePointer<WCHAR>(bitPattern: UInt(id))
     }
 
-    private enum TimerId: UINT_PTR {
-        case primaryElectionRetry = 1
-        case primaryLockWatchdog = 2
-        case suspensionLeaseReconcile = 3
-    }
+    /// Owns this process's entire platform-neutral lifecycle policy -- see
+    /// the identical property on the macOS class above for the full
+    /// rationale (unchanged here) and why `lazy` is required (this class has
+    /// no stored-property-initializing `init` body either).
+    private lazy var lifecycle = AppLifecycleCoordinator(host: self)
 
-    private var primaryElectionTimerRunning = false
-    private var primaryLockWatchdogRunning = false
-
-    /// Same role and same unsynchronized-on-purpose reasoning as the macOS
-    /// class's `isInternalTermination`: every reader and writer here runs on
-    /// the UI thread (see this class's THREADING note above), which is this
-    /// platform's equivalent of "the main thread" for that guarantee.
-    private var isInternalTermination = false
+    /// Backing storage for `scheduleRepeatingCallback(interval:_:)`: each
+    /// call allocates a fresh Win32 timer id (`SetTimer`'s `uIDEvent`) and
+    /// remembers which closure that id maps back to, since `WM_TIMER` only
+    /// ever hands `handleTimer(id:)` the raw id, never the closure itself.
+    /// Unlike the pre-consolidation `TimerId` enum (three fixed, named
+    /// cases), this is dynamic because `AppLifecycleCoordinator` -- Windows
+    /// and macOS alike -- calls `scheduleRepeatingCallback` generically, with
+    /// no notion of "which of three known timers this is" for this protocol
+    /// witness to key off of.
+    private var timerCallbacks: [UINT_PTR: () -> Void] = [:]
+    /// Next id `scheduleRepeatingCallback(interval:_:)` will hand out.
+    /// Starts at 1: `SetTimer` treats a `uIDEvent` of 0 as "let the system
+    /// choose an id", which is not the semantics wanted here.
+    private var nextTimerId: UINT_PTR = 1
 
     public init() {}
 
@@ -702,7 +588,7 @@ public final class AppDelegate {
         if let error = suspensionBootstrap.error {
             Logger.shared.log("Suspension lease bootstrap failed; overlays remain ordered out: \(error)", level: "ERROR")
         }
-        startSuspensionLeaseReconciliation()
+        lifecycle.startSuspensionLeaseReconciliation()
 
         OverlayWindowController.shared.setup()
         OverlayWindowController.shared.onCaptureVisibleChanged = { [weak self] visible in
@@ -712,88 +598,33 @@ public final class AppDelegate {
         MCPServer.shared.start()
 
         if InstanceLock.shared.acquire() {
-            setupTrayIcon()
+            lifecycle.becamePrimary()
         } else {
             Logger.shared.log("Another AI Chalkboard instance already owns the tray icon; skipping tray setup in this process. MCP server and overlay continue running normally here.", level: "INFO")
-            startPrimaryElectionRetry()
+            lifecycle.startPrimaryElectionRetry()
         }
 
         MCPServer.shared.log("AI Chalkboard background agent initialized.")
     }
 
-    private func startSuspensionLeaseReconciliation() {
-        guard let hwnd = trayWindow else { return }
-        SetTimer(hwnd, TimerId.suspensionLeaseReconcile.rawValue, AppLifecyclePolicy.suspensionLeaseReconcileIntervalMs, nil)
-    }
-
-    // MARK: - Primary re-election (secondary instances only)
-    //
-    // See the macOS class's `startPrimaryElectionRetry()` for the full "why
-    // does a secondary need this at all" rationale -- unchanged here, only
-    // `Timer`/`RunLoop.main` becomes `SetTimer`/`WM_TIMER`.
-
-    private func startPrimaryElectionRetry() {
-        guard let hwnd = trayWindow, !primaryElectionTimerRunning else { return }
-        primaryElectionTimerRunning = true
-        SetTimer(hwnd, TimerId.primaryElectionRetry.rawValue, AppLifecyclePolicy.primaryElectionRetryIntervalMs, nil)
-        Logger.shared.log("Secondary instance: polling every \(AppLifecyclePolicy.primaryElectionRetryIntervalMs / 1000)s to take over as primary if the current primary dies (otherwise this process would be left with no tray icon and no window).", level: "INFO")
-    }
-
-    private func stopPrimaryElectionRetry() {
-        guard primaryElectionTimerRunning, let hwnd = trayWindow else { return }
-        KillTimer(hwnd, TimerId.primaryElectionRetry.rawValue)
-        primaryElectionTimerRunning = false
-    }
-
-    private func primaryElectionRetryTick() {
-        guard InstanceLock.shared.retryAcquire() else { return }
-        stopPrimaryElectionRetry()
-        Logger.shared.log("Promoted to PRIMARY instance: the previous primary released the instance lock (it exited, crashed or was killed). Installing the tray icon so this process regains a user-facing way to clear annotations and quit.", level: "INFO")
-        setupTrayIcon()
-    }
-
-    /// See the macOS class's `startPrimaryLockWatchdog()` for why the
-    /// primary needs its own repair poll, distinct from the secondary's
-    /// election poll -- identical reasoning, `SetTimer`/`WM_TIMER` in place
-    /// of `Timer`/`RunLoop.main`.
-    private func startPrimaryLockWatchdog() {
-        guard let hwnd = trayWindow, !primaryLockWatchdogRunning else { return }
-        primaryLockWatchdogRunning = true
-        SetTimer(hwnd, TimerId.primaryLockWatchdog.rawValue, AppLifecyclePolicy.primaryElectionRetryIntervalMs, nil)
-    }
-
-    private func stopPrimaryLockWatchdog() {
-        guard primaryLockWatchdogRunning, let hwnd = trayWindow else { return }
-        KillTimer(hwnd, TimerId.primaryLockWatchdog.rawValue)
-        primaryLockWatchdogRunning = false
-    }
-
-    private func primaryLockWatchdogTick() {
-        guard InstanceLock.shared.revalidatePrimaryLock() == .relinquishToPathOwner else { return }
-        stopPrimaryLockWatchdog()
-        tearDownTrayIcon()
-        Logger.shared.log("Demoted from PRIMARY instance: another process owns the repaired instance lock. Removed this process's tray icon and resumed secondary election polling.", level: "WARN")
-        startPrimaryElectionRetry()
-    }
-
     // MARK: - Termination
     //
     // See the macOS class's "Termination" section for the full
-    // user-vs-internal rationale this mirrors throughout.
+    // user-vs-internal rationale this mirrors throughout; it is now shared,
+    // literal code in `AppLifecycleCoordinator`, not restated here.
 
     /// Same contract as the macOS class's static method of the same name:
     /// call immediately before `AppHost.terminate()` from every path that is
     /// NOT a user quit. `AppHost.terminate()` on Windows forwards to
-    /// `AppDelegate.current`, so this simply looks that instance up and sets
-    /// its flag -- see the macOS twin for why a missing delegate only WARNs
-    /// rather than failing.
+    /// `AppDelegate.current`, so this simply looks that instance up and
+    /// forwards to its coordinator -- see the macOS twin for why a missing
+    /// delegate only WARNs rather than failing.
     public static func markInternalTermination(reason: String) {
         guard let delegate = current else {
             Logger.shared.log("markInternalTermination(\(reason)): no AppDelegate available; termination will be treated as user-initiated.", level: "WARN")
             return
         }
-        delegate.isInternalTermination = true
-        Logger.shared.log("Internal termination path: \(reason). This process will terminate WITHOUT broadcasting quit to sibling instances.", level: "INFO")
+        delegate.lifecycle.markInternalTermination(reason: reason)
     }
 
     /// Entry point for `AppHost.terminate()`. SAFE TO CALL FROM ANY THREAD:
@@ -817,35 +648,32 @@ public final class AppDelegate {
     /// comment for the full user-vs-internal reasoning, which this restates
     /// rather than departs from.
     private func requestTermination() {
-        if isInternalTermination {
+        if lifecycle.evaluateTermination() {
+            // Reaching here means `terminate()` was invoked by a path this
+            // port does not expect to originate a user quit. The one
+            // genuine user-quit path today, the tray menu's "Quit AI
+            // Chalkboard" (`quitApp()` below), deliberately does NOT call
+            // `terminate()` directly -- it posts a QUIT broadcast, exactly
+            // like the macOS status menu's `quitApp()`, and expects the
+            // broadcast's own receive handler to call
+            // `markInternalTermination(reason:)` before ever reaching here
+            // (see `quitApp()`'s doc comment; `InstanceBroadcast` has no
+            // Windows implementation yet, which is a tracked gap, not a
+            // design choice made here). Fail safe rather than silently
+            // skipping the fan-out that gap would otherwise cause: broadcast
+            // anyway, mirroring the macOS class's Dock/Cmd-Q branch, so an
+            // unanticipated caller still takes sibling instances down with
+            // it instead of stranding them.
+            Logger.shared.log("requestTermination: reached with no internal-termination flag set; broadcasting QUIT before terminating (see doc comment on this method).", level: "WARN")
+            InstanceBroadcast.shared.postQuitAll(scopedToLaunchMode: true)
+        } else {
             // Lifecycle shutdown -- already accounted for by whoever set the
             // flag (MCPServer's transport-failure path, or
             // Launcher/main.swift's console-control handler). Proceed
             // straight to shutdown: nothing here should delay or
             // second-guess that decision.
             Logger.shared.log("requestTermination: internal/lifecycle shutdown already flagged; terminating this process only, no quit broadcast.", level: "INFO")
-            shutdownNow()
-            return
         }
-
-        // Reaching here with the flag still false means `terminate()` was
-        // invoked by a path this port does not expect to originate a user
-        // quit. The one genuine user-quit path today, the tray menu's
-        // "Quit AI Chalkboard" (`quitApp()` below), deliberately does NOT
-        // call `terminate()` directly -- it posts a QUIT broadcast, exactly
-        // like the macOS status menu's `quitApp()`, and expects the
-        // broadcast's own receive handler to call
-        // `markInternalTermination(reason:)` before ever reaching here (see
-        // `quitApp()`'s doc comment; `InstanceBroadcast` has no Windows
-        // implementation yet, which is a tracked gap, not a design choice
-        // made here). Fail safe rather than silently skipping the fan-out
-        // that gap would otherwise cause: mark and broadcast anyway,
-        // mirroring the macOS class's Dock/Cmd-Q branch, so an unanticipated
-        // caller still takes sibling instances down with it instead of
-        // stranding them.
-        isInternalTermination = true
-        Logger.shared.log("requestTermination: reached with no internal-termination flag set; broadcasting QUIT before terminating (see doc comment on this method).", level: "WARN")
-        InstanceBroadcast.shared.postQuitAll(scopedToLaunchMode: true)
         shutdownNow()
     }
 
@@ -919,6 +747,25 @@ public final class AppDelegate {
         init(_ work: @escaping () -> Void) { self.work = work }
     }
 
+    /// The `CancellableTimer` handle `scheduleRepeatingCallback(interval:_:)`
+    /// returns. Holds `delegate` weakly -- exactly like the `AppLifecycleCoordinator`
+    /// -> `AppHostUI` relationship this serves, a cancellable outstanding
+    /// past this process's lifetime must never be what keeps `AppDelegate`
+    /// itself alive.
+    private final class WindowsCancellableTimer: CancellableTimer {
+        private weak var delegate: AppDelegate?
+        private let id: UINT_PTR
+
+        init(delegate: AppDelegate, id: UINT_PTR) {
+            self.delegate = delegate
+            self.id = id
+        }
+
+        func cancel() {
+            delegate?.cancelTimer(id: id)
+        }
+    }
+
     // MARK: - Tray window / icon
 
     /// Creates a hidden, message-only (`HWND_MESSAGE`-parented) window that
@@ -962,18 +809,19 @@ public final class AppDelegate {
         trayWindow = hwnd
     }
 
-    /// The status-bar item is gated to the primary instance only (see
-    /// InstanceLock). In MCP mode the tray icon is the ONLY remaining UI
-    /// affordance to Clear/Quit, mirroring the macOS class's
-    /// `setupStatusMenu()` exactly.
-    private func setupTrayIcon() {
-        guard let hwnd = trayWindow, !trayIconAdded else { return }
+    // MARK: - AppHostUI: primary UI install/remove
+    //
+    // `AppLifecycleCoordinator.becamePrimary()` is what calls
+    // `installPrimaryUI()` -- and starts the lock-integrity watchdog -- from
+    // BOTH paths into primary (winning at t=0, and being promoted by the
+    // election retry), matching the macOS class's identical conformance
+    // exactly. See that method's doc comment.
 
-        // Owning the tray icon and owning the instance lock are the same
-        // role, so the lock-integrity poll starts here rather than at
-        // either call site -- see the macOS class's `setupStatusMenu()` for
-        // why. Idempotent.
-        startPrimaryLockWatchdog()
+    /// The tray icon is gated to the primary instance only (see
+    /// InstanceLock). In MCP mode it is the ONLY remaining UI affordance to
+    /// Clear/Quit, mirroring the macOS class's `installPrimaryUI()` exactly.
+    public func installPrimaryUI() {
+        guard let hwnd = trayWindow, !trayIconAdded else { return }
 
         var data = NOTIFYICONDATAW()
         data.cbSize = UInt32(MemoryLayout<NOTIFYICONDATAW>.size)
@@ -1005,6 +853,46 @@ public final class AppDelegate {
         data.uID = 1
         Shell_NotifyIconW(DWORD(NIM_DELETE), &data)
         trayIconAdded = false
+    }
+
+    /// Called only by `AppLifecycleCoordinator`'s lock watchdog, when this
+    /// process must relinquish the primary role to another process that now
+    /// owns the repaired lock -- see that method's doc comment. Matches the
+    /// macOS class's identical conformance.
+    public func removePrimaryUI() {
+        tearDownTrayIcon()
+    }
+
+    // MARK: - AppHostUI: repeating-timer scheduling
+    //
+    // `SetTimer`/`WM_TIMER` on this UI thread in place of the macOS
+    // conformance's `Timer`/`RunLoop.main` -- see `timerCallbacks`'s doc
+    // comment above for why a dynamically-allocated id, not the old fixed
+    // `TimerId` enum, is what keys dispatch now that `AppLifecycleCoordinator`
+    // calls this generically.
+
+    public func scheduleRepeatingCallback(interval: TimeInterval, _ callback: @escaping () -> Void) -> CancellableTimer {
+        let id = nextTimerId
+        nextTimerId += 1
+        timerCallbacks[id] = callback
+        if let hwnd = trayWindow {
+            SetTimer(hwnd, id, UInt32(interval * 1000), nil)
+        } else {
+            // No message window yet (the narrow startup race documented on
+            // `runOnUIThread(_:)`): there is nowhere to attach a Win32 timer.
+            // Recorded in `timerCallbacks` regardless so the returned handle
+            // is at least a well-formed no-op rather than a dangling id;
+            // this callback simply never fires.
+            Logger.shared.log("AppDelegate (Windows): scheduleRepeatingCallback called with no tray window yet; timer id \(id) will not fire.", level: "WARN")
+        }
+        return WindowsCancellableTimer(delegate: self, id: id)
+    }
+
+    private func cancelTimer(id: UINT_PTR) {
+        if let hwnd = trayWindow {
+            KillTimer(hwnd, id)
+        }
+        timerCallbacks[id] = nil
     }
 
     /// Windows analogue of the macOS class's `applyCaptureIndicator(visible:)`
@@ -1118,13 +1006,15 @@ public final class AppDelegate {
         }
     }
 
+    /// Dispatches a `WM_TIMER` back to whichever closure
+    /// `scheduleRepeatingCallback(interval:_:)` registered for this id --
+    /// see `timerCallbacks`'s doc comment. Every timer this process runs
+    /// (the primary-election retry poll, the primary-lock watchdog, the
+    /// suspension-lease reconcile tick) is scheduled through that one
+    /// `AppHostUI` method by `AppLifecycleCoordinator`, so there is nothing
+    /// left here that needs to know which of those three a given id is.
     private func handleTimer(id: WPARAM) {
-        switch TimerId(rawValue: UINT_PTR(id)) {
-        case .primaryElectionRetry: primaryElectionRetryTick()
-        case .primaryLockWatchdog: primaryLockWatchdogTick()
-        case .suspensionLeaseReconcile: _ = SuspensionLeaseCoordinator.shared.reconcile()
-        case nil: break
-        }
+        timerCallbacks[UINT_PTR(id)]?()
     }
 
     /// Dispatch target for `chalkboardAppDelegateWndProc` below, once it has

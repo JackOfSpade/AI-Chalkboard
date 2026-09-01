@@ -320,7 +320,17 @@ extension MCPServer {
             let explanation = visible
                 ? "AI Chalkboard now requests capture eligibility and renders every annotation for placement checks. The capture program can still omit overlay windows through its own filters. Restore false when finished."
                 : "AI Chalkboard now requests legacy capture exclusion and has restored normal per-app rendering. Modern capture programs may independently include or exclude these windows, so this is not a privacy guarantee."
-            sendTextResult(id: id, text: "capture_visible = \(visible) (sharingType = \(visible ? "NSWindowSharingType.readOnly" : "NSWindowSharingType.none")), applied locally before this response; a broadcast has been sent to sibling AI Chalkboard instances. \(explanation)")
+            // Name the mechanism this platform actually used. Reporting
+            // `NSWindowSharingType` to a Windows caller describes an API that
+            // does not exist there; the Windows overlay toggles
+            // SetWindowDisplayAffinity instead. Same reasoning as the
+            // platform-split prose in MCPToolCatalog.
+            #if os(macOS)
+            let appliedMechanism = visible ? "sharingType = NSWindowSharingType.readOnly" : "sharingType = NSWindowSharingType.none"
+            #elseif os(Windows)
+            let appliedMechanism = visible ? "display affinity = WDA_NONE" : "display affinity = WDA_EXCLUDEFROMCAPTURE"
+            #endif
+            sendTextResult(id: id, text: "capture_visible = \(visible) (\(appliedMechanism)), applied locally before this response; a broadcast has been sent to sibling AI Chalkboard instances. \(explanation)")
 
         default:
             sendErrorResult(id: id, text: "Unknown tool: \(name)")

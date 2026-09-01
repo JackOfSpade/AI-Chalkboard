@@ -9,7 +9,48 @@ import Foundation
 /// arrows, callouts, handwriting, grids -- still goes directly through
 /// path_data; there is no canned tool for those.
 enum MCPToolCatalog {
+    // PLATFORM-ACCURATE TOOL PROSE. These strings are not documentation for a
+    // human reader -- they are the catalog an AI agent reads to decide how to
+    // CALL these tools, so naming the wrong platform's API is a correctness
+    // problem rather than a wording nit. Telling a Windows caller to "ask macOS
+    // to show its permission prompt" describes a prompt that cannot exist
+    // there, and telling it to pass a "bundle id" names an identifier Windows
+    // has no concept of. The underlying capability is the same on both
+    // platforms; only the mechanism and its identifiers differ.
+    #if os(macOS)
+    /// macOS identifies applications by bundle identifier.
     static let appParamDescription = "Optional app to LINK this drawing to: bundle id or display name. It is visible only while that app is frontmost. If omitted, the previous non-Claude app is used. Pass an empty string for GLOBAL visibility."
+
+    static let accessibilityStatusDescription = "Reports whether macOS Accessibility permission is available for element lookup. Set request_permission=true only to explicitly ask macOS to show its permission prompt; false/default never prompts."
+
+    static let requestPermissionDescription = "Explicitly request the macOS Accessibility permission prompt when access is not granted; default false."
+
+    static let captureBackendName = "ScreenCaptureKit"
+
+    /// Distinct from `appParamDescription`: `highlight_element` must resolve
+    /// the argument to a LIVE PROCESS to walk its element hierarchy, so unlike
+    /// the drawing tools' visibility linkage there is no meaningful "global"
+    /// value to accept.
+    static let highlightAppParamDescription = "Running target app bundle id or display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."
+    #elseif os(Windows)
+    /// Windows has no bundle-identifier concept; `ActiveAppTracker` identifies
+    /// an application by its executable name, matched case-insensitively.
+    static let appParamDescription = "Optional app to LINK this drawing to: executable name (for example \"chrome.exe\", matched case-insensitively) or window/display name. It is visible only while that app is frontmost. If omitted, the previous non-Claude app is used. Pass an empty string for GLOBAL visibility."
+
+    /// UI Automation needs no persistent grant to check ahead of time, so this
+    /// reports reachability rather than a permission state, and
+    /// `request_permission` has nothing to request. Said plainly so a caller
+    /// does not wait for a prompt that will never appear.
+    static let accessibilityStatusDescription = "Reports whether UI Automation is reachable for element lookup. Windows has no Accessibility permission to grant or prompt for, so this reports availability, not a permission state, and request_permission has no effect."
+
+    static let requestPermissionDescription = "Accepted for cross-platform compatibility but has NO EFFECT on Windows: there is no Accessibility permission prompt to request."
+
+    static let captureBackendName = "GDI BitBlt"
+
+    /// See the macOS counterpart: `highlight_element` resolves this to a live
+    /// process, so "global" is not a valid value here either.
+    static let highlightAppParamDescription = "Running target app executable name (for example \"chrome.exe\", matched case-insensitively) or window/display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."
+    #endif
 
     private static let sharedDrawProperties: [String: Any] = [
         "screen_id": ["type": "string", "maxLength": 128, "description": "Current screen ID/index from get_screens; omitted/blank defaults to main, while an unknown explicit value is rejected instead of falling back to another display."],
@@ -172,9 +213,9 @@ enum MCPToolCatalog {
         ],
         [
             "name": "get_accessibility_status",
-            "description": "Reports whether macOS Accessibility permission is available for element lookup. Set request_permission=true only to explicitly ask macOS to show its permission prompt; false/default never prompts.",
+            "description": accessibilityStatusDescription,
             "inputSchema": ["type": "object", "properties": [
-                "request_permission": ["type": "boolean", "description": "Explicitly request the macOS Accessibility permission prompt when access is not granted; default false."]
+                "request_permission": ["type": "boolean", "description": requestPermissionDescription]
             ]]
         ],
         [
@@ -218,7 +259,7 @@ enum MCPToolCatalog {
             "description": "Finds one running app's Accessibility element by label and draws a vector highlight around its live bounds -- rect (default), ellipse, or circle; see shape. Matching is exact by default; ambiguous labels are rejected unless occurrence is supplied. The resolved frame is anchored at creation time, not continuously tracked as the UI moves.",
             "inputSchema": ["type": "object", "properties": [
                 "label": ["type": "string", "minLength": 1, "maxLength": DrawingDefaults.maxHighlightLabelCharacters, "description": "Accessibility title, description, or value to match."],
-                "app": ["type": "string", "description": "Running target app bundle id or display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."],
+                "app": ["type": "string", "description": highlightAppParamDescription],
                 "role": ["type": "string", "description": "Optional raw Accessibility role, for example AXButton."],
                 "match": ["type": "string", "enum": ["exact", "contains"], "description": "Label matching mode; exact is the default."],
                 "occurrence": ["type": "integer", "minimum": 1, "description": "One-based candidate index, required when a label is ambiguous."],
@@ -305,11 +346,11 @@ enum MCPToolCatalog {
         ],
         [
             "name": "verify_annotation",
-            "description": "Uses the exact live renderer to composite one drawing into either a supplied clean screenshot or a Chalkboard-owned ScreenCaptureKit image, returning a tight PNG crop. Chalkboard capture is single-flight and times out after 30 seconds. screenshot_path and capture_source are mutually exclusive. This verifies placement against UI pixels, not raw framebuffer presentation or occlusion.",
+            "description": "Uses the exact live renderer to composite one drawing into either a supplied clean screenshot or a Chalkboard-owned \(captureBackendName) image, returning a tight PNG crop. Chalkboard capture is single-flight and times out after 30 seconds. screenshot_path and capture_source are mutually exclusive. This verifies placement against UI pixels, not raw framebuffer presentation or occlusion.",
             "inputSchema": ["type": "object", "properties": [
                 "annotation_id": ["type": "string"],
                 "screenshot_path": ["type": "string", "description": "Absolute path to a clean uncropped full-display raster screenshot."],
-                "capture_source": ["type": "string", "enum": ["chalkboard"], "description": "Use Chalkboard's in-memory ScreenCaptureKit capture. Required when screenshot_path is omitted."],
+                "capture_source": ["type": "string", "enum": ["chalkboard"], "description": "Use Chalkboard's in-memory \(captureBackendName) capture. Required when screenshot_path is omitted."],
                 "request_permission": ["type": "boolean", "description": "For capture_source=chalkboard only: explicitly request Screen Recording permission if absent; default false."],
                 "padding_px": ["type": "number", "minimum": 0, "maximum": AnnotationVerificationCompositor.maxPaddingPx]
             ], "required": ["annotation_id"]]

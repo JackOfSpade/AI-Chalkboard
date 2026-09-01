@@ -139,6 +139,132 @@ struct ClearBroadcastRequest {
     }
 }
 
+// MARK: - Platform-neutral message model
+//
+// Everything above this point (the `Notification.Name` extension, `QuitScope`,
+// `BroadcastKey`, `ClearBroadcastRequest`) was already shared between
+// platforms before this file's two platform branches were consolidated.
+// `BroadcastMessage` below is the single description of every broadcast this
+// app ever sends or receives, on either transport: each platform's
+// `InstanceBroadcast.post(_:)` maps one of these onto its own wire format (a
+// `DistributedNotificationCenter` name/object/userInfo triple on macOS, one
+// JSON `WindowsBroadcastEnvelope` on Windows), and each platform's receive
+// path maps its own wire format back onto a `BroadcastMessage` before handing
+// it to the policy functions below. Adding a fifth broadcast kind means
+// adding one case here plus one encode/decode mapping per platform -- never
+// two independently-evolving field lists drifting apart, which is what
+// `BroadcastKey` (macOS's `userInfo` keys) and the old, hand-written
+// `WindowsBroadcastEnvelope` construction sites used to be.
+private enum BroadcastMessage {
+    /// See `ClearBroadcastRequest`'s doc comment for its own fields.
+    case clear(ClearBroadcastRequest)
+    /// See `Notification.Name.chalkboardSetCaptureVisible`'s doc comment.
+    case setCaptureVisible(Bool)
+    /// See `Notification.Name.chalkboardSuspensionInvalidated`'s doc comment.
+    /// `nil` only ever occurs on the RECEIVE side, for a malformed or
+    /// pre-this-field payload -- every poster always supplies a real
+    /// generation (see `InstanceBroadcast.postSuspensionInvalidation`).
+    case suspensionInvalidated(generation: UInt64?)
+    /// See `QuitScope`'s doc comment for what `nil` vs. a launch mode means.
+    case quit(scope: String?)
+}
+
+// MARK: - Platform-neutral broadcast policy
+//
+// This is the state machine both platform branches used to implement
+// independently: what a received broadcast DOES to this process, and
+// whether a received QUIT should be obeyed at all. The functions below are a
+// LITERAL extraction of what used to be duplicated, line-for-line and
+// comment-for-comment, inside macOS's `handleClearAllBroadcast` /
+// `handleSetCaptureVisibleBroadcast` / `handleSuspensionInvalidatedBroadcast`
+// / `handleQuitAllBroadcast` and Windows's twins of the same four methods.
+// Neither platform's handler does anything beyond decoding its own wire
+// format into a `BroadcastMessage` and calling into here -- see each
+// `InstanceBroadcast` conformance's "Receiving" section.
+
+/// Applies a received CLEAR broadcast: mutates `AnnotationStore.shared`,
+/// logs what happened, and repaints this process's overlays.
+///
+/// Safe to call from any thread: `AnnotationStore`'s mutations are
+/// NSLock-guarded and its change notification hops to the main queue itself.
+private func applyClearBroadcast(_ request: ClearBroadcastRequest) {
+    switch request.scope {
+    case .all:
+        let removed = request.apply(to: AnnotationStore.shared)
+        Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=all. Removed \(removed) annotation(s) from this process's store and repainting its overlays.", level: "INFO")
+
+    case .active:
+        // The poster resolved the target app; this process must NOT
+        // re-derive it (see postClear's doc comment). A missing appId means
+        // the poster could not determine a frontmost app, in which case
+        // only the global annotations are removed.
+        let removed = request.apply(to: AnnotationStore.shared)
+        Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=active app=\(request.appName ?? request.appId ?? "<none: global annotations only>"). Removed \(removed) annotation(s) from this process's store; annotations linked to other apps were left untouched.", level: "INFO")
+    }
+
+    // `clearAll()` already triggers `onStoreChanged` -> `refreshViews()`.
+    // This explicit repaint is belt-and-braces for the startup window in
+    // which `OverlayWindowController.setup()`'s async block has not yet
+    // assigned that closure. `refreshViews()` only sets `needsDisplay`, so
+    // running it twice is free.
+    OverlayWindowController.shared.refreshViews()
+}
+
+/// Applies a received SET-CAPTURE-VISIBLE broadcast to this process's own
+/// overlay windows.
+private func applySetCaptureVisibleBroadcast(_ visible: Bool) {
+    Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=SET-CAPTURE-VISIBLE visible=\(visible). Applying to this process's overlay windows.", level: "INFO")
+
+    // `setCaptureVisible` is thread-safe (NSLock around the flag, main-queue
+    // hop for the window mutation) and no-ops when the value is unchanged,
+    // which is what makes a self-delivered copy of this broadcast free. This
+    // function does no de-duplication of its own on purpose; doing so would
+    // risk drifting out of sync with the real state `OverlayWindowController`
+    // tracks.
+    OverlayWindowController.shared.setCaptureVisible(visible)
+}
+
+/// Applies a received durable-suspension-invalidation wake-up hint.
+private func applySuspensionInvalidatedBroadcast(generation: UInt64?) {
+    // A malformed or hostile hint is harmless: reconcile reads canonical
+    // state and never executes a desired state supplied by the broadcast
+    // channel.
+    _ = SuspensionLeaseCoordinator.shared.reconcile(announcedGeneration: generation)
+}
+
+/// Whether THIS process should act on a received QUIT broadcast that
+/// carried `senderScope`. `nil` is the deliberate, unscoped, all-instances
+/// quit (the status-menu's explicit "Quit AI Chalkboard", and also what an
+/// older, pre-scoping build's payload-less post looks like). A non-nil scope
+/// must equal this process's own launch mode -- a Dock/Cmd-Q quit does not
+/// cross launch modes. See `QuitScope`'s doc comment for the full "two MCP
+/// servers plus a hand-launched GUI copy" rationale this protects.
+private func shouldActOnQuitBroadcast(senderScope: String?) -> Bool {
+    senderScope == nil || senderScope == QuitScope.current
+}
+
+// MARK: - Transport primitive
+//
+/// The one platform primitive `InstanceBroadcast` needs underneath all of the
+/// policy above: "register to receive every broadcast" and "send one to
+/// every peer, including myself, asynchronously and non-reentrantly". Every
+/// Darwin (`DistributedNotificationCenter`/AppKit) or Win32 API call in this
+/// file lives inside a conformance of this protocol below (`InstanceBroadcast`
+/// itself, once per platform) -- this protocol's own declaration imports
+/// neither.
+private protocol BroadcastTransport: AnyObject {
+    /// Registers this process to receive every broadcast kind. MUST be
+    /// called by every instance -- primary and secondary alike -- see each
+    /// conformance's own doc comment for why.
+    func registerObservers()
+
+    /// Sends `message` to every peer instance in this session, including
+    /// this process. Self-delivery back to this process's own handler MUST be
+    /// asynchronous and never re-entrant with respect to this call -- see
+    /// each conformance's doc comment for why.
+    func post(_ message: BroadcastMessage)
+}
+
 #if os(macOS)
 /// Cross-process fan-out for the two menu-bar actions ("Clear All Annotations"
 /// and "Quit AI Chalkboard").
@@ -183,7 +309,12 @@ struct ClearBroadcastRequest {
 /// touches fd 1, and every diagnostic below goes through `Logger.shared.log`
 /// (stderr + rotating file). Never add a Swift `print` call to this file -- it
 /// writes to stdout and would corrupt the JSON-RPC stream.
-public final class InstanceBroadcast: NSObject {
+///
+/// This class is the ONLY thing in the app that conforms to `BroadcastTransport`
+/// on macOS: every `DistributedNotificationCenter` call lives here, and
+/// everything ABOVE this `#if os(macOS)` block (the message model and the
+/// policy functions it feeds) has no AppKit or Darwin dependency at all.
+public final class InstanceBroadcast: NSObject, BroadcastTransport {
     public static let shared = InstanceBroadcast()
 
     // THREADING: every stored property below is main-thread-only. Callers are
@@ -326,12 +457,7 @@ public final class InstanceBroadcast: NSObject {
         let request = ClearBroadcastRequest(scope: scope, appId: appId, appName: appName)
 
         Logger.shared.log("InstanceBroadcast: posting CLEAR broadcast (scope=\(scope.rawValue), app=\(appName ?? appId ?? "n/a")) to all AI Chalkboard instances.", level: "INFO")
-        DistributedNotificationCenter.default().postNotificationName(
-            .chalkboardClearAll,
-            object: nil,
-            userInfo: request.userInfo,
-            deliverImmediately: true
-        )
+        post(.clear(request))
     }
 
     /// Posts a capture-visibility change to every instance, including this one.
@@ -340,23 +466,13 @@ public final class InstanceBroadcast: NSObject {
     /// back to this process too and the handler applies it here as well.
     public func postSetCaptureVisible(_ visible: Bool) {
         Logger.shared.log("InstanceBroadcast: posting SET-CAPTURE-VISIBLE broadcast (visible=\(visible)) to all AI Chalkboard instances.", level: "INFO")
-        DistributedNotificationCenter.default().postNotificationName(
-            .chalkboardSetCaptureVisible,
-            object: nil,
-            userInfo: [BroadcastKey.visible: visible ? "true" : "false"],
-            deliverImmediately: true
-        )
+        post(.setCaptureVisible(visible))
     }
 
     /// Broadcasts only a durable-state wake-up hint. It deliberately contains
     /// no requested presentation state and needs no ACK transport.
     public func postSuspensionInvalidation(generation: UInt64) {
-        DistributedNotificationCenter.default().postNotificationName(
-            .chalkboardSuspensionInvalidated,
-            object: nil,
-            userInfo: [BroadcastKey.generation: String(generation)],
-            deliverImmediately: true
-        )
+        post(.suspensionInvalidated(generation: generation))
     }
 
     /// Posts "quit" to every instance, including this one.
@@ -370,14 +486,7 @@ public final class InstanceBroadcast: NSObject {
         let scope = scopedToLaunchMode ? QuitScope.current : nil
         Logger.shared.log("InstanceBroadcast: posting QUIT broadcast (scope=\(scope ?? "<all instances>")) to \(scopedToLaunchMode ? "AI Chalkboard instances launched in the same mode" : "all coexisting AI Chalkboard instances") (user-initiated quit).", level: "INFO")
 
-        // `object:` carries the launch mode only for Dock/Cmd-Q. A nil object
-        // is deliberately an all-instance status-menu quit.
-        DistributedNotificationCenter.default().postNotificationName(
-            .chalkboardQuitAll,
-            object: scope,
-            userInfo: nil,
-            deliverImmediately: true
-        )
+        post(.quit(scope: scope))
 
         // Watchdog, quit only -- LETHAL, and that is a REVERSAL of the previous
         // "deliberately non-lethal" design. This comment supersedes it.
@@ -421,34 +530,28 @@ public final class InstanceBroadcast: NSObject {
         }
     }
 
+    /// `BroadcastTransport` conformance: the only place in this class that
+    /// actually calls `DistributedNotificationCenter`. Every `postX` method
+    /// above builds the `BroadcastMessage` describing what it wants to say and
+    /// hands it here; this function owns turning that into the
+    /// name/object/userInfo triple `postNotificationName` wants -- see
+    /// `BroadcastMessage`'s `macOSName`/`macOSObject`/`macOSUserInfo`
+    /// properties just below for that mapping.
+    fileprivate func post(_ message: BroadcastMessage) {
+        DistributedNotificationCenter.default().postNotificationName(
+            message.macOSName,
+            object: message.macOSObject,
+            userInfo: message.macOSUserInfo,
+            deliverImmediately: true
+        )
+    }
+
     // MARK: - Receiving (every instance: primary AND secondary)
 
     @objc private func handleClearAllBroadcast(_ notification: Notification) {
-        let request = ClearBroadcastRequest(notification: notification)
-
-        // Safe from any thread: AnnotationStore's mutations are NSLock-guarded
-        // and its change notification hops to the main queue itself. (In
-        // practice distributed notifications are delivered on the main thread.)
-        switch request.scope {
-        case .all:
-            let removed = request.apply(to: AnnotationStore.shared)
-            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=all. Removed \(removed) annotation(s) from this process's store and repainting its overlays.", level: "INFO")
-
-        case .active:
-            // The poster resolved the target app; this process must NOT
-            // re-derive it (see postClear's doc comment). A missing appId means
-            // the poster could not determine a frontmost app, in which case
-            // only the global annotations are removed.
-            let removed = request.apply(to: AnnotationStore.shared)
-            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=active app=\(request.appName ?? request.appId ?? "<none: global annotations only>"). Removed \(removed) annotation(s) from this process's store; annotations linked to other apps were left untouched.", level: "INFO")
-        }
-
-        // `clearAll()` already triggers `onStoreChanged` -> `refreshViews()`.
-        // This explicit repaint is belt-and-braces for the startup window in
-        // which `OverlayWindowController.setup()`'s async block has not yet
-        // assigned that closure. `refreshViews()` only sets `needsDisplay`, so
-        // running it twice is free.
-        OverlayWindowController.shared.refreshViews()
+        // (In practice distributed notifications are delivered on the main
+        // thread, though `applyClearBroadcast` does not depend on that.)
+        applyClearBroadcast(ClearBroadcastRequest(notification: notification))
     }
 
     @objc private func handleSetCaptureVisibleBroadcast(_ notification: Notification) {
@@ -457,20 +560,12 @@ public final class InstanceBroadcast: NSObject {
         // default -- rather than accidentally exposing the overlay to screen
         // recording.
         let visible = (notification.userInfo?[BroadcastKey.visible] as? String) == "true"
-
-        Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=SET-CAPTURE-VISIBLE visible=\(visible). Applying to this process's overlay windows.", level: "INFO")
-
-        // `setCaptureVisible` is thread-safe (NSLock around the flag, main-queue
-        // hop for the window mutation) and no-ops when the value is unchanged,
-        // which is what makes the self-delivered copy of this notification free.
-        OverlayWindowController.shared.setCaptureVisible(visible)
+        applySetCaptureVisibleBroadcast(visible)
     }
 
     @objc private func handleSuspensionInvalidatedBroadcast(_ notification: Notification) {
         let generation = (notification.userInfo?[BroadcastKey.generation] as? String).flatMap(UInt64.init)
-        // A malformed or hostile hint is harmless: reconcile reads canonical
-        // state and never executes a desired state supplied by DNC.
-        _ = SuspensionLeaseCoordinator.shared.reconcile(announcedGeneration: generation)
+        applySuspensionInvalidatedBroadcast(generation: generation)
     }
 
     @objc private func handleQuitAllBroadcast(_ notification: Notification) {
@@ -496,12 +591,10 @@ public final class InstanceBroadcast: NSObject {
         MainThread.async { [weak self] in
             guard let self = self else { return }
 
-            // A non-nil scope is a Dock/Cmd-Q quit, which reaches only the
-            // same launch mode. A nil scope is the status-menu's deliberate
-            // all-instance quit (and is also compatible with older builds).
-            //
             let ownScope = QuitScope.current
-            if let senderScope = senderScope, senderScope != ownScope {
+            // See `shouldActOnQuitBroadcast`'s doc comment for the
+            // scope-matching contract this enforces (shared with Windows).
+            if let senderScope = senderScope, !shouldActOnQuitBroadcast(senderScope: senderScope) {
                 Logger.shared.log("InstanceBroadcast: IGNORING scoped QUIT broadcast from a '\(senderScope)' instance -- this process is '\(ownScope)'. Dock/Cmd-Q does not cross launch modes.", level: "INFO")
                 return
             }
@@ -524,6 +617,43 @@ public final class InstanceBroadcast: NSObject {
     }
 }
 
+private extension BroadcastMessage {
+    /// This message's `DistributedNotificationCenter` channel name. Kept as
+    /// four distinct, stable names (rather than one name with a `kind` field
+    /// in `userInfo`) because that is the existing, verified-working wire
+    /// contract older builds already observe -- see the file-top
+    /// `Notification.Name` doc comments.
+    var macOSName: Notification.Name {
+        switch self {
+        case .clear: return .chalkboardClearAll
+        case .setCaptureVisible: return .chalkboardSetCaptureVisible
+        case .suspensionInvalidated: return .chalkboardSuspensionInvalidated
+        case .quit: return .chalkboardQuitAll
+        }
+    }
+
+    /// QUIT is the one broadcast whose payload rides on `object` rather than
+    /// `userInfo` -- see `postQuitAll`'s doc comment and the QUIT broadcast's
+    /// `object` doc comment at the top of this file for why.
+    var macOSObject: String? {
+        if case let .quit(scope) = self { return scope }
+        return nil
+    }
+
+    var macOSUserInfo: [String: String]? {
+        switch self {
+        case .clear(let request):
+            return request.userInfo
+        case .setCaptureVisible(let visible):
+            return [BroadcastKey.visible: visible ? "true" : "false"]
+        case .suspensionInvalidated(let generation):
+            return generation.map { [BroadcastKey.generation: String($0)] }
+        case .quit:
+            return nil
+        }
+    }
+}
+
 #elseif os(Windows)
 
 // MARK: - Windows wire payload
@@ -539,7 +669,10 @@ public final class InstanceBroadcast: NSObject {
 /// legacy or malformed payload on macOS (see its "Legacy/malformed payloads
 /// meant 'clear all'" comment above) -- a future build that adds a field
 /// must not become undecodable by an older sibling still running the
-/// previous build, and vice versa.
+/// previous build, and vice versa. This struct is this transport's own wire
+/// format; `BroadcastMessage` (shared, above) is the platform-neutral model
+/// it is encoded from and decoded into -- see the `BroadcastMessage`
+/// extension below this class for that mapping.
 private struct WindowsBroadcastEnvelope: Codable {
     enum Kind: String, Codable {
         case clear, quit, setCaptureVisible, suspensionInvalidated
@@ -680,26 +813,29 @@ private func chalkboardBroadcastWndProc(_ hWnd: HWND?, _ uMsg: UINT, _ wParam: W
 /// with respect to the calling thread, the same as `postNotificationName`
 /// returning before the local observer fires ~2ms later on macOS.
 ///
-/// LAUNCH-MODE SCOPING is identical in spirit to the macOS branch: `postQuit
-/// All(scopedToLaunchMode:)` still carries `QuitScope.current` (or `nil` for
-/// an unscoped, all-instances quit) inside the JSON payload's `scope` field,
-/// and `handleQuitAllBroadcast` still compares it against this process's own
-/// `QuitScope.current` before terminating. That logic is entirely
-/// platform-neutral (`QuitScope`/`ClearBroadcastRequest`/`BroadcastKey`
-/// above have no AppKit or WinSDK dependency) and is reused verbatim, not
-/// reimplemented.
+/// LAUNCH-MODE SCOPING is identical in spirit to the macOS branch -- and, now
+/// that both branches are consolidated onto shared policy, literally the
+/// same code: `postQuitAll(scopedToLaunchMode:)` still carries
+/// `QuitScope.current` (or `nil` for an unscoped, all-instances quit) inside
+/// the JSON payload's `scope` field, and `handleQuitAllBroadcast` decides
+/// whether to act on it via the shared `shouldActOnQuitBroadcast(senderScope:)`
+/// function -- the exact same function the macOS branch's
+/// `handleQuitAllBroadcast` calls. That logic is entirely platform-neutral
+/// (`QuitScope`/`ClearBroadcastRequest`/`BroadcastKey`/`BroadcastMessage`/
+/// `shouldActOnQuitBroadcast` above have no AppKit or WinSDK dependency) and
+/// is reused verbatim, not reimplemented.
 ///
 /// ECHO SUPPRESSION FOR CAPTURE-VISIBLE STATE: exactly as on macOS, this file
 /// does no de-duplication of its own for a self-delivered
-/// `setCaptureVisible` broadcast -- `handleSetCaptureVisibleBroadcast` calls
+/// `setCaptureVisible` broadcast -- the shared `applySetCaptureVisibleBroadcast`
+/// function (which this class's `dispatchIncoming` calls, the same function
+/// the macOS branch's handler calls) invokes
 /// `OverlayWindowController.shared.setCaptureVisible(visible)`
-/// unconditionally, the same call the macOS branch makes, and relies on that
-/// method's own documented no-op-when-unchanged behaviour (see the macOS
-/// branch's comment on `handleSetCaptureVisibleBroadcast`) to make a
-/// self-delivered copy free. This file intentionally does not duplicate that
-/// idempotency locally; doing so would risk it drifting out of sync with the
-/// real state `OverlayWindowController` tracks.
-public final class InstanceBroadcast {
+/// unconditionally and relies on that method's own documented
+/// no-op-when-unchanged behaviour to make a self-delivered copy free. See
+/// that shared function's doc comment for why duplicating that idempotency
+/// locally would be worse, not better.
+public final class InstanceBroadcast: BroadcastTransport {
     public static let shared = InstanceBroadcast()
 
     /// Reverse-DNS-style and version-suffixed for the same reason the macOS
@@ -917,19 +1053,19 @@ public final class InstanceBroadcast {
     /// payload rather than be re-derived by each receiver.
     public func postClear(scope: ClearScope, appId: String?, appName: String?) {
         Logger.shared.log("InstanceBroadcast: posting CLEAR broadcast (scope=\(scope.rawValue), app=\(appName ?? appId ?? "n/a")) to all AI Chalkboard instances.", level: "INFO")
-        broadcast(WindowsBroadcastEnvelope(kind: .clear, scope: scope.rawValue, appId: appId, appName: appName, visible: nil, generation: nil))
+        post(.clear(ClearBroadcastRequest(scope: scope, appId: appId, appName: appName)))
     }
 
     public func postSetCaptureVisible(_ visible: Bool) {
         Logger.shared.log("InstanceBroadcast: posting SET-CAPTURE-VISIBLE broadcast (visible=\(visible)) to all AI Chalkboard instances.", level: "INFO")
-        broadcast(WindowsBroadcastEnvelope(kind: .setCaptureVisible, scope: nil, appId: nil, appName: nil, visible: visible, generation: nil))
+        post(.setCaptureVisible(visible))
     }
 
     /// Broadcasts only a durable-state wake-up hint, exactly like the macOS
     /// branch: no requested presentation state travels here, and no ACK
     /// transport is needed -- see that branch's identical doc comment.
     public func postSuspensionInvalidation(generation: UInt64) {
-        broadcast(WindowsBroadcastEnvelope(kind: .suspensionInvalidated, scope: nil, appId: nil, appName: nil, visible: nil, generation: String(generation)))
+        post(.suspensionInvalidated(generation: generation))
     }
 
     /// Posts "quit" to every instance, including this one. See the macOS
@@ -938,7 +1074,7 @@ public final class InstanceBroadcast {
     public func postQuitAll(scopedToLaunchMode: Bool = false) {
         let scope = scopedToLaunchMode ? QuitScope.current : nil
         Logger.shared.log("InstanceBroadcast: posting QUIT broadcast (scope=\(scope ?? "<all instances>")) to \(scopedToLaunchMode ? "AI Chalkboard instances launched in the same mode" : "all coexisting AI Chalkboard instances") (user-initiated quit).", level: "INFO")
-        broadcast(WindowsBroadcastEnvelope(kind: .quit, scope: scope, appId: nil, appName: nil, visible: nil, generation: nil))
+        post(.quit(scope: scope))
 
         // Watchdog, quit only -- same fail-safe purpose as the macOS
         // branch's identically-named watchdog (read its long comment for the
@@ -966,10 +1102,16 @@ public final class InstanceBroadcast {
         }
     }
 
-    /// Encodes `envelope` once, delivers it to this process asynchronously
-    /// and non-reentrantly (see this class's doc comment), then sends it to
-    /// every sibling window this session's `discoverSiblingWindows()` finds.
-    private func broadcast(_ envelope: WindowsBroadcastEnvelope) {
+    /// `BroadcastTransport` conformance: converts `message` to this
+    /// transport's own wire envelope, encodes it once, delivers it to this
+    /// process asynchronously and non-reentrantly (see this class's doc
+    /// comment), then sends it to every sibling window this session's
+    /// `discoverSiblingWindows()` finds. Every `postX` method above builds
+    /// the `BroadcastMessage` describing what it wants to say and hands it
+    /// here -- see `BroadcastMessage.windowsEnvelope` just below this class
+    /// for the encode mapping.
+    fileprivate func post(_ message: BroadcastMessage) {
+        let envelope = message.windowsEnvelope
         guard let data = try? JSONEncoder().encode(envelope),
               let json = String(data: data, encoding: .utf8) else {
             Logger.shared.log("InstanceBroadcast: failed to encode a \(envelope.kind.rawValue) broadcast payload; nothing was sent.", level: "ERROR")
@@ -1105,11 +1247,13 @@ public final class InstanceBroadcast {
     // MARK: - Receiving
 
     /// Decodes one JSON payload (from either `WM_COPYDATA` or the local
-    /// self-delivery path) and dispatches it to the matching handler below.
-    /// Runs on the pump thread for BOTH paths -- see this class's doc
-    /// comment on why self-delivery is routed back through the same
-    /// `WNDPROC` rather than, say, a raw `DispatchQueue.global().async` --
-    /// which gives every handler the same threading guarantees a
+    /// self-delivery path) into the shared `BroadcastMessage` model and
+    /// dispatches it to the matching shared policy function (or, for QUIT,
+    /// this class's own `handleQuitAllBroadcast`, which needs this
+    /// instance's state). Runs on the pump thread for BOTH paths -- see this
+    /// class's doc comment on why self-delivery is routed back through the
+    /// same `WNDPROC` rather than, say, a raw `DispatchQueue.global().async`
+    /// -- which gives every handler the same threading guarantees a
     /// `WM_COPYDATA` delivery from a sibling process would have.
     fileprivate func dispatchIncoming(json: String) {
         guard let data = json.data(using: .utf8),
@@ -1117,50 +1261,19 @@ public final class InstanceBroadcast {
             Logger.shared.log("InstanceBroadcast: RECEIVED a broadcast payload that could not be decoded; ignoring it. A malformed or hostile payload is harmless here -- every handler below only re-reads canonical local/durable state, never executes a command carried solely by the payload's shape.", level: "WARN")
             return
         }
-        switch envelope.kind {
-        case .clear: handleClearAllBroadcast(envelope)
-        case .setCaptureVisible: handleSetCaptureVisibleBroadcast(envelope)
-        case .suspensionInvalidated: handleSuspensionInvalidatedBroadcast(envelope)
-        case .quit: handleQuitAllBroadcast(envelope)
+        switch envelope.message {
+        case .clear(let request):
+            applyClearBroadcast(request)
+        case .setCaptureVisible(let visible):
+            applySetCaptureVisibleBroadcast(visible)
+        case .suspensionInvalidated(let generation):
+            applySuspensionInvalidatedBroadcast(generation: generation)
+        case .quit(let scope):
+            handleQuitAllBroadcast(senderScope: scope)
         }
     }
 
-    private func handleClearAllBroadcast(_ envelope: WindowsBroadcastEnvelope) {
-        let request = ClearBroadcastRequest(
-            scope: envelope.scope.flatMap(ClearScope.init(rawValue:)) ?? .all,
-            appId: envelope.appId,
-            appName: envelope.appName
-        )
-
-        switch request.scope {
-        case .all:
-            let removed = request.apply(to: AnnotationStore.shared)
-            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=all. Removed \(removed) annotation(s) from this process's store and repainting its overlays.", level: "INFO")
-        case .active:
-            let removed = request.apply(to: AnnotationStore.shared)
-            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=active app=\(request.appName ?? request.appId ?? "<none: global annotations only>"). Removed \(removed) annotation(s) from this process's store; annotations linked to other apps were left untouched.", level: "INFO")
-        }
-
-        OverlayWindowController.shared.refreshViews()
-    }
-
-    private func handleSetCaptureVisibleBroadcast(_ envelope: WindowsBroadcastEnvelope) {
-        let visible = envelope.visible == true
-
-        Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=SET-CAPTURE-VISIBLE visible=\(visible). Applying to this process's overlay windows.", level: "INFO")
-        OverlayWindowController.shared.setCaptureVisible(visible)
-    }
-
-    private func handleSuspensionInvalidatedBroadcast(_ envelope: WindowsBroadcastEnvelope) {
-        let generation = envelope.generation.flatMap(UInt64.init)
-        // A malformed or hostile hint is harmless: reconcile reads canonical
-        // state and never executes a desired state supplied by this channel.
-        _ = SuspensionLeaseCoordinator.shared.reconcile(announcedGeneration: generation)
-    }
-
-    private func handleQuitAllBroadcast(_ envelope: WindowsBroadcastEnvelope) {
-        let senderScope = envelope.scope
-
+    private func handleQuitAllBroadcast(senderScope: String?) {
         // MainThread.async here for the same reason the macOS branch hops
         // before touching `isQuitting`/terminating: whichever Windows
         // lifecycle owner eventually installs `onQuitRequested` will need to
@@ -1173,7 +1286,9 @@ public final class InstanceBroadcast {
             guard let self else { return }
 
             let ownScope = QuitScope.current
-            if let senderScope, senderScope != ownScope {
+            // See `shouldActOnQuitBroadcast`'s doc comment for the
+            // scope-matching contract this enforces (shared with macOS).
+            if let senderScope, !shouldActOnQuitBroadcast(senderScope: senderScope) {
                 Logger.shared.log("InstanceBroadcast: IGNORING scoped QUIT broadcast from a '\(senderScope)' instance -- this process is '\(ownScope)'. A launch-mode-scoped quit does not cross launch modes.", level: "INFO")
                 return
             }
@@ -1185,6 +1300,47 @@ public final class InstanceBroadcast {
             self.stateLock.unlock()
 
             self.terminate(reason: "received QUIT broadcast from another instance (or from this process's own menu)")
+        }
+    }
+}
+
+private extension BroadcastMessage {
+    /// This message's Windows wire encoding -- see `WindowsBroadcastEnvelope`'s
+    /// doc comment for why JSON (not a `userInfo`-style dictionary) is this
+    /// transport's payload shape.
+    var windowsEnvelope: WindowsBroadcastEnvelope {
+        switch self {
+        case .clear(let request):
+            return WindowsBroadcastEnvelope(kind: .clear, scope: request.scope.rawValue, appId: request.appId, appName: request.appName, visible: nil, generation: nil)
+        case .setCaptureVisible(let visible):
+            return WindowsBroadcastEnvelope(kind: .setCaptureVisible, scope: nil, appId: nil, appName: nil, visible: visible, generation: nil)
+        case .suspensionInvalidated(let generation):
+            return WindowsBroadcastEnvelope(kind: .suspensionInvalidated, scope: nil, appId: nil, appName: nil, visible: nil, generation: generation.map(String.init))
+        case .quit(let scope):
+            return WindowsBroadcastEnvelope(kind: .quit, scope: scope, appId: nil, appName: nil, visible: nil, generation: nil)
+        }
+    }
+}
+
+private extension WindowsBroadcastEnvelope {
+    /// Reconstructs the platform-neutral message this envelope's JSON
+    /// encoded, mirroring `ClearBroadcastRequest.init(notification:)`'s
+    /// generous defaults for a malformed or legacy payload (see that
+    /// initializer's comment on the macOS branch).
+    var message: BroadcastMessage {
+        switch kind {
+        case .clear:
+            return .clear(ClearBroadcastRequest(
+                scope: scope.flatMap(ClearScope.init(rawValue:)) ?? .all,
+                appId: appId,
+                appName: appName
+            ))
+        case .setCaptureVisible:
+            return .setCaptureVisible(visible == true)
+        case .suspensionInvalidated:
+            return .suspensionInvalidated(generation: generation.flatMap(UInt64.init))
+        case .quit:
+            return .quit(scope: scope)
         }
     }
 }
