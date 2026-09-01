@@ -249,18 +249,136 @@ if ($needed.Count -eq 0) {
     Fail "Dependency scan found zero Swift runtime DLLs required by AIChalkboard.exe -- llvm-objdump likely failed silently; investigate before shipping a dist that will STATUS_DLL_NOT_FOUND on launch."
 }
 
+# ---------------------------------------------------------------------------
+# 3b. Lock-tolerant replacement of a single deployed file.
+#
+#    Claude Desktop runs the PREVIOUS build's AIChalkboard.exe as a
+#    long-lived MCP server child process, and Windows locks a RUNNING
+#    executable's image file -- and every Swift runtime DLL it has loaded --
+#    against deletion. This is the normal case on every rebuild while the
+#    connector is installed, not an edge case: the observed failure is
+#    "Remove-Item : ... Access to the path 'AIChalkboard.exe' is denied.",
+#    and it reproduces identically in an elevated Administrator shell,
+#    because an image lock is not a permissions problem -- elevation cannot
+#    override it.
+#
+#    What Windows DOES still allow against a locked file is RENAMING it -- a
+#    directory-entry operation -- even though it forbids deleting,
+#    truncating, or overwriting it. This is the same technique Windows
+#    self-updaters use: rename the locked file aside so the already-running
+#    process keeps using its already-mapped old image, then write a fresh
+#    file at the original path. So instead of one blunt
+#    `Remove-Item -Recurse -Force $appDir` (which dies the instant it
+#    reaches whichever locked file it enumerates first, mid-directory, and
+#    used to take out the entire dist folder with it), every file this
+#    script deploys is replaced individually: plain delete first, and only
+#    on failure, rename aside.
+# ---------------------------------------------------------------------------
+$script:anyRenamedAside = $false
+
+function Get-LockHolderReport([string]$path) {
+    # Best-effort diagnostic for the Fail() message below, not a guarantee of
+    # completeness -- this only enumerates AIChalkboard.exe processes, which
+    # covers the actual observed cause (Claude Desktop's MCP server child),
+    # not every conceivable handle holder on $path.
+    $holders = @(Get-CimInstance Win32_Process -Filter "Name='AIChalkboard.exe'" -ErrorAction SilentlyContinue)
+    if ($holders.Count -eq 0) {
+        return "  (no AIChalkboard.exe process is currently running -- some other program has '$path' open)"
+    }
+    $lines = foreach ($proc in $holders) {
+        $parentName = "unknown"
+        $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.ParentProcessId)" -ErrorAction SilentlyContinue
+        if ($parent) { $parentName = $parent.Name }
+        "  PID $($proc.ProcessId), parent: $parentName (PID $($proc.ParentProcessId))"
+    }
+    return ($lines -join "`n")
+}
+
+function Remove-OrRenameAside([string]$path) {
+    if (-not (Test-Path $path)) { return }
+    try {
+        Remove-Item -Force $path -ErrorAction Stop
+        return
+    } catch {
+        # Fall through to the rename-aside path below. Not every possible
+        # delete failure is a lock, but a rename attempt is a cheap,
+        # harmless next step either way -- and if the real cause is
+        # something else, the rename below fails too and reports it.
+    }
+
+    $directory = Split-Path $path -Parent
+    $leaf = Split-Path $path -Leaf
+    $maxAttempts = 1000
+    for ($counter = 1; $counter -le $maxAttempts; $counter++) {
+        $candidateName = "$leaf.old-$counter"
+        if (Test-Path (Join-Path $directory $candidateName)) { continue }
+        try {
+            Rename-Item -Path $path -NewName $candidateName -ErrorAction Stop
+            $script:anyRenamedAside = $true
+            return
+        } catch {
+            Fail (
+                "Cannot update '$path' -- it is locked and could not be deleted or renamed aside.`n" +
+                "Likely holding process(es):`n$(Get-LockHolderReport $path)`n`n" +
+                "Fully quit Claude Desktop (it keeps AIChalkboard.exe running as a long-lived MCP server child process) and re-run this script."
+            )
+        }
+    }
+    Fail "Could not find a free '$leaf.old-N' name aside for '$path' after $maxAttempts attempts -- clean up '$directory' by hand and re-run this script."
+}
+
 $distDir = Join-Path $repoRoot "dist"
 $appDir = Join-Path $distDir "AIChalkboard"
 Write-Output "Creating deployable layout at $appDir..."
-if (Test-Path $appDir) { Remove-Item -Recurse -Force $appDir }
-New-Item -ItemType Directory -Path $appDir | Out-Null
 
-Copy-Item $buildExe (Join-Path $appDir "AIChalkboard.exe")
+# Best-effort cleanup of *.old-* files renamed aside by a PREVIOUS run (see
+# Remove-OrRenameAside above). Once the process that held the lock has
+# exited, these are ordinary deletable files -- but this is purely cosmetic
+# housekeeping (nothing reads a *.old-* file, and Remove-OrRenameAside picks
+# a name that avoids colliding with one anyway), so a failure here must
+# NEVER fail the build; a leftover just waits for the next run to try again.
+if (Test-Path $appDir) {
+    Get-ChildItem $appDir -Filter "*.old-*" -File -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-Item -Force $_.FullName -ErrorAction SilentlyContinue
+    }
+}
+
+if (-not (Test-Path $appDir)) {
+    New-Item -ItemType Directory -Path $appDir | Out-Null
+}
+
+# Note this no longer wipes $appDir wholesale: only the exact files this
+# build deploys (the exe, and this toolchain's current DLL closure) are
+# touched. On the common path -- app not running -- Remove-OrRenameAside's
+# plain-delete branch makes this behave exactly like the old
+# delete-directory-then-recopy did, with no leftovers.
+$exeDest = Join-Path $appDir "AIChalkboard.exe"
+Remove-OrRenameAside $exeDest
+Copy-Item $buildExe $exeDest
 
 foreach ($key in $needed) {
-    Copy-Item $runtimeDllIndex[$key] (Join-Path $appDir (Split-Path $runtimeDllIndex[$key] -Leaf))
+    $dllDest = Join-Path $appDir (Split-Path $runtimeDllIndex[$key] -Leaf)
+    Remove-OrRenameAside $dllDest
+    Copy-Item $runtimeDllIndex[$key] $dllDest
 }
 Write-Output "Copied $($needed.Count) Swift runtime DLL(s): $($needed -join ', ')"
+
+# ---------------------------------------------------------------------------
+# 4b. Build-identifier sidecar file: the Windows analogue of macOS's
+#    Info.plist embedding (see build_app.sh, and Sources\Support\BuildMetadata.swift's
+#    "buildIdentifier" doc comment). A bare .exe has no bundle to embed
+#    metadata into, so BuildMetadata reads this small file back out of the
+#    directory containing the RUNNING executable instead. Plain
+#    [System.IO.File]::WriteAllText with an explicit no-BOM UTF8Encoding,
+#    not `Out-File -Encoding utf8` / `Set-Content` -- both of those emit a
+#    UTF-8 BOM in Windows PowerShell 5.1, and a BOM has already silently
+#    broken this project once (the Claude Desktop config file). The name
+#    here must match BuildMetadata.windowsSidecarFileName exactly.
+# ---------------------------------------------------------------------------
+$sidecarPath = Join-Path $appDir "build-identifier.txt"
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($sidecarPath, $buildIdentifier, $utf8NoBom)
+Write-Output "Wrote build identifier sidecar: $sidecarPath"
 
 # ---------------------------------------------------------------------------
 # 5. No code-signing step here, deliberately.
@@ -285,3 +403,11 @@ Write-Output ""
 Write-Output "Paste into claude_desktop_config.json as the MCP server 'command':"
 Write-Output "  `"$exePath`""
 Write-Output "  (as a JSON string, i.e. with backslashes escaped: `"$($exePath -replace '\\','\\')`")"
+
+if ($script:anyRenamedAside) {
+    Write-Output ""
+    Write-Output "NOTE: $appDir had one or more files locked by an already-running AIChalkboard.exe."
+    Write-Output "Those files were renamed aside (*.old-N) rather than overwritten -- the new build above is complete and on disk,"
+    Write-Output "but the ALREADY-RUNNING connector process is still executing its OLD image from before this rename, so it is NOT running this build."
+    Write-Output "Fully quit Claude Desktop and relaunch it to pick up this build."
+}
