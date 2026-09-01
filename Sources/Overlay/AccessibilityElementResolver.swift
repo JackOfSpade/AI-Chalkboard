@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import ApplicationServices
 import Foundation
@@ -949,3 +950,588 @@ public enum AccessibilityElementResolver {
             && frame.width > 0 && frame.height > 0
     }
 }
+
+#elseif os(Windows)
+import CChalkboardWin
+import Foundation
+
+/// The two intentionally small text matching modes supported by element
+/// lookup. Mirrors `chalk_uia_find_element`'s `ChalkUiaMatchMode` exactly
+/// (`CHALK_UIA_MATCH_EXACT` / `CHALK_UIA_MATCH_CONTAINS`); see this type's
+/// macOS counterpart for why exact is the safe default.
+public enum AccessibilityLabelMatchMode: String, Codable, Equatable {
+    case exact
+    case contains
+}
+
+/// Screen-space geometry, in the SAME units `chalk_uia_find_element`'s
+/// `ChalkRect` and `chalk_capture_monitor` already use: virtual-desktop,
+/// top-left-origin, y-down Win32 screen coordinates. Unlike the macOS
+/// counterpart, no bottom-left-to-top-left flip is ever needed to interpret
+/// this struct -- see `backingRect(forAccessibilityFrame:screens:)` below.
+public struct AccessibilityScreenRect: Codable, Equatable {
+    public let x: Double
+    public let y: Double
+    public let width: Double
+    public let height: Double
+
+    public init(x: Double, y: Double, width: Double, height: Double) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+/// The output geometry that free-draw tools consume: top-left-origin backing
+/// pixels local to one physical display. Identical shape to the macOS type.
+public struct AccessibilityBackingRect: Codable, Equatable {
+    public let screenId: String
+    public let x: Double
+    public let y: Double
+    public let width: Double
+    public let height: Double
+
+    public init(screenId: String, x: Double, y: Double, width: Double, height: Double) {
+        self.screenId = screenId
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+/// Result of a read-only UI Automation lookup. `matchedAttribute` is always
+/// `"Name"` on Windows -- `chalk_uia_find_element` only ever matches UIA's
+/// Name property, unlike macOS's title/description/value cascade -- and
+/// `role` is always `nil`: the shim never reports a control type back to
+/// Swift (see `AccessibilityElementResolverError.roleFilterNotSupported`).
+/// `matchedLabel` is the QUERY string, not necessarily the element's actual
+/// published Name: `chalk_uia_find_element` reports bounds and counts only,
+/// never the matched string itself, so under `.contains` mode a caller does
+/// not see back what the real Name was (only that something containing the
+/// query matched). This is a genuine, disclosed reduction versus macOS,
+/// where `matchedLabel` is always the real attribute value that was read.
+public struct AccessibilityElementMatch: Codable, Equatable {
+    public let matchedAttribute: String
+    public let matchedLabel: String
+    public let role: String?
+    public let accessibilityFrame: AccessibilityScreenRect
+    public let backingFrame: AccessibilityBackingRect
+
+    public init(matchedAttribute: String, matchedLabel: String, role: String?,
+                accessibilityFrame: AccessibilityScreenRect, backingFrame: AccessibilityBackingRect) {
+        self.matchedAttribute = matchedAttribute
+        self.matchedLabel = matchedLabel
+        self.role = role
+        self.accessibilityFrame = accessibilityFrame
+        self.backingFrame = backingFrame
+    }
+}
+
+/// Used only to describe the exposed-name sample `chalk_uia_sample_names`
+/// collects for a `.noMatches` error (see that case below). Unlike macOS,
+/// this is never used to preview an AMBIGUOUS match set: `chalk_uia_find_
+/// element` reports only a count for that case (see `.ambiguous` below), not
+/// per-candidate labels/roles.
+public struct AccessibilityElementCandidate: Codable, Equatable {
+    public let matchedAttribute: String
+    public let matchedLabel: String
+    public let role: String?
+
+    public init(matchedAttribute: String, matchedLabel: String, role: String?) {
+        self.matchedAttribute = matchedAttribute
+        self.matchedLabel = matchedLabel
+        self.role = role
+    }
+}
+
+public struct AccessibilityElementRequest: Equatable {
+    public let label: String
+    /// Always rejected with `.roleFilterNotSupported` when non-nil on
+    /// Windows: `chalk_uia_find_element` has no role/control-type parameter
+    /// at all (see that error case's doc comment). Kept in this struct's
+    /// shape anyway so `MCPToolHandlers+Highlight.swift`'s call site does
+    /// not need a platform-conditional argument list.
+    public let role: String?
+    public let matchMode: AccessibilityLabelMatchMode
+    /// One-based match index. Omit it to require exactly one candidate.
+    /// Maps directly to `chalk_uia_find_element`'s `occurrence` parameter,
+    /// which uses the SAME 0-means-"require exactly one" convention.
+    public let occurrence: Int?
+    public let maxNodes: Int
+    public let timeoutSeconds: TimeInterval
+
+    public init(label: String, role: String? = nil,
+                matchMode: AccessibilityLabelMatchMode = .exact,
+                occurrence: Int? = nil, maxNodes: Int = AccessibilityElementResolver.defaultMaxNodes,
+                timeoutSeconds: TimeInterval = AccessibilityElementResolver.defaultTraversalTimeoutSeconds) {
+        self.label = label
+        self.role = role
+        self.matchMode = matchMode
+        self.occurrence = occurrence
+        self.maxNodes = maxNodes
+        self.timeoutSeconds = timeoutSeconds
+    }
+}
+
+/// Windows has no persistent, revocable permission grant analogous to macOS
+/// TCC/Accessibility trust -- see `AccessibilityElementResolver.trustStatus`
+/// below for why this always reports `trusted: true` rather than performing
+/// a check it has no way to make ahead of a real, per-process lookup.
+public struct AccessibilityTrustStatus: Codable, Equatable {
+    public let trusted: Bool
+    public let promptRequested: Bool
+    public let note: String
+
+    public init(trusted: Bool, promptRequested: Bool, note: String) {
+        self.trusted = trusted
+        self.promptRequested = promptRequested
+        self.note = note
+    }
+}
+
+/// Windows counterpart of the macOS error taxonomy, matched one-for-one
+/// against `chalk_uia_find_element`'s documented `ChalkErrorCode`s (see
+/// chalkboard_win.h Section 3) wherever an equivalent macOS condition
+/// exists, PLUS two cases with no macOS analogue at all:
+/// `.roleFilterNotSupported` (the shim has no role/control-type parameter)
+/// and `.elevationBoundary` (UIPI has no macOS AX counterpart). See each
+/// case below for its exact shim mapping.
+public enum AccessibilityElementResolverError: LocalizedError, Equatable {
+    case invalidRequest(String)
+    case invalidProcessID
+    /// Maps `CHALK_ERR_UIA_UNAVAILABLE`. The header itself names this "the
+    /// Windows analogue of macOS's Accessibility not trusted": the UI
+    /// Automation COM service could not be reached at all (CoCreateInstance
+    /// of CUIAutomation failed, or CoInitializeEx failed on the shim's
+    /// worker thread), so no lookup can succeed until it clears.
+    case accessibilityNotTrusted
+    /// Maps `CHALK_ERR_UIA_INVALID_PROCESS` for a process ID that PASSED the
+    /// `processID > 0` sanity check below but that the shim could not find a
+    /// root automation element for (no visible top-level windows -- either
+    /// the process is not running, or it simply has none yet). This is the
+    /// Windows analogue of macOS's `applicationUnavailable`, NOT
+    /// `invalidProcessID`: a live process that has not created a window yet
+    /// is "running but currently exposing nothing", exactly the condition
+    /// `applicationUnavailable`'s macOS wording already describes -- see
+    /// `resolve(processID:request:screens:)`'s pre-check for the OTHER half
+    /// of `CHALK_ERR_UIA_INVALID_PROCESS`'s documented meaning ("does not
+    /// name a currently-running process"), which this file catches earlier,
+    /// Swift-side, as `.invalidProcessID` instead, mirroring macOS's own
+    /// `processID > 0` guard.
+    case applicationUnavailable
+    /// Maps `CHALK_ERR_UIA_RETRYABLE_TIMEOUT`. The header explicitly
+    /// documents this as retryable "the same way the macOS resolver treats
+    /// applicationBusy" -- a UIA provider call did not answer within
+    /// `timeout_seconds` (COM RPC timeout, or a busy target), not a
+    /// permanent absence of automation support.
+    case applicationBusy
+    /// Maps `CHALK_ERR_UIA_NODE_BUDGET_EXHAUSTED`. Counts elements VISITED
+    /// by the shim's breadth-first ControlView walk, exactly like macOS's
+    /// `traversalLimitReached` -- narrowing `label` does not lower it; only
+    /// `max_nodes`/`timeout_seconds`/`occurrence` do.
+    case traversalLimitReached(Int)
+    /// Maps `CHALK_ERR_UIA_NO_MATCH`. `exposedSample` is collected via a
+    /// SEPARATE `chalk_uia_sample_names` call (see
+    /// `AccessibilityElementResolver.sampleNames`) after the primary lookup
+    /// fails, since -- unlike macOS, where the sample is free (reusing reads
+    /// the BFS already made) -- the shim's own manual walk is opaque to
+    /// Swift and gives back no per-node data to harvest.
+    case noMatches(label: String, role: String?, exposedSample: [AccessibilityElementCandidate])
+    /// Maps `CHALK_ERR_UIA_AMBIGUOUS`. Carries only a COUNT, unlike macOS's
+    /// `.ambiguous([AccessibilityElementCandidate])`: `chalk_uia_find_
+    /// element` reports `out_match_count` for this case and nothing else --
+    /// no per-candidate label/role list is available at this layer. Closing
+    /// that gap would need either a shim change (a candidate-list out
+    /// parameter) or a second best-effort `chalk_uia_sample_names` scan
+    /// filtered client-side for names that plausibly matched; neither is
+    /// implemented here (see this port's contractChanges/followUps).
+    case ambiguous(matchCount: Int)
+    /// Maps `CHALK_ERR_UIA_OCCURRENCE_OUT_OF_RANGE`. Same shape as macOS:
+    /// `available` and `framelessMatchCount` come straight from the shim's
+    /// `out_match_count`/`out_frameless_count`.
+    case occurrenceOutOfRange(requested: Int, available: Int, framelessMatchCount: Int)
+    /// Maps `CHALK_ERR_UIA_NO_USABLE_BOUNDS`. `matchCount` is
+    /// `out_frameless_count`: elements whose Name matched but whose
+    /// `BoundingRectangle` was empty/non-finite, so there was nothing to
+    /// draw around -- same meaning as macOS's `matchesHaveNoUsableFrame`.
+    case matchesHaveNoUsableFrame(matchCount: Int)
+    case frameCannotBeMapped
+    /// NO MACOS ANALOGUE. `chalk_uia_find_element` has no role/control-type
+    /// parameter at all -- the header's Section 3 only ever matches on the
+    /// Name property (see `ChalkUiaMatchMode`'s doc comment). Rather than
+    /// silently ignore a caller-supplied `role` (which would produce
+    /// results the caller reasonably believes were role-filtered but were
+    /// not), `AccessibilityElementResolver.resolve` refuses up front with
+    /// this case whenever `request.role` is non-nil. This is a genuine,
+    /// disclosed capability gap versus macOS's native `kAXRoleAttribute`
+    /// filtering -- see contractChanges.
+    case roleFilterNotSupported
+    /// NO MACOS ANALOGUE. Maps `CHALK_ERR_UIA_ACCESS_DENIED`: the target
+    /// process is elevated (running as administrator) and AI Chalkboard is
+    /// not, so User Interface Privilege Isolation (UIPI) blocks UI
+    /// Automation from crossing into its tree at all. No retry, no budget
+    /// change, and no macOS AX permission has ever needed to express this --
+    /// macOS's Accessibility API carries no equivalent privilege-level
+    /// boundary. The only fixes are running AI Chalkboard elevated too, or
+    /// falling back to screenshot-measured coordinates.
+    case elevationBoundary
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidRequest(let message):
+            return "Invalid accessibility lookup request: \(message)"
+        case .invalidProcessID:
+            return "The target app does not have a valid running process ID, so its UI Automation tree cannot be inspected."
+        case .accessibilityNotTrusted:
+            return "AI Chalkboard could not reach the Windows UI Automation service (the COM UIA client could not be created). This usually clears on its own; retry the lookup. Unlike macOS, there is no permission to grant in a settings panel here."
+        case .applicationUnavailable:
+            return "The target app's UI Automation hierarchy is unavailable: it has no visible top-level windows yet. Ensure the app is running and has at least one window open, then retry."
+        case .applicationBusy:
+            return "The target app did not answer its UI Automation request within the messaging timeout. This is usually transient (the app was busy), not a missing UI Automation implementation; retry the lookup rather than assuming the UI is not exposed to UI Automation."
+        case .traversalLimitReached(let limit):
+            return "Stopped after inspecting \(limit) UI Automation elements without finishing the tree. This cap counts elements VISITED, not candidates, so narrowing label does not lower it. Try supplying occurrence FIRST (e.g. occurrence: 1): the walk only keeps going past a match in order to PROVE uniqueness, so an explicit occurrence returns the first highlightable match immediately instead of finishing the tree. If ambiguity detection across the whole tree is actually required, raise max_nodes (up to \(AccessibilityElementResolver.absoluteMaxNodes)) together with timeout_seconds (up to \(Int(AccessibilityElementResolver.maxTraversalTimeoutSeconds))). Some applications publish hierarchies far larger than any bounded read can enumerate; for those, element anchoring is not available at all -- measure from an uncropped full-display screenshot instead and confirm the result with verify_annotation."
+        case .noMatches(let label, let role, let exposedSample):
+            let roleNote = role.map { " with role '\($0)'" } ?? ""
+            guard !exposedSample.isEmpty else {
+                return "No UI Automation element matched name '\(label)'\(roleNote). The UI may not expose that control to Windows UI Automation."
+            }
+            let lowerQuery = label.lowercased()
+            let ranked = exposedSample.sorted { lhs, rhs in
+                Self.isRelatedLabel(lhs.matchedLabel, toLowercasedQuery: lowerQuery)
+                    && !Self.isRelatedLabel(rhs.matchedLabel, toLowercasedQuery: lowerQuery)
+            }
+            let preview = ranked.prefix(8).map { "'\($0.matchedLabel)'" }.joined(separator: ", ")
+            let more = ranked.count > 8 ? " (and \(ranked.count - 8) more)" : ""
+            return "No UI Automation element matched name '\(label)'\(roleNote). Names that ARE exposed here include: \(preview)\(more). Retry with one of those names instead of falling back to screen coordinates."
+        case .ambiguous(let matchCount):
+            return "UI Automation lookup is ambiguous across \(matchCount) elements. Windows UI Automation does not report a per-element preview for this case (unlike macOS); supply a one-based occurrence to disambiguate."
+        case .occurrenceOutOfRange(let requested, let available, let framelessMatchCount):
+            let framelessNote = framelessMatchCount > 0
+                ? " \(framelessMatchCount) additional element(s) also matched the name but were skipped because they published no usable bounding rectangle, so they could not be assigned an occurrence."
+                : ""
+            return "Requested accessibility occurrence \(requested), but only \(available) highlightable matching element(s) were found. Occurrence is one-based.\(framelessNote)"
+        case .matchesHaveNoUsableFrame(let matchCount):
+            return "\(matchCount) element(s) matched the name but none published a usable bounding rectangle, so there is nothing to draw around. Try a different name, or fall back to screenshot-measured coordinates confirmed with verify_annotation."
+        case .frameCannotBeMapped:
+            return "The matched element's bounding rectangle does not fit wholly on one connected display, so safe screen-local backing-pixel placement is impossible."
+        case .roleFilterNotSupported:
+            return "role filtering is not supported on Windows: the UI Automation lookup this build uses matches only an element's Name property and has no control-type/role parameter. Omit role, or narrow the search with occurrence instead."
+        case .elevationBoundary:
+            return "The target app is running elevated (as administrator) and AI Chalkboard is not, so Windows UI Privilege Isolation (UIPI) blocks UI Automation from reading its interface. Run AI Chalkboard elevated too, or fall back to screenshot-measured coordinates confirmed with verify_annotation."
+        }
+    }
+
+    private static func isRelatedLabel(_ label: String, toLowercasedQuery lowercasedQuery: String) -> Bool {
+        let lowercasedLabel = label.lowercased()
+        return lowercasedLabel.contains(lowercasedQuery) || lowercasedQuery.contains(lowercasedLabel)
+    }
+}
+
+/// Read-only bridge from a running application's UI Automation tree to
+/// Chalkboard's screen-local backing pixels -- the Windows counterpart of
+/// the macOS `AccessibilityElementResolver` above, backed by
+/// `chalk_uia_find_element`/`chalk_uia_sample_names` instead of AXUIElement.
+/// Same public API surface (type names, static members, method signatures
+/// modulo the `pid_t` -> `UInt32` process-id type -- see
+/// `resolve(processID:request:screens:)`'s doc comment) so
+/// `MCPToolCatalog.swift`/`MCPToolHandlers.swift`/`MCPToolHandlers+
+/// Highlight.swift` need no platform branching of their own to call it.
+public enum AccessibilityElementResolver {
+    public static let defaultMaxNodes = 3_000
+    public static let absoluteMaxNodes = 10_000
+    public static let defaultTraversalTimeoutSeconds: TimeInterval = 2.0
+    public static let minTraversalTimeoutSeconds: TimeInterval = 0.5
+    public static let maxTraversalTimeoutSeconds: TimeInterval = 10.0
+    /// Bounds on the `chalk_uia_sample_names` sample attached to a
+    /// `.noMatches` error. Same numeric values as macOS for parity, though
+    /// the mechanism differs (a real, separate shim call here vs. free reuse
+    /// of reads the BFS already made on macOS -- see `.noMatches`'s doc
+    /// comment on `AccessibilityElementResolverError`).
+    static let maxExposedSampleCount = 64
+    static let maxExposedSampleLabelCharacters = 128
+    /// UTF-16 code units reserved for `chalk_uia_sample_names`'s NUL-
+    /// separated output buffer. Comfortably larger than
+    /// `maxExposedSampleCount` NUL-terminated short control names could ever
+    /// need; `chalk_uia_sample_names` degrades gracefully (writes fewer
+    /// names, never partially) if this is ever too small.
+    private static let sampleNamesBufferCapacity = 8_192
+
+    // Literal ChalkErrorCode / ChalkUiaMatchMode values from chalkboard_win.h,
+    // used directly (not via the imported C enum's case names) for the same
+    // reason `WindowsRasterImageError`'s shim-status mapping does this --
+    // robustness to however ClangImporter happens to shape a plain
+    // (non-`enum class`) C enum, independent of this file.
+    private static let chalkOk: Int32 = 0
+    private static let chalkErrInvalidArgument: Int32 = -1
+    private static let chalkErrUiaUnavailable: Int32 = -300
+    private static let chalkErrUiaNoMatch: Int32 = -301
+    private static let chalkErrUiaNoUsableBounds: Int32 = -302
+    private static let chalkErrUiaAmbiguous: Int32 = -303
+    private static let chalkErrUiaOccurrenceOutOfRange: Int32 = -304
+    private static let chalkErrUiaRetryableTimeout: Int32 = -305
+    private static let chalkErrUiaNodeBudgetExhausted: Int32 = -306
+    private static let chalkErrUiaAccessDenied: Int32 = -307
+    private static let chalkErrUiaInvalidProcess: Int32 = -308
+    private static let chalkUiaMatchExact: Int32 = 0
+    private static let chalkUiaMatchContains: Int32 = 1
+
+    /// Windows UI Automation has no persistent, revocable permission grant
+    /// analogous to macOS TCC/Accessibility trust -- `CHALK_ERR_UIA_
+    /// UNAVAILABLE` (COM/UIA service unreachable) and `CHALK_ERR_UIA_ACCESS_
+    /// DENIED` (elevation boundary) are each discovered per-call, against
+    /// one specific process, by `chalk_uia_find_element`/`chalk_uia_sample_
+    /// names` -- chalkboard_win.h exposes no process-independent probe this
+    /// method could call instead. Reporting an honest "unknown until you
+    /// try" would break `AccessibilityTrustStatus.trusted`'s `Bool` contract
+    /// for every caller (`get_accessibility_status`), so this reports an
+    /// OPTIMISTIC `trusted: true` unconditionally and says so in `note` --
+    /// `highlight_element`'s own `accessibilityNotTrusted`/`elevationBoundary`
+    /// errors are the true, per-lookup signal on this platform. This is a
+    /// disclosed behavioral difference from macOS's `trustStatus()`, which
+    /// performs a REAL live check (`AXIsProcessTrustedWithOptions`) that can
+    /// genuinely answer `false` — see contractChanges.
+    public static func trustStatus(requestPrompt: Bool = false) -> AccessibilityTrustStatus {
+        var note = "Windows UI Automation has no persistent permission grant to check ahead of a lookup (unlike macOS Accessibility/TCC). Availability and elevation-boundary failures are reported per element lookup by highlight_element itself, not by this status check."
+        if requestPrompt {
+            note += " request_permission has no effect on Windows: there is no system prompt to trigger."
+        }
+        return AccessibilityTrustStatus(trusted: true, promptRequested: false, note: note)
+    }
+
+    /// Finds a target inside a running application identified by its
+    /// Windows process id. `UInt32`, not `pid_t` -- `pid_t` does not exist
+    /// on the Windows Swift toolchain (confirmed: it fails to compile), and
+    /// `UInt32` is both what `chalk_uia_find_element`'s `process_id`
+    /// parameter is declared as and what `GetProcessId`/`GetWindowThread
+    /// ProcessId` naturally hand back. This is a disclosed process-id-type
+    /// difference from the macOS signature -- see contractChanges. Nothing
+    /// outside this file and `MCPToolHandlers+Highlight.swift` (both owned
+    /// together) depends on the exact type name.
+    public static func resolve(
+        processID: UInt32,
+        request: AccessibilityElementRequest,
+        screens: [ScreenInfo]
+    ) throws -> AccessibilityElementMatch {
+        guard processID > 0 else { throw AccessibilityElementResolverError.invalidProcessID }
+        let normalized = try validated(request)
+        guard !screens.isEmpty else { throw AccessibilityElementResolverError.frameCannotBeMapped }
+
+        var outBounds = ChalkRect(x: 0, y: 0, w: 0, h: 0)
+        var outMatchCount: Int32 = 0
+        var outFramelessCount: Int32 = 0
+        let matchModeArg = normalized.matchMode == .contains ? chalkUiaMatchContains : chalkUiaMatchExact
+        // 0 means "require exactly one" -- the SAME sentinel convention
+        // `AccessibilityElementRequest.occurrence == nil` already uses on
+        // macOS, so no translation beyond unwrapping is needed.
+        let occurrenceArg = Int32(normalized.occurrence ?? 0)
+
+        let status: Int32 = withWideString(normalized.label) { wname in
+            chalk_uia_find_element(
+                processID, wname, matchModeArg, occurrenceArg,
+                Int32(normalized.maxNodes), normalized.timeoutSeconds,
+                &outBounds, &outMatchCount, &outFramelessCount
+            )
+        }
+
+        switch status {
+        case chalkOk:
+            let frame = AccessibilityScreenRect(x: outBounds.x, y: outBounds.y, width: outBounds.w, height: outBounds.h)
+            guard let backingFrame = backingRect(forAccessibilityFrame: frame, screens: screens) else {
+                throw AccessibilityElementResolverError.frameCannotBeMapped
+            }
+            return AccessibilityElementMatch(
+                matchedAttribute: "Name",
+                // See AccessibilityElementMatch's doc comment: the shim
+                // never reports the element's actual Name back, only that
+                // one matched, so this echoes the query rather than the
+                // real published string.
+                matchedLabel: normalized.label,
+                role: nil,
+                accessibilityFrame: frame,
+                backingFrame: backingFrame
+            )
+        case chalkErrUiaNoMatch:
+            throw AccessibilityElementResolverError.noMatches(
+                label: normalized.label, role: nil, exposedSample: sampleNames(processID: processID)
+            )
+        case chalkErrUiaNoUsableBounds:
+            throw AccessibilityElementResolverError.matchesHaveNoUsableFrame(matchCount: Int(outFramelessCount))
+        case chalkErrUiaAmbiguous:
+            throw AccessibilityElementResolverError.ambiguous(matchCount: Int(outMatchCount))
+        case chalkErrUiaOccurrenceOutOfRange:
+            throw AccessibilityElementResolverError.occurrenceOutOfRange(
+                requested: normalized.occurrence ?? 0, available: Int(outMatchCount),
+                framelessMatchCount: Int(outFramelessCount)
+            )
+        case chalkErrUiaRetryableTimeout:
+            throw AccessibilityElementResolverError.applicationBusy
+        case chalkErrUiaNodeBudgetExhausted:
+            throw AccessibilityElementResolverError.traversalLimitReached(normalized.maxNodes)
+        case chalkErrUiaAccessDenied:
+            throw AccessibilityElementResolverError.elevationBoundary
+        case chalkErrUiaInvalidProcess:
+            // Reached only for a positive processID the shim itself could
+            // not find a root element for -- see applicationUnavailable's
+            // doc comment for why THIS is the right Swift case rather than
+            // invalidProcessID (already handled by the guard above).
+            throw AccessibilityElementResolverError.applicationUnavailable
+        case chalkErrUiaUnavailable:
+            throw AccessibilityElementResolverError.accessibilityNotTrusted
+        case chalkErrInvalidArgument:
+            // Defense in depth only: `validated(_:)` above should already
+            // have rejected anything that would make the shim itself see an
+            // invalid argument.
+            throw AccessibilityElementResolverError.invalidRequest("Windows UI Automation lookup rejected its own arguments (shim status \(status)).")
+        default:
+            throw AccessibilityElementResolverError.invalidRequest("Windows UI Automation lookup failed with unexpected status \(status).")
+        }
+    }
+
+    /// Pure AX top-left global logical-point -> local backing-pixel
+    /// conversion -- the Windows counterpart of the macOS function of the
+    /// same name, dramatically simpler because there is no AppKit bottom-
+    /// left-origin flip to undo: `frame` (from `chalk_uia_find_element`'s
+    /// `ChalkRect`) and `screen.windowServerFrame` are both already in the
+    /// SAME virtual-desktop, top-left-origin, y-down Win32 screen-coordinate
+    /// space (the same convention `chalk_capture_monitor` documents).
+    ///
+    /// ASSUMPTION, disclosed rather than silently relied upon: this treats
+    /// `frame` and every screen's `windowServerFrame` as already being in
+    /// the SAME physical-pixel units -- it does not multiply by `backing
+    /// ScaleFactor` the way the macOS conversion (points -> pixels) must.
+    /// That is correct only if (a) AI Chalkboard is Per-Monitor-V2 DPI
+    /// aware, so `IUIAutomationElement.get_CurrentBoundingRectangle` hands
+    /// back physical pixels rather than DIPs, and (b) the Windows
+    /// `ScreenSnapshot`/`buildScreenInfos()` implementation (owned
+    /// separately -- not part of this change) populates `windowServerFrame`
+    /// in physical pixels too, matching `chalk_capture_monitor`'s own pixel
+    /// space. If either side of that assumption changes, this conversion
+    /// must change with it -- see contractChanges/followUps.
+    public static func backingRect(
+        forAccessibilityFrame frame: AccessibilityScreenRect,
+        screens: [ScreenInfo]
+    ) -> AccessibilityBackingRect? {
+        guard isUsable(frame) else { return nil }
+        let frameRect = ScreenCoordinateRect(x: frame.x, y: frame.y, width: frame.width, height: frame.height)
+        // Elements which straddle displays cannot be represented by one
+        // Chalkboard annotation, whose coordinates deliberately name exactly
+        // one screen -- same "reject rather than silently clip or choose a
+        // monitor" policy as the macOS branch.
+        guard let screen = screens.first(where: { fullyContains($0.windowServerFrame, frameRect) }) else {
+            return nil
+        }
+        return AccessibilityBackingRect(
+            screenId: screen.id,
+            x: frame.x - screen.windowServerFrame.x,
+            y: frame.y - screen.windowServerFrame.y,
+            width: frame.width,
+            height: frame.height
+        )
+    }
+
+    // MARK: - Pure matching helpers
+
+    /// Kept for API parity with the macOS resolver even though `resolve()`
+    /// never calls it here (name matching happens inside the C++ shim's own
+    /// walk, invisible to Swift) -- a pure, platform-independent predicate
+    /// with no reason to differ from macOS's.
+    static func labelMatches(_ candidate: String, query: String, mode: AccessibilityLabelMatchMode) -> Bool {
+        switch mode {
+        case .exact:
+            return candidate == query
+        case .contains:
+            return candidate.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+        }
+    }
+
+    private static func validated(_ request: AccessibilityElementRequest) throws -> AccessibilityElementRequest {
+        let label = request.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !label.isEmpty else {
+            throw AccessibilityElementResolverError.invalidRequest("label must be a non-empty string.")
+        }
+        guard label.count <= 1_024 else {
+            throw AccessibilityElementResolverError.invalidRequest("label may contain at most 1024 characters.")
+        }
+        // See AccessibilityElementResolverError.roleFilterNotSupported: the
+        // shim has no role/control-type parameter, so a supplied role is
+        // refused outright rather than silently ignored (which would make
+        // a caller believe results were role-filtered when they were not).
+        if request.role != nil {
+            throw AccessibilityElementResolverError.roleFilterNotSupported
+        }
+        if let occurrence = request.occurrence, occurrence < 1 {
+            throw AccessibilityElementResolverError.invalidRequest("occurrence must be one-based and greater than zero when supplied.")
+        }
+        guard request.maxNodes > 0, request.maxNodes <= absoluteMaxNodes else {
+            throw AccessibilityElementResolverError.invalidRequest("maxNodes must be between 1 and \(absoluteMaxNodes).")
+        }
+        guard request.timeoutSeconds.isFinite,
+              request.timeoutSeconds >= minTraversalTimeoutSeconds,
+              request.timeoutSeconds <= maxTraversalTimeoutSeconds else {
+            throw AccessibilityElementResolverError.invalidRequest("timeoutSeconds must be between \(minTraversalTimeoutSeconds) and \(maxTraversalTimeoutSeconds).")
+        }
+        return AccessibilityElementRequest(label: label, role: nil, matchMode: request.matchMode,
+                                           occurrence: request.occurrence, maxNodes: request.maxNodes,
+                                           timeoutSeconds: request.timeoutSeconds)
+    }
+
+    /// Collects the exposed-name sample for a `.noMatches` error via
+    /// `chalk_uia_sample_names`, mirroring the intent of macOS's free reuse
+    /// of BFS reads -- but as a genuinely separate call, since the shim's
+    /// own internal walk gives Swift no per-node data to harvest. Best-
+    /// effort: any non-`CHALK_OK` status (unavailable, access denied,
+    /// invalid process -- all of which `resolve()` would already have hit
+    /// moments earlier via `chalk_uia_find_element` for the SAME process)
+    /// degrades to an empty sample rather than throwing a second, redundant
+    /// error out of an error-message-building helper.
+    private static func sampleNames(processID: UInt32) -> [AccessibilityElementCandidate] {
+        var buffer = [UInt16](repeating: 0, count: sampleNamesBufferCapacity)
+        var outCount: Int32 = 0
+        let status: Int32 = buffer.withUnsafeMutableBufferPointer { buf in
+            chalk_uia_sample_names(processID, Int32(maxExposedSampleCount), buf.baseAddress, Int32(buf.count), &outCount)
+        }
+        guard status == chalkOk, outCount > 0 else { return [] }
+
+        var candidates: [AccessibilityElementCandidate] = []
+        var cursor = 0
+        for _ in 0..<Int(outCount) {
+            guard cursor < buffer.count else { break }
+            var end = cursor
+            while end < buffer.count, buffer[end] != 0 { end += 1 }
+            let name = String(decoding: buffer[cursor..<end], as: UTF16.self)
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, trimmed.count <= maxExposedSampleLabelCharacters {
+                candidates.append(AccessibilityElementCandidate(matchedAttribute: "Name", matchedLabel: trimmed, role: nil))
+            }
+            cursor = end + 1 // skip the NUL separator
+        }
+        return candidates
+    }
+
+    /// Converts a Swift `String` to the NUL-terminated UTF-16 buffer every
+    /// text-taking shim call expects -- same helper shape as
+    /// `GDIPlusDrawingContext.withWideString`, duplicated locally rather
+    /// than shared because these two files have no common base type to hang
+    /// a shared helper on without restructuring either one.
+    private static func withWideString<R>(_ text: String, _ body: (UnsafePointer<UInt16>) -> R) -> R {
+        var utf16 = Array(text.utf16)
+        utf16.append(0)
+        return utf16.withUnsafeBufferPointer { buf in
+            body(buf.baseAddress!)
+        }
+    }
+
+    private static func fullyContains(_ outer: ScreenCoordinateRect, _ inner: ScreenCoordinateRect) -> Bool {
+        let epsilon = 0.000_1
+        return inner.x >= outer.x - epsilon && inner.y >= outer.y - epsilon
+            && inner.maxX <= outer.maxX + epsilon && inner.maxY <= outer.maxY + epsilon
+    }
+
+    private static func isUsable(_ frame: AccessibilityScreenRect) -> Bool {
+        [frame.x, frame.y, frame.width, frame.height].allSatisfy(\.isFinite)
+            && frame.width > 0 && frame.height > 0
+    }
+}
+#endif

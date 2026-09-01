@@ -1,4 +1,5 @@
 import Foundation
+#if os(macOS)
 import AppKit
 
 public final class OverlayWindowController: NSObject {
@@ -344,3 +345,210 @@ public final class OverlayWindowController: NSObject {
         return (window: window, view: overlayView)
     }
 }
+
+#elseif os(Windows)
+import WinSDK
+import CChalkboardWin
+
+/// Windows twin of the macOS `OverlayWindowController` above -- same public/
+/// internal API surface (shared MCP code in `Sources/MCP` calls these
+/// members by name and does not itself branch on platform), different
+/// mechanism throughout: one `WS_POPUP`/layered Win32 window per monitor
+/// instead of one borderless `NSWindow` per `NSScreen`, and
+/// `WindowsUIThread` in place of AppKit's implicit main-thread affinity.
+///
+/// See `WindowsUIThread`'s doc comment for why that dedicated thread, not
+/// `MainThread`/`DispatchQueue.main`, is this class's affinity domain on
+/// Windows: nothing pumps `DispatchQueue.main` here, and every `HWND` this
+/// class owns must be created on, and only ever touched from, the one
+/// thread that pumps its message loop.
+public final class OverlayWindowController {
+    public static let shared = OverlayWindowController()
+
+    /// Same policy, and the same reasoning, as the macOS branch's identical
+    /// constant -- see its doc comment. `set_capture_visible(true)` is
+    /// exactly as easy to forget about here as there.
+    public static let captureAutoRevertInterval: TimeInterval = 5 * 60
+
+    /// One entry per real physical monitor, in `buildScreenInfos()`'s
+    /// enumeration order at the last rebuild. The Windows analogue of the
+    /// macOS branch's index-aligned `overlayWindows`/`overlayViews` pair --
+    /// see `WindowsOverlayWindow`'s doc comment for why one array of one
+    /// combined object (window + render target + presentation surface)
+    /// replaces that pair's two-array pairing invariant here: there is
+    /// nothing to keep in sync because there is only one thing per screen.
+    // internal (not private): OverlayWindowController+Presentation.swift and
+    // OverlayWindowController+Diagnostics.swift (Windows) read and mutate
+    // this array. UI-THREAD-ONLY, like every mutable stored property below.
+    var overlayWindows: [WindowsOverlayWindow] = []
+
+    /// UI-THREAD-ONLY. Same fail-closed-until-reconciled contract the macOS
+    /// branch's identical field documents.
+    var annotationsSuspended = true
+    var annotationsSuspensionGeneration: UInt64?
+
+    /// Guards `_captureVisible` only -- same reasoning as the macOS branch's
+    /// identical lock: written from the UI thread, read from the MCP
+    /// server's background read queue.
+    let captureLock = NSLock()
+    var _captureVisible = false
+
+    public var onCaptureVisibleChanged: ((Bool) -> Void)?
+
+    /// Cancelable stand-in for the macOS branch's `Timer`-based auto-revert.
+    /// `Foundation.Timer` only fires while something actively runs the
+    /// `RunLoop`/`CFRunLoop` it was scheduled on; `WindowsUIThread`'s message
+    /// loop is a raw `GetMessage`/`TranslateMessage`/`DispatchMessage` pump,
+    /// not a `CFRunLoop`, so a `Timer` scheduled there would simply never
+    /// fire. `DispatchWorkItem` on a background queue needs no run loop at
+    /// all -- `libdispatch` services it from its own thread pool -- so it is
+    /// the correct Windows substitute, not a weakened guarantee: cancelling
+    /// the previous work item on every call plays exactly the role
+    /// `Timer.invalidate()` plays on macOS.
+    var captureAutoRevertWorkItem: DispatchWorkItem?
+
+    private init() {}
+
+    public func setup() {
+        // Per-PROCESS, must precede creating any window at all -- see
+        // `ensureProcessDpiAwareness()`'s doc comment. This is the earliest
+        // point this app's Windows overlay subsystem controls; it still
+        // needs `Launcher/main.swift`'s Windows branch to actually call
+        // `setup()` before doing anything else, exactly as
+        // `AppDelegate.applicationDidFinishLaunching` calls it on macOS --
+        // see this change's follow-ups for that remaining integration.
+        Self.ensureProcessDpiAwareness()
+        WindowsUIThread.shared.start()
+        WindowsUIThread.shared.async { [weak self] in
+            self?.rebuildOverlayWindows()
+
+            // Same single-closure-slot contract as the macOS branch's
+            // identical assignment -- see its doc comment. This is still the
+            // only place that assigns `onStoreChanged`.
+            AnnotationStore.shared.onStoreChanged = { [weak self] in
+                self?.refreshViews()
+            }
+        }
+    }
+
+    private static var dpiAwarenessRequested = false
+
+    /// Requests Per-Monitor-v2 DPI awareness for this whole process, exactly
+    /// once, before any overlay window is created. Per Microsoft's own
+    /// documentation this must be set before creating any window that
+    /// depends on it and cannot be changed afterward, which is why
+    /// `setup()` calls this as its very first action rather than folding it
+    /// into `rebuildOverlayWindows()` (called again on every display
+    /// change, when it would be a no-op at best and a documented-invalid
+    /// call at worst).
+    ///
+    /// Per-Monitor-v2 awareness is what makes every rect this file reads
+    /// from `GetMonitorInfoW`/`GetWindowRect` already PHYSICAL pixels in a
+    /// TOP-LEFT-origin virtual-desktop space, with no separate DPI-scaling
+    /// pass needed anywhere in this class -- see `ScreenSnapshot.swift`'s
+    /// Windows `buildScreenInfos()` doc comment.
+    private static func ensureProcessDpiAwareness() {
+        guard !dpiAwarenessRequested else { return }
+        dpiAwarenessRequested = true
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == ((DPI_AWARENESS_CONTEXT)-4)
+        // (winuser.h). Built from that documented bit pattern rather than
+        // referencing the SDK macro by name -- same reasoning as
+        // `WindowsOverlayWindow`'s window-style constants: this is a
+        // pointer-typed sentinel, not a real handle, and the literal value
+        // is stable Win32 API surface regardless of exactly how
+        // ClangImporter shapes the imported name.
+        guard let context = DPI_AWARENESS_CONTEXT(bitPattern: -4) else {
+            Logger.shared.log("OverlayWindowController: could not construct DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2; overlay windows may render at the wrong scale on mixed-DPI setups.", level: "ERROR")
+            return
+        }
+        if SetProcessDpiAwarenessContext(context) {
+            return
+        }
+
+        // FAILURE IS USUALLY BENIGN AND EXPECTED HERE. Process DPI awareness
+        // can only be set ONCE per process, and `Launcher/main.swift` already
+        // sets exactly this context at startup -- deliberately, because it
+        // must happen before any window exists. A second call therefore fails
+        // with ERROR_ACCESS_DENIED (5) even though the process is already in
+        // precisely the state this function wants.
+        //
+        // Reporting that as an ERROR was actively misleading: a real run logged
+        // "SetProcessDpiAwarenessContext failed" on every startup while DPI
+        // awareness was in fact correctly applied, which is exactly the kind of
+        // false alarm that trains a reader to ignore the log. So ask what the
+        // process's awareness actually IS and only complain when it is wrong.
+        //
+        // This function is kept (rather than deleted in favour of main.swift's
+        // call) because `OverlayWindowController.setup()` is also reachable
+        // from tests and in-process hosts that never ran main.swift, where this
+        // IS the only call that sets it.
+        let lastError = GetLastError()
+        let current = GetThreadDpiAwarenessContext()
+        if AreDpiAwarenessContextsEqual(current, context) {
+            Logger.shared.log("OverlayWindowController: SetProcessDpiAwarenessContext returned false (GetLastError=\(lastError)) because process DPI awareness was already set to PER_MONITOR_AWARE_V2 (normally by Launcher/main.swift at startup). No action needed.", level: "DEBUG")
+        } else {
+            Logger.shared.log("OverlayWindowController: SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) failed (GetLastError=\(lastError)) and the process is NOT per-monitor-v2 aware. Overlay windows may be scaled/blurred by DWM instead of rendering at native per-monitor resolution.", level: "ERROR")
+        }
+    }
+
+    /// UI-THREAD-ONLY. Tears down every existing `WindowsOverlayWindow` and
+    /// creates one fresh one per monitor `buildScreenInfos()` currently
+    /// reports -- the Windows analogue of the macOS branch's identically-
+    /// named method, called for the same two reasons: `setup()`, and a
+    /// display-configuration change (`handleDisplayOrDpiChange()` here,
+    /// `NSApplication.didChangeScreenParametersNotification` there).
+    private func rebuildOverlayWindows() {
+        for window in overlayWindows {
+            window.close()
+        }
+        overlayWindows.removeAll()
+
+        // Newly (re)created windows are born with whatever capture-debug
+        // request is currently in effect, mirroring the macOS branch's
+        // `desiredSharingType` -- so a display reconfiguration mid-debug-
+        // session does not silently revert the user's toggle.
+        let excluded = desiredExcludedFromCapture
+        for info in buildScreenInfos() {
+            let frame = ChalkRect(
+                x: info.appKitFrame.x, y: info.appKitFrame.y,
+                w: info.appKitFrame.width, h: info.appKitFrame.height
+            )
+            guard let window = WindowsOverlayWindow(screenId: info.id, frame: frame) else {
+                Logger.shared.log("OverlayWindowController: failed to create an overlay window for screenId=\(info.id); that display will have no annotation overlay until the next rebuild.", level: "ERROR")
+                continue
+            }
+            window.setExcludedFromCapture(excluded)
+            Logger.shared.log(
+                "OverlayWindowController: configured screen id=\(info.id) name='\(info.name)' physicalPixels=\(info.widthPx)x\(info.heightPx) backingScaleFactor=\(info.backingScaleFactor).",
+                level: "INFO"
+            )
+            overlayWindows.append(window)
+        }
+
+        refreshViewsNow()
+    }
+
+    /// Entry point `chalkboardOverlayWndProc` (a plain C callback with no
+    /// state of its own) calls on `WM_DISPLAYCHANGE`/`WM_DPICHANGED`.
+    ///
+    /// `WM_DISPLAYCHANGE` is broadcast to EVERY top-level window, so it
+    /// arrives once per existing overlay window (one per monitor) for a
+    /// single logical display-configuration event. This does not need its
+    /// own explicit de-duplication beyond routing through
+    /// `WindowsUIThread.async`: the loop that delivers these messages is
+    /// single-threaded, so the FIRST arrival's `rebuildOverlayWindows()`
+    /// runs to completion (destroying every window that existed at that
+    /// moment, including whichever one is still on the call stack) before
+    /// the loop advances to the next queued message -- and Win32 documents
+    /// that `DispatchMessage` silently discards a message whose target
+    /// window has since been destroyed, rather than redelivering it to
+    /// whatever new window now occupies that `HWND` value. So at most one
+    /// rebuild actually runs per burst; this is not relying on a coincidence
+    /// so much as on `DispatchMessage`'s own documented behavior.
+    func handleDisplayOrDpiChange() {
+        WindowsUIThread.shared.async { [weak self] in
+            self?.rebuildOverlayWindows()
+        }
+    }
+}
+#endif

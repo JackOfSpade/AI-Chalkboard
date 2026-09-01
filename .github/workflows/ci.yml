@@ -114,10 +114,28 @@ jobs:
           # build_app.sh is named explicitly: it lives at the repo root, so no
           # directory glob below reaches it, and it was going unlinted despite
           # being the script that assembles and codesigns the shipped .app.
+          #
+          # build_app.ps1 (also at the repo root, the Windows equivalent of
+          # build_app.sh) is deliberately NOT listed here and must never be:
+          # it's PowerShell, and shellcheck lints POSIX/bash shell script --
+          # pointing it at a .ps1 file either errors out or, worse, "passes"
+          # having not actually checked anything meaningful. None of the
+          # patterns below are broad enough to glob it in today (there's no
+          # bare `*.sh`/`*` at the repo root, only the explicit build_app.sh
+          # name and directory-scoped `dir/*.sh` globs), but the exclude
+          # filter right after this array is a deliberate backstop: if this
+          # list is ever loosened to a root-level glob, a stray *.ps1 gets
+          # silently dropped here instead of failing the lint (or falsely
+          # passing) on a file it can't parse.
           files=(build_app.sh scripts/*.sh tests/*.sh .claude/*.sh)
           shopt -u nullglob
           existing=()
-          for f in "${files[@]}"; do [ -f "$f" ] && existing+=("$f"); done
+          for f in "${files[@]}"; do
+            case "$f" in
+              *.ps1) continue ;;
+            esac
+            [ -f "$f" ] && existing+=("$f")
+          done
           if [ "${#existing[@]}" -eq 0 ]; then
             echo "::error::shellcheck found zero .sh files across build_app.sh, scripts/, tests/, .claude/ — broken checkout or repo layout, not nothing to check."
             exit 1
@@ -274,3 +292,55 @@ jobs:
       - name: Verify deployed bundle survives SwiftPM rebuild (act-local CI only)
         if: ${{ env.ACT == 'true' }}
         run: bash tests/test_deployment_layout.sh
+
+  build-windows:
+    name: swift build (debug + release) + swift test (Windows)
+    runs-on: windows-latest
+    # windows-latest is billed at the standard multiplier (unlike macos-latest's
+    # 10x), so unlike the `build` job above there is no cheap/expensive split to
+    # make here -- this job just builds and tests the Windows port directly.
+    #
+    # No build_app.ps1 / dist assembly step here, deliberately, mirroring why
+    # the macOS `build` job above only runs build_app.sh under `if: env.ACT ==
+    # 'true'`: this repo has no code-signing identity to fail closed without
+    # attempting on a hosted runner (Windows has none to begin with -- see
+    # build_app.ps1's own comment on why there is no signing step at all), but
+    # the dist layout step still depends on the local Swift Runtimes directory
+    # layout and DLL closure being reproducible, which is exercised by hand
+    # against this developer's real Swift install rather than here. `swift
+    # build`, `swift build -c release`, and `swift test` below already cover
+    # the part of the Windows port -- the actual Swift/C++ source compiling
+    # and passing its test suite on Windows -- that most needs a CI gate.
+    steps:
+      - uses: actions/checkout@v7
+
+      # compnerd/gha-setup-swift, not swift-actions/setup-swift: compnerd is
+      # the Swift project's own Windows-platform maintainer and this action is
+      # the long-standing, actively-used way Swift's own Windows CI (and
+      # downstream Windows-porting projects) install a toolchain on
+      # windows-latest. swift-actions/setup-swift markets itself as
+      # multi-platform, but as of this writing its own issue tracker has open
+      # reports of specific recent Swift versions being unavailable on
+      # Windows -- a live risk for a repo that (like this one) tracks a
+      # specific pinned Swift version. Pinned to v0.4.0 (not @main), the same
+      # tag-pinning convention this file already uses for actions/checkout
+      # and actions/cache above, so a future release of the action can't
+      # silently change how the toolchain gets installed on this blocking
+      # gate.
+      - name: Install Swift toolchain (Windows)
+        uses: compnerd/gha-setup-swift@v0.4.0
+        with:
+          swift-version: swift-6.3.3-release
+          swift-build: 6.3.3-RELEASE
+
+      - name: Toolchain version (recorded in the log)
+        run: swift --version
+
+      - name: swift build (debug)
+        run: swift build
+
+      - name: swift build (release)
+        run: swift build -c release
+
+      - name: swift test
+        run: swift test

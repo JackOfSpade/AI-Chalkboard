@@ -1,3 +1,16 @@
+// This entire suite is macOS-only, guarded as a whole: every type it
+// exercises (`ScreenCapturePermissionDecision`, `ScreenCaptureApplicationIdentity`,
+// `ScreenCaptureProvider.shouldExclude(_:for:)`,
+// `ScreenCaptureProvider.exclusionScope(for:)`) is declared inside
+// `ScreenCaptureProvider.swift`'s `#if os(macOS)` branch with no Windows
+// counterpart at all -- per that file's own contract notes, Windows has no
+// TCC-style permission model to decide between (`permissionStatus()` always
+// reports `granted: true` there) and `chalk_capture_monitor` cannot exclude
+// any window, including this process's own overlay, from its captures (see
+// `ScreenCaptureExclusionScope`'s Windows doc comment), so there is no
+// sibling-identity-matching or exclusion-scope-reporting logic on that
+// platform for an equivalent test to exercise.
+#if os(macOS)
 import XCTest
 @testable import AIChalkboardCore
 
@@ -99,3 +112,4 @@ final class ScreenCaptureProviderTests: XCTestCase {
         XCTAssertTrue(scope.note.contains("executable path"))
     }
 }
+#endif

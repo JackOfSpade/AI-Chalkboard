@@ -1,6 +1,17 @@
 import Foundation
+#if os(macOS)
 import AppKit
 import Darwin
+#endif
+// Nothing below this line needs AppKit or Darwin directly (both imports
+// above exist only because macOS's `OverlayWindowController`/process-
+// identity calls used to require them transitively); everything in this
+// file is policy over `SuspensionLeaseStorage` (which has its own
+// `#if os(macOS)/#elseif os(Windows)` split) plus plain Foundation types, so
+// it is single-sourced across both platforms rather than duplicated into two
+// `#if os(macOS)/#elseif os(Windows)` branches -- see the `pid_t` ->
+// `Int32` note on `OperationResult` below for the one type-level adjustment
+// that made that possible.
 
 /// Durable, cross-process source of truth for temporary overlay suspension.
 ///
@@ -35,9 +46,18 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         /// linearized registry snapshot, not proof that every peer has painted.
         public let peerPresentationSettled: Bool
         public let scope: String
-        public let candidatePIDs: [pid_t]
+        // `Int32`, not `pid_t`: `pid_t` is a Darwin-only typealias (itself
+        // just `Int32` under the hood) and this struct is shared, unmodified
+        // source between the macOS and Windows branches of
+        // `SuspensionQuiescence.swift`. Spelling the field as `Int32`
+        // directly is not a behavior or ABI change on macOS -- `pid_t` IS
+        // `Int32`, not a distinct type Swift enforces separately -- and it
+        // is also exactly the type `GetWindowThreadProcessId`'s `DWORD` out-
+        // parameter narrows to on the Windows branch (see that file), so one
+        // struct definition serves both platforms.
+        public let candidatePIDs: [Int32]
         public let candidatePIDsTruncated: Bool
-        public let visibleOwnerPIDs: [pid_t]
+        public let visibleOwnerPIDs: [Int32]
         public let visibleWindowNumbers: [Int]
         public let discoveryErrors: [String]
     }
@@ -282,8 +302,12 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     /// so the caller can order every local overlay out before returning.
     @discardableResult
     public func withPresentationPermit(_ body: (Snapshot) -> Void) -> Snapshot {
-        precondition(Thread.isMainThread,
-                     "Presentation permits must run on the AppKit main thread")
+        // `MainThread.isCurrentUIThread`, NOT `Thread.isMainThread`: on Windows
+        // the overlay's windows are owned by a dedicated Win32 message-loop
+        // thread, not the process main thread, so the literal main-thread test
+        // fails there for correctly-dispatched work. See MainThread.
+        precondition(MainThread.isCurrentUIThread,
+                     "Presentation permits must run on the platform UI thread (AppKit main thread on macOS, the Win32 message-loop thread on Windows)")
 
         // `refreshViewsNow` can be reached reentrantly by an AppKit update
         // while the outer permit is refreshing a view.  A second `flock` on a

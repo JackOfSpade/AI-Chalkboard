@@ -1,4 +1,7 @@
+import Foundation
+#if os(macOS)
 import CoreGraphics
+#endif
 import XCTest
 @testable import AIChalkboardCore
 
@@ -28,7 +31,7 @@ final class MCPShapeGeometryTests: XCTestCase {
     /// (curve extrema included, not just control points) -- the same
     /// entry point `SVGPathParserTests` uses.
     private func boundingBox(of pathData: String) throws -> CGRect {
-        try SVGPathParser.parse(pathData).boundingBoxOfPath
+        try SVGPathParser.parse(pathData).bounds
     }
 
     private func makeShapeOutcome(

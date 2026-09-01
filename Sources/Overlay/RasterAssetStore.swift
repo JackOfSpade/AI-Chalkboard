@@ -1,6 +1,10 @@
+#if os(macOS)
 import AppKit
-import Foundation
 import ImageIO
+#elseif os(Windows)
+import CChalkboardWin
+#endif
+import Foundation
 
 /// A path-free description of a raster image retained by `RasterAssetStore`.
 ///
@@ -42,6 +46,12 @@ public struct RasterAssetHandle: Equatable, Sendable {
     }
 }
 
+/// Platform-neutral. Every case here is reachable on macOS exactly as
+/// before; `.unsupportedFormatOnSystem` and `.decodingUnavailable` are
+/// reachable ONLY from the Windows `decode(path:)` branch below (WIC can
+/// report failure classes ImageIO has no equivalent for -- see that branch's
+/// doc comment) and are simply never thrown on macOS, so adding them here
+/// changes nothing about macOS's existing error surface.
 public enum RasterAssetStoreError: LocalizedError, Equatable {
     case invalidPath
     case unreadableFile
@@ -49,6 +59,22 @@ public enum RasterAssetStoreError: LocalizedError, Equatable {
     case imageTooLarge
     case invalidDimensions
     case storeCapacityExceeded
+    /// WINDOWS ONLY: the Windows Imaging Component has no decoder installed
+    /// for this file's container format on this machine. The common
+    /// real-world case is HEIC/HEIF without Microsoft's "HEIF Image
+    /// Extensions" installed from the Microsoft Store -- kept distinct from
+    /// `.unsupportedImage` because the fix ("install a codec") is completely
+    /// different from "this file is malformed", and collapsing the two would
+    /// send a user to re-export a file that was never the problem. See
+    /// `CHALK_ERR_UNSUPPORTED_FORMAT` in chalkboard_win.h.
+    case unsupportedFormatOnSystem
+    /// WINDOWS ONLY: WIC itself could not be initialized, or a heap/COM
+    /// allocation failed while decoding -- a systemic failure of the decoder
+    /// subsystem, not a statement about this particular file. Kept distinct
+    /// from `.unsupportedImage` for the same reason `.unsupportedFormatOnSystem`
+    /// is: the two need different responses from a caller (retry / restart
+    /// AI Chalkboard, versus fix or replace the file).
+    case decodingUnavailable
 
     public var errorDescription: String? {
         switch self {
@@ -64,6 +90,10 @@ public enum RasterAssetStoreError: LocalizedError, Equatable {
             return "The image has invalid decoded pixel dimensions."
         case .storeCapacityExceeded:
             return "The retained raster-image budget is full. Clear existing image annotations before adding more."
+        case .unsupportedFormatOnSystem:
+            return "Windows has no image decoder installed for this file's format. This is the common outcome for HEIC/HEIF files when the Microsoft \"HEIF Image Extensions\" are not installed from the Microsoft Store. Install the codec, or convert/re-export the image to PNG, JPEG, TIFF, or BMP, then retry."
+        case .decodingUnavailable:
+            return "The Windows image decoder could not decode this image because of a system-level failure (decoder initialization or a memory allocation failure), not a problem with the file itself. Retry, or restart AI Chalkboard if the failure persists."
         }
     }
 }
@@ -78,6 +108,19 @@ public enum RasterAssetStoreError: LocalizedError, Equatable {
 /// The store serializes its small dictionary with an `NSLock`.  Decoding is
 /// done before taking that lock, so a slow image read never blocks drawing a
 /// previously loaded asset.
+///
+/// PLATFORM SPLIT: the budget accounting below (per-image size/dimension
+/// limits, the aggregate asset-count/byte budget, the lease mechanism, batch
+/// rollback via `remove`/`removeAll`) is pure policy over `Int`/`UInt64`
+/// values and stays a SINGLE, unduplicated implementation on both platforms.
+/// Only `decode(path:)` (what actually turns bytes on disk into pixels) and
+/// `StoredAsset`'s image field are platform-specific: macOS decodes via
+/// ImageIO into a `CGImage`/`NSImage` pair, Windows decodes via
+/// `WindowsRasterImage` (WIC, through the `CChalkboardWin` shim). Every
+/// limit and every rejection reason a caller can observe is identical
+/// between the two, except where this file documents an honest, Windows-only
+/// addition (`.unsupportedFormatOnSystem`, `.decodingUnavailable`) -- see
+/// `RasterAssetStoreError`'s doc comment above.
 public final class RasterAssetStore: @unchecked Sendable {
     public static let shared = RasterAssetStore()
 
@@ -95,9 +138,13 @@ public final class RasterAssetStore: @unchecked Sendable {
 
     private struct StoredAsset {
         let descriptor: RasterAssetHandle
+        let decodedByteCount: UInt64
+        #if os(macOS)
         let cgImage: CGImage
         let nsImage: NSImage
-        let decodedByteCount: UInt64
+        #elseif os(Windows)
+        let windowsImage: WindowsRasterImage
+        #endif
     }
 
     /// A strong, immutable snapshot of one or more decoded assets.  Holding a
@@ -107,6 +154,7 @@ public final class RasterAssetStore: @unchecked Sendable {
     /// The lease deliberately exposes only images by opaque id; source paths
     /// and store mutation remain unavailable to rendering code.
     public final class Lease: @unchecked Sendable {
+        #if os(macOS)
         private let images: [String: NSImage]
 
         fileprivate init(images: [String: NSImage]) {
@@ -116,6 +164,22 @@ public final class RasterAssetStore: @unchecked Sendable {
         public func image(id: String) -> NSImage? {
             images[id]
         }
+        #elseif os(Windows)
+        private let images: [String: WindowsRasterImage]
+
+        fileprivate init(images: [String: WindowsRasterImage]) {
+            self.images = images
+        }
+
+        /// Mirrors macOS's `image(id:)` spelling, but returns
+        /// `WindowsRasterImage` -- which, unlike `NSImage`, already conforms
+        /// to `RasterImageHandle` on its own, so a Windows call site never
+        /// needs the `NSImageRasterHandle`-style wrapping step macOS's
+        /// `.map(NSImageRasterHandle.init)` call sites use.
+        public func image(id: String) -> WindowsRasterImage? {
+            images[id]
+        }
+        #endif
     }
 
     private let lock = NSLock()
@@ -146,36 +210,59 @@ public final class RasterAssetStore: @unchecked Sendable {
     /// is never stored or returned.
     @discardableResult
     public func load(path: String) throws -> RasterAssetHandle {
+        #if os(macOS)
         let image = try decode(path: path)
         let descriptor = RasterAssetHandle(
             id: UUID().uuidString,
             widthPx: image.width,
             heightPx: image.height
         )
-        let stored = StoredAsset(
+        return try retain(StoredAsset(
             descriptor: descriptor,
+            decodedByteCount: descriptor.decodedByteCount,
             cgImage: image,
             nsImage: NSImage(
                 cgImage: image,
                 size: NSSize(width: image.width, height: image.height)
-            ),
-            decodedByteCount: descriptor.decodedByteCount
+            )
+        ))
+        #elseif os(Windows)
+        let image = try decode(path: path)
+        let descriptor = RasterAssetHandle(
+            id: UUID().uuidString,
+            widthPx: image.pixelWidth,
+            heightPx: image.pixelHeight
         )
+        return try retain(StoredAsset(
+            descriptor: descriptor,
+            decodedByteCount: descriptor.decodedByteCount,
+            windowsImage: image
+        ))
+        #endif
+    }
 
+    /// Applies the aggregate store budget (asset count + total decoded bytes)
+    /// to an already-decoded, already-validated `StoredAsset` and inserts it
+    /// on success. This is the SHARED half of `load(path:)` described in the
+    /// class doc comment: identical guard, identical lock discipline,
+    /// identical error on both platforms -- only what got decoded into
+    /// `stored` differs, and this method never looks at that.
+    private func retain(_ stored: StoredAsset) throws -> RasterAssetHandle {
         let retained = withLock {
             guard assets.count < maxStoredAssets,
                   retainedDecodedBytes <= maxTotalDecodedBytes,
                   stored.decodedByteCount <= maxTotalDecodedBytes - retainedDecodedBytes else {
                 return false
             }
-            assets[descriptor.id] = stored
+            assets[stored.descriptor.id] = stored
             retainedDecodedBytes += stored.decodedByteCount
             return true
         }
         guard retained else { throw RasterAssetStoreError.storeCapacityExceeded }
-        return descriptor
+        return stored.descriptor
     }
 
+    #if os(macOS)
     /// Returns the retained image for Core Graphics drawing, if it exists.
     /// `CGImage` is immutable, so sharing this retained reference is safe.
     public func cgImage(for id: String) -> CGImage? {
@@ -194,6 +281,16 @@ public final class RasterAssetStore: @unchecked Sendable {
     public func image(id: String) -> NSImage? {
         nsImage(for: id)
     }
+    #elseif os(Windows)
+    /// The compact drawing-facing spelling: fetch the retained decoded image
+    /// by its opaque handle id. Mirrors macOS's `image(id:)` -- the store
+    /// retains one reference from `load(path:)` until the matching
+    /// `release(id:)` -- but returns `WindowsRasterImage` (already a
+    /// `RasterImageHandle`) rather than a bare platform image type.
+    public func image(id: String) -> WindowsRasterImage? {
+        withLock { assets[id]?.windowsImage }
+    }
+    #endif
 
     /// Atomically snapshots the requested images into a lease.  A later
     /// release removes the store's ownership but cannot invalidate the
@@ -208,7 +305,11 @@ public final class RasterAssetStore: @unchecked Sendable {
                     snapshot[id] = asset
                 }
             }
+            #if os(macOS)
             return Lease(images: snapshot.mapValues(\.nsImage))
+            #elseif os(Windows)
+            return Lease(images: snapshot.mapValues(\.windowsImage))
+            #endif
         }
     }
 
@@ -253,6 +354,7 @@ public final class RasterAssetStore: @unchecked Sendable {
         withLock { retainedDecodedBytes }
     }
 
+    #if os(macOS)
     private func decode(path: String) throws -> CGImage {
         // Open once, validate that opened descriptor, then decode the exact
         // bounded byte snapshot read from it.  This avoids validating one
@@ -286,7 +388,64 @@ public final class RasterAssetStore: @unchecked Sendable {
         try validate(width: decodedImage.width, height: decodedImage.height)
         return try materialize(decodedImage)
     }
+    #elseif os(Windows)
+    /// WINDOWS NOTE, READ BEFORE CHANGING: this is NOT a line-for-line port of
+    /// the macOS branch above, because `chalk_image_decode_file` (the only
+    /// decode entry point `CChalkboardWin` exposes -- see chalkboard_win.h
+    /// Section 2) takes a PATH, not an in-memory buffer; there is no
+    /// decode-from-bytes call to hand pre-validated bytes to the way
+    /// `CGImageSourceCreateWithData` lets the macOS branch do. Two real
+    /// consequences follow, both recorded precisely rather than silently
+    /// smoothed over:
+    ///
+    /// 1. TOCTOU: `BoundedLocalFile.read` below opens ITS OWN handle to
+    ///    validate the path and the input-size cap (matching macOS's
+    ///    behavior exactly), then `WindowsRasterImage.decode(path:)` has WIC
+    ///    open the SAME path again to actually decode it. macOS's decode
+    ///    reads bytes once, from one already-open, already-validated
+    ///    descriptor, and hands those exact bytes to ImageIO -- no second
+    ///    open, no gap. On Windows the file could theoretically be replaced
+    ///    between these two opens. `BoundedLocalFile.read`'s own TOCTOU
+    ///    defenses (O_NOFOLLOW-equivalent reparse-point rejection, a
+    ///    trailing-byte grow check) still apply to ITS open, but they cannot
+    ///    reach into WIC's separate one.
+    /// 2. NO PRE-DECODE METADATA CHECK: macOS validates declared width/height
+    ///    from image METADATA before ever asking ImageIO to fully decode
+    ///    pixels -- an early rejection of an obvious image bomb that never
+    ///    materializes its pixels at all. `chalk_image_decode_file` exposes
+    ///    no metadata-only probe (only a single call that decodes and
+    ///    returns final dimensions together), so on Windows the size/dimension
+    ///    cap in `validate(width:height:)` can only be applied AFTER WIC has
+    ///    already fully decoded the image -- the decode itself always runs to
+    ///    completion first. The aggregate store budget in `retain(_:)` is
+    ///    unaffected (that check is timing-independent), but a single
+    ///    maliciously huge file costs one real WIC decode on Windows that
+    ///    macOS's metadata pre-check can sometimes avoid.
+    private func decode(path: String) throws -> WindowsRasterImage {
+        do {
+            _ = try BoundedLocalFile.read(path: path, maxBytes: maxInputFileBytes)
+        } catch BoundedLocalFileError.invalidPath {
+            throw RasterAssetStoreError.invalidPath
+        } catch {
+            throw RasterAssetStoreError.unreadableFile
+        }
 
+        let decoded: WindowsRasterImage
+        do {
+            decoded = try WindowsRasterImage.decode(path: path)
+        } catch let error as WindowsRasterImageError {
+            throw RasterAssetStoreError(windowsDecodeError: error)
+        } catch {
+            throw RasterAssetStoreError.decodingUnavailable
+        }
+
+        try validate(width: decoded.pixelWidth, height: decoded.pixelHeight)
+        return decoded
+    }
+    #endif
+
+    /// Platform-neutral: both branches' `decode(path:)` call this with the
+    /// same declared-or-actual pixel dimensions and the same limits.
     private func validate(width: Int, height: Int) throws {
         guard width > 0, height > 0 else {
             throw RasterAssetStoreError.invalidDimensions
@@ -298,6 +457,7 @@ public final class RasterAssetStore: @unchecked Sendable {
         }
     }
 
+    #if os(macOS)
     /// Detaches the retained asset from ImageIO's file-backed provider.  This
     /// both guarantees that loading has finished before `load` returns and
     /// means the store retains pixels only -- never the caller's source URL.
@@ -320,6 +480,7 @@ public final class RasterAssetStore: @unchecked Sendable {
         }
         return materialized
     }
+    #endif
 
     private func withLock<T>(_ body: () -> T) -> T {
         lock.lock()
@@ -327,10 +488,45 @@ public final class RasterAssetStore: @unchecked Sendable {
         return body()
     }
 
+    #if os(macOS)
     private static let supportedTypeIdentifiers: Set<String> = [
         "public.png",
         "public.jpeg",
         "public.heic",
         "public.tiff"
     ]
+    #endif
 }
+
+#if os(Windows)
+private extension RasterAssetStoreError {
+    /// Maps a `WindowsRasterImage.decode(path:)` failure to the closest
+    /// honest `RasterAssetStoreError`. `.decodeFailed` maps to
+    /// `.unsupportedImage` deliberately, not approximately: macOS's own
+    /// `decode(path:)` above already throws that SAME case both when
+    /// `CGImageSourceGetCount` rejects a multi-frame file and when
+    /// `CGImageSourceCreateImageAtIndex` fails on a corrupt one -- i.e.
+    /// "recognized container, pixels could not be decoded" is exactly what
+    /// `.unsupportedImage` has always meant on macOS, so this is a faithful
+    /// match, not a stretch.
+    init(windowsDecodeError: WindowsRasterImageError) {
+        switch windowsDecodeError {
+        case .invalidArgument:
+            // Should not happen: `path` was already validated as an absolute
+            // Windows path by `BoundedLocalFile.read` immediately above this
+            // call. Kept mapped to `.invalidPath` rather than `.unknown` so a
+            // latent bug here still surfaces an actionable message instead of
+            // a bare status number.
+            self = .invalidPath
+        case .fileNotFound:
+            self = .unreadableFile
+        case .unsupportedFormat:
+            self = .unsupportedFormatOnSystem
+        case .decodeFailed:
+            self = .unsupportedImage
+        case .wicInitFailed, .outOfMemory, .unknown:
+            self = .decodingUnavailable
+        }
+    }
+}
+#endif

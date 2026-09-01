@@ -1,4 +1,6 @@
+#if os(macOS)
 import ApplicationServices
+#endif
 import XCTest
 @testable import AIChalkboardCore
 
@@ -39,6 +41,38 @@ final class AccessibilityElementResolverTests: XCTestCase {
         XCTAssertFalse(AccessibilityElementResolver.labelMatches("Color", query: "Fusion", mode: .contains))
     }
 
+    // Windows-only note: every test below through
+    // `testZeroOriginAnchorIsUsedEvenWhenItIsNeitherScreensFirstNorIsMain`
+    // encodes macOS-specific coordinate-space semantics that do not hold on
+    // Windows, confirmed by actually running this suite on Windows (all
+    // five failed with wrong numbers/unexpected nils before this guard was
+    // added, not merely a hypothesized difference):
+    //   * macOS AX reports element frames in POINTS, which `backingRect`
+    //     must multiply by `backingScaleFactor` to reach physical backing
+    //     pixels -- these fixtures build a `scale: 2` screen and an AX
+    //     frame in points specifically to exercise that multiply. Windows
+    //     UI Automation reports `BoundingRectangle` directly in PHYSICAL
+    //     pixels already (Per-Monitor-v2 DPI awareness -- see
+    //     `ScreenSnapshot.swift`'s Windows `buildScreenInfos()` doc
+    //     comment), so the Windows `backingRect` deliberately does NOT
+    //     multiply by scale (see that method's Windows doc comment) --
+    //     applying these macOS fixtures' point-based expectations there
+    //     would silently double the reported position/size.
+    //   * macOS's conversion anchors to whichever display sits at AppKit
+    //     global (0, 0) specifically because AX's own global coordinate
+    //     space is anchored there too (a quirk of AppKit's bottom-left,
+    //     Y-up screen model) -- see `testConversionAnchorsToZeroOriginDisplayNotTheFocusedMainScreen`/
+    //     `testMissingZeroOriginDisplayReturnsNilInsteadOfAnchoringToAnArbitraryScreen`/
+    //     `testZeroOriginAnchorIsUsedEvenWhenItIsNeitherScreensFirstNorIsMain`.
+    //     Windows UI Automation and `GetMonitorInfoW` already share ONE
+    //     common top-left-origin virtual-desktop space with no equivalent
+    //     quirk to correct for, so the Windows `backingRect` does a plain
+    //     per-screen origin subtraction with no "hunt for the zero-origin
+    //     anchor display" step at all (see that method's Windows doc
+    //     comment) -- there is no anchor-display invariant for these tests'
+    //     "missing anchor" / "anchor is not first/main" scenarios to
+    //     exercise there.
+    #if os(macOS)
     func testPrimaryDisplayAccessibilityFrameConvertsToLocalBackingPixels() throws {
         let primary = screen(
             id: "main",
@@ -160,6 +194,7 @@ final class AccessibilityElementResolverTests: XCTestCase {
         XCTAssertEqual(result.width, 240)
         XCTAssertEqual(result.height, 60)
     }
+    #endif
 
     func testFrameStraddlingDisplaysIsRejectedRatherThanSilentlyClipped() {
         let left = screen(id: "left", appKitFrame: ScreenCoordinateRect(x: -1_000, y: 0, width: 1_000, height: 800), scale: 1)
@@ -178,6 +213,18 @@ final class AccessibilityElementResolverTests: XCTestCase {
         ))
     }
 
+    // Windows-only note: `traversalDeadlineExceeded`/`initialElements`/
+    // `boundedAppendCount`/`isTransientAXFailure`/`resolveInitialElements`
+    // (and the `AXError`/`AttributeFetch<Element>` types they use) are all
+    // internal helpers of macOS's AXUIElement-based breadth-first walk, with
+    // no declared counterpart in the Windows branch at all -- the Windows
+    // resolver's traversal happens inside the C++ shim's own manual walk
+    // (`chalk_uia.cpp`), opaque to Swift, so there is nothing here to unit
+    // test on that platform. Every test below through
+    // `testResolveInitialElementsThrowsBusyWhenChildrenTimesOutEvenIfWindowsAnsweredDefinitivelyEmpty`
+    // that depends on one of these symbols is guarded macOS-only for that
+    // reason; see each guard for the specific symbol.
+    #if os(macOS)
     func testTraversalDeadlineUsesMonotonicElapsedTime() {
         XCTAssertFalse(AccessibilityElementResolver.traversalDeadlineExceeded(
             startedAt: 100, now: 101.999, timeout: 2
@@ -221,6 +268,7 @@ final class AccessibilityElementResolverTests: XCTestCase {
             0
         )
     }
+    #endif
 
     // MARK: - AccessibilityElementResolverError.applicationBusy (item 8)
 
@@ -236,6 +284,14 @@ final class AccessibilityElementResolverTests: XCTestCase {
         )
     }
 
+    // Windows-only note: this test asserts exact macOS wording fragments
+    // ("not a missing Accessibility implementation") against `applicationBusy`'s
+    // `errorDescription`. The Windows branch's own `applicationBusy` message
+    // makes the identical no-missing-implementation, retry-worthy point but
+    // in different words ("not a missing UI Automation implementation") --
+    // see that case's Windows doc comment -- so this exact-phrase assertion
+    // does not carry over; a Windows-worded equivalent is not written here.
+    #if os(macOS)
     func testApplicationBusyMessageDoesNotClaimTheAppLacksAccessibilityMetadata() throws {
         // THE bug `applicationBusy` exists to fix: a timed-out top-level AX
         // fetch used to be reported as `applicationUnavailable`, whose
@@ -256,6 +312,7 @@ final class AccessibilityElementResolverTests: XCTestCase {
         XCTAssertTrue(message.localizedCaseInsensitiveContains("transient"))
         XCTAssertTrue(message.localizedCaseInsensitiveContains("retry"))
     }
+    #endif
 
     // MARK: - AccessibilityElementResolverError.noMatches exposed-sample preview (item 9)
 
@@ -263,6 +320,15 @@ final class AccessibilityElementResolverTests: XCTestCase {
         AccessibilityElementCandidate(matchedAttribute: "AXTitle", matchedLabel: label, role: role)
     }
 
+    // Windows-only note: every test below through
+    // `testNoMatchesPreviewFallsBackToUnknownRoleWhenRoleIsNil` asserts the
+    // exact macOS `.noMatches` wording ("...to macOS Accessibility.",
+    // "Labels that ARE exposed here..."). The Windows branch's `.noMatches`
+    // case carries the same sample-ranking behavior but different wording
+    // ("...to Windows UI Automation.", "Names that ARE exposed here...") --
+    // see that case's Windows doc comment -- so these exact-string
+    // assertions are macOS-specific.
+    #if os(macOS)
     func testNoMatchesWithEmptySampleKeepsTheOriginalSentenceVerbatim() {
         XCTAssertEqual(
             AccessibilityElementResolverError.noMatches(label: "Foo", role: nil, exposedSample: []).errorDescription,
@@ -318,9 +384,14 @@ final class AccessibilityElementResolverTests: XCTestCase {
         )
         XCTAssertTrue(message.contains("'NoRole' [unknown role]"), "expected in: \(message)")
     }
+    #endif
 
     // MARK: - AccessibilityElementResolver.isTransientAXFailure (item 10)
 
+    // Windows-only note: `isTransientAXFailure`/`AXError` are macOS-only
+    // (see the guard at `testTraversalDeadlineUsesMonotonicElapsedTime`
+    // above for why).
+    #if os(macOS)
     func testTransientAXFailureClassificationPinsEveryCase() {
         // The measured-bug cases: the call could not get an answer, and a
         // retry may well succeed. `.cannotComplete` is the code Apple
@@ -350,8 +421,13 @@ final class AccessibilityElementResolverTests: XCTestCase {
         XCTAssertFalse(AccessibilityElementResolver.isTransientAXFailure(.illegalArgument))
         XCTAssertFalse(AccessibilityElementResolver.isTransientAXFailure(.apiDisabled))
     }
+    #endif
 
     // MARK: - AccessibilityElementResolver.resolveInitialElements (item 10)
+    // Windows-only note: `resolveInitialElements`/`AttributeFetch<Element>`
+    // are macOS-only (see the guard at
+    // `testTraversalDeadlineUsesMonotonicElapsedTime` above for why).
+    #if os(macOS)
 
     private typealias Fetch = AccessibilityElementResolver.AttributeFetch<Int>
 
@@ -449,6 +525,7 @@ final class AccessibilityElementResolverTests: XCTestCase {
             XCTAssertEqual(error as? AccessibilityElementResolverError, .applicationBusy)
         }
     }
+    #endif
 
     // MARK: - AccessibilityElementResolverError.matchesHaveNoUsableFrame
     //
@@ -485,6 +562,9 @@ final class AccessibilityElementResolverTests: XCTestCase {
         XCTAssertNotEqual(framelessMessage, noMatchesMessage)
     }
 
+    // Windows-only note: exact macOS `.noMatches` wording -- see the guard
+    // above `testNoMatchesWithEmptySampleKeepsTheOriginalSentenceVerbatim`.
+    #if os(macOS)
     func testNoMatchesIsStillThrownWithItsExposedSampleWhenNothingMatchedAtAll() throws {
         // Confirms the ordinary "the label was never seen" path is untouched
         // by the frame-usability split above: `.noMatches` keeps reporting
@@ -499,6 +579,7 @@ final class AccessibilityElementResolverTests: XCTestCase {
                 + "'Tracking Panel' [AXGroup]. Retry with one of those labels (optionally adding a role) instead of falling back to screen coordinates."
         )
     }
+    #endif
 
     // MARK: - AccessibilityElementResolverError.occurrenceOutOfRange framelessMatchCount
 
@@ -514,6 +595,12 @@ final class AccessibilityElementResolverTests: XCTestCase {
         )
     }
 
+    // Windows-only note: this asserts the exact macOS frameless-note wording
+    // ("matched the label", "no usable screen frame (no AXPosition/AXSize)").
+    // The Windows branch's `occurrenceOutOfRange` frameless note makes the
+    // identical point in different words ("matched the name", "no usable
+    // bounding rectangle") -- see that case's Windows doc comment.
+    #if os(macOS)
     func testOccurrenceOutOfRangeWithFramelessMatchesAppendsHowManyWereSkipped() {
         XCTAssertEqual(
             AccessibilityElementResolverError.occurrenceOutOfRange(
@@ -524,6 +611,7 @@ final class AccessibilityElementResolverTests: XCTestCase {
                 + " (no AXPosition/AXSize), so they could not be assigned an occurrence."
         )
     }
+    #endif
 
     // MARK: - Traversal error messages name `occurrence` as the escape hatch first
 
@@ -540,6 +628,15 @@ final class AccessibilityElementResolverTests: XCTestCase {
         XCTAssertTrue(message.localizedCaseInsensitiveContains("screenshot"))
     }
 
+    // Windows-only note: `AccessibilityElementResolverError.traversalTimedOut`
+    // has no case on Windows at all -- `CHALK_ERR_UIA_RETRYABLE_TIMEOUT`
+    // (a per-call COM RPC timeout) maps to `.applicationBusy` instead, and
+    // the Windows shim's own overall traversal deadline is enforced
+    // C++-side inside `chalk_uia_find_element`, surfaced (if ever hit) as
+    // `.traversalLimitReached` there being the only node/time-budget
+    // exhaustion case exposed to Swift. This test and the one below it both
+    // reference `.traversalTimedOut` directly, so both are macOS-only.
+    #if os(macOS)
     func testTraversalTimedOutNamesOccurrenceBeforeRaisingTimeoutSecondsAndKeepsTheScreenshotFallback() throws {
         let message = try XCTUnwrap(AccessibilityElementResolverError.traversalTimedOut(seconds: 2.0).errorDescription)
         XCTAssertTrue(message.contains("occurrence: 1"), "expected the concrete occurrence example in: \(message)")
@@ -564,6 +661,7 @@ final class AccessibilityElementResolverTests: XCTestCase {
         XCTAssertTrue(limitMessage.contains(fallbackSentence), "missing verbatim fallback sentence in: \(limitMessage)")
         XCTAssertTrue(timeoutMessage.contains(fallbackSentence), "missing verbatim fallback sentence in: \(timeoutMessage)")
     }
+    #endif
 
     // MARK: - AccessibilityElementResolver.backingRect frame-usability edge cases (isUsable)
     //

@@ -3,11 +3,42 @@ import XCTest
 @testable import AIChalkboardCore
 
 final class SuspensionLeaseCoordinatorTests: XCTestCase {
+    /// `SuspensionLeaseCoordinator.withPresentationPermit(_:)` preconditions
+    /// on `MainThread.isCurrentUIThread` (see that method's doc comment):
+    /// production code only ever reaches it from the platform's real UI
+    /// thread. On macOS that thread genuinely is the process's main thread,
+    /// which is also the thread XCTest runs test methods on by default, so
+    /// a test can call it directly. On Windows the UI thread is
+    /// `WindowsUIThread` -- a dedicated thread distinct from whatever thread
+    /// runs the test -- so calling `withPresentationPermit` directly from a
+    /// test body trips the precondition and crashes the whole test process
+    /// (confirmed: this is exactly what happened before this helper was
+    /// added). This runs `body` on the real Windows UI thread to match what
+    /// a production caller (e.g. `OverlayWindowController`'s Windows
+    /// `setAnnotationsSuspended`) actually does; on macOS it is a no-op
+    /// pass-through since the test is already on the right thread.
+    private func runOnPlatformUIThread<T>(_ body: () -> T) -> T {
+        #if os(macOS)
+        return body()
+        #elseif os(Windows)
+        WindowsUIThread.shared.start()
+        return WindowsUIThread.shared.sync(body)
+        #endif
+    }
+
     private func withTemporaryCoordinator(_ body: (SuspensionLeaseCoordinator, URL) throws -> Void) throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AIChalkboardLeaseCoordinatorTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // Windows has no POSIX mode bits: the Windows storage layer hardens
+        // this directory by owner SID rather than by 0o700 (see
+        // SuspensionLeaseStorage.swift's `validateOwnerIsCurrentUser` for
+        // what that does and does not prove), and a freshly created temp
+        // directory is already owned by the current user, so there is
+        // nothing to set here on that platform.
+        #if os(macOS)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
         defer { try? FileManager.default.removeItem(at: directory) }
         try body(SuspensionLeaseCoordinator(storageDirectory: directory), directory)
     }
@@ -54,6 +85,13 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         }
     }
 
+    // Windows has no POSIX mode bits, so there is no Windows analogue of
+    // "repair a pre-existing 0o755 directory to 0o700" -- the equivalent
+    // Windows hardening is ownership (SID), not mode, and is exercised by
+    // the cross-platform tests above/below instead. See
+    // SuspensionLeaseStorage.swift's `validateOwnerIsCurrentUser` doc
+    // comment for what the Windows ownership check does and does not prove.
+    #if os(macOS)
     func testBootstrapSecuresPreexistingNonWritableSupportDirectory() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AIChalkboardLeaseCoordinatorLegacyModeTests-\(UUID().uuidString)", isDirectory: true)
@@ -89,6 +127,7 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         XCTAssertTrue(bootstrap.annotationsSuspended)
         XCTAssertNotNil(bootstrap.error)
     }
+    #endif
 
     func testExpiryCreatesTombstoneAndCannotLeaveLeaseSuspended() throws {
         try withTemporaryCoordinator { coordinator, _ in
@@ -156,6 +195,18 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         }
     }
 
+    // Symbolic-link creation on Windows requires either Developer Mode or an
+    // elevated/SeCreateSymbolicLinkPrivilege process, neither of which a
+    // normal CI/test run can assume, so this test's symlink-swap scenario
+    // is macOS-only. The Windows storage layer applies the equivalent
+    // FILE_FLAG_OPEN_REPARSE_POINT ("this platform's O_NOFOLLOW") defense to
+    // both the directory and the lock/state files -- see
+    // SuspensionLeaseStorage.swift's `openSecureDirectory()` and
+    // `openValidatedRegularFile()` doc comments -- but it is not exercised
+    // by an automated test here. The hard-linked-replacement half of this
+    // same defense-in-depth IS covered cross-platform, by
+    // `testHardLinkedReplacementLockFailsClosed` below.
+    #if os(macOS)
     func testUnsafeCoordinatorDirectoryAndLockFilesFailClosed() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AIChalkboardLeaseCoordinatorUnsafeTests-\(UUID().uuidString)", isDirectory: true)
@@ -180,13 +231,36 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         XCTAssertTrue(symlinkLock.annotationsSuspended)
         XCTAssertNotNil(symlinkLock.error)
     }
+    #endif
 
+    // Hard links (unlike symlinks) need no elevated privilege to create on
+    // NTFS, and Windows exposes the same link-count concept POSIX does
+    // (`BY_HANDLE_FILE_INFORMATION.nNumberOfLinks`, the analogue of
+    // `st_nlink`), so this test's coverage carries over unchanged -- see
+    // SuspensionLeaseStorage.swift's `openValidatedRegularFile()` and
+    // `validateHeldLock()`.
+    //
+    // WINDOWS NOTE, discovered by actually running this test: on this
+    // toolchain, `FileManager.linkItem(at:to:)` on Windows fails with the
+    // exact same `ERROR_PRIVILEGE_NOT_HELD` (Win32 error 1314) this file's
+    // `testUnsafeCoordinatorDirectoryAndLockFilesFailClosed` symlink case
+    // hits on a machine without Developer Mode/elevation, matching
+    // `InstanceLockTests.testReparsePointLockPathCannotLockItsTarget`'s
+    // already-established skip pattern for the identical underlying
+    // limitation. This is an environment/toolchain limitation of creating
+    // the fixture, not a defect in `validateHeldLock()`'s own hard-link
+    // rejection logic (untouched, still exercised whenever the fixture can
+    // actually be created).
     func testHardLinkedReplacementLockFailsClosed() throws {
         try withTemporaryCoordinator { _, directory in
             let source = directory.appendingPathComponent("replacement-source")
             let lock = directory.appendingPathComponent("annotations-suspension-v3.lock")
             try Data("ordinary file".utf8).write(to: source)
-            try FileManager.default.linkItem(at: source, to: lock)
+            do {
+                try FileManager.default.linkItem(at: source, to: lock)
+            } catch {
+                throw XCTSkip("Creating a hard link requires Developer Mode or elevation on this machine (\(error)); cannot exercise the replaced-lock path here.")
+            }
 
             let snapshot = SuspensionLeaseCoordinator(storageDirectory: directory).bootstrapAndReconcile()
             XCTAssertFalse(snapshot.isBootstrapped)
@@ -388,7 +462,9 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AIChalkboardPermitRaceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let presenter = SuspensionLeaseCoordinator(storageDirectory: directory, instanceNonce: "presenter")
@@ -405,7 +481,7 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         let resultLock = NSLock()
         var acquired: SuspensionLeaseOperationResult?
 
-        let firstPermit = presenter.withPresentationPermit { snapshot in
+        let firstPermit = runOnPlatformUIThread { presenter.withPresentationPermit { snapshot in
             XCTAssertFalse(snapshot.annotationsSuspended)
             DispatchQueue.global().async {
                 acquireStarted.signal()
@@ -419,7 +495,7 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
             // until this closure completes, because the permit still owns the
             // exact same flock used by mutation persistence.
             XCTAssertEqual(acquireReachedCommit.wait(timeout: .now() + 0.15), .timedOut)
-        }
+        } }
         XCTAssertFalse(firstPermit.annotationsSuspended)
 
         wait(for: [acquireFinished], timeout: 3)
@@ -428,7 +504,7 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         let token = try XCTUnwrap(result?.leaseToken)
 
         var nextPermit: SuspensionLeaseSnapshot?
-        _ = presenter.withPresentationPermit { nextPermit = $0 }
+        runOnPlatformUIThread { _ = presenter.withPresentationPermit { nextPermit = $0 } }
         XCTAssertTrue(nextPermit?.annotationsSuspended == true,
                       "the next permit must deny presentation after the acquire persisted")
         _ = acquirer.releaseLease(token: token)
@@ -438,7 +514,9 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AIChalkboardLeaseRaceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let firstCoordinator = SuspensionLeaseCoordinator(storageDirectory: directory, instanceNonce: "first")
@@ -478,7 +556,9 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AIChalkboardNonceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
         defer { try? FileManager.default.removeItem(at: directory) }
         let key = "a0b1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d"
         let owner = SuspensionLeaseCoordinator(storageDirectory: directory, instanceNonce: "owner")
@@ -497,14 +577,43 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         let directory = parent.appendingPathComponent("state", isDirectory: true)
         let moved = parent.appendingPathComponent("moved", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
         defer { try? FileManager.default.removeItem(at: parent) }
+        // Tracks whether the hook's swap actually took effect -- see the
+        // Windows-only skip check below, added after this test genuinely
+        // failed on Windows for a reason unrelated to `validateHeldLock`'s
+        // own logic (confirmed by direct instrumentation): `FileManager
+        // .moveItem` on this environment fails the directory move with
+        // `ERROR_ACCESS_DENIED` while this process still holds its own open
+        // directory/lock-file handles into it, so the swap this test relies
+        // on to exercise the fail-closed path never actually happens here,
+        // and the subsequent `createDirectory` then fails too
+        // (`ERROR_ALREADY_EXISTS`, since the original directory never
+        // moved). `validateHeldLock` cannot be "wrong" about a replacement
+        // that never occurred -- it correctly saw an unchanged identity and
+        // did not throw. On macOS this swap always succeeds (POSIX rename
+        // never cares about open handles), so `swapSucceeded` is written
+        // but never read there.
+        var swapSucceeded = true
         let coordinator = SuspensionLeaseCoordinator(storageDirectory: directory, storagePrecommitHook: {
-            try? FileManager.default.moveItem(at: directory, to: moved)
-            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            do {
+                try FileManager.default.moveItem(at: directory, to: moved)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            } catch {
+                swapSucceeded = false
+            }
+            #if os(macOS)
             try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            #endif
         })
         let result = coordinator.acquireLease(seconds: 60)
+        #if os(Windows)
+        guard swapSucceeded else {
+            throw XCTSkip("This environment does not allow replacing the storage directory while this process still holds its own directory/lock handles into it (FileManager.moveItem/createDirectory failed inside the precommit hook); cannot exercise the fail-closed directory-replacement path here.")
+        }
+        #endif
         XCTAssertFalse(result.success)
         XCTAssertTrue(result.annotationsSuspended)
         XCTAssertNotNil(result.error)

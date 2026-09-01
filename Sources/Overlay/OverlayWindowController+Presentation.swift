@@ -1,4 +1,5 @@
 import Foundation
+#if os(macOS)
 import AppKit
 
 extension OverlayWindowController {
@@ -377,3 +378,274 @@ extension OverlayWindowController {
         }
     }
 }
+
+#elseif os(Windows)
+import WinSDK
+
+extension OverlayWindowController {
+    /// Same contract as the macOS branch's identical property: a synchronous
+    /// query of state already in effect, not a pending mutation.
+    public var isAnnotationsSuspended: Bool {
+        WindowsUIThread.shared.sync { annotationsSuspended }
+    }
+
+    public var isCaptureVisible: Bool {
+        captureLock.lock(); defer { captureLock.unlock() }
+        return _captureVisible
+    }
+
+    /// Whether a newly (re)created window should be born with
+    /// `WDA_EXCLUDEFROMCAPTURE` applied -- the Windows analogue of the
+    /// macOS branch's `desiredSharingType`, so a `rebuildOverlayWindows()`
+    /// triggered by a display change does not silently revert the user's
+    /// capture-debug toggle.
+    var desiredExcludedFromCapture: Bool {
+        !isCaptureVisible
+    }
+
+    /// Turns capture-debug mode on/off across every overlay window by
+    /// calling `chalk_window_set_excluded_from_capture` live on each -- no
+    /// window teardown/recreation, mirroring the macOS branch's live
+    /// `sharingType` reassignment and for the same reason: rebuilding would
+    /// flicker every overlay and briefly drop annotations off screen on what
+    /// is meant to be an instant debugging toggle.
+    ///
+    /// UNLIKE macOS's three-state `NSWindow.SharingType` (`.none`/
+    /// `.readOnly`/`.readWrite`), `SetWindowDisplayAffinity` is BINARY:
+    /// excluded or not excluded. There is no Windows equivalent of
+    /// `.readOnly` vs `.readWrite`, and `WDA_EXCLUDEFROMCAPTURE` requires
+    /// Windows 10 version 2004 (build 19041) or later -- see
+    /// `chalk_window_set_excluded_from_capture`'s doc comment in
+    /// `chalkboard_win.h`. This is a real, honest reduction from the macOS
+    /// three-state contract, not a defect in this file.
+    @discardableResult
+    public func setCaptureVisible(_ visible: Bool) -> Bool {
+        WindowsUIThread.shared.sync {
+            captureLock.lock()
+            let changed = (_captureVisible != visible)
+            _captureVisible = visible
+            captureLock.unlock()
+
+            // Renewed on EVERY request for `true`, including a same-value
+            // renewal -- see the macOS branch's identical note on its own
+            // `scheduleCaptureAutoRevert` call for why this is not gated
+            // behind `changed`.
+            scheduleCaptureAutoRevert(visible: visible)
+
+            guard changed else { return changed }
+
+            let excluded = !visible
+            for window in overlayWindows {
+                window.setExcludedFromCapture(excluded)
+            }
+
+            // Synchronous with the exclusion-flag mutation, exactly like the
+            // macOS branch's `refreshViewsNow()` call here: a caller may
+            // safely inspect capture/debug state immediately after this
+            // method returns.
+            refreshViewsNow()
+
+            Logger.shared.log(
+                "OverlayWindowController: capture-debug request set to \(visible) (excludedFromCapture = \(excluded)) on \(overlayWindows.count) window reference(s), applied live without rebuilding.",
+                level: "INFO"
+            )
+
+            onCaptureVisibleChanged?(visible)
+            return changed
+        }
+    }
+
+    @discardableResult
+    public func setAnnotationsSuspended(_ suspended: Bool) -> Bool {
+        WindowsUIThread.shared.sync {
+            setAnnotationsSuspended(suspended, generation: annotationsSuspensionGeneration ?? 0)
+        }
+    }
+
+    /// Same generation-aware authority as the macOS branch's identical
+    /// method: the only source of truth is a generation read from the
+    /// durable suspension-lease registry (`SuspensionLeaseCoordinator`,
+    /// shared verbatim with macOS -- it is Foundation-level state, not
+    /// AppKit-bound), and a call carrying an older generation than the one
+    /// already applied is ignored so queue reordering can never resurrect an
+    /// overlay after a later suspension.
+    @discardableResult
+    public func setAnnotationsSuspended(_ suspended: Bool, generation: UInt64) -> Bool {
+        WindowsUIThread.shared.sync {
+            if let applied = annotationsSuspensionGeneration, generation < applied {
+                return false
+            }
+            annotationsSuspensionGeneration = generation
+            let changed = annotationsSuspended != suspended
+            annotationsSuspended = suspended
+
+            if suspended {
+                hideAllOverlayWindows()
+            } else {
+                refreshViewsNow()
+            }
+
+            Logger.shared.log(
+                "OverlayWindowController: applied durable annotations suspension generation=\(generation) suspended=\(suspended) on \(overlayWindows.count) overlay window reference(s).",
+                level: "INFO"
+            )
+            return changed
+        }
+    }
+
+    public func forceAnnotationsSuspendedFailClosed() {
+        WindowsUIThread.shared.sync {
+            annotationsSuspended = true
+            hideAllOverlayWindows()
+            Logger.shared.log("OverlayWindowController: suspension registry unavailable; hid overlays fail-closed.", level: "ERROR")
+        }
+    }
+
+    /// Invalidates any pending auto-revert work item and, if `visible` is
+    /// true, schedules a fresh one. See `captureAutoRevertWorkItem`'s doc
+    /// comment on `OverlayWindowController` for why a `DispatchWorkItem` on
+    /// a background queue -- not a `Timer` -- is the correct Windows
+    /// substitute for the macOS branch's `Timer`-based version.
+    private func scheduleCaptureAutoRevert(visible: Bool) {
+        captureAutoRevertWorkItem?.cancel()
+        captureAutoRevertWorkItem = nil
+
+        guard visible else { return }
+
+        let interval = Self.captureAutoRevertInterval
+        let item = DispatchWorkItem {
+            Logger.shared.log(
+                "OverlayWindowController: capture-debug mode auto-reverting to OFF after \(Int(interval))s with no renewal (call set_capture_visible(true) again if still debugging).",
+                level: "WARN"
+            )
+            InstanceBroadcast.shared.postSetCaptureVisible(false)
+        }
+        captureAutoRevertWorkItem = item
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + interval, execute: item)
+    }
+
+    /// Identical contract to the macOS branch's identically-named method --
+    /// see its doc comment for the full "what should currently be painted"
+    /// rationale, which is platform-independent (it bottoms out in
+    /// `AnnotationStore.isVisible(_:onScreen:forApp:)`, shared verbatim with
+    /// macOS).
+    public func currentlyVisibleAnnotations(forScreenId screenId: String) -> [Annotation] {
+        if isAnnotationsSuspended {
+            return []
+        }
+        if isCaptureVisible {
+            return AnnotationStore.shared.getForScreen(screenId)
+        }
+        return AnnotationStore.shared.getForScreen(screenId, visibleForApp: ActiveAppTracker.shared.currentAppId)
+    }
+
+    /// Same emptiness-only shortcut as the macOS branch's identical method,
+    /// kept in lockstep with `currentlyVisibleAnnotations(forScreenId:)`
+    /// above for the same reason that method's doc comment gives.
+    func hasCurrentlyVisibleAnnotations(forScreenId screenId: String) -> Bool {
+        if isAnnotationsSuspended {
+            return false
+        }
+        if isCaptureVisible {
+            return !AnnotationStore.shared.getForScreen(screenId).isEmpty
+        }
+        return AnnotationStore.shared.hasVisibleAnnotations(
+            forScreenId: screenId, visibleForApp: ActiveAppTracker.shared.currentAppId
+        )
+    }
+
+    /// Repaints every overlay and decides, per screen, whether its window
+    /// belongs on screen at all -- see the macOS branch's extensive doc
+    /// comment on this same method for why an idle overlay must be fully
+    /// hidden (not merely click-through) when it has nothing to paint. Every
+    /// word of that reasoning applies unchanged here: `WS_EX_TRANSPARENT`
+    /// only affects real mouse-event delivery (verified on this machine:
+    /// `WindowFromPoint` over such a window returns the window underneath),
+    /// not "which window is topmost at this point" queries such as
+    /// `EnumWindows`/window-ownership pre-checks, and this app's overlay
+    /// windows are `WS_EX_TOPMOST` and monitor-sized specifically so an
+    /// annotation can sit above the taskbar and every other window.
+    public func refreshViews() {
+        WindowsUIThread.shared.async { [weak self] in
+            self?.refreshViewsNow()
+        }
+    }
+
+    /// UI-THREAD-ONLY. Kept separate from `refreshViews()` so
+    /// `presentationStatus(for:)` can synchronously settle ordering before
+    /// sampling -- same reason the macOS branch keeps this split.
+    // internal (not private): OverlayWindowController+Diagnostics.swift
+    // (Windows) calls this to settle ordering before sampling.
+    func refreshViewsNow() {
+        precondition(WindowsUIThread.shared.isCurrentThread, "Overlay window ordering is WindowsUIThread-only")
+        guard annotationsSuspensionGeneration != nil else {
+            hideAllOverlayWindows()
+            return
+        }
+        _ = SuspensionLeaseCoordinator.shared.withPresentationPermit { [weak self] permit in
+            self?.refreshViewsNow(under: permit)
+        }
+    }
+
+    /// Runs only from `withPresentationPermit`, while its durable flock is
+    /// held -- identical contract to the macOS branch's identical method.
+    private func refreshViewsNow(under permit: SuspensionLeaseSnapshot) {
+        precondition(WindowsUIThread.shared.isCurrentThread, "Overlay window ordering is WindowsUIThread-only")
+        if permit.error != nil || permit.annotationsSuspended {
+            if permit.error == nil {
+                if let applied = annotationsSuspensionGeneration {
+                    if permit.generation >= applied {
+                        annotationsSuspensionGeneration = permit.generation
+                    }
+                } else {
+                    annotationsSuspensionGeneration = permit.generation
+                }
+            }
+            annotationsSuspended = true
+            hideAllOverlayWindows()
+            return
+        }
+
+        if let applied = annotationsSuspensionGeneration, permit.generation < applied {
+            annotationsSuspended = true
+            hideAllOverlayWindows()
+            return
+        }
+        annotationsSuspensionGeneration = permit.generation
+        annotationsSuspended = false
+
+        for window in overlayWindows {
+            let annotations = currentlyVisibleAnnotations(forScreenId: window.screenId)
+            guard !annotations.isEmpty else {
+                window.setVisible(false)
+                continue
+            }
+            // Snapshot every raster this frame needs before drawing any of
+            // it, for exactly the reason the macOS branch's `OverlayView
+            // .draw(_:)` leases one before calling `AnnotationRenderer` --
+            // see that file's doc comment. There is no `OverlayView` on
+            // Windows (this controller paints directly, see
+            // `WindowsOverlayWindow.repaint(annotations:imageForAssetId:)`),
+            // so this lease lives here instead.
+            let assetIDs = annotations.flatMap { $0.kind.rasterAssetIds }
+            let rasterLease = RasterAssetStore.shared.lease(ids: assetIDs)
+            window.repaint(annotations: annotations) { assetId in
+                rasterLease.image(id: assetId)
+            }
+            window.setVisible(true)
+        }
+    }
+
+    private func hideAllOverlayWindows() {
+        precondition(WindowsUIThread.shared.isCurrentThread, "Overlay window ordering is WindowsUIThread-only")
+        // An externally implemented ownership heuristic can only see an
+        // absent overlay when *every* process-local window is fully hidden.
+        // Do this before consulting per-app/capture filters: suspension is
+        // an absolute presentation override -- same reasoning as the macOS
+        // branch's `orderAllOverlayWindowsOut()`.
+        for window in overlayWindows {
+            window.setVisible(false)
+        }
+    }
+}
+#endif

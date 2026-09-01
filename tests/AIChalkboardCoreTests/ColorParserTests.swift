@@ -1,4 +1,3 @@
-import AppKit
 import XCTest
 @testable import AIChalkboardCore
 
@@ -10,37 +9,29 @@ import XCTest
 /// hardened ("#12GG56", "#GGGGGG", "0xff0000", "#12345" all must fall back to
 /// red rather than silently parsing a truncated prefix).
 final class ColorParserTests: XCTestCase {
-    private let defaultRed = (r: CGFloat(1.0), g: CGFloat(0.2), b: CGFloat(0.2), a: CGFloat(0.9))
+    private let defaultRed = (r: 1.0, g: 0.2, b: 0.2, a: 0.9)
 
     private func assertColor(
-        _ color: NSColor,
-        r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat,
-        accuracy: CGFloat = 0.005,
+        _ color: ChalkColor,
+        r: Double, g: Double, b: Double, a: Double,
+        accuracy: Double = 0.005,
         file: StaticString = #filePath, line: UInt = #line
     ) {
-        guard let converted = color.usingColorSpace(.deviceRGB) else {
-            XCTFail("could not convert color to a comparable color space", file: file, line: line)
-            return
-        }
-        XCTAssertEqual(converted.redComponent, r, accuracy: accuracy, "red", file: file, line: line)
-        XCTAssertEqual(converted.greenComponent, g, accuracy: accuracy, "green", file: file, line: line)
-        XCTAssertEqual(converted.blueComponent, b, accuracy: accuracy, "blue", file: file, line: line)
-        XCTAssertEqual(converted.alphaComponent, a, accuracy: accuracy, "alpha", file: file, line: line)
+        XCTAssertEqual(color.red, r, accuracy: accuracy, "red", file: file, line: line)
+        XCTAssertEqual(color.green, g, accuracy: accuracy, "green", file: file, line: line)
+        XCTAssertEqual(color.blue, b, accuracy: accuracy, "blue", file: file, line: line)
+        XCTAssertEqual(color.alpha, a, accuracy: accuracy, "alpha", file: file, line: line)
     }
 
     private func assertColorsEqual(
-        _ lhs: NSColor, _ rhs: NSColor,
-        accuracy: CGFloat = 0.005,
+        _ lhs: ChalkColor, _ rhs: ChalkColor,
+        accuracy: Double = 0.005,
         file: StaticString = #filePath, line: UInt = #line
     ) {
-        guard let a = lhs.usingColorSpace(.deviceRGB), let b = rhs.usingColorSpace(.deviceRGB) else {
-            XCTFail("could not convert colors to a comparable color space", file: file, line: line)
-            return
-        }
-        XCTAssertEqual(a.redComponent, b.redComponent, accuracy: accuracy, "red", file: file, line: line)
-        XCTAssertEqual(a.greenComponent, b.greenComponent, accuracy: accuracy, "green", file: file, line: line)
-        XCTAssertEqual(a.blueComponent, b.blueComponent, accuracy: accuracy, "blue", file: file, line: line)
-        XCTAssertEqual(a.alphaComponent, b.alphaComponent, accuracy: accuracy, "alpha", file: file, line: line)
+        XCTAssertEqual(lhs.red, rhs.red, accuracy: accuracy, "red", file: file, line: line)
+        XCTAssertEqual(lhs.green, rhs.green, accuracy: accuracy, "green", file: file, line: line)
+        XCTAssertEqual(lhs.blue, rhs.blue, accuracy: accuracy, "blue", file: file, line: line)
+        XCTAssertEqual(lhs.alpha, rhs.alpha, accuracy: accuracy, "alpha", file: file, line: line)
     }
 
     private func assertDefaultRed(_ input: String?, file: StaticString = #filePath, line: UInt = #line) {
@@ -50,7 +41,7 @@ final class ColorParserTests: XCTestCase {
     // MARK: - Named colors
 
     func testEveryNamedColorMapsToItsDocumentedRGBA() {
-        let expectations: [(String, CGFloat, CGFloat, CGFloat, CGFloat)] = [
+        let expectations: [(String, Double, Double, Double, Double)] = [
             ("red", 1.0, 0.2, 0.2, 0.9),
             ("green", 0.2, 0.85, 0.3, 0.9),
             ("blue", 0.2, 0.5, 1.0, 0.9),
@@ -83,7 +74,7 @@ final class ColorParserTests: XCTestCase {
         // treated this as ARGB, alpha (0x11) would land in red instead.
         assertColor(
             ColorParser.parse("#11223344"),
-            r: CGFloat(0x11) / 255.0, g: CGFloat(0x22) / 255.0, b: CGFloat(0x33) / 255.0, a: CGFloat(0x44) / 255.0
+            r: Double(0x11) / 255.0, g: Double(0x22) / 255.0, b: Double(0x33) / 255.0, a: Double(0x44) / 255.0
         )
     }
 

@@ -67,6 +67,7 @@ final class InstanceLockTests: XCTestCase {
         }
     }
 
+    #if os(macOS)
     func testSymlinkLockPathCannotLockItsTarget() throws {
         try withTemporaryLockFile { lockURL in
             let targetURL = lockURL.deletingLastPathComponent().appendingPathComponent("unrelated.lock")
@@ -86,4 +87,38 @@ final class InstanceLockTests: XCTestCase {
             XCTAssertTrue(targetLock.acquire(), "instance.lock must not follow and lock an unrelated symlink target")
         }
     }
+    #elseif os(Windows)
+    // Windows equivalent of the macOS symlink test above. Creating a
+    // reparse point (`CreateSymbolicLinkW` under the hood) requires either
+    // Developer Mode or an elevated/privileged process on stock Windows, so
+    // this skips rather than fails when neither is available in the current
+    // environment -- mirroring BoundedLocalFileTests' `mkfifo` skip pattern
+    // for the same "this environment cannot exercise the OS feature" reason.
+    func testReparsePointLockPathCannotLockItsTarget() throws {
+        try withTemporaryLockFile { lockURL in
+            let targetURL = lockURL.deletingLastPathComponent().appendingPathComponent("unrelated.lock")
+            try Data().write(to: targetURL)
+            do {
+                try FileManager.default.createSymbolicLink(
+                    atPath: lockURL.path,
+                    withDestinationPath: targetURL.path
+                )
+            } catch {
+                throw XCTSkip("Creating a symlink requires Developer Mode or elevation on this machine (\(error)); cannot exercise the reparse-point path here.")
+            }
+
+            // The unsafe path still follows acquire()'s documented fail-open
+            // policy, but openLockFile() opens the reparse point itself
+            // (FILE_FLAG_OPEN_REPARSE_POINT) and rejects it as
+            // FILE_ATTRIBUTE_REPARSE_POINT before LockFileEx ever runs, so it
+            // must not acquire a lock on the reparse point's target. A
+            // normal lock on that target must remain available.
+            let unsafePath = InstanceLock(lockURL: lockURL)
+            XCTAssertTrue(unsafePath.acquire())
+
+            let targetLock = InstanceLock(lockURL: targetURL)
+            XCTAssertTrue(targetLock.acquire(), "instance.lock must not follow and lock an unrelated reparse-point target")
+        }
+    }
+    #endif
 }

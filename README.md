@@ -1,6 +1,6 @@
 # AI Chalkboard 🎨
 
-A lightweight, click-through, AI-only drawing overlay for macOS controlled via an in-process **Model Context Protocol (MCP)** server over `stdio`.
+A lightweight, click-through, AI-only drawing overlay for macOS and Windows 10/11 controlled via an in-process **Model Context Protocol (MCP)** server over `stdio`.
 
 Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Claude Code**) to draw unrestricted vector or raster artwork directly over UI elements during visual computer-use tasks, while **all human mouse and keyboard input passes straight through** to underlying apps.
 
@@ -12,15 +12,203 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 - **Multi-Monitor Aware**: Automatically spawns transparent overlay windows across all connected displays and adjusts when display configurations change.
 - **First-Class Text and Free Drawing**: `draw_text` renders normal UI labels directly. `draw_path` accepts arbitrary SVG geometry, `draw_image` places caller-rendered raster art, and `draw_batch` combines primitives atomically. This keeps shapes unrestricted without making ordinary text a PNG-generation chore.
 - **Centre-and-Radius Shapes**: `draw_shape` (and `draw_batch`'s `type: "shape"` items) draw a circle, ellipse, or rectangle from a centre and radius (or a rect's corner), instead of the caller hand-writing `draw_path`'s raw SVG arc commands. The app computes the closed path itself — including the two-arc construction a full ellipse needs, since a single SVG arc command cannot close on itself — because every hand-written arc was a chance to mis-center it, which is how measured placement error was actually entering. `draw_path` remains the tool for anything the centre/radius model doesn't cover: arrows, callouts, handwriting, and other freeform geometry.
-- **Coordinate-Space Inputs**: `draw_path`, `draw_shape`, `draw_image`, `draw_text`, and `draw_batch` accept top-left-origin `backing_pixels` (the default), `normalized` 0…1, or `screenshot_pixels` coordinates. When geometry is measured from an image, use `screenshot_pixels` with the exact dimensions of that same uncropped full-display image version after any client/model resize. Detectable cropped/window aspect mismatches are rejected instead of being silently stretched across a display. A crop with the display's exact aspect ratio is mathematically indistinguishable from a downsampled full-display image, so callers must preserve full-display provenance. SVG paths retain source coordinates plus their backing-pixel scale; text/image positions are stored in backing pixels. Stroke, font, padding, and other style dimensions always remain backing pixels. `draw_shape` is the one exception to "coordinates and lengths transform the same way": its centres (`center_x`/`center_y`, or a rect's `x`/`y` corner) go through the same position transform as every other tool, but its lengths (`radius`, `radius_x`, `radius_y`, `width`, `height`) are scaled per axis instead — so a `circle` requested under `normalized` on a non-square display resolves to an ellipse in backing pixels, by design, because one radius fraction is not the same physical distance on both axes. `backingScaleFactor` reflects the active macOS display mode, not the panel's marketing label.
-- **Element-Anchored Highlighting**: `highlight_element` can locate a named accessible UI element (for example, a button titled “Fusion”) and highlight its resolved bounds as a rectangle (default), ellipse, or circle via `shape` — round and pill-shaped controls (radio buttons, circular icon buttons) get a ring around their actual silhouette instead of just their bounding box. `get_accessibility_status` reports whether macOS Accessibility access is available before a call depends on it.
+- **Coordinate-Space Inputs**: `draw_path`, `draw_shape`, `draw_image`, `draw_text`, and `draw_batch` accept top-left-origin `backing_pixels` (the default), `normalized` 0…1, or `screenshot_pixels` coordinates. When geometry is measured from an image, use `screenshot_pixels` with the exact dimensions of that same uncropped full-display image version after any client/model resize. Detectable cropped/window aspect mismatches are rejected instead of being silently stretched across a display. A crop with the display's exact aspect ratio is mathematically indistinguishable from a downsampled full-display image, so callers must preserve full-display provenance. SVG paths retain source coordinates plus their backing-pixel scale; text/image positions are stored in backing pixels. Stroke, font, padding, and other style dimensions always remain backing pixels. `draw_shape` is the one exception to "coordinates and lengths transform the same way": its centres (`center_x`/`center_y`, or a rect's `x`/`y` corner) go through the same position transform as every other tool, but its lengths (`radius`, `radius_x`, `radius_y`, `width`, `height`) are scaled per axis instead — so a `circle` requested under `normalized` on a non-square display resolves to an ellipse in backing pixels, by design, because one radius fraction is not the same physical distance on both axes. `backingScaleFactor` reflects the active macOS display mode, not the panel's marketing label, on macOS; on Windows it is derived from `GetDpiForMonitor`'s effective DPI divided by 96.
+- **Element-Anchored Highlighting**: `highlight_element` can locate a named accessible UI element (for example, a button titled “Fusion”) and highlight its resolved bounds as a rectangle (default), ellipse, or circle via `shape` — round and pill-shaped controls (radio buttons, circular icon buttons) get a ring around their actual silhouette instead of just their bounding box. Element lookup goes through macOS's Accessibility (AX) API on macOS and Windows UI Automation (UIA) on Windows — see "Platform differences" below for how the two diverge. `get_accessibility_status` reports whether macOS Accessibility access is available before a call depends on it; on Windows there is no persistent, checkable grant to report ahead of time, so the same tool always reports optimistic availability and says so, and the true per-lookup signal is `highlight_element`'s own error (see "Platform differences").
 - **Stable In-Place Adjustment**: `update_annotation` moves or restyles an existing annotation without minting a new ID, preserving the ID used by verification and clear operations. Explicit `z_index` controls ordering between annotations; later batch items remain on top of earlier items within that batch.
-- **Leased Suspension for Click Workflows**: `suspend_annotations` acquires a 1–60-second (15-second default) lease and orders overlay windows out while retaining annotations and IDs. Keep its `leaseToken` secret and release exactly that token with `resume_annotations`; overlapping callers cannot accidentally resume one another’s overlays. An optional canonical UUID idempotency key makes safe retries return the same active lease only from its creator MCP server process instance. Generate a fresh random UUID and treat it as secret too; reuse from another instance is rejected and never reveals the other lease token. The result only says `clickSafeAtObservation: true` after bounded WindowServer observation and a final durable read confirm that exact live generation and its peer presentation are settled. This is point-in-time evidence, not raw-framebuffer/occlusion proof and not true simultaneous highlight-and-click support.
+- **Leased Suspension for Click Workflows**: `suspend_annotations` acquires a 1–60-second (15-second default) lease and orders overlay windows out while retaining annotations and IDs. Keep its `leaseToken` secret and release exactly that token with `resume_annotations`; overlapping callers cannot accidentally resume one another’s overlays. An optional canonical UUID idempotency key makes safe retries return the same active lease only from its creator MCP server process instance. Generate a fresh random UUID and treat it as secret too; reuse from another instance is rejected and never reveals the other lease token. The result only says `clickSafeAtObservation: true` after bounded observation and a final durable read confirm that exact live generation and its peer presentation are settled — on macOS that observation reads WindowServer, the compositor's own registration; on Windows there is no equivalent single ground-truth read, so it is instead two Win32/DWM window-state samples (`IsWindowVisible` plus the DWM cloak flag) corroborated by a `DwmFlush()`-observed compositor frame boundary, a meaningfully weaker guarantee than a compositor registration read (see "Platform differences" below). This is point-in-time evidence on both platforms, not raw-framebuffer/occlusion proof and not true simultaneous highlight-and-click support.
 - **Persists Until Explicitly Cleared**: A drawing has no lifetime and no timeout. It stays on screen until something explicitly clears it — the AI calling `clear` (by `annotation_id`, by `app`, or `scope="all"`), or the user clicking the menu-bar "Clear Annotations for Current App + Global" (⌘K) or "Clear Everything (All Apps)". `duration_seconds` is not a tool parameter any more: supplying it on any drawing tool is REJECTED outright rather than silently ignored, so a caller cannot come away believing a drawing will clean itself up. This guarantee holds only for the life of the MCP server process — annotations are held in server memory, not written to disk, so they do not survive that process restarting or quitting.
-- **Closed-Loop Verification**: `verify_annotation` proves free-draw placement against a clean UI screenshot using the exact live renderer. `verify_presentation` separately checks the retained AppKit window/view, WindowServer on-screen registration, and bounded alignment with the annotation's target display so agents can detect most presentation failures without asking a human to eyeball the display.
-- **Bounded Diagnostics**: Coordinate/verification rejections and lifecycle/presentation events are timestamped in UTC and written to stderr plus `~/Library/Logs/AIChalkboard/ai_chalkboard.log`. Message payloads are capped at 16 KiB; the log rotates at 5 MiB and keeps one backup (each file can exceed the threshold only by a bounded final record). If size measurement or rotation cannot complete, file writes pause while stderr continues, so a persistent filesystem error cannot create an infinitely growing log. Rejection records use fixed reason codes and numeric geometry rather than persisting caller text, UI labels, or local asset paths.
-- **Capture Debug Request**: `set_capture_visible(true)` asks compatible capture paths to include the overlay and renders all annotations for placement checks. Capture programs retain their own app/window filters, so inclusion is not guaranteed; `.none` is also not a privacy boundary on modern macOS. Two safety nets guard against forgetting to turn it back off: it auto-reverts to `false` after 5 minutes with no renewal, and the menu-bar icon tints orange for as long as it's on.
-- **Launch-Mode-Dependent Lifecycle UI**: The activation policy is chosen at runtime from `argv`, not from the bundle. A direct GUI launch (Finder/Dock) uses `.regular`, so the app appears in the Dock and Cmd-Tab and can be quit by right-clicking its Dock icon. An MCP launch (`--mcp`, how Claude Desktop/Cowork start it) uses `.accessory` instead — no Dock icon, no Cmd-Tab entry, since one config entry spawns several processes and each would otherwise add its own Dock icon. `LSUIElement` is deliberately left `false` in `Info.plist`: a static plist cannot branch on `argv`, so the runtime `setActivationPolicy` call is the only thing that can tell the two modes apart. In MCP mode the menu-bar status item — "Clear Annotations for Current App + Global" (⌘K), "Clear Everything (All Apps)", "Capture Debug Mode", "Quit AI Chalkboard" (⌘Q) — is the **only** user-facing control surface, and only the primary instance owns one.
+- **Closed-Loop Verification**: `verify_annotation` proves free-draw placement against a clean UI screenshot using the exact live renderer — the same `AnnotationRenderer` Swift source on both platforms, though the rasterizer underneath differs (Core Graphics on macOS, GDI+ on Windows), so output is not bit-identical across platforms. `verify_presentation` separately checks the retained window state and bounded alignment with the annotation's target display so agents can detect most presentation failures without asking a human to eyeball the display. On macOS this is a dual-witness check — AppKit's own window state cross-checked against `CGWindowListCopyWindowInfo`, WindowServer's independently maintained ledger. Windows has no equivalent second source for an ordinary window: `verify_presentation` there reads only this process's own Win32 state (`IsWindowVisible`/`GetWindowRect`/extended style) plus DWM's independently maintained cloak flag, which is real but much narrower evidence — see "Platform differences" below.
+- **Bounded Diagnostics**: Coordinate/verification rejections and lifecycle/presentation events are timestamped in UTC and written to stderr plus a rotating log file — `~/Library/Logs/AIChalkboard/ai_chalkboard.log` on macOS, `%LOCALAPPDATA%\AIChalkboard\Logs\ai_chalkboard.log` on Windows. Message payloads are capped at 16 KiB; the log rotates at 5 MiB and keeps one backup (each file can exceed the threshold only by a bounded final record). Cross-process rotation is coordinated with `flock` on macOS and `LockFileEx` on Windows, and each platform detects another process having rotated the file out from under it by comparing file identity — POSIX inode on macOS, `GetFileInformationByHandle`'s volume-serial/file-index pair on Windows, which Microsoft documents as not guaranteed stable across a close/reopen on every filesystem the way a POSIX inode is (the only consequence of that instability here is a harmless extra close-and-reopen, never a misdirected write). If size measurement or rotation cannot complete, file writes pause while stderr continues, so a persistent filesystem error cannot create an infinitely growing log. Rejection records use fixed reason codes and numeric geometry rather than persisting caller text, UI labels, or local asset paths.
+- **Capture Debug Request**: `set_capture_visible(true)` asks compatible capture paths to include the overlay and renders all annotations for placement checks. Capture programs retain their own app/window filters, so inclusion is not guaranteed; on macOS `NSWindow.SharingType.none` is also not a privacy boundary on modern releases. On Windows the same toggle instead governs `SetWindowDisplayAffinity`'s `WDA_EXCLUDEFROMCAPTURE`, which only ever affects captures taken by *other* applications of *this* window — it has no bearing on Chalkboard's own `chalk_capture_monitor` (BitBlt) capture route, which always includes every composited window (see "Platform differences" below). Two safety nets guard against forgetting to turn it back off: it auto-reverts to `false` after 5 minutes with no renewal, and the menu-bar icon tints orange for as long as it's on.
+- **Launch-Mode-Dependent Lifecycle UI** (macOS specifics; Windows has a parallel status-icon control surface described below but no bundle/`Info.plist`/Dock concept to branch on): The activation policy is chosen at runtime from `argv`, not from the bundle. A direct GUI launch (Finder/Dock) uses `.regular`, so the app appears in the Dock and Cmd-Tab and can be quit by right-clicking its Dock icon. An MCP launch (`--mcp`, how Claude Desktop/Cowork start it) uses `.accessory` instead — no Dock icon, no Cmd-Tab entry, since one config entry spawns several processes and each would otherwise add its own Dock icon. `LSUIElement` is deliberately left `false` in `Info.plist`: a static plist cannot branch on `argv`, so the runtime `setActivationPolicy` call is the only thing that can tell the two modes apart. In MCP mode the menu-bar status item — "Clear Annotations for Current App + Global" (⌘K), "Clear Everything (All Apps)", "Capture Debug Mode", "Quit AI Chalkboard" (⌘Q) — is the **only** user-facing control surface, and only the primary instance owns one. On Windows the equivalent is a system-tray icon owned by whichever process wins the same primary-election lock (see "Single-instance lock" below); Windows has no bundle/Dock/Cmd-Tab concept for a launch-mode-dependent policy to select between.
+
+---
+
+## Platform differences
+
+AI Chalkboard is one Swift package built for both macOS and Windows, with
+platform code split by `#if os(macOS)` / `#if os(Windows)`. The Windows port
+is functional — verified end to end as an MCP stdio server, with the tray
+icon, single-instance election, monitor enumeration, and frontmost-app
+tracking all working — but several guarantees the macOS build makes are
+provably weaker on Windows, because the two OSes simply do not expose
+equivalent primitives. This section states each difference plainly rather
+than letting parity be assumed.
+
+**Screen-capture permission.** macOS gates screen capture behind TCC's Screen
+Recording permission: an ungranted app's capture calls fail, and
+`get_accessibility_status`/verification capture report that honestly.
+Windows has no capture-permission model for a desktop application at all —
+any process able to run code in the session can already read the composited
+screen. `get_accessibility_status`-style permission reporting on Windows
+therefore always reports capture as granted, with an explicit note that there
+is no permission system to check. This is a real reduction in what the OS
+enforces on Windows, not a convenience: there is no equivalent of revoking
+Screen Recording access for this app.
+
+**Sibling-instance capture exclusion.** On macOS, Chalkboard's verification
+capture goes through ScreenCaptureKit, which can be configured to exclude a
+list of *other* applications — Chalkboard uses this to exclude every running
+instance of itself (by process ID, bundle identifier, and executable path),
+so a sibling MCP process's overlay never contaminates a capture. Windows'
+only related primitive, `SetWindowDisplayAffinity`'s
+`WDA_EXCLUDEFROMCAPTURE`, lets a window exclude only *itself*, and even that
+is documented to affect only captures taken by *other* applications (Zoom,
+OBS, the Windows built-in recorder) — not Chalkboard's own capture route.
+Chalkboard's Windows verification capture (`chalk_capture_monitor`, BitBlt
+with `CAPTUREBLT`) has no exclusion mechanism whatsoever: it includes every
+window composited on screen, including this process's own overlay and any
+sibling AI Chalkboard instance's overlay. `ScreenCaptureExclusionScope`
+reports every dimension `false` on Windows for exactly this reason — it is
+never non-trivial there the way it can be on macOS.
+
+**`verify_presentation`.** On macOS this is a dual-witness proof: AppKit's
+own window state cross-checked against `CGWindowListCopyWindowInfo`,
+WindowServer's independently maintained record of what it is actually
+compositing — two genuinely separate witnesses, one of which this process
+does not control. Windows has no equivalent second source for an ordinary
+application window: `EnumWindows`/`IsWindowVisible`/`GetWindowRect` all read
+the same user32 window-manager state this process itself just set, which can
+confirm a request was applied but proves nothing an adversarial or merely
+buggy caller couldn't fake by reading its own state back. The one exception
+is `DwmGetWindowAttribute(DWMWA_CLOAKED)`: DWM is a genuinely separate
+subsystem from user32, so its cloak bit is real independent evidence — just
+much narrower than `CGWindowList` (cloaked-or-not only, no
+bounds/alpha/z-order cross-check). The Windows result never claims the
+confidence the macOS one does; its independent-registration fields are
+always `nil` there, and every response's `note` says so explicitly rather
+than reusing macOS's wording.
+
+**`verify_annotation`.** The renderer itself is literally the same shared
+Swift source on both platforms (`AnnotationRenderer`, drawing through a
+platform-neutral `DrawingContext`) — the "same renderer, cross-checked
+against the platform's own screenshot" guarantee holds on both. What differs
+is the rasterizer underneath: Core Graphics/Quartz on macOS, GDI+ on
+Windows. Different rasterizers legitimately produce different antialiasing,
+hinting, and rounding, so a Windows verification PNG is not bit-identical to
+a macOS verification PNG of the same annotation at the same geometry — the
+honest claim is "the same renderer, verified by cross-check", never "the
+same pixels".
+
+**`suspend_annotations` / `clickSafeAtObservation`.** The observational basis
+is weaker on Windows for the same underlying reason as `verify_presentation`.
+On macOS, post-suspension quiescence is checked by reading WindowServer's own
+registration twice, ~50ms apart. Windows has no equivalent single
+ground-truth read, so it instead takes two Win32/DWM window-state samples
+(`IsWindowVisible` plus the DWM cloak flag) and corroborates them with a
+`DwmFlush()` call that proves a real compositor frame boundary was crossed
+during the observation — but does not prove which windows were included in
+that frame, only that the compositor is alive and did real work. It is the
+closest honest equivalent available, not the same claim: `clickSafeAtObservation:
+true` derived from the Windows path means "no evidence of an on-screen
+Chalkboard window survived two Win32/DWM state samples plus a real compositor
+frame boundary", not "the compositor has confirmed nothing is on screen",
+which is what the same field means on macOS.
+
+**Element highlighting.** macOS uses the Accessibility (AX) API; Windows uses
+UI Automation (UIA), read through its `ControlView` — a tree-view choice that
+changes what "the tree" contains relative to AX's own hierarchy. Per-call
+messaging timeouts differ in kind, not just in number: macOS's
+`AXUIElementSetMessagingTimeout` is an OS-enforced bound on a single AX call.
+Windows uses `IUIAutomation2`'s `ConnectionTimeout`/`TransactionTimeout` where
+that interface is available, which gives a comparable real timeout; when it
+is not available (or a provider ignores it), the shim instead runs the UIA
+call on a dedicated worker thread and simply stops *waiting* on it after the
+timeout — the call itself is not cancelled, so a truly hung provider leaves
+that worker thread blocked indefinitely rather than being interrupted the way
+an OS-enforced bound interrupts it on macOS. The permission model also
+differs in kind, not just presence/absence: UI Automation has no persistent,
+revocable grant to check ahead of a lookup the way macOS AX/TCC trust does,
+so `get_accessibility_status` on Windows always reports optimistic
+availability and says so; the true per-lookup signal (including an elevation
+boundary AX has no equivalent of) is `highlight_element`'s own error.
+Separately: every measured number in the "Permissions, capture, and proof
+limits" section above (~5,200 elements/second, the 60,000-element DaVinci
+Resolve tree, the occurrence-shortcut timings) is a macOS AX measurement,
+taken against macOS's traversal. No comparable measurement has been taken
+against Windows UIA, and those numbers are not assumed to transfer — UIA's
+per-call shape, `ControlView` scoping, and COM marshaling overhead are all
+different enough that they could differ substantially in either direction.
+
+**App identity.** macOS identifies a running application by its bundle
+identifier (`"com.apple.Safari"`), a stable, OS-assigned string. Windows has
+no such concept; `ActiveAppTracker` on Windows instead uses the process's
+executable file name (e.g. `"chrome.exe"`), compared case-insensitively,
+resolved via `QueryFullProcessImageNameW`. This is now part of the `app` MCP
+parameter's contract on Windows, and it is a coarser identity than a bundle
+id in one specific way: several distinct running processes can legitimately
+share one identity string. Every Chromium-based app spawns many
+`chrome.exe`/`msedge.exe` helper processes, and DaVinci Resolve spawns
+render/worker helpers under related executable names, so app targeting and
+the `app` parameter can be more ambiguous on Windows for multi-process apps
+than the equivalent macOS bundle-id lookup.
+
+**Image formats.** `draw_image`/`verify_annotation` accept PNG/JPEG/HEIC/TIFF
+on both platforms, but HEIC/HEIF decoding on Windows depends on the user
+having installed Microsoft's "HEIF Image Extensions" from the Microsoft
+Store — it is not bundled with Windows or with this app. A missing codec is
+reported as its own distinct "unsupported format on this system" error
+(`unsupportedFormatOnSystem`), not folded into a generic decode failure, so a
+caller can tell "install the codec or re-export as PNG/JPEG/TIFF/BMP" apart
+from "this file is corrupt".
+
+**Log path.** `~/Library/Logs/AIChalkboard/ai_chalkboard.log` on macOS;
+`%LOCALAPPDATA%\AIChalkboard\Logs\ai_chalkboard.log` on Windows. Both rotate
+at 5 MiB with one backup and use a platform-appropriate advisory lock
+(`flock` / `LockFileEx`) to coordinate rotation across the multiple processes
+Claude Desktop routinely spawns for one config entry — see "Single-instance
+lock" below for why file-identity checks (used to detect another process
+having rotated the file) are correspondingly best-effort on Windows.
+
+**Termination.** macOS delivers SIGTERM/SIGINT/SIGHUP, which this app
+catches to shut down gracefully — closing overlay windows, flushing logs, and
+fanning a quit out to sibling instances before exiting. Windows has a
+comparable console-control shutdown path this app also handles gracefully.
+But Windows additionally exposes `TerminateProcess`, a hard-kill primitive
+with no equivalent signal-handler opportunity at all — unlike SIGKILL, which
+is at least the deliberately-last-resort case on POSIX, `TerminateProcess` is
+commonly the default "stop this process" call in Windows process-management
+tooling. A host that reaches for it gives this app no chance to close
+windows, flush the log, or notify sibling instances — a genuine
+termination-safety difference worth knowing about when choosing how a host
+manages this process's lifecycle.
+
+**Window layering.** macOS places the overlay at `NSWindow.Level.statusBar`
+after an empirical probe (a borderless probe window at each candidate level,
+screenshotted, and pixel-checked against the Dock's icon pixels and the menu
+bar's glyph pixels) confirmed it draws above both the Dock (level 20) and the
+real menu bar content (levels 24–25), not just their background bands.
+Windows uses the `WS_EX_TOPMOST` extended window style, which keeps the
+overlay above ordinary application windows including a fullscreen app's own
+window. Whether it also draws above the Windows taskbar and system tray —
+the Windows analogues of the Dock and menu bar — is not covered by the macOS
+measurement above and has not been separately measured on Windows; this
+README does not claim that parity, only the `WS_EX_TOPMOST` mechanism.
+
+**Single-instance lock.** Both platforms elect one process as primary (owner
+of the tray icon / menu-bar item) using a filesystem lock, with an identical
+fail-open-at-startup / fail-closed-on-retry design. The underlying lock
+differs in strength: POSIX `flock()` (macOS) is *advisory* — a
+non-participating process can read, write, or delete the lock file freely,
+and only a fellow participant in the election ever observes contention.
+Win32's `LockFileEx` (Windows) is *mandatory* — the OS enforces the locked
+byte range against any process attempting a conflicting access, participant
+or not, which is strictly more restrictive than the POSIX contract, never
+less. Working the other direction, Windows is weaker on file-identity
+checks: several places in this election need to prove "the handle/descriptor
+I hold is still the file this path names". POSIX does this with
+`st_dev`/`st_ino`, a hard kernel guarantee for a live file. The closest
+Windows analogue, `GetFileInformationByHandle`'s
+(`dwVolumeSerialNumber`, `nFileIndexHigh`, `nFileIndexLow`), is documented by
+Microsoft as *not* guaranteed stable across a close-and-reopen on every
+filesystem (some remote and FAT-family volumes can hand back a different
+file index for what is, on disk, the same file). Every identity check in
+this codebase is deliberately shaped so the only possible consequence is an
+unnecessary "looks replaced" verdict — a harmless extra close-and-reopen, or
+an extra declined promotion followed by a retry — never the unsafe direction
+of two different files being mistaken for one. In short: identity checks on
+Windows are best-effort and fail toward re-election, not toward silently
+trusting a stale handle.
 
 ---
 
@@ -36,14 +224,14 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 | `draw_text` | `text`, `x`, `y`, `font_size`, `color?`, `background_color?`, `background_opacity?`, `padding_px?`, `opacity?`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `z_index?`, `screen_id?`, `app?` | Renders a text label at a top-left position without requiring an intermediate raster image. `font_size` is required. |
 | `draw_batch` | `items`, `coordinate_space?`, `screenshot_width?`, `screenshot_height?`, `screen_id?`, `app?`, `z_index?` | Atomically adds up to 100 mixed path/image/text/shape primitives under one annotation ID, with a 16-image / 128 MiB decoded-raster sublimit. Each item's `type` is `path`, `image`, `text`, or `shape`; `shape` items take the same fields as `draw_shape`. |
 | `highlight_element` | `label`, `app?`, `role?`, `match?`, `occurrence?`, `max_nodes?`, `timeout_seconds?`, `shape?`, `padding_px?`, `stroke_color?`/`color?`, `stroke_width?`, `stroke_opacity?`, `fill_color?`, `fill_opacity?`, `z?`/`z_index?` | Resolves one element in a running app's Accessibility hierarchy and draws a vector highlight around its bounds — rectangle (default), ellipse, or circle via `shape`. Exact matching is the default; ambiguous results require a one-based occurrence. `max_nodes` (default 3,000, ceiling 10,000) and `timeout_seconds` (default 2.0, ceiling 10.0) bound the traversal that finds it. |
-| `get_accessibility_status` | `request_permission?` | Reports macOS Accessibility authorization. `request_permission` defaults to false; set it true only to explicitly ask macOS to show its permission prompt. |
+| `get_accessibility_status` | `request_permission?` | macOS: reports real Accessibility (TCC) authorization; `request_permission` defaults to false, set it true only to explicitly ask macOS to show its permission prompt. Windows: always reports optimistic availability, since UI Automation has no persistent grant to check ahead of a lookup — `request_permission` has no effect there; the true per-lookup signal is `highlight_element`'s own error. |
 | `update_annotation` | `annotation_id`, `offset_x?`, `offset_y?`, `opacity?`, `z_index?`, kind-specific style fields | Moves or restyles an annotation in place. Its ID and creation identity remain stable. |
 | `suspend_annotations` | `lease_seconds?`, `idempotency_key?` | Acquires a short-lived suspension lease and returns secret `leaseToken`. `lease_seconds` is integer 1–60 (default 15); `idempotency_key` is an optional secret lowercase canonical UUID for retries from the same MCP server process instance. Reuse elsewhere errors without revealing a token. Only act on `clickSafeAtObservation: true`. |
 | `resume_annotations` | `lease_token` | Releases exactly one returned secret `leaseToken`. If another lease remains, the result succeeds only when `peerPresentationSettled=true`; otherwise the token is released but the result is an error. With no remaining lease, the result records a linearized snapshot/restoration request, not global convergence proof. Tombstone cleanup lasts 120 seconds. |
 | `clear` | `annotation_id?`, `scope?`, `app?` | Clears one exact ID when supplied. Otherwise pass `app` to target that app plus globals; omission preserves fallback-app behavior. Use `scope="all"` (without `app`) to clear every app. |
 | `list_annotations` | `offset?`, `limit?` | Returns a bounded page of active annotations, which persist until explicitly cleared (there is no TTL to report), plus top-level `annotationsSuspended`. Follow `nextOffset` to page; huge geometry is explicitly summarized instead of producing an oversized MCP response. |
 | `verify_annotation` | `annotation_id`, `screenshot_path?` or `capture_source="chalkboard"`, `request_permission?`, `padding_px?` | Returns a PNG crop composited with the exact live renderer. Exactly one screenshot source is required; `request_permission` is valid only for Chalkboard capture and defaults to false. |
-| `verify_presentation` | `annotation_id` | Checks AppKit drawable state plus WindowServer all/on-screen registration and target-display bounds. Catches missing/hidden/detached/transparent/wrong-level/frame/display windows; does not claim raw-framebuffer proof. |
+| `verify_presentation` | `annotation_id` | macOS: checks AppKit drawable state cross-checked against WindowServer's independently maintained all/on-screen registration, plus target-display bounds — a dual-witness check. Windows: checks this process's own Win32 window state (visibility/frame/extended style) plus DWM's independently maintained cloak flag — a single-source check with one narrow independent corroboration, materially weaker evidence than the macOS dual-witness form (see "Platform differences"). Neither platform claims raw-framebuffer proof. |
 | `get_active_app` | `none` | Returns raw/current frontmost app state, the fallback app targeted by untagged drawing calls, and local `annotationsSuspended` presentation state. |
 | `set_capture_visible` | `visible` | Applies capture-debug state locally before responding, then broadcasts it to sibling instances; external capture filters still decide inclusion. |
 
@@ -70,6 +258,13 @@ Malformed JSON and non-object JSON-RPC payloads (including batch arrays) now rec
 `-32700` / `-32600` error response instead of silence.
 
 ## Permissions, capture, and proof limits
+
+This section documents macOS specifics — including every measured number in it
+(element/second rates, the DaVinci Resolve tree size, the occurrence-shortcut
+timings) — which are macOS Accessibility (AX) measurements and are not assumed
+to transfer to Windows UI Automation (UIA); no comparable measurement has been
+taken there. See "Platform differences" below for what is known, and not yet
+measured, about the Windows path.
 
 `highlight_element` uses the macOS Accessibility API. It cannot inspect another
 application until macOS grants AI Chalkboard Accessibility permission; callers
@@ -138,24 +333,33 @@ not available — the supported path is screenshot-measured coordinates confirme
 with `verify_annotation`, the same fallback named throughout this section.
 
 Chalkboard-side capture avoids depending on another computer-use tool's
-per-application screenshot grant, but it still needs macOS Screen Recording
-permission. `request_permission` may ask macOS for that grant; it never bypasses
-TCC. A failed or denied request returns an error instead of pretending that the
-annotation was verified. One verification capture may run at a time and waits up
-to 30 seconds; if a framework capture is still winding down after a timeout,
-the next request returns a retryable error rather than accumulating background
-captures.
+per-application screenshot grant. On macOS it still needs Screen Recording
+permission: `request_permission` may ask macOS for that grant; it never bypasses
+TCC, and a failed or denied request returns an error instead of pretending that
+the annotation was verified. On Windows there is no such grant to request or be
+denied at all — see "Platform differences" below — so `request_permission` is a
+no-op there and capture cannot fail for permission reasons. One verification
+capture may run at a time and waits up to 30 seconds on macOS; if a framework
+capture is still winding down after a timeout, the next request returns a
+retryable error rather than accumulating background captures.
 
 `verify_annotation` is a synthetic composite: it proves the stored annotation's
-geometry against the supplied or captured UI image. `verify_presentation` proves
-that AppKit and WindowServer registered a drawable overlay at the expected
-display. Neither operation is raw-framebuffer evidence, and neither can prove
-that every pixel was unoccluded by another process, system surface, or capture
-filter. Raw-framebuffer and occlusion proof are permanently unsupported by this
-architecture.
+geometry against the supplied or captured UI image, using the same renderer
+source on both platforms (see "Element-Anchored Highlighting" and "Platform
+differences" above/below for the rasterizer caveat). `verify_presentation`
+proves that the live overlay window is registered and drawable at the expected
+display — on macOS this is a dual-witness proof (AppKit cross-checked against
+WindowServer's independent ledger); on Windows it is single-source evidence
+from this process's own Win32 state plus DWM's cloak flag, a materially weaker
+guarantee (see "Platform differences"). Neither platform's operation is
+raw-framebuffer evidence, and neither can prove that every pixel was unoccluded
+by another process, system surface, or capture filter. Raw-framebuffer and
+occlusion proof are permanently unsupported by this architecture on either
+platform.
 
-`window.ignoresMouseEvents` means real macOS pointer events pass through the
-overlay. While an annotation is visible, though, the full-screen overlay still
+`window.ignoresMouseEvents` (macOS) / `WS_EX_TRANSPARENT` (Windows) means real
+pointer events pass through the overlay on both platforms. While an annotation
+is visible, though, the full-screen overlay still
 appears in ordinary topmost-window listings. A computer-use click ownership
 heuristic must consult the reported click-through state (or dispatch a real
 click), rather than treating the presence of any non-allowlisted overlay window
@@ -223,6 +427,8 @@ the repo as a baseline, and never compared across machines.
 
 ## Build & Run Instructions
 
+### macOS
+
 ```bash
 ./build_app.sh
 ```
@@ -237,9 +443,31 @@ requirement stable across rebuilds so macOS Screen Recording and Accessibility
 grants survive ordinary local updates. The build fails instead of falling back
 to ad-hoc signing if that exact identity or its private key is unavailable.
 
+### Windows
+
+Prerequisites:
+- Swift 6.3+ for Windows (the toolchain, runtime, and platform SDK components from swift.org/install, installed under `%LOCALAPPDATA%\Programs\Swift`)
+- Visual Studio 2022 Build Tools with the "Desktop development with C++" (VC++) workload and a Windows 10/11 SDK component
+
+```powershell
+.\build_app.ps1
+```
+Locates the Swift toolchain/runtime/SDK, imports the MSVC build environment
+from `vcvars64.bat` (via `vswhere`), runs `swift build -c release`, and
+assembles a deployable layout at `dist\AIChalkboard\` containing
+`AIChalkboard.exe` plus every Swift runtime DLL it imports (determined by
+walking the executable's PE import table and closing over what the Swift
+toolchain's own runtime directory provides), so the result runs without the
+Swift toolchain on `PATH`. Unlike macOS there is no bundle format, code
+signing identity, or TCC grant tied to a signature — the script's job is
+narrower than `build_app.sh`'s: assemble the exe and its DLL closure, nothing
+more.
+
 ---
 
 ## Claude Desktop / Cowork Integration
+
+### macOS
 
 Add AI Chalkboard to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -253,6 +481,30 @@ Add AI Chalkboard to `~/Library/Application Support/Claude/claude_desktop_config
   }
 }
 ```
+
+### Windows
+
+Add AI Chalkboard to `%APPDATA%\Claude\claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "ai-chalkboard": {
+      "command": "C:\\Users\\jack\\Desktop\\AI-Chalkboard\\dist\\AIChalkboard\\AIChalkboard.exe",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+Point `command` at the `AIChalkboard.exe` under `dist\AIChalkboard\` that
+`build_app.ps1` produces — the one bundled with the Swift runtime DLLs it
+needs — not the raw `.build\x86_64-unknown-windows-msvc\release\AIChalkboard.exe`
+output. Claude Desktop launches the MCP server with its own environment, not
+your shell's `PATH`, so a copy that depends on the Swift toolchain being on
+`PATH` will fail to start (missing-DLL exit) under Claude Desktop even though
+it runs fine from a developer shell. JSON requires every backslash in a
+Windows path to be doubled, as shown above.
 
 ---
 

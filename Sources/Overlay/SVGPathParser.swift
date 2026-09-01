@@ -1,24 +1,15 @@
-import CoreGraphics
 import Foundation
 
-/// The resolved drawing operations in an SVG path.  This is intentionally a
-/// small, Foundation-free representation so callers can inspect a parsed path
-/// (and unit tests can assert its geometry) without having to introspect a
-/// `CGPath` callback.
-enum SVGPathElement: Equatable {
-    case move(CGPoint)
-    case line(CGPoint)
-    case quad(control: CGPoint, to: CGPoint)
-    case cubic(control1: CGPoint, control2: CGPoint, to: CGPoint)
-    case close
-}
-
-/// A parsed SVG path, ready for Core Graphics rendering.  Coordinates stay in
-/// the caller's coordinate system; the overlay is responsible for its normal
+/// A parsed SVG path, exposing its resolved operations and bounds without
+/// depending on a platform graphics framework.  Coordinates stay in the
+/// caller's coordinate system; the overlay is responsible for its normal
 /// backing-pixel-to-point and Y-axis transforms.
+///
+/// `SVGPathElement` itself lives in `ChalkGeometry.swift` alongside
+/// `ChalkPath`/`ChalkTransform`, the platform-neutral stand-ins for
+/// `CGPath`/`CGAffineTransform` this type and `SVGPathParser` are built on.
 struct SVGPathGeometry {
     let elements: [SVGPathElement]
-    let path: CGPath
     let bounds: CGRect
 
     /// A path containing only moveto commands (or only zero-length segments)
@@ -81,20 +72,24 @@ enum SVGPathParseError: Error, Equatable, LocalizedError {
 enum SVGPathParser {
     /// Renderer-facing entry point. The path remains in SVG/top-left backing
     /// pixel coordinates; callers may apply their normal drawing transform.
-    static func parse(_ pathData: String) throws -> CGPath {
-        try parseGeometry(pathData).path
+    static func parse(_ pathData: String) throws -> ChalkPath {
+        ChalkPath(elements: try parsedElements(pathData))
     }
 
     /// Inspection-oriented entry point with resolved operations and bounds.
     /// This is useful for validation diagnostics and deterministic tests.
     static func parseGeometry(_ pathData: String) throws -> SVGPathGeometry {
+        let chalkPath = try parse(pathData)
+        return SVGPathGeometry(elements: chalkPath.elements, bounds: chalkPath.bounds)
+    }
+
+    private static func parsedElements(_ pathData: String) throws -> [SVGPathElement] {
         var parser = Parser(pathData)
         let elements = try parser.parse()
         guard elements.allSatisfy(areFinite) else {
             throw SVGPathParseError.nonFiniteGeometry
         }
-        let path = makeCGPath(from: elements)
-        return SVGPathGeometry(elements: elements, path: path, bounds: path.boundingBoxOfPath)
+        return elements
     }
 
     private static func areFinite(_ element: SVGPathElement) -> Bool {
@@ -106,20 +101,6 @@ enum SVGPathParser {
             return isFinite(control1) && isFinite(control2) && isFinite(point)
         case .close: return true
         }
-    }
-
-    private static func makeCGPath(from elements: [SVGPathElement]) -> CGPath {
-        let path = CGMutablePath()
-        for element in elements {
-            switch element {
-            case let .move(point): path.move(to: point)
-            case let .line(point): path.addLine(to: point)
-            case let .quad(control, to): path.addQuadCurve(to: to, control: control)
-            case let .cubic(control1, control2, to): path.addCurve(to: to, control1: control1, control2: control2)
-            case .close: path.closeSubpath()
-            }
-        }
-        return path.copy()!
     }
 
     private struct Parser {

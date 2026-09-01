@@ -1,5 +1,9 @@
 import Foundation
+#if os(macOS)
 import AppKit
+#elseif os(Windows)
+import WinSDK
+#endif
 
 // MARK: - Cross-process broadcast names
 //
@@ -135,6 +139,7 @@ struct ClearBroadcastRequest {
     }
 }
 
+#if os(macOS)
 /// Cross-process fan-out for the two menu-bar actions ("Clear All Annotations"
 /// and "Quit AI Chalkboard").
 ///
@@ -518,3 +523,670 @@ public final class InstanceBroadcast: NSObject {
         }
     }
 }
+
+#elseif os(Windows)
+
+// MARK: - Windows wire payload
+
+/// The Windows transport (message-only-window `WM_COPYDATA`, see
+/// `InstanceBroadcast` below) has no built-in notion of a named channel with
+/// a typed `userInfo` dictionary the way `DistributedNotificationCenter`
+/// does, so every broadcast this process sends or receives is one JSON
+/// object of this shape. JSON, not a packed binary struct, on purpose: an
+/// unrecognized/missing field decodes to `nil` rather than a hard failure,
+/// which is the same forward/backward tolerance
+/// `ClearBroadcastRequest.init(notification:)` already relies on for a
+/// legacy or malformed payload on macOS (see its "Legacy/malformed payloads
+/// meant 'clear all'" comment above) -- a future build that adds a field
+/// must not become undecodable by an older sibling still running the
+/// previous build, and vice versa.
+private struct WindowsBroadcastEnvelope: Codable {
+    enum Kind: String, Codable {
+        case clear, quit, setCaptureVisible, suspensionInvalidated
+    }
+    let kind: Kind
+    let scope: String?
+    let appId: String?
+    let appName: String?
+    let visible: Bool?
+    let generation: String?
+}
+
+/// Heap box carrying one JSON payload through the async, non-reentrant
+/// self-delivery path (`InstanceBroadcast.deliverLocally`). `PostMessageW`
+/// cannot carry `WM_COPYDATA`'s pointer-to-caller's-stack payload safely
+/// (the sender may have already returned by the time the message is
+/// dequeued), so self-delivery uses a private `WM_APP`-range message whose
+/// `LPARAM` is a retained pointer to one of these boxes instead; the pump
+/// thread takes ownership (`takeRetainedValue()`) when it dequeues the
+/// message. File-scope (not nested in `InstanceBroadcast`) purely so the
+/// free-function `WNDPROC` below -- which cannot capture `self` -- can name
+/// it directly.
+private final class WindowsLocalBroadcastPayload {
+    let json: String
+    init(_ json: String) { self.json = json }
+}
+
+/// The `WNDPROC` for `InstanceBroadcast`'s Windows message-only broadcast
+/// window. Must be a capture-free, file-scope function (or the Swift
+/// compiler cannot treat it as the `@convention(c)` function pointer
+/// `WNDCLASSEXW.lpfnWndProc` requires) -- there is no way to bind it to a
+/// particular `InstanceBroadcast` instance the way an `@objc` selector target
+/// would on macOS, so it recovers the instance from `GWLP_USERDATA`, which
+/// `InstanceBroadcast` stashes on the window immediately after creating it.
+private func chalkboardBroadcastWndProc(_ hWnd: HWND?, _ uMsg: UINT, _ wParam: WPARAM, _ lParam: LPARAM) -> LRESULT {
+    switch uMsg {
+    case UINT(WM_COPYDATA):
+        // WM_COPYDATA is the one Win32 message whose payload the OS itself
+        // marshals into this process's address space for the duration of
+        // this call (unlike an ordinary LPARAM, which is just an integer);
+        // reading `lParam` as a `COPYDATASTRUCT*` here is the documented,
+        // correct way to receive it, and `dataPtr`/`cbData` are valid only
+        // until this function returns -- hence copying them into a `Data`
+        // immediately rather than retaining the pointer.
+        guard let hWnd,
+              let structPtr = UnsafeRawPointer(bitPattern: UInt(bitPattern: Int(lParam))) else {
+            return 0
+        }
+        let cds = structPtr.assumingMemoryBound(to: COPYDATASTRUCT.self).pointee
+        guard let dataPtr = cds.lpData else { return 0 }
+        let payload = Data(bytes: dataPtr, count: Int(cds.cbData))
+        guard let json = String(data: payload, encoding: .utf8) else { return 0 }
+        InstanceBroadcast.windowsInstance(for: hWnd)?.dispatchIncoming(json: json)
+        // A nonzero return is the documented convention for "this receiver
+        // accepted the WM_COPYDATA"; nothing on the sending side currently
+        // inspects it (SendMessageTimeoutW is used for its timeout, not its
+        // result value), but returning it correctly costs nothing and keeps
+        // this receiver well-behaved for any future sender that does check.
+        return 1
+
+    case InstanceBroadcast.localDeliveryMessage:
+        guard let hWnd,
+              let boxPtr = UnsafeRawPointer(bitPattern: UInt(bitPattern: Int(lParam))) else {
+            return 0
+        }
+        // `takeRetainedValue()`, not `takeUnretainedValue()`: this consumes
+        // the +1 retain `InstanceBroadcast.deliverLocally` created when it
+        // posted the message, so the box is released exactly once, here,
+        // when the pump thread actually dequeues it -- never on the posting
+        // thread, which is the whole point of routing self-delivery through
+        // `PostMessageW` instead of calling the handler inline.
+        let box = Unmanaged<WindowsLocalBroadcastPayload>.fromOpaque(boxPtr).takeRetainedValue()
+        InstanceBroadcast.windowsInstance(for: hWnd)?.dispatchIncoming(json: box.json)
+        return 0
+
+    default:
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam)
+    }
+}
+
+/// Cross-process fan-out for the two menu-bar actions ("Clear All
+/// Annotations" and "Quit AI Chalkboard"), Windows twin.
+///
+/// Same reasons to exist as the macOS branch above (read its doc comment for
+/// the full "two MCP processes, one status item, one AnnotationStore per
+/// process" rationale -- none of that changes on Windows) but built on a
+/// completely different transport, because `DistributedNotificationCenter`
+/// is a Darwin-only wrapper around `distnoted` and Swift on Windows has no
+/// Objective-C runtime for `@objc`/`#selector`-based observer registration
+/// even if a cross-process pub/sub bus like it existed here.
+///
+/// THE WINDOWS TRANSPORT: each instance creates one `HWND_MESSAGE` window
+/// (invisible, never painted, costs no taskbar/Alt-Tab presence) under a
+/// well-known window class name, on a dedicated thread that runs nothing but
+/// a `GetMessage`/`DispatchMessage` pump for it. Broadcasting means walking
+/// every OTHER window registered under that same class name (`FindWindowExW`
+/// with `HWND_MESSAGE` as the parent, repeated until it returns `nil`) and
+/// sending each one a `WM_COPYDATA` carrying this broadcast's JSON payload.
+/// `WM_COPYDATA` is the right primitive here -- unlike
+/// `RegisterWindowMessage` + `PostMessage(HWND_BROADCAST)`, which can only
+/// carry two integers (`WPARAM`/`LPARAM`) and has no way to attach the
+/// scope/appId/appName/generation payload this channel needs -- it is the
+/// documented Win32 mechanism for handing an arbitrary-length buffer to
+/// another process's window procedure.
+///
+/// SESSION SCOPING -- READ BEFORE ASSUMING THIS "JUST WORKS" LIKE macOS:
+/// macOS's login session has no equivalent of Remote Desktop, Fast User
+/// Switching, or Session 0 service isolation putting multiple, mutually
+/// invisible desktop sessions on ONE machine at once. Windows does. Two
+/// users RDP'd into the same box, or one user's interactive session next to
+/// Session 0's service session, must never have one session's Clear/Quit
+/// reach the other's overlay instances. In practice this is largely enforced
+/// by the OS already -- each interactive session gets its own Window
+/// Station (`WinSta0`), and `FindWindowExW` only searches windows on the
+/// calling thread's own desktop/window station -- but this file does not
+/// rely on that alone as an unverified assumption about window-station
+/// behaviour across every Windows version and Group Policy configuration it
+/// will ever run under. `discoverSiblingWindows()` below additionally reads
+/// each candidate window's owning PID (`GetWindowThreadProcessId`) and maps
+/// it to a session id (`ProcessIdToSessionId`), and skips any candidate
+/// whose session does not match this process's own -- making the scoping an
+/// explicit, provable property of this code, not folklore about Windows
+/// Terminal Services isolation.
+///
+/// SELF-DELIVERY, ASYNC AND NON-REENTRANT (matching the macOS branch's
+/// documented contract, see its "IMPORTANT -- WHY THE POSTERS DO NO LOCAL
+/// WORK" comment): `WM_COPYDATA` can only be sent with the blocking
+/// `SendMessageW`/`SendMessageTimeoutW` -- there is no way to `PostMessage`
+/// it safely, because the receiver must finish reading the sender's buffer
+/// before the sender's stack frame (or, here, the local byte array) goes
+/// away. Sending it to THIS process's own broadcast window would therefore
+/// make every post block until this process's own handler finished running
+/// -- exactly the reentrant-looking, "did not return first" behaviour macOS
+/// explicitly avoids. So self-delivery is special-cased: `deliverLocally`
+/// posts (never sends) a private `WM_APP`-range message carrying a small
+/// heap-allocated payload box, which the pump thread only picks up on its
+/// own next loop iteration -- genuinely asynchronous, and never reentrant
+/// with respect to the calling thread, the same as `postNotificationName`
+/// returning before the local observer fires ~2ms later on macOS.
+///
+/// LAUNCH-MODE SCOPING is identical in spirit to the macOS branch: `postQuit
+/// All(scopedToLaunchMode:)` still carries `QuitScope.current` (or `nil` for
+/// an unscoped, all-instances quit) inside the JSON payload's `scope` field,
+/// and `handleQuitAllBroadcast` still compares it against this process's own
+/// `QuitScope.current` before terminating. That logic is entirely
+/// platform-neutral (`QuitScope`/`ClearBroadcastRequest`/`BroadcastKey`
+/// above have no AppKit or WinSDK dependency) and is reused verbatim, not
+/// reimplemented.
+///
+/// ECHO SUPPRESSION FOR CAPTURE-VISIBLE STATE: exactly as on macOS, this file
+/// does no de-duplication of its own for a self-delivered
+/// `setCaptureVisible` broadcast -- `handleSetCaptureVisibleBroadcast` calls
+/// `OverlayWindowController.shared.setCaptureVisible(visible)`
+/// unconditionally, the same call the macOS branch makes, and relies on that
+/// method's own documented no-op-when-unchanged behaviour (see the macOS
+/// branch's comment on `handleSetCaptureVisibleBroadcast`) to make a
+/// self-delivered copy free. This file intentionally does not duplicate that
+/// idempotency locally; doing so would risk it drifting out of sync with the
+/// real state `OverlayWindowController` tracks.
+public final class InstanceBroadcast {
+    public static let shared = InstanceBroadcast()
+
+    /// Reverse-DNS-style and version-suffixed for the same reason the macOS
+    /// branch's `Notification.Name`s are: it is a session-wide namespace (any
+    /// process in this Windows session can, in principle, create a window
+    /// under this class name), and `.v1` leaves room to change the wire
+    /// schema later without an old and a new build silently misinterpreting
+    /// each other's payloads -- an old build simply will not find (or be
+    /// found by) a differently-versioned class name.
+    private static let windowClassName = "com.aichalkboard.overlay.broadcast.v1"
+    private static let windowClassNameWide: [UInt16] = Array(windowClassName.utf16) + [0]
+
+    /// The `HWND_MESSAGE` sentinel (`(HWND)-3`), used as every broadcast
+    /// window's parent so it never appears in the taskbar, Alt-Tab, or
+    /// `EnumWindows`'s top-level enumeration -- message-only windows exist
+    /// purely to have a `WNDPROC` and a message queue.
+    private static let hwndMessageOnly = HWND(bitPattern: -3)
+
+    /// Private, process-local message used only for the async self-delivery
+    /// path described in this class's doc comment above. `WM_APP` (0x8000)
+    /// is the documented start of the range Win32 reserves for
+    /// application-defined messages.
+    // `fileprivate`, not `private`: the free-function `WNDPROC`
+    // (`chalkboardBroadcastWndProc`, file-scope above -- it cannot be a
+    // method and capture `self`) switches on this value, and a top-level
+    // function is outside a `private` member's access scope even in the
+    // same file. `fileprivate` is still as narrow as Swift allows while
+    // remaining visible to that function.
+    fileprivate static let localDeliveryMessage: UINT = UINT(WM_APP) + 1
+
+    // THREADING: `hwnd`/`isRegistered`/`isQuitting` are read and written from
+    // multiple threads by construction -- the pump thread that owns the
+    // message-only window, whatever thread calls `postX`, and the 1s
+    // watchdog's background queue -- unlike the macOS branch, which can get
+    // away with "everything is main-thread-only" because AppKit and
+    // DistributedNotificationCenter delivery are both main-thread affairs
+    // here. `stateLock` guards exactly these three fields.
+    private let stateLock = NSLock()
+    private var hwnd: HWND?
+    private var isRegistered = false
+    private var isQuitting = false
+
+    /// Signalled once the pump thread has either created its broadcast
+    /// window (success) or given up (failure, already logged). `register
+    /// Observers()` waits on it so a `postX` call immediately afterward never
+    /// races an unset `hwnd` -- matching the macOS branch's `addObserver`
+    /// calls, which are synchronous by the time `registerObservers()`
+    /// returns.
+    private let readySemaphore = DispatchSemaphore(value: 0)
+
+    /// Retained for the process lifetime so the pump thread is never
+    /// deallocated out from under its own running loop.
+    private var pumpThread: Thread?
+
+    /// Set by whichever Windows lifecycle owner eventually exists (the
+    /// Windows analogue of `AppDelegate`) to run its own graceful shutdown --
+    /// closing overlay windows, flushing logs -- before the process actually
+    /// exits. By the time this is invoked, `InstanceBroadcast` has already
+    /// decided termination must happen, already set `isQuitting`, and already
+    /// logged why; this closure's only job is the actual shutdown action.
+    ///
+    /// WHY A CLOSURE, NOT A DIRECT CALL LIKE THE macOS BRANCH'S
+    /// `AppDelegate.markInternalTermination` + `NSApp.terminate(nil)`: there
+    /// is no Windows lifecycle owner in this codebase yet (no Windows
+    /// `AppDelegate`), and hard-wiring a call to a type that does not exist
+    /// would make this file itself uncompilable rather than merely pending
+    /// the rest of the Windows port. This mirrors a pattern already used
+    /// elsewhere in this codebase for the same kind of cross-module wiring --
+    /// `OverlayWindowController.onCaptureVisibleChanged`, set from
+    /// `AppDelegate.applicationDidFinishLaunching` -- rather than inventing a
+    /// new one. When the Windows lifecycle owner lands, it should set this to
+    /// its own graceful-shutdown routine (and end that routine by returning
+    /// from its message loop, or calling `ExitProcess`).
+    ///
+    /// If nothing has set this -- including today, since it does not exist
+    /// yet -- the fallback in `terminate(reason:)` below still terminates the
+    /// process. A user's Quit must never be silently ignored merely because
+    /// the graceful-shutdown hook has not been wired up yet; it just skips
+    /// whatever window teardown the eventual owner would have performed.
+    public var onQuitRequested: ((_ reason: String) -> Void)?
+
+    private init() {}
+
+    // MARK: - Registration
+
+    /// Windows counterpart to the macOS branch's `registerObservers()`: see
+    /// its doc comment for why this MUST be called by every instance
+    /// (primary and secondary alike) and MUST NOT be gated on
+    /// `InstanceLock.shared.acquire()`. That reasoning is unchanged here.
+    ///
+    /// Unlike the macOS branch (which registers four `@objc` selectors
+    /// against an already-running AppKit main run loop), this spins up its
+    /// OWN dedicated thread with its own `GetMessage` pump -- there is no
+    /// guarantee this process's main thread runs a Win32 message loop at
+    /// all, and even if the eventual Windows overlay window owner runs one
+    /// on main, coupling this channel's delivery to that loop's health would
+    /// be an unwanted dependency in both directions. Blocks (briefly, sub-
+    /// millisecond in the ordinary case) until the broadcast window exists or
+    /// setup has definitively failed, so that a `postX` call immediately
+    /// afterward behaves the same as it does on macOS: it never races a
+    /// not-yet-registered channel.
+    public func registerObservers() {
+        stateLock.lock()
+        guard !isRegistered else { stateLock.unlock(); return }
+        isRegistered = true
+        stateLock.unlock()
+
+        let thread = Thread { [self] in runBroadcastPump() }
+        thread.name = "AIChalkboard.InstanceBroadcast.Pump"
+        pumpThread = thread
+        thread.start()
+
+        // A generous but bounded wait: this runs once, at startup, and must
+        // not hang application launch forever if window-class registration
+        // is somehow broken on this machine. `runBroadcastPump()` signals
+        // this semaphore on every exit path, success or failure.
+        if readySemaphore.wait(timeout: .now() + 5) == .timedOut {
+            Logger.shared.log("InstanceBroadcast: timed out waiting for the Windows broadcast window to initialize. Cross-process clear/quit/capture-visibility/suspension broadcasts may not work in this process.", level: "ERROR")
+        }
+    }
+
+    /// Runs entirely on the dedicated pump thread started by
+    /// `registerObservers()`. Registers the well-known window class (once
+    /// per process; `ERROR_CLASS_ALREADY_EXISTS` on a second attempt in the
+    /// same process is not expected given the `isRegistered` guard above, but
+    /// is tolerated rather than treated as fatal), creates this instance's
+    /// `HWND_MESSAGE` window, stashes `self` on it via `GWLP_USERDATA` so the
+    /// free-function `WNDPROC` above can recover it, then pumps messages
+    /// until the window is destroyed (which, in practice, is never -- the
+    /// window and this thread are both process-lifetime, exactly like the
+    /// macOS branch's observer registration).
+    private func runBroadcastPump() {
+        var windowClass = WNDCLASSEXW()
+        windowClass.cbSize = UINT(MemoryLayout<WNDCLASSEXW>.size)
+        windowClass.lpfnWndProc = chalkboardBroadcastWndProc
+        windowClass.hInstance = GetModuleHandleW(nil)
+
+        let atom: ATOM = Self.windowClassNameWide.withUnsafeBufferPointer { buffer in
+            var classToRegister = windowClass
+            classToRegister.lpszClassName = buffer.baseAddress
+            return RegisterClassExW(&classToRegister)
+        }
+        if atom == 0 {
+            let registrationError = GetLastError()
+            guard registrationError == DWORD(ERROR_CLASS_ALREADY_EXISTS) else {
+                Logger.shared.log("InstanceBroadcast: RegisterClassExW failed (Win32 error \(registrationError)); this process cannot send or receive cross-process clear/quit/capture-visibility/suspension broadcasts.", level: "ERROR")
+                readySemaphore.signal()
+                return
+            }
+        }
+
+        let createdWindow: HWND? = Self.windowClassNameWide.withUnsafeBufferPointer { buffer in
+            CreateWindowExW(0, buffer.baseAddress, nil, 0, 0, 0, 0, 0,
+                             Self.hwndMessageOnly, nil, GetModuleHandleW(nil), nil)
+        }
+        guard let createdWindow else {
+            Logger.shared.log("InstanceBroadcast: CreateWindowExW failed (Win32 error \(GetLastError())); this process cannot send or receive cross-process clear/quit/capture-visibility/suspension broadcasts.", level: "ERROR")
+            readySemaphore.signal()
+            return
+        }
+
+        let selfPointer = Unmanaged.passUnretained(self).toOpaque()
+        // `LONG_PTR` is `Int64` on this toolchain (a distinct typealias, not
+        // interchangeable with plain `Int` for overload resolution), so the
+        // pointer must round-trip through `UInt64` explicitly rather than
+        // `UInt`/`Int`'s own `bitPattern:` initializers.
+        _ = SetWindowLongPtrW(createdWindow, GWLP_USERDATA,
+                               LONG_PTR(bitPattern: UInt64(UInt(bitPattern: selfPointer))))
+
+        stateLock.lock()
+        hwnd = createdWindow
+        stateLock.unlock()
+
+        Logger.shared.log("InstanceBroadcast: registered Windows message-only broadcast window (class \(Self.windowClassName)) for clear, quit, capture visibility, and durable suspension-lease invalidation. Suspension notifications are wake-up hints only; canonical state is read from the lease registry.", level: "INFO")
+        readySemaphore.signal()
+
+        // Blocks this dedicated thread until the window is destroyed, which
+        // in practice is never (see this method's doc comment) -- this is
+        // the Windows analogue of the macOS branch's "delivery requires a
+        // running main run loop" note, except this loop belongs entirely to
+        // `InstanceBroadcast` rather than depending on AppKit's.
+        // `GetMessageW` bridges to Swift `Bool` on this toolchain (unlike
+        // the raw three-state `BOOL`/`WINBOOL` -1-on-error C contract), so
+        // the loop below cannot distinguish WM_QUIT (`false`) from a genuine
+        // `GetLastError` failure the way idiomatic C Win32 code can -- both
+        // simply end the pump. That is an acceptable loss here: this loop's
+        // only job is to keep dispatching for the lifetime of the process
+        // (the window is never explicitly destroyed -- see this method's
+        // doc comment), so either outcome means the same thing in practice,
+        // "stop pumping".
+        var message = MSG()
+        while GetMessageW(&message, nil, 0, 0) {
+            TranslateMessage(&message)
+            DispatchMessageW(&message)
+        }
+    }
+
+    /// Recovers the owning `InstanceBroadcast` from a broadcast window's
+    /// `GWLP_USERDATA`, for use by the free-function `WNDPROC` above (which
+    /// cannot capture `self`). Returns `nil` before `runBroadcastPump()` has
+    /// stashed it (the brief window between `CreateWindowExW` returning and
+    /// `SetWindowLongPtrW` running, during which `WM_CREATE`/`WM_NCCREATE`
+    /// etc. can already reach the `WNDPROC`) or if `hWnd` is not one of this
+    /// process's own broadcast windows.
+    fileprivate static func windowsInstance(for hWnd: HWND) -> InstanceBroadcast? {
+        let raw = GetWindowLongPtrW(hWnd, GWLP_USERDATA)
+        guard raw != 0, let pointer = UnsafeRawPointer(bitPattern: UInt(bitPattern: Int(raw))) else { return nil }
+        return Unmanaged<InstanceBroadcast>.fromOpaque(pointer).takeUnretainedValue()
+    }
+
+    // MARK: - Posting
+
+    /// See the macOS branch's identical-in-spirit doc comment on why the
+    /// scope must be resolved once, by the poster, and travel in the
+    /// payload rather than be re-derived by each receiver.
+    public func postClear(scope: ClearScope, appId: String?, appName: String?) {
+        Logger.shared.log("InstanceBroadcast: posting CLEAR broadcast (scope=\(scope.rawValue), app=\(appName ?? appId ?? "n/a")) to all AI Chalkboard instances.", level: "INFO")
+        broadcast(WindowsBroadcastEnvelope(kind: .clear, scope: scope.rawValue, appId: appId, appName: appName, visible: nil, generation: nil))
+    }
+
+    public func postSetCaptureVisible(_ visible: Bool) {
+        Logger.shared.log("InstanceBroadcast: posting SET-CAPTURE-VISIBLE broadcast (visible=\(visible)) to all AI Chalkboard instances.", level: "INFO")
+        broadcast(WindowsBroadcastEnvelope(kind: .setCaptureVisible, scope: nil, appId: nil, appName: nil, visible: visible, generation: nil))
+    }
+
+    /// Broadcasts only a durable-state wake-up hint, exactly like the macOS
+    /// branch: no requested presentation state travels here, and no ACK
+    /// transport is needed -- see that branch's identical doc comment.
+    public func postSuspensionInvalidation(generation: UInt64) {
+        broadcast(WindowsBroadcastEnvelope(kind: .suspensionInvalidated, scope: nil, appId: nil, appName: nil, visible: nil, generation: String(generation)))
+    }
+
+    /// Posts "quit" to every instance, including this one. See the macOS
+    /// branch's doc comment for the scoping contract
+    /// (`scopedToLaunchMode`/`QuitScope`), which is unchanged here.
+    public func postQuitAll(scopedToLaunchMode: Bool = false) {
+        let scope = scopedToLaunchMode ? QuitScope.current : nil
+        Logger.shared.log("InstanceBroadcast: posting QUIT broadcast (scope=\(scope ?? "<all instances>")) to \(scopedToLaunchMode ? "AI Chalkboard instances launched in the same mode" : "all coexisting AI Chalkboard instances") (user-initiated quit).", level: "INFO")
+        broadcast(WindowsBroadcastEnvelope(kind: .quit, scope: scope, appId: nil, appName: nil, visible: nil, generation: nil))
+
+        // Watchdog, quit only -- same fail-safe purpose as the macOS
+        // branch's identically-named watchdog (read its long comment for the
+        // full "a quit that visibly quits beats a quit that appears to be
+        // ignored" reasoning, which is unchanged here), but the failure mode
+        // it guards against is narrower and platform-specific: on macOS the
+        // risk is `distnoted`, an OS daemon entirely OUTSIDE this process,
+        // silently failing to loop the notification back. Here, self-
+        // delivery is entirely IN-PROCESS (`deliverLocally` -> `PostMessageW`
+        // to this process's own pump thread), so the realistic failure modes
+        // are narrower still -- `PostMessageW` itself failing, or the pump
+        // thread having died -- but the consequence (a Quit that silently
+        // does nothing) would be exactly as bad, so the same fail-safe
+        // applies.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            let alreadyQuitting = self.isQuitting
+            if !alreadyQuitting { self.isQuitting = true }
+            self.stateLock.unlock()
+            guard !alreadyQuitting else { return }
+
+            Logger.shared.log("InstanceBroadcast: QUIT broadcast could not be confirmed after 1s -- this process never received its own local delivery back, so something about the in-process broadcast window is broken. Terminating THIS process anyway so the user's Quit is not silently ignored; any sibling that DID receive the broadcast is already dying independently, and any sibling that missed it re-elects itself primary the same way the macOS branch's watchdog comment describes.", level: "WARN")
+            self.terminate(reason: "quit broadcast unconfirmed; terminating locally")
+        }
+    }
+
+    /// Encodes `envelope` once, delivers it to this process asynchronously
+    /// and non-reentrantly (see this class's doc comment), then sends it to
+    /// every sibling window this session's `discoverSiblingWindows()` finds.
+    private func broadcast(_ envelope: WindowsBroadcastEnvelope) {
+        guard let data = try? JSONEncoder().encode(envelope),
+              let json = String(data: data, encoding: .utf8) else {
+            Logger.shared.log("InstanceBroadcast: failed to encode a \(envelope.kind.rawValue) broadcast payload; nothing was sent.", level: "ERROR")
+            return
+        }
+
+        deliverLocally(json)
+
+        for sibling in discoverSiblingWindows() {
+            sendCopyData(json, to: sibling)
+        }
+    }
+
+    /// The async, non-reentrant self-delivery path described in this class's
+    /// doc comment: posts (never sends) a private message carrying a
+    /// retained pointer to a heap-allocated payload box, which the pump
+    /// thread decodes and releases when it actually dequeues the message.
+    private func deliverLocally(_ json: String) {
+        stateLock.lock()
+        let target = hwnd
+        stateLock.unlock()
+
+        guard let target else {
+            Logger.shared.log("InstanceBroadcast: cannot deliver a broadcast to this process -- no broadcast window exists (registerObservers() was not called, or failed). This process will not see its own action take effect.", level: "ERROR")
+            return
+        }
+
+        let box = WindowsLocalBroadcastPayload(json)
+        let boxPointer = Unmanaged.passRetained(box).toOpaque()
+        let lparam = LPARAM(bitPattern: UInt64(UInt(bitPattern: boxPointer)))
+        guard PostMessageW(target, Self.localDeliveryMessage, 0, lparam) else {
+            // Nobody will ever dequeue this box -- release it here rather
+            // than leaking it, and log loudly: this specifically means the
+            // poster will not see its own Clear/Quit/etc. take effect.
+            Unmanaged<WindowsLocalBroadcastPayload>.fromOpaque(boxPointer).release()
+            Logger.shared.log("InstanceBroadcast: PostMessageW failed to queue a local self-delivery (Win32 error \(GetLastError())).", level: "ERROR")
+            return
+        }
+    }
+
+    /// Walks every `HWND_MESSAGE` child window registered under this
+    /// process's own well-known broadcast class, EXCLUDING this process's
+    /// own window (self-delivery goes through `deliverLocally` instead) and
+    /// any window whose owning process is not in this same Windows session
+    /// (see this class's "SESSION SCOPING" doc comment above).
+    private func discoverSiblingWindows() -> [HWND] {
+        stateLock.lock()
+        let selfWindow = hwnd
+        stateLock.unlock()
+
+        var ourSessionId: DWORD = 0
+        guard ProcessIdToSessionId(GetCurrentProcessId(), &ourSessionId) else {
+            Logger.shared.log("InstanceBroadcast: ProcessIdToSessionId failed for this process (Win32 error \(GetLastError())); cannot safely confirm sibling discovery is scoped to this session, so no siblings will be contacted this round.", level: "ERROR")
+            return []
+        }
+
+        var siblings: [HWND] = []
+        var previous: HWND?
+        while true {
+            let found: HWND? = Self.windowClassNameWide.withUnsafeBufferPointer { buffer in
+                FindWindowExW(Self.hwndMessageOnly, previous, buffer.baseAddress, nil)
+            }
+            guard let found else { break }
+            previous = found
+            if found == selfWindow { continue }
+
+            var ownerPID: DWORD = 0
+            _ = GetWindowThreadProcessId(found, &ownerPID)
+            var ownerSessionId: DWORD = 0
+            guard ProcessIdToSessionId(ownerPID, &ownerSessionId), ownerSessionId == ourSessionId else { continue }
+
+            siblings.append(found)
+        }
+        return siblings
+    }
+
+    /// Sends one already-encoded payload to one sibling window.
+    ///
+    /// `SendMessageTimeoutW`, deliberately not the plain, unbounded
+    /// `SendMessageW`: `WM_COPYDATA` is inherently a blocking cross-process
+    /// call -- the receiving thread must finish processing it before this
+    /// call can return, unlike `distnoted`'s fire-and-forget fan-out on
+    /// macOS -- so one hung, debugger-suspended, or SIGSTOP-equivalent
+    /// sibling must not be able to stall a Clear/Quit broadcast to every
+    /// OTHER sibling indefinitely. `SMTO_ABORTIFHUNG` lets Windows itself
+    /// bail out as soon as it considers the target unresponsive; the fixed
+    /// 2-second ceiling is a backstop beyond that. THIS IS AN HONEST,
+    /// DELIBERATE DIVERGENCE FROM macOS, not an oversight -- see
+    /// contractChanges for the precise statement of what is and is not
+    /// guaranteed here.
+    private func sendCopyData(_ json: String, to target: HWND) {
+        stateLock.lock()
+        let selfWindow = hwnd
+        stateLock.unlock()
+
+        var bytes = Array(json.utf8)
+        let delivered: Bool = bytes.withUnsafeMutableBufferPointer { buffer -> Bool in
+            var copyData = COPYDATASTRUCT()
+            // Unused: the envelope's own `kind` field carries the meaning,
+            // so there is nothing else worth tagging this with.
+            copyData.dwData = 0
+            copyData.cbData = DWORD(buffer.count)
+            copyData.lpData = UnsafeMutableRawPointer(buffer.baseAddress)
+            return withUnsafeMutablePointer(to: &copyData) { copyDataPointer -> Bool in
+                let lparam = LPARAM(bitPattern: UInt64(UInt(bitPattern: copyDataPointer)))
+                let wparam: WPARAM = selfWindow.map { WPARAM(UInt64(UInt(bitPattern: $0))) } ?? 0
+                var sendResult: DWORD_PTR = 0
+                let completed = SendMessageTimeoutW(
+                    target, UINT(WM_COPYDATA), wparam, lparam,
+                    UINT(SMTO_ABORTIFHUNG), 2000, &sendResult
+                )
+                return completed != 0
+            }
+        }
+
+        if !delivered {
+            Logger.shared.log("InstanceBroadcast: WM_COPYDATA send to a sibling broadcast window timed out or failed (Win32 error \(GetLastError())); that sibling instance did not receive this broadcast.", level: "WARN")
+        }
+    }
+
+    /// Terminates this process, routing through `onQuitRequested` when a
+    /// Windows lifecycle owner has installed one (see that property's doc
+    /// comment) and falling back to an immediate `ExitProcess` when none has.
+    private func terminate(reason: String) {
+        if let onQuitRequested {
+            onQuitRequested(reason)
+        } else {
+            Logger.shared.log("InstanceBroadcast: no Windows termination handler is installed (onQuitRequested); falling back to an immediate ExitProcess. Reason: \(reason)", level: "WARN")
+            ExitProcess(0)
+        }
+    }
+
+    // MARK: - Receiving
+
+    /// Decodes one JSON payload (from either `WM_COPYDATA` or the local
+    /// self-delivery path) and dispatches it to the matching handler below.
+    /// Runs on the pump thread for BOTH paths -- see this class's doc
+    /// comment on why self-delivery is routed back through the same
+    /// `WNDPROC` rather than, say, a raw `DispatchQueue.global().async` --
+    /// which gives every handler the same threading guarantees a
+    /// `WM_COPYDATA` delivery from a sibling process would have.
+    fileprivate func dispatchIncoming(json: String) {
+        guard let data = json.data(using: .utf8),
+              let envelope = try? JSONDecoder().decode(WindowsBroadcastEnvelope.self, from: data) else {
+            Logger.shared.log("InstanceBroadcast: RECEIVED a broadcast payload that could not be decoded; ignoring it. A malformed or hostile payload is harmless here -- every handler below only re-reads canonical local/durable state, never executes a command carried solely by the payload's shape.", level: "WARN")
+            return
+        }
+        switch envelope.kind {
+        case .clear: handleClearAllBroadcast(envelope)
+        case .setCaptureVisible: handleSetCaptureVisibleBroadcast(envelope)
+        case .suspensionInvalidated: handleSuspensionInvalidatedBroadcast(envelope)
+        case .quit: handleQuitAllBroadcast(envelope)
+        }
+    }
+
+    private func handleClearAllBroadcast(_ envelope: WindowsBroadcastEnvelope) {
+        let request = ClearBroadcastRequest(
+            scope: envelope.scope.flatMap(ClearScope.init(rawValue:)) ?? .all,
+            appId: envelope.appId,
+            appName: envelope.appName
+        )
+
+        switch request.scope {
+        case .all:
+            let removed = request.apply(to: AnnotationStore.shared)
+            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=all. Removed \(removed) annotation(s) from this process's store and repainting its overlays.", level: "INFO")
+        case .active:
+            let removed = request.apply(to: AnnotationStore.shared)
+            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=CLEAR scope=active app=\(request.appName ?? request.appId ?? "<none: global annotations only>"). Removed \(removed) annotation(s) from this process's store; annotations linked to other apps were left untouched.", level: "INFO")
+        }
+
+        OverlayWindowController.shared.refreshViews()
+    }
+
+    private func handleSetCaptureVisibleBroadcast(_ envelope: WindowsBroadcastEnvelope) {
+        let visible = envelope.visible == true
+
+        Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=SET-CAPTURE-VISIBLE visible=\(visible). Applying to this process's overlay windows.", level: "INFO")
+        OverlayWindowController.shared.setCaptureVisible(visible)
+    }
+
+    private func handleSuspensionInvalidatedBroadcast(_ envelope: WindowsBroadcastEnvelope) {
+        let generation = envelope.generation.flatMap(UInt64.init)
+        // A malformed or hostile hint is harmless: reconcile reads canonical
+        // state and never executes a desired state supplied by this channel.
+        _ = SuspensionLeaseCoordinator.shared.reconcile(announcedGeneration: generation)
+    }
+
+    private func handleQuitAllBroadcast(_ envelope: WindowsBroadcastEnvelope) {
+        let senderScope = envelope.scope
+
+        // MainThread.async here for the same reason the macOS branch hops
+        // before touching `isQuitting`/terminating: whichever Windows
+        // lifecycle owner eventually installs `onQuitRequested` will need to
+        // perform window teardown, and Win32 windows -- like AppKit -- are
+        // thread-affine to whatever thread created them. Dispatching here
+        // keeps that contract true regardless of which thread this handler
+        // itself runs on (today, always the pump thread; see
+        // `dispatchIncoming`'s doc comment).
+        MainThread.async { [weak self] in
+            guard let self else { return }
+
+            let ownScope = QuitScope.current
+            if let senderScope, senderScope != ownScope {
+                Logger.shared.log("InstanceBroadcast: IGNORING scoped QUIT broadcast from a '\(senderScope)' instance -- this process is '\(ownScope)'. A launch-mode-scoped quit does not cross launch modes.", level: "INFO")
+                return
+            }
+
+            Logger.shared.log("InstanceBroadcast: RECEIVED broadcast action=QUIT (scope=\(senderScope ?? "<legacy: unscoped>"), this process=\(ownScope)). Terminating this process.", level: "INFO")
+
+            self.stateLock.lock()
+            self.isQuitting = true
+            self.stateLock.unlock()
+
+            self.terminate(reason: "received QUIT broadcast from another instance (or from this process's own menu)")
+        }
+    }
+}
+
+#endif

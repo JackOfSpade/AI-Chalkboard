@@ -1,11 +1,11 @@
-import CoreGraphics
+import Foundation
 import XCTest
 @testable import AIChalkboardCore
 
 final class SVGPathParserTests: XCTestCase {
-    func testRendererFacingAPIProducesCoreGraphicsPathInSourceCoordinates() throws {
+    func testRendererFacingAPIProducesPathInSourceCoordinates() throws {
         let path = try SVGPathParser.parse("M10 20 L30 40")
-        XCTAssertEqual(path.boundingBoxOfPath, CGRect(x: 10, y: 20, width: 20, height: 20))
+        XCTAssertEqual(path.bounds, CGRect(x: 10, y: 20, width: 20, height: 20))
     }
 
     func testMoveLineHorizontalVerticalAndClose() throws {
@@ -86,5 +86,39 @@ final class SVGPathParserTests: XCTestCase {
         XCTAssertFalse(try SVGPathParser.parseGeometry("M 10 10 L 10 10 Z").hasDrawableGeometry)
         XCTAssertTrue(try SVGPathParser.parseGeometry("M 10 10 L 10 20").hasDrawableGeometry)
         XCTAssertTrue(try SVGPathParser.parseGeometry("M 10 10 Q 20 20 10 10").hasDrawableGeometry)
+    }
+
+    // MARK: - ChalkPath.bounds tight-vs-loose semantics
+    //
+    // `ChalkPath.bounds` must match `CGPath.boundingBoxOfPath` (the TIGHT
+    // bound of the curve as actually drawn), not `CGPath.boundingBox` (the
+    // LOOSE bound that also includes control points lying outside the
+    // rendered curve). Both quads below have a control point far outside the
+    // curve's own extent, so a loose, control-point-inclusive bound would
+    // disagree with these numbers.
+
+    func testQuadraticBoundsAreTightNotControlPointInclusive() throws {
+        // Control point (50, 100) lies far above the curve; the curve's own
+        // peak is its t=0.5 extremum at y=50, not the control point's y=100.
+        let path = try SVGPathParser.parse("M0 0 Q 50 100 100 0")
+        XCTAssertEqual(path.bounds, CGRect(x: 0, y: 0, width: 100, height: 50))
+    }
+
+    func testCubicBoundsAreTightNotControlPointInclusive() throws {
+        // Both control points sit at y=100; the curve's own peak (t=0.5) is
+        // y=75, not the control points' y=100. The x extrema both land
+        // exactly on the endpoints (x is monotonic along this symmetric
+        // curve), so the width still matches the endpoints exactly.
+        let path = try SVGPathParser.parse("M0 0 C 0 100 100 100 100 0")
+        XCTAssertEqual(path.bounds, CGRect(x: 0, y: 0, width: 100, height: 75))
+    }
+
+    func testParseAndParseGeometryAgreeOnElements() throws {
+        // `parse(_:)` (renderer-facing, returns `ChalkPath`) and
+        // `parseGeometry(_:)` (inspection-facing, returns `SVGPathGeometry`)
+        // both derive from the same single tokenisation pass; their
+        // resolved operations must be identical.
+        let data = "M0 0 L10 0 C 10 10 20 10 20 0 Q 25 -10 30 0 Z"
+        XCTAssertEqual(try SVGPathParser.parse(data).elements, try SVGPathParser.parseGeometry(data).elements)
     }
 }

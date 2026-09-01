@@ -9,6 +9,39 @@ import Foundation
 /// `@testable import` can exercise the exact coercion logic every draw tool
 /// relies on directly, with no process to spawn and no stdio to fake.
 enum MCPArgument {
+    /// Reports whether `number` is actually the JSON `true`/`false` literal
+    /// boxed as `NSNumber` (which `JSONSerialization` does on every
+    /// platform), as opposed to a genuine JSON number. Used everywhere below
+    /// that must reject a boolean argument masquerading as a number.
+    ///
+    /// On macOS this is a direct CoreFoundation type-identity check: JSON
+    /// booleans bridge to an `NSNumber` backed by `CFBoolean`, a type
+    /// distinct from `CFNumber`, so comparing `CFGetTypeID` is exact.
+    ///
+    /// `CFGetTypeID`/`CFBooleanGetTypeID` are not available through
+    /// `Foundation` on Windows (no CoreFoundation module is exposed by this
+    /// toolchain's swift-corelibs-foundation), so the Windows branch instead
+    /// checks the NSNumber's ObjC type-encoding character. `"c"` (signed
+    /// char) is the encoding both Darwin's CFBoolean and a `Bool`-initialized
+    /// `NSNumber` report, and `JSONSerialization` never boxes a genuine JSON
+    /// integer that way (integral values are always boxed at `"q"`/`"l"`
+    /// width or wider, and fractional values as `"d"` -- see `integer(_:)`
+    /// below, which already relies on that same width convention). This is
+    /// therefore an exact match for "this NSNumber is a JSON boolean" in
+    /// practice for values `JSONSerialization` itself produces, though it is
+    /// a narrower, string-typecode-based test rather than macOS's real
+    /// type-identity check -- a hand-constructed `NSNumber(value: Int8(...))`
+    /// argument (not something the MCP JSON transport can produce) would be
+    /// misclassified as boolean by this fallback.
+    private static func isJSONBooleanNumber(_ number: NSNumber) -> Bool {
+        #if os(macOS)
+        return CFGetTypeID(number) == CFBooleanGetTypeID()
+        #elseif os(Windows)
+        return String(cString: number.objCType) == "c"
+        #endif
+    }
+
+
     /// Coerces an MCP tool argument to `Double`, accepting a JSON number or a
     /// numeric string and rejecting everything else. This is the single
     /// shared numeric helper for every draw tool (radius, coordinates,
@@ -28,7 +61,7 @@ enum MCPArgument {
     ///     corrupt rendering or scheduling.
     static func double(_ value: Any?) -> Double? {
         if let num = value as? NSNumber {
-            guard CFGetTypeID(num) != CFBooleanGetTypeID() else { return nil }
+            guard !isJSONBooleanNumber(num) else { return nil }
             let d = num.doubleValue
             return d.isFinite ? d : nil
         }
@@ -45,7 +78,7 @@ enum MCPArgument {
     /// permissive bridge cast.
     static func bool(_ value: Any?) -> Bool? {
         guard let number = value as? NSNumber,
-              CFGetTypeID(number) == CFBooleanGetTypeID() else {
+              isJSONBooleanNumber(number) else {
             return nil
         }
         return number.boolValue
@@ -86,7 +119,7 @@ enum MCPArgument {
     /// doubles explicitly instead of silently truncating them.
     static func integer(_ value: Any?) -> Int? {
         if let number = value as? NSNumber {
-            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            guard !isJSONBooleanNumber(number) else { return nil }
 
             // JSONSerialization preserves integral JSON values as integral
             // NSNumbers where it can. Going through `doubleValue` first loses

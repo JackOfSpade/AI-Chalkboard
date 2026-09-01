@@ -1,5 +1,4 @@
 import Foundation
-import AppKit
 
 /// Validates the portion of a JSON-RPC request that is specific to MCP tool
 /// calls before any tool handler receives it. Keeping this pure makes the
@@ -76,9 +75,10 @@ public final class MCPServer: @unchecked Sendable {
 
     /// Guards `transportFailureFired` below. `readLoop` runs on the
     /// background `DispatchQueue.global` queue started by `start()`, while
-    /// `terminateAfterTransportFailure` hops to the MAIN queue partway
-    /// through its own body (see that method) to call `NSApp.terminate`; the
-    /// flag itself, though, has to be safe to set and read from either queue,
+    /// `terminateAfterTransportFailure` hops to the UI thread partway
+    /// through its own body (see that method, and `AppHost.runOnMain`) to
+    /// call `AppHost.terminate()`; the flag itself, though, has to be safe
+    /// to set and read from either queue,
     /// since `readLoop` polls it from the background queue while a write
     /// failure detected inside `sendResponse` -- also on the background
     /// queue, but logically a separate event from `readLoop`'s own EOF/
@@ -226,8 +226,8 @@ public final class MCPServer: @unchecked Sendable {
     /// that a write inside `handleMessage` had already failed, so it kept
     /// handing the chunk's remaining lines to `handleMessage`, each of which
     /// produced another failed write and therefore another call here -- N
-    /// separate `DispatchQueue.main.async { markInternalTermination;
-    /// NSApp.terminate }` closures instead of one. `readLoop` breaking out
+    /// separate `AppHost.runOnMain { markInternalTermination;
+    /// AppHost.terminate() }` closures instead of one. `readLoop` breaking out
     /// promptly (above) now makes that pile-up far less likely, but this
     /// guard is what actually GUARANTEES this function's effects happen at
     /// most once, regardless of how many times, or from which of its three
@@ -247,25 +247,28 @@ public final class MCPServer: @unchecked Sendable {
 
         log("\(reason) while in MCP mode. Terminating process to avoid leaving an orphaned background instance.")
 
-        // NSApp.terminate(_:) must be called on the main thread. readLoop()
-        // runs on a background DispatchQueue.global() queue (see start()) and
-        // sendResponse() is called from that same queue's call stack, so we
-        // hop to the main queue rather than calling it directly here. Routing
-        // through NSApp.terminate(nil) (instead of a bare exit(0)) keeps this
-        // symmetric with the SIGTERM/SIGINT/SIGHUP shutdown path in the
-        // launcher entry point, and ensures
-        // AppDelegate.applicationWillTerminate's clean-shutdown log line still
-        // fires.
-        DispatchQueue.main.async {
+        // The platform's app-termination call must run on the UI thread.
+        // readLoop() runs on a background DispatchQueue.global() queue (see
+        // start()) and sendResponse() is called from that same queue's call
+        // stack, so we hop via AppHost.runOnMain rather than calling
+        // AppHost.terminate() directly here -- see that function's doc
+        // comment for why this is NOT plain `DispatchQueue.main.async`.
+        // Routing through AppHost.terminate() (instead of a bare exit(0))
+        // keeps this symmetric with the SIGTERM/SIGINT/SIGHUP (macOS) /
+        // console-control (Windows) shutdown paths in the launcher entry
+        // point, and ensures the platform's clean-shutdown log line (macOS:
+        // AppDelegate.applicationWillTerminate) still fires.
+        AppHost.runOnMain {
             // LIFECYCLE shutdown, NOT a user quit. Claude Desktop gives each of
             // the two processes it spawns its own stdin/stdout pipes, so one
             // pipe breaking says nothing about the sibling's -- the sibling may
             // still be serving its client perfectly well. Marking the
-            // termination internal is what stops
-            // AppDelegate.applicationShouldTerminate from broadcasting a quit
-            // that would take that healthy sibling down with us.
+            // termination internal is what stops AppDelegate's termination
+            // choke point (applicationShouldTerminate on macOS,
+            // requestTermination on Windows) from broadcasting a quit that
+            // would take that healthy sibling down with us.
             AppDelegate.markInternalTermination(reason: reason)
-            NSApp.terminate(nil)
+            AppHost.terminate()
         }
     }
 

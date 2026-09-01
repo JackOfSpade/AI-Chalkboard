@@ -1,11 +1,36 @@
 import Foundation
 // Foundation re-exports Darwin on Apple platforms, which is where open(2),
 // flock(2), fstat(2)/stat(2), and close(2) come from below.
+#if os(Windows)
+// Windows has no POSIX layer for Foundation to re-export. The analogous
+// file-identity, locking, and durability primitives used below
+// (CreateFileW, LockFileEx/UnlockFileEx, GetFileInformationByHandle,
+// GetFileAttributesExW, FlushFileBuffers, CloseHandle, GetLastError) come
+// from the plain-C Win32 surface that WinSDK exposes directly.
+import WinSDK
+#endif
 
 public final class Logger: @unchecked Sendable {
     public static let shared = Logger()
 
+    #if os(macOS)
     private var fileHandle: FileHandle?
+    #elseif os(Windows)
+    // A raw Win32 HANDLE rather than Foundation's FileHandle: the identity
+    // check in reopenIfRotatedAwayFromUnderUs() below must call
+    // GetFileInformationByHandle on exactly the handle these writes go
+    // through, and there is no supported way to recover the underlying
+    // HANDLE from a FileHandle wrapper. NOTE: on this toolchain's WinSDK
+    // overlay, `HANDLE` itself resolves to a plain non-optional
+    // `UnsafeMutableRawPointer` (not already-optional, despite what an
+    // earlier version of this comment claimed) -- so the property is
+    // declared `HANDLE?` explicitly and stores nil to mean "no file
+    // currently open", mirroring `FileHandle?` above -- there is no
+    // separate "invalid" sentinel stored here (see openAppendHandle(at:),
+    // which maps Win32's INVALID_HANDLE_VALUE to nil itself).
+    private var fileHandle: HANDLE?
+    #endif
+
     private let logFileURL: URL
     private let backupFileURL: URL
     private let lockFileURL: URL
@@ -76,9 +101,7 @@ public final class Logger: @unchecked Sendable {
 
     private init() {
         let fileManager = FileManager.default
-        let logsDir = fileManager.urls(for: .libraryDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("Logs")
-            .appendingPathComponent("AIChalkboard")
+        let logsDir = PlatformPaths.logDirectory
 
         try? fileManager.createDirectory(at: logsDir, withIntermediateDirectories: true)
 
@@ -110,6 +133,7 @@ public final class Logger: @unchecked Sendable {
         log("==================================================")
     }
 
+    #if os(macOS)
     // Opens (creating if necessary) the log file with O_APPEND.
     //
     // BUG FIX (concurrent writers corrupt the log): Claude Desktop routinely
@@ -143,6 +167,93 @@ public final class Logger: @unchecked Sendable {
         }
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
+    #elseif os(Windows)
+    // Opens (creating if necessary) the log file for atomic append.
+    //
+    // WINDOWS NOTE: this is the Windows analogue of the O_APPEND bug fix
+    // documented on the macOS branch above (concurrent Claude Desktop
+    // instances writing this same log file). Windows has no O_APPEND flag,
+    // but the same "each write atomically seeks to EOF first" guarantee is
+    // available by a different, documented route: opening the handle with
+    // ONLY the FILE_APPEND_DATA right -- and deliberately withholding the
+    // broader FILE_WRITE_DATA right -- makes the OS itself force every
+    // WriteFile call on that handle to append at the file's current end,
+    // ignoring whatever the handle's own file pointer says. This is
+    // documented Win32 behavior, not an emulation layered on top of it.
+    // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE matches the
+    // sharing this needs: sibling processes must still be able to open,
+    // write to, and rename/delete this same path while we hold it open,
+    // since rotateIfNeeded() below relies on being able to rename the live
+    // file out from under any process (including this one) still holding a
+    // handle to it.
+    private static func openAppendHandle(at url: URL) -> HANDLE? {
+        let rawHandle: HANDLE? = url.path.withCString(encodedAs: UTF16.self) { widePath in
+            CreateFileW(
+                widePath,
+                DWORD(FILE_APPEND_DATA),
+                DWORD(FILE_SHARE_READ) | DWORD(FILE_SHARE_WRITE) | DWORD(FILE_SHARE_DELETE),
+                nil,
+                DWORD(OPEN_ALWAYS),
+                DWORD(FILE_ATTRIBUTE_NORMAL),
+                nil
+            )
+        }
+        guard let handle = rawHandle, handle != INVALID_HANDLE_VALUE else {
+            // A logging failure must never take down the MCP server. Report to
+            // stderr only and continue with fileHandle == nil; log() already
+            // writes to stderr unconditionally, so output isn't fully lost.
+            let msg = "[Logger] Failed to open log file at \(url.path) (Win32 error \(GetLastError())). Logging to stderr only.\n"
+            stderrLock.lock()
+            Logger.writeStderr(msg)
+            stderrLock.unlock()
+            return nil
+        }
+        return handle
+    }
+
+    /// Best-effort analogue of `stat`/`fstat`'s (st_dev, st_ino) identity
+    /// pair, used by reopenIfRotatedAwayFromUnderUs() below to detect that
+    /// another process rotated the log file out from under this one.
+    /// Microsoft documents the file-index portion of this as NOT guaranteed
+    /// to stay constant over the life of a file on every filesystem (it can
+    /// change after the file is closed and reopened on some filesystems,
+    /// e.g. certain remote or FAT volumes) -- unlike a POSIX inode, which is
+    /// a hard guarantee. That caveat only ever costs an unnecessary
+    /// close-and-reopen against the same still-live path here (harmless);
+    /// it never causes the opposite, unsafe outcome of concluding two
+    /// different files are the same one and continuing to write to a
+    /// detached handle.
+    private static func fileInformation(ofOpenHandle handle: HANDLE) -> BY_HANDLE_FILE_INFORMATION? {
+        var info = BY_HANDLE_FILE_INFORMATION()
+        guard GetFileInformationByHandle(handle, &info) else { return nil }
+        return info
+    }
+
+    /// Opens a short-lived, attributes-only handle purely to identify
+    /// whatever file currently sits at `path` -- the Windows analogue of
+    /// POSIX `stat(path)`, which needs no open file descriptor at all.
+    /// `dwDesiredAccess: 0` requests no read/write rights (a documented
+    /// Win32 idiom for a metadata-only handle), and the same sharing flags
+    /// as openAppendHandle(at:) above mean this never contends with, or
+    /// blocks, any writer -- including this same process's own append
+    /// handle.
+    private static func fileInformation(atPath path: String) -> BY_HANDLE_FILE_INFORMATION? {
+        let rawHandle: HANDLE? = path.withCString(encodedAs: UTF16.self) { widePath in
+            CreateFileW(
+                widePath,
+                0,
+                DWORD(FILE_SHARE_READ) | DWORD(FILE_SHARE_WRITE) | DWORD(FILE_SHARE_DELETE),
+                nil,
+                DWORD(OPEN_EXISTING),
+                DWORD(FILE_ATTRIBUTE_NORMAL),
+                nil
+            )
+        }
+        guard let probeHandle = rawHandle, probeHandle != INVALID_HANDLE_VALUE else { return nil }
+        defer { CloseHandle(probeHandle) }
+        return fileInformation(ofOpenHandle: probeHandle)
+    }
+    #endif
 
     // Encodes `line` as UTF-8 and writes it to stderr, returning the encoded
     // bytes (whether or not the stderr write itself succeeded -- see the
@@ -212,14 +323,15 @@ public final class Logger: @unchecked Sendable {
     }
 
     // Writes pre-encoded line data to the current file handle, degrading to
-    // stderr-only on any failure rather than crashing the MCP server. Using
-    // the throwing `write(contentsOf:)` API (not the legacy non-throwing
-    // `write(_:)`) matters here: the legacy API can raise an uncatchable
-    // Objective-C exception on failure (e.g. EPIPE), which would terminate
-    // this process outright.
+    // stderr-only on any failure rather than crashing the MCP server.
     private func writeToFile(_ data: Data) {
         guard !suppressFileWritesUntilRotationSucceeds,
               let handle = fileHandle else { return }
+        #if os(macOS)
+        // Using the throwing `write(contentsOf:)` API (not the legacy
+        // non-throwing `write(_:)`) matters here: the legacy API can raise an
+        // uncatchable Objective-C exception on failure (e.g. EPIPE), which
+        // would terminate this process outright.
         do {
             try handle.write(contentsOf: data)
             // BUG FIX (fsync on every line is ~8x slower and unnecessary):
@@ -246,11 +358,51 @@ public final class Logger: @unchecked Sendable {
             Logger.writeStderr(msg)
             Logger.stderrLock.unlock()
         }
+        #elseif os(Windows)
+        // WINDOWS NOTE: WriteFile reports failure through its BOOL return
+        // value plus GetLastError(), not through a thrown/raised exception,
+        // so there is no Objective-C-exception hazard here the way there is
+        // with FileHandle's legacy write(_:) API on macOS (see that branch
+        // above) -- checking `writeSucceeded` below is already complete
+        // failure handling.
+        //
+        // Same non-fsync-per-line reasoning as the macOS branch above
+        // applies here: this is a diagnostic log, not a durability-critical
+        // store, and the handle is opened for atomic append (see
+        // openAppendHandle(at:)) so the write itself still reaches the OS
+        // immediately. FlushFileBuffers is reserved for the same rare,
+        // high-value writes as macOS's synchronize() call: the rotation
+        // banner below and the synchronous FATAL path in logSync().
+        let writeSucceeded = data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) -> Bool in
+            guard let base = buffer.baseAddress, !buffer.isEmpty else { return true }
+            var bytesWritten: DWORD = 0
+            let ok = WriteFile(handle, base, DWORD(buffer.count), &bytesWritten, nil)
+            return ok && bytesWritten == DWORD(buffer.count)
+        }
+        if !writeSucceeded {
+            let msg = "[Logger] File write failed: Win32 error \(GetLastError()). Logging to stderr only for this line.\n"
+            // Safe to take stderrLock here: writeToFile() only ever runs
+            // inside `queue` (from log()'s queue.async or logSync()'s
+            // queue.sync), and nothing holds stderrLock while waiting on
+            // `queue` (see the lock's declaration), so there is no path back
+            // to a deadlock.
+            Logger.stderrLock.lock()
+            Logger.writeStderr(msg)
+            Logger.stderrLock.unlock()
+        }
+        #endif
     }
 
     // Detects that another process rotated the log out from under this one,
     // and self-heals by reopening against the path.
     //
+    // Returns the live log path's size as observed by the stat this method
+    // already had to perform, purely so the rotateIfNeeded() call that always
+    // follows can reuse it instead of stat()ing the very same path a second
+    // time on every single log line. Returns nil whenever that number would
+    // be missing or stale -- no handle yet, either stat failed, or we just
+    // reopened -- and rotateIfNeeded() then takes its own fresh measurement.
+    #if os(macOS)
     // BUG FIX (rotation across processes silently misroutes logs): POSIX file
     // descriptors follow inodes, not paths. If process A rotates (renames the
     // current log to the backup name, then creates a fresh file at the
@@ -261,13 +413,6 @@ public final class Logger: @unchecked Sendable {
     // our own descriptor and stat the current path, and if the inodes differ,
     // someone else rotated, so close and reopen against the path to land back
     // on the live file.
-    //
-    // Returns the live log path's size as observed by the stat this method
-    // already had to perform, purely so the rotateIfNeeded() call that always
-    // follows can reuse it instead of stat()ing the very same path a second
-    // time on every single log line. Returns nil whenever that number would
-    // be missing or stale -- no handle yet, either stat failed, or we just
-    // reopened -- and rotateIfNeeded() then takes its own fresh measurement.
     @discardableResult
     private func reopenIfRotatedAwayFromUnderUs() -> UInt64? {
         guard let handle = fileHandle else {
@@ -297,6 +442,53 @@ public final class Logger: @unchecked Sendable {
 
         return UInt64(max(pathStat.st_size, 0))
     }
+    #elseif os(Windows)
+    // WINDOWS NOTE (rotation across processes silently misroutes logs): the
+    // same race macOS's comment above describes applies unchanged on
+    // Windows -- Win32 handles, like POSIX descriptors, follow the
+    // underlying file, not the path string used to open them. If process A
+    // rotates (renames the current log to the backup name, then creates a
+    // fresh file at the original path), process B's already-open handle
+    // still refers to the renamed file — B would keep appending into what is
+    // now the backup file forever. We guard against this on the same code
+    // path that runs before every write: query the identity of our own open
+    // handle and of whatever is currently at the path, and if they differ,
+    // someone else rotated, so close and reopen against the path to land
+    // back on the live file. See fileInformation(ofOpenHandle:)'s doc
+    // comment above for the identity pair used and its one honest gap
+    // versus the POSIX inode check.
+    @discardableResult
+    private func reopenIfRotatedAwayFromUnderUs() -> UInt64? {
+        guard let handle = fileHandle else {
+            fileHandle = Logger.openAppendHandle(at: logFileURL)
+            return nil
+        }
+
+        guard let handleInfo = Logger.fileInformation(ofOpenHandle: handle) else { return nil }
+        guard let pathInfo = Logger.fileInformation(atPath: logFileURL.path) else {
+            // Path momentarily missing (e.g. another process mid-rename);
+            // leave the handle as-is and retry on the next log() call.
+            return nil
+        }
+
+        let sameFile =
+            handleInfo.dwVolumeSerialNumber == pathInfo.dwVolumeSerialNumber &&
+            handleInfo.nFileIndexHigh == pathInfo.nFileIndexHigh &&
+            handleInfo.nFileIndexLow == pathInfo.nFileIndexLow
+
+        guard sameFile else {
+            CloseHandle(handle)
+            fileHandle = Logger.openAppendHandle(at: logFileURL)
+            // Another process is actively rotating this path right now, so
+            // the size read a moment ago is exactly the kind of number that
+            // goes stale between the stat and the reopen. Report nothing and
+            // let rotateIfNeeded() measure the file we actually ended up on.
+            return nil
+        }
+
+        return (UInt64(pathInfo.nFileSizeHigh) << 32) | UInt64(pathInfo.nFileSizeLow)
+    }
+    #endif
 
     // Rotates the log file when it exceeds maxFileSizeBytes.
     //
@@ -352,6 +544,7 @@ public final class Logger: @unchecked Sendable {
             return
         }
 
+        #if os(macOS)
         let lockFd = open(lockFileURL.path, O_WRONLY | O_CREAT, 0o644)
         guard lockFd != -1 else {
             // Can't coordinate rotation right now; skip rotating this round
@@ -382,6 +575,55 @@ public final class Logger: @unchecked Sendable {
             return
         }
         defer { flock(lockFd, LOCK_UN) }
+        #elseif os(Windows)
+        // WINDOWS NOTE: LockFileEx is the Win32 analogue of flock() used
+        // above -- it locks a byte range of an open handle rather than the
+        // whole file at once, so the entire practically-unbounded range
+        // [0, UInt32.max] is locked here to get the same whole-file
+        // advisory-lock effect flock() gives on macOS. LOCKFILE_FAIL_IMMEDIATELY
+        // is the non-blocking counterpart to LOCK_NB, for the exact same
+        // reason given on the macOS branch above: a blocking wait here would
+        // stall this process's single serial `queue` forever if the lock
+        // holder is stuck (a suspended process, a paused debugger). On
+        // failure, another process is already rotating, so this round is
+        // skipped and a later log() call reassesses -- either that process
+        // finishes rotating (and our next call picks up the fresh file via
+        // the identity self-heal above) or it eventually releases the lock
+        // and a later line retries successfully.
+        let lockHandle: HANDLE? = lockFileURL.path.withCString(encodedAs: UTF16.self) { widePath in
+            CreateFileW(
+                widePath,
+                DWORD(GENERIC_WRITE),
+                DWORD(FILE_SHARE_READ) | DWORD(FILE_SHARE_WRITE),
+                nil,
+                DWORD(OPEN_ALWAYS),
+                DWORD(FILE_ATTRIBUTE_NORMAL),
+                nil
+            )
+        }
+        guard let lockHandle = lockHandle, lockHandle != INVALID_HANDLE_VALUE else {
+            // Can't coordinate rotation right now; skip rotating this round
+            // rather than risk racing another process. We'll reassess on the
+            // next log() call.
+            suppressFileWritesUntilRotationSucceeds = true
+            return
+        }
+        defer { CloseHandle(lockHandle) }
+
+        var lockOverlapped = OVERLAPPED()
+        guard LockFileEx(
+            lockHandle,
+            DWORD(LOCKFILE_EXCLUSIVE_LOCK) | DWORD(LOCKFILE_FAIL_IMMEDIATELY),
+            0,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF,
+            &lockOverlapped
+        ) else {
+            suppressFileWritesUntilRotationSucceeds = true
+            return
+        }
+        defer { UnlockFileEx(lockHandle, 0, 0xFFFF_FFFF, 0xFFFF_FFFF, &lockOverlapped) }
+        #endif
 
         // Re-check under the lock: another process may have already rotated
         // while we were waiting to acquire it. This MUST be a fresh stat and
@@ -438,11 +680,22 @@ public final class Logger: @unchecked Sendable {
             return
         }
 
+        #if os(macOS)
         // Close the handle on the now-renamed (backup) inode and reopen
         // against the path, which recreates the fresh file via O_CREAT. This
         // is the same self-heal used by reopenIfRotatedAwayFromUnderUs(), run
         // here directly since we're the process that performed the rotation.
         try? fileHandle?.close()
+        #elseif os(Windows)
+        // Close the handle on the now-renamed (backup) file and reopen
+        // against the path, which recreates the fresh file via OPEN_ALWAYS
+        // (see openAppendHandle(at:) above). This is the same self-heal used
+        // by reopenIfRotatedAwayFromUnderUs(), run here directly since we're
+        // the process that performed the rotation.
+        if let handle = fileHandle {
+            CloseHandle(handle)
+        }
+        #endif
         fileHandle = Logger.openAppendHandle(at: logFileURL)
         lastRotationFailure = nil
         suppressFileWritesUntilRotationSucceeds = false
@@ -450,12 +703,26 @@ public final class Logger: @unchecked Sendable {
         if let newHandle = fileHandle {
             let rotationMsg = "[\(dateFormatter.string(from: Date()))] [PID: \(ProcessInfo.processInfo.processIdentifier)] [INFO] Log file rotated: 5 MB limit reached. Oldest logs moved to ai_chalkboard.1.log\n"
             if let msgData = rotationMsg.data(using: .utf8) {
+                #if os(macOS)
                 try? newHandle.write(contentsOf: msgData)
                 // Unlike routine per-line writes (see writeToFile), a
                 // rotation is a rare, significant event worth the fsync
                 // cost to make sure the banner marking the new file's start
                 // is durable.
                 try? newHandle.synchronize()
+                #elseif os(Windows)
+                _ = msgData.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) -> Bool in
+                    guard let base = buffer.baseAddress, !buffer.isEmpty else { return true }
+                    var bytesWritten: DWORD = 0
+                    return WriteFile(newHandle, base, DWORD(buffer.count), &bytesWritten, nil)
+                }
+                // Same reasoning as the macOS branch above: unlike routine
+                // per-line writes (see writeToFile), a rotation is a rare,
+                // significant event worth the extra FlushFileBuffers cost to
+                // make sure the banner marking the new file's start is
+                // durable.
+                FlushFileBuffers(newHandle)
+                #endif
             }
         }
     }
@@ -499,15 +766,36 @@ public final class Logger: @unchecked Sendable {
             // abort()/exit and this may be the only record of why. This is
             // the other genuinely-rare, high-value write alongside the
             // rotation banner that justifies paying for fsync.
+            #if os(macOS)
             try? self.fileHandle?.synchronize()
+            #elseif os(Windows)
+            if let handle = self.fileHandle {
+                FlushFileBuffers(handle)
+            }
+            #endif
         }
     }
 
+    #if os(macOS)
     private static func fileSize(atPath path: String) -> UInt64? {
         var s = stat()
         guard stat(path, &s) == 0 else { return nil }
         return UInt64(s.st_size)
     }
+    #elseif os(Windows)
+    // Windows analogue of stat()'s size read: GetFileAttributesExW needs no
+    // open handle at all, matching stat()'s zero-handle simplicity (unlike
+    // fileInformation(atPath:) above, which genuinely needs a handle to read
+    // GetFileInformationByHandle's volume/index identity fields).
+    private static func fileSize(atPath path: String) -> UInt64? {
+        var data = WIN32_FILE_ATTRIBUTE_DATA()
+        let ok = path.withCString(encodedAs: UTF16.self) { widePath in
+            GetFileAttributesExW(widePath, GetFileExInfoStandard, &data)
+        }
+        guard ok else { return nil }
+        return (UInt64(data.nFileSizeHigh) << 32) | UInt64(data.nFileSizeLow)
+    }
+    #endif
 
     /// Returns a valid-Unicode diagnostic message within `maxMessageBytes`.
     /// Internal so the byte-boundary behavior can be tested without opening a

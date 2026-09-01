@@ -1,5 +1,7 @@
 import Foundation
-import AppKit
+#if os(Windows)
+import WinSDK
+#endif
 
 /// A rectangle in one named desktop coordinate space.  `ScreenInfo` carries
 /// both the AppKit point-space rectangle and the WindowServer rectangle so a
@@ -121,6 +123,9 @@ public struct ScreenSnapshot {
     }
 }
 
+#if os(macOS)
+import AppKit
+
 extension OverlayWindowController {
     public func getScreenId(screen: NSScreen, index: Int) -> String {
         if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
@@ -200,3 +205,150 @@ extension OverlayWindowController {
         return infos
     }
 }
+#elseif os(Windows)
+import WinSDK
+
+extension OverlayWindowController {
+    /// Takes one snapshot of the Windows display layout and answers every
+    /// screen question a single MCP tool call needs to ask against it -- the
+    /// same contract `screenSnapshot()` documents on macOS above, minus that
+    /// branch's specific TOCTOU story (`EnumDisplayMonitors` plus one
+    /// `GetMonitorInfoW`/`GetDpiForMonitor` pair per handle is a synchronous,
+    /// single-threaded walk on the UI thread, not two independently-timed
+    /// reads of a value that can change out from under them).
+    public func screenSnapshot() -> ScreenSnapshot {
+        WindowsUIThread.shared.sync {
+            ScreenSnapshot(screens: self.buildScreenInfos())
+        }
+    }
+
+    /// UI-THREAD-ONLY by convention, mirroring the macOS `buildScreenInfos()`
+    /// doc comment's MAIN-THREAD-ONLY contract: every caller here already
+    /// runs inside a `WindowsUIThread.sync`/`.async` block. Nothing about
+    /// `EnumDisplayMonitors`/`GetMonitorInfoW`/`GetDpiForMonitor` actually
+    /// requires that specific thread (unlike `NSScreen`, these are plain
+    /// synchronous Win32 queries with no AppKit-style thread affinity), but
+    /// keeping this call site on the same thread that owns window
+    /// creation/destruction avoids a second concurrency story existing only
+    /// for screen enumeration.
+    // internal (not private): OverlayWindowController+Diagnostics.swift's
+    // presentationStatus(for:) derives its expected geometry from these same
+    // ScreenInfos, exactly as it does on macOS.
+    func buildScreenInfos() -> [ScreenInfo] {
+        final class MonitorBox {
+            var handles: [HMONITOR] = []
+        }
+        let box = MonitorBox()
+        let boxPointer = Unmanaged.passUnretained(box).toOpaque()
+        _ = EnumDisplayMonitors(nil, nil, { hMonitor, _, _, lParam in
+            guard let hMonitor, let raw = UnsafeRawPointer(bitPattern: Int(lParam)) else { return true }
+            Unmanaged<MonitorBox>.fromOpaque(raw).takeUnretainedValue().handles.append(hMonitor)
+            return true
+        }, LPARAM(Int(bitPattern: boxPointer)))
+
+        var infos: [ScreenInfo] = []
+        infos.reserveCapacity(box.handles.count)
+
+        for (idx, hMonitor) in box.handles.enumerated() {
+            var infoEx = MONITORINFOEXW()
+            infoEx.cbSize = UInt32(MemoryLayout<MONITORINFOEXW>.size)
+            // MONITORINFOEXW is binary-compatible with MONITORINFO for its
+            // first four fields (cbSize, rcMonitor, rcWork, dwFlags) --
+            // `szDevice` is appended after them, which is exactly the C
+            // idiom GetMonitorInfoW's documentation relies on: pass the
+            // larger struct's address, sized correctly via `cbSize`, and the
+            // extended fields come back filled in too.
+            let gotInfo = withUnsafeMutablePointer(to: &infoEx) { exPtr -> Bool in
+                exPtr.withMemoryRebound(to: MONITORINFO.self, capacity: 1) { miPtr in
+                    GetMonitorInfoW(hMonitor, miPtr)
+                }
+            }
+            guard gotInfo else {
+                Logger.shared.log("OverlayWindowController: GetMonitorInfoW failed for monitor index \(idx); skipping it.", level: "ERROR")
+                continue
+            }
+
+            let rect = infoEx.rcMonitor
+            let widthPx = Int(rect.right - rect.left)
+            let heightPx = Int(rect.bottom - rect.top)
+            guard widthPx > 0, heightPx > 0 else { continue }
+
+            var dpiX: UInt32 = 96
+            var dpiY: UInt32 = 96
+            let dpiStatus = GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)
+            if dpiStatus != S_OK {
+                Logger.shared.log("OverlayWindowController: GetDpiForMonitor failed (hresult=\(dpiStatus)) for monitor index \(idx); defaulting to 96 DPI (scale 1.0).", level: "WARN")
+                dpiX = 96
+            }
+            let scale = Double(dpiX) / 96.0
+
+            // Microsoft documents HMONITOR as potentially REASSIGNED across a
+            // display-configuration change (unplugging one monitor and
+            // plugging in a different one can hand the new one the same
+            // handle value within this process's lifetime) -- see
+            // `ScreenSnapshot.resolve(_:)`'s doc comment above for why an id
+            // that can silently start meaning a different physical display
+            // is unacceptable here. The device name (`\\.\DISPLAYn`)
+            // `GetMonitorInfoW`'s extended struct reports is the OS's own
+            // stable-per-session label for the physical output -- the
+            // closest Windows analogue of the macOS branch's
+            // `CGDirectDisplayID`-derived id -- so that, not the raw
+            // `HMONITOR`, is what this reports as `id`.
+            let deviceName = withUnsafePointer(to: infoEx.szDevice) { namePtr -> String in
+                namePtr.withMemoryRebound(to: UInt16.self, capacity: Int(CCHDEVICENAME)) { wide in
+                    String(decodingCString: wide, as: UTF16.self)
+                }
+            }
+            let isMain = (infoEx.dwFlags & DWORD(MONITORINFOF_PRIMARY)) != 0
+
+            // Windows' virtual desktop is already top-left-origin, physical
+            // pixels once this process is Per-Monitor-v2 DPI aware (see
+            // `OverlayWindowController.setup()`'s one-time
+            // `SetProcessDpiAwarenessContext` call) -- there is no second,
+            // independently-maintained coordinate space the way AppKit's
+            // point-space `appKitFrame` and WindowServer's pixel-space
+            // `windowServerFrame` genuinely are two different systems on
+            // macOS. Reporting the SAME rect under both field names here is
+            // deliberate: it tells a caller written against the macOS shape
+            // of `ScreenInfo` that these two fields are NOT independent
+            // evidence of anything on this platform, rather than silently
+            // leaving `windowServerFrame` looking like a real second source
+            // the way a fabricated synthetic 0,0-origin rect would.
+            let deviceRect = ScreenCoordinateRect(
+                x: Double(rect.left), y: Double(rect.top),
+                width: Double(widthPx), height: Double(heightPx)
+            )
+
+            infos.append(ScreenInfo(
+                id: deviceName,
+                index: idx,
+                name: deviceName,
+                widthPx: widthPx,
+                heightPx: heightPx,
+                // "Points" on Windows ARE physical pixels: the Windows paint
+                // path (`OverlayWindowController+Presentation.swift`) feeds
+                // `AnnotationRenderer.drawAnnotations` a `scaleFactor` of
+                // exactly `1.0` against a physical-pixel-sized canvas, rather
+                // than converting through `backingScaleFactor` the way the
+                // macOS `OverlayView` does -- `GDIPlusDrawingContext`'s base
+                // coordinate flip has no DPI-scale term of its own to
+                // compose with (see that file's coordinate-contract doc
+                // comment), so a physical-pixel render target is what stays
+                // correct without touching that file. `widthPt`/`heightPt`
+                // are reported here purely for API-shape parity with the
+                // macOS `ScreenInfo`; no drawing-path code on either platform
+                // actually reads them (grepped to confirm: only
+                // `widthPx`/`heightPx` feed real coordinate math).
+                widthPt: Double(widthPx),
+                heightPt: Double(heightPx),
+                backingScaleFactor: scale,
+                isMain: isMain,
+                appKitFrame: deviceRect,
+                windowServerFrame: deviceRect,
+                displayID: nil
+            ))
+        }
+        return infos
+    }
+}
+#endif

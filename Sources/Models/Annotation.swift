@@ -1,5 +1,4 @@
 import Foundation
-import AppKit
 
 public enum AnnotationKind: Codable {
     case vectorPath(

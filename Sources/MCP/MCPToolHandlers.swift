@@ -31,16 +31,34 @@ extension MCPServer {
             }
             let captureVisible = OverlayWindowController.shared.isCaptureVisible
             let annotationsSuspended = OverlayWindowController.shared.isAnnotationsSuspended
+            // PLATFORM-ACCURATE PROSE, not a cosmetic detail. These strings are
+            // read by the AI agent deciding how to compute coordinates, so
+            // describing macOS's AppKit/NSScreen model to a Windows caller is a
+            // correctness problem, not a wording nit: there is no NSScreen and
+            // no sharingType there, and a reader told otherwise cannot reason
+            // about what widthPx actually is. The MECHANISM and the numbers are
+            // the same on both platforms (top-left-origin physical pixels); only
+            // the API these values are sourced from differs.
+            #if os(macOS)
+            let coordinateSpaceNote = "AppKit backing pixels: widthPx/heightPx are NSScreen.frame point dimensions multiplied by that same screen's NSScreen.backingScaleFactor. Drawing uses this same scale source."
+            let backingScaleSource = "NSScreen.backingScaleFactor"
+            let captureOnNote = "Capture-debug mode is ON: overlay windows request sharingType=.readOnly and render every annotation. A capture tool may still omit these windows through its own app/window filter. Call set_capture_visible(false) to restore normal filtering."
+            let captureOffNote = "Capture-debug mode is OFF (default): overlay windows request legacy sharingType=.none and render only annotations visible for the active app. This is not a security guarantee; modern capture tools control their own inclusion filters."
+            #elseif os(Windows)
+            let coordinateSpaceNote = "Physical device pixels: widthPx/heightPx are the monitor's rectangle as reported by GetMonitorInfoW under PER_MONITOR_AWARE_V2 DPI awareness, which is already in physical pixels. backingScaleFactor is that monitor's effective DPI divided by 96 and is reported for scaling stroke widths and font sizes; it is NOT applied again to widthPx/heightPx. Drawing uses this same scale source."
+            let backingScaleSource = "GetDpiForMonitor effective DPI / 96.0"
+            let captureOnNote = "Capture-debug mode is ON: overlay windows clear SetWindowDisplayAffinity (WDA_NONE) and render every annotation. A capture tool may still omit these windows through its own filter. Call set_capture_visible(false) to restore normal filtering."
+            let captureOffNote = "Capture-debug mode is OFF (default): overlay windows request SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) and render only annotations visible for the active app. This is not a security guarantee, it requires Windows 10 version 2004 or later, and it excludes only THIS process's own windows -- Windows has no way to exclude another process's windows from a capture."
+            #endif
+
             let payload: [String: Any] = [
                 "screens": screenArray,
-                "coordinateSpace": "AppKit backing pixels: widthPx/heightPx are NSScreen.frame point dimensions multiplied by that same screen's NSScreen.backingScaleFactor. Drawing uses this same scale source.",
+                "coordinateSpace": coordinateSpaceNote,
                 "drawingFromScreenshot": "Use coordinate_space='screenshot_pixels' and the exact width/height of the uncropped full-display image version you measured, after any client/model resize. Detectable cropped/window aspect mismatches are rejected. A same-aspect crop cannot be distinguished from a downsampled full-display image, so preserve full-display provenance. Never send resized-image coordinates as backing_pixels.",
-                "backingScaleSource": "NSScreen.backingScaleFactor",
+                "backingScaleSource": backingScaleSource,
                 "captureVisible": captureVisible,
                 "annotationsSuspended": annotationsSuspended,
-                "captureNote": captureVisible
-                    ? "Capture-debug mode is ON: overlay windows request sharingType=.readOnly and render every annotation. A capture tool may still omit these windows through its own app/window filter. Call set_capture_visible(false) to restore normal filtering."
-                    : "Capture-debug mode is OFF (default): overlay windows request legacy sharingType=.none and render only annotations visible for the active app. This is not a security guarantee; modern capture tools control their own inclusion filters.",
+                "captureNote": captureVisible ? captureOnNote : captureOffNote,
                 "suspensionNote": annotationsSuspended
                     ? "Annotations are suspended: all overlay windows are ordered out while store entries are retained. Release the exact suspension lease token with resume_annotations to restore normal presentation once no other lease remains."
                     : "Annotations are not suspended. suspend_annotations is available as a temporary click-workaround, not simultaneous visual click-through."

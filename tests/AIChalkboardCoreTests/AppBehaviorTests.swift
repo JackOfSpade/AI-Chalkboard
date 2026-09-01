@@ -1,8 +1,22 @@
+#if os(macOS)
 import AppKit
+#endif
 import XCTest
 @testable import AIChalkboardCore
 
 final class AppBehaviorTests: XCTestCase {
+    #if os(macOS)
+    // Windows-only note: the Windows `AppDelegate` builds its tray context
+    // menu from raw Win32 `CreatePopupMenu`/`AppendMenuW` calls (see
+    // `AppDelegate.swift`'s Windows branch, "Windows analogue of the macOS
+    // class's makeStatusMenu()") rather than an `NSMenu` of `NSMenuItem`s
+    // with Objective-C `target`/`action` pairs -- there is no Swift-visible
+    // menu-item/selector object graph to introspect the way this test does
+    // on macOS (no Objective-C runtime on Windows at all, per this port's
+    // ground rules), so an equivalent structural assertion would need a
+    // live HMENU walked via `GetMenuItemCount`/`GetMenuItemInfoW`, a
+    // meaningfully different test left as unwritten follow-up rather than
+    // approximated here.
     func testStatusMenuItemsHaveExplicitDelegateTargetsAndExpectedActions() {
         let delegate = AppDelegate()
         let menu = delegate.makeStatusMenu()
@@ -23,6 +37,7 @@ final class AppBehaviorTests: XCTestCase {
             XCTAssertTrue(item.isEnabled)
         }
     }
+    #endif
 
     func testBundleIdentifierSyntaxRejectsPrefixesAndAcceptsCompleteIds() {
         XCTAssertTrue(BundleIdentifierSyntax.looksComplete("com.apple.Safari"))
@@ -32,10 +47,24 @@ final class AppBehaviorTests: XCTestCase {
         XCTAssertFalse(BundleIdentifierSyntax.looksComplete("com.apple.Safari Beta"))
     }
 
+    // `ActiveAppTracker.isSystemSessionApp` takes a bundle id on macOS
+    // ("com.apple.loginwindow") but an executable file name on Windows
+    // ("LockApp.exe"/"LogonUI.exe" -- see that method's Windows doc
+    // comment), so the two platforms need different literal identity
+    // strings; the underlying property under test (session/lock-screen UI
+    // is never an untagged-draw fallback target, case-insensitively) is the
+    // same on both.
     func testLoginwindowIsNeverAnUntaggedDrawFallback() {
+        #if os(macOS)
         XCTAssertTrue(ActiveAppTracker.isSystemSessionApp("com.apple.loginwindow"))
         XCTAssertTrue(ActiveAppTracker.isSystemSessionApp("COM.APPLE.LOGINWINDOW"))
         XCTAssertFalse(ActiveAppTracker.isSystemSessionApp("com.apple.finder"))
+        #elseif os(Windows)
+        XCTAssertTrue(ActiveAppTracker.isSystemSessionApp("LockApp.exe"))
+        XCTAssertTrue(ActiveAppTracker.isSystemSessionApp("lockapp.exe"))
+        XCTAssertTrue(ActiveAppTracker.isSystemSessionApp("LogonUI.exe"))
+        XCTAssertFalse(ActiveAppTracker.isSystemSessionApp("explorer.exe"))
+        #endif
     }
 
     func testPhysicalStrokeWidthIsStableAcrossBackingScales() {
@@ -63,6 +92,14 @@ final class AppBehaviorTests: XCTestCase {
         )
     }
 
+    #if os(macOS)
+    // Windows-only note: `overlayWindowAnimationBehavior` (an
+    // `NSWindow.AnimationBehavior`) has no declared counterpart on the
+    // Windows `OverlayWindowController` -- `SetWindowPos`'s
+    // `SWP_HIDEWINDOW`/`SWP_SHOWWINDOW | SWP_NOACTIVATE` combination (the
+    // actual suspend/resume mechanism there, see that class's Windows
+    // `setVisible(_:)`) has no separate "implicit ordering animation" to
+    // disable in the first place, so there is nothing analogous to assert.
     func testOverlayWindowsDisableImplicitOrderingAnimation() {
         XCTAssertEqual(
             OverlayWindowController.overlayWindowAnimationBehavior,
@@ -70,6 +107,7 @@ final class AppBehaviorTests: XCTestCase {
             "suspend/resume must not leave a transient, partially visible WindowServer overlay"
         )
     }
+    #endif
 
     func testOnCaptureVisibleChangedFiresOnlyOnActualStateChanges() {
         addTeardownBlock {

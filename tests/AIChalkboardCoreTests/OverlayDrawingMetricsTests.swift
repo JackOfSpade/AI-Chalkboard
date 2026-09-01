@@ -1,12 +1,13 @@
-import AppKit
+import Foundation
 import XCTest
 @testable import AIChalkboardCore
 
 /// `OverlayDrawingMetrics` is the pure pixel-to-point and Y-flip math shared
-/// by every `OverlayView.draw*` method. These tests exercise it directly with
-/// no `NSView`/`NSGraphicsContext` involved, so a future edit that inverts the
-/// flip or breaks the zero-scale fallback fails here instead of only being
-/// visible as a subtly-wrong on-screen render.
+/// by every `AnnotationRenderer.draw*` method. These tests exercise it
+/// directly with no `NSView`/`NSGraphicsContext`/`DrawingContext` involved, so
+/// a future edit that inverts the flip or breaks the zero-scale fallback
+/// fails here instead of only being visible as a subtly-wrong on-screen
+/// render.
 final class OverlayDrawingMetricsTests: XCTestCase {
     func testPointsForPhysicalPixelsAt1xScale() {
         XCTAssertEqual(OverlayDrawingMetrics.points(forPhysicalPixels: 100, backingScaleFactor: 1), 100)

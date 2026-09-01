@@ -3,6 +3,15 @@ dist/
 .DS_Store
 *.swp
 
+# Redirected build/test output at the repo root. On Windows, `swift build`
+# writes a harmless symlink warning to stderr that makes PowerShell report a
+# false failure, so the practical invocation there is
+# `cmd /c "swift build > build.log 2>&1"`. That idiom leaves these behind;
+# they are transient console output, never anything the repo should carry.
+build.log
+tests.log
+testrun*.log
+
 # Python bytecode from the MCP stdio harness. CI runs `python3 -m py_compile`
 # on test_mcp_stdio.py and tests/test_mcp_stdio_harness.py, and running the
 # same command locally leaves these behind at the repo root and under tests/.

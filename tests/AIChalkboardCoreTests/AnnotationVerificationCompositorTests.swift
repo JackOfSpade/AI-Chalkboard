@@ -1,3 +1,28 @@
+// This entire suite is macOS-only, guarded as a whole rather than
+// test-by-test: every fixture and every assertion below is built directly
+// on AppKit/CoreGraphics types that either do not exist on Windows or exist
+// with a materially different shape there --
+//   * `NSBitmapImageRep`/`NSGraphicsContext`/`NSBezierPath`/`NSColor` (used
+//     throughout to build PNG fixtures AND to read back individual composited
+//     pixels via `NSBitmapImageRep.colorAt(x:y:)`) have no counterpart at
+//     all; the Windows renderer reads/writes raw premultiplied-BGRA buffers
+//     through WIC (`chalk_image_encode_png`/`chalk_image_decode_file`) and
+//     GDI+, not a bitmap-rep object with per-pixel `NSColor` accessors.
+//   * `CoreGraphicsDrawingContext` (used directly by several tests below to
+//     drive `AnnotationRenderer.drawAnnotations` outside the compositor) is
+//     macOS-only; the Windows `DrawingContext` implementation is
+//     `GDIPlusDrawingContext`, constructed and inspected differently.
+//   * `AnnotationVerificationCompositor.composite(...screenshot: CGImage...)`
+//     is a CGImage-typed overload that only exists on macOS -- the Windows
+//     branch's in-memory overload takes `WindowsScreenCaptureImage` instead
+//     (see `AnnotationVerificationCompositor.swift`'s Windows branch).
+// A true Windows equivalent of this suite (built on `GDIPlusDrawingContext`,
+// raw BGRA buffer sampling in place of `colorAt`, and
+// `WindowsScreenCaptureImage` fixtures) is real, valuable, currently-missing
+// coverage -- deliberately left as follow-up work rather than approximated
+// here, since it amounts to a parallel test suite rather than a mechanical
+// per-line port.
+#if os(macOS)
 import AppKit
 import XCTest
 @testable import AIChalkboardCore
@@ -120,13 +145,14 @@ final class AnnotationVerificationCompositorTests: XCTestCase {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = graphics
         graphics.cgContext.clear(CGRect(x: 0, y: 0, width: 200, height: 100))
-        let renderer = OverlayView(frame: CGRect(x: 0, y: 0, width: 200, height: 100))
-        renderer.scaleFactor = 1
+        let drawingContext = CoreGraphicsDrawingContext(context: graphics.cgContext)
         let text = AnnotationKind.text(
             text: "A", x: 20, y: 20, fontSize: 12, textColorHex: "white",
             backgroundColorHex: "black", backgroundOpacity: 1, paddingPx: 20, opacity: 0.5
         )
-        renderer.drawAnnotations([annotation(text)], in: graphics.cgContext, canvasSize: CGSize(width: 200, height: 100))
+        AnnotationRenderer.drawAnnotations(
+            [annotation(text)], into: drawingContext, canvasSize: CGSize(width: 200, height: 100), scaleFactor: 1
+        ) { _ in nil }
         graphics.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()
 
@@ -147,14 +173,15 @@ final class AnnotationVerificationCompositorTests: XCTestCase {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = graphics
         graphics.cgContext.clear(CGRect(x: 0, y: 0, width: 200, height: 100))
-        let renderer = OverlayView(frame: CGRect(x: 0, y: 0, width: 200, height: 100))
-        renderer.scaleFactor = 1
+        let drawingContext = CoreGraphicsDrawingContext(context: graphics.cgContext)
         let filledSquare = AnnotationKind.vectorPath(
             data: "M 20 20 L 180 20 L 180 80 L 20 80 Z", strokeColorHex: nil, strokeWidth: 0,
             strokeOpacity: 0, fillColorHex: "black", fillOpacity: 0.5, dash: [],
             usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1
         )
-        renderer.drawAnnotations([annotation(filledSquare)], in: graphics.cgContext, canvasSize: CGSize(width: 200, height: 100))
+        AnnotationRenderer.drawAnnotations(
+            [annotation(filledSquare)], into: drawingContext, canvasSize: CGSize(width: 200, height: 100), scaleFactor: 1
+        ) { _ in nil }
         graphics.flushGraphics()
         NSGraphicsContext.restoreGraphicsState()
 
@@ -214,3 +241,4 @@ final class AnnotationVerificationCompositorTests: XCTestCase {
         XCTAssertEqual(result.metadata["screenshotPixels"] as? [String: Int], ["width": 200, "height": 100])
     }
 }
+#endif

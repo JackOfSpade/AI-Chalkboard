@@ -1,23 +1,51 @@
 import Foundation
+#if os(macOS)
 import AppKit
 import CoreGraphics
 import Darwin
+#elseif os(Windows)
+import WinSDK
+#endif
 
-/// Conservative WindowServer evidence used after a lease acquisition.  It is
-/// intentionally a snapshot, not a promise: another process can create a
-/// window immediately afterward and only a click dispatcher that participates
-/// in this protocol can close that remaining race.
+/// Conservative evidence used after a lease acquisition, taken by reading
+/// this platform's own window-presentation state rather than trusting a
+/// timer.  It is intentionally a snapshot, not a promise: another process can
+/// create a window immediately afterward and only a click dispatcher that
+/// participates in this protocol can close that remaining race.
+///
+/// WHAT "quiescent" MEANS IS PLATFORM-DEPENDENT, AND THAT DIFFERENCE IS
+/// LOAD-BEARING -- see the doc comments on the macOS and Windows
+/// `observeQuiescence()` implementations below (and, for the precise
+/// end-to-end honesty statement, this port's contractChanges) before reusing
+/// `quiescent`/`scope` for anything beyond what `SuspensionLeaseCoordinator`
+/// already does with them. In short: on macOS this is a read of WindowServer
+/// -- the compositor's own registration of what it is currently presenting.
+/// On Windows there is no equivalent single ground-truth read, so this is
+/// instead two Win32/DWM window-STATE samples (`IsWindowVisible` plus
+/// `DWMWA_CLOAKED`) taken 50ms apart, corroborated by a `DwmFlush()` proving
+/// a real compositor frame boundary was crossed during the observation. That
+/// is a meaningfully weaker guarantee than a compositor registration read,
+/// and `SuspensionQuiescenceObservation.scope`'s Windows text says so
+/// explicitly rather than reusing the macOS wording.
 public struct SuspensionQuiescenceObservation: Equatable {
     public let quiescent: Bool
-    public let candidatePIDs: [pid_t]
+    // `Int32`, not `pid_t`: `pid_t` is a Darwin-only typealias (itself just
+    // `Int32`), and this struct is shared, unmodified source between the
+    // macOS and Windows implementations below. Spelling it as `Int32`
+    // directly changes nothing about macOS behavior or its ABI -- `pid_t` IS
+    // `Int32` -- and it is also exactly the type `GetWindowThreadProcessId`'s
+    // `DWORD` process id narrows to on Windows, so one struct definition
+    // serves both platforms without an `#if` of its own.
+    public let candidatePIDs: [Int32]
     public let candidatePIDsTruncated: Bool
-    public let visibleOwnerPIDs: [pid_t]
+    public let visibleOwnerPIDs: [Int32]
     public let visibleWindowNumbers: [Int]
     public let discoveryErrors: [String]
     public let sampleCount: Int
     public let scope: String
 }
 
+#if os(macOS)
 public extension SuspensionLeaseCoordinator {
     /// Takes two WindowServer samples about 50ms apart.  It only returns true
     /// when both are empty for every conservatively discovered Chalkboard PID.
@@ -194,3 +222,245 @@ public extension SuspensionLeaseCoordinator {
         return info.pbi_uid
     }
 }
+
+#elseif os(Windows)
+
+/// WINDOWS QUIESCENCE EVIDENCE -- read this before trusting or relaxing
+/// `quiescent` on this platform.
+///
+/// macOS's `observeQuiescence()` above reads `CGWindowListCopyWindowInfo`:
+/// WindowServer -- the actual compositor process that owns final on-screen
+/// presentation -- enumerating what IT is currently compositing. That is a
+/// read of the compositor's own registration, about as close to ground
+/// truth as a userspace API gets.
+///
+/// Windows has no single equivalent call. There is no "ask the DWM
+/// compositor what it is presenting right now" API this shim can reach from
+/// documented, stable Win32/DWM surfaces. What IS available, and what this
+/// implementation uses, is two separate and complementary pieces of
+/// evidence:
+///
+///   1. Win32/DWM WINDOW STATE: `IsWindowVisible` (a window's own visibility
+///      flag) plus `DwmGetWindowAttribute(..., DWMWA_CLOAKED, ...)` (whether
+///      DWM has cloaked it -- a window can be Win32-visible yet invisible on
+///      screen, most commonly a suspended UWP app or a window parked on an
+///      inactive virtual desktop; skipping cloaked windows avoids a false
+///      "not quiescent", and a FAILED cloaked-attribute read is treated as
+///      "assume visible", i.e. fails closed rather than assuming uncloaked).
+///      This is bookkeeping Win32/DWM maintain ABOUT windows, not a read of
+///      what the compositor has actually painted into the current frame.
+///
+///   2. `DwmFlush()`: blocks the calling thread until the DWM compositor has
+///      produced (or is guaranteed to imminently produce) its next composed
+///      frame. This proves a real compositor frame boundary was crossed
+///      during the observation -- but it does NOT prove which windows were
+///      included in that frame, only that the compositor is alive and did
+///      real work while this sample was taken. Its failure (no DWM
+///      composition active -- some remote-desktop configurations, or
+///      composition forcibly disabled) is recorded as a discovery error and
+///      forces `quiescent = false`, the same fail-closed treatment macOS
+///      gives a missing WindowServer window list.
+///
+/// Combining "no candidate-owned window reports itself visible-and-uncloaked"
+/// (sampled twice, 50ms apart, exactly like the macOS branch) with "a real
+/// compositor frame boundary was observed to pass" is the closest honest
+/// equivalent this file can build. It is NOT the same claim as macOS's: it
+/// is possible, in principle, for Win32/DWM's tracked window state to
+/// briefly disagree with what is actually composited on screen in a way a
+/// direct compositor-registration read would not. Any `clickSafeAtObservation
+/// : true` an MCP caller sees that was derived from this branch (see
+/// `MCPToolHandlers+Suspension.swift`, unchanged and shared) means "no
+/// evidence of an on-screen Chalkboard window survived two Win32/DWM state
+/// samples plus a real compositor frame boundary" -- not "the compositor has
+/// confirmed nothing is on screen", which is what the same field honestly
+/// means on macOS. This distinction is recorded verbatim in this port's
+/// contractChanges; do not quietly reuse the macOS wording anywhere this
+/// value is surfaced.
+public extension SuspensionLeaseCoordinator {
+    /// Windows twin of the macOS branch's `observeQuiescence(timeout:)`:
+    /// same two-samples-50ms-apart timing harness (kept textually parallel
+    /// to the macOS version on purpose, so the two are easy to compare),
+    /// different evidence underneath -- see the WINDOWS QUIESCENCE EVIDENCE
+    /// comment above.
+    func observeQuiescence(timeout: TimeInterval = 1.0) -> SuspensionQuiescenceObservation {
+        let started = DispatchTime.now().uptimeNanoseconds
+        let first = Self.sample()
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000
+        guard elapsed + 0.05 <= max(0, timeout) else {
+            return Self.observation(first: first, second: first, sampleCount: 1)
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+        let second = Self.sample()
+        return Self.observation(first: first, second: second, sampleCount: 2)
+    }
+
+    private static let discoveryScope = "same-session Chalkboard executables discovered by Toolhelp32 process enumeration plus currently visible (IsWindowVisible, not DWM-cloaked) on-screen windows owned by those processes, corroborated by a DwmFlush()-observed compositor frame boundary -- Win32/DWM WINDOW STATE, not a read of the compositor's own presentation ledger; see this file's WINDOWS QUIESCENCE EVIDENCE comment above"
+
+    private static let maximumEvidenceEntries = 128
+    private typealias Sample = (pids: [Int32], truncated: Bool, errors: [String], visible: [(Int32, Int)], visibleTruncated: Bool)
+
+    private static func sample() -> Sample {
+        let discovery = discoverCandidateProcesses()
+        let visible = visibleWindows(ownedBy: Set(discovery.pids))
+        let visibleTruncated = visible.count > maximumEvidenceEntries
+
+        var errors = discovery.errors
+        // See WINDOWS QUIESCENCE EVIDENCE point 2 above: this is the second,
+        // complementary half of this platform's evidence, not an incidental
+        // side effect. A failure here means this sample has NO compositor-
+        // frame-boundary evidence at all, so it is recorded as a discovery
+        // error -- which the `quiescent` formula in `observation(...)` below
+        // already treats as fail-closed, exactly like a missing WindowServer
+        // window list does on macOS.
+        let flushResult = DwmFlush()
+        if flushResult != S_OK {
+            errors.append("DwmFlush failed (HRESULT \(flushResult)); this sample has no compositor-frame-boundary evidence.")
+        }
+
+        return (discovery.pids, discovery.truncated, errors,
+                Array(visible.prefix(maximumEvidenceEntries)), visibleTruncated)
+    }
+
+    private static func observation(first: Sample, second: Sample,
+                                    sampleCount: Int) -> SuspensionQuiescenceObservation {
+        let all = first.visible + second.visible
+        let allCandidates = Array(Set(first.pids + second.pids)).sorted()
+        let candidatesTruncated = first.truncated || second.truncated || allCandidates.count > maximumEvidenceEntries || first.visibleTruncated || second.visibleTruncated
+        let candidates = Array(allCandidates.prefix(maximumEvidenceEntries))
+        let errors = Array(Set(first.errors + second.errors)).sorted()
+        return SuspensionQuiescenceObservation(
+            quiescent: sampleCount == 2 && all.isEmpty && errors.isEmpty && !candidatesTruncated,
+            candidatePIDs: candidates, candidatePIDsTruncated: candidatesTruncated,
+            visibleOwnerPIDs: Array(Set(all.map(\.0))).sorted(),
+            visibleWindowNumbers: Array(Set(all.map(\.1))).sorted(),
+            discoveryErrors: errors, sampleCount: sampleCount, scope: discoveryScope
+        )
+    }
+
+    /// Same-executable discovery, Windows twin of the macOS branch's libproc
+    /// scan: this process itself, plus every OTHER same-session process
+    /// (Toolhelp32 enumeration is already scoped to processes this account
+    /// can inspect, and a foreign-session process's window/security
+    /// boundary makes it unopenable for `QueryFullProcessImageNameW` in the
+    /// ordinary case) whose full executable path matches this process's own.
+    /// A process this account cannot open (a different user, an elevated
+    /// process from a standard-integrity caller) is silently skipped, not
+    /// treated as a match -- mirroring the macOS branch's libproc loop,
+    /// which only inserts a PID on a confirmed UID+path match and otherwise
+    /// just continues.
+    private static func discoverCandidateProcesses() -> (pids: [Int32], truncated: Bool, errors: [String]) {
+        var pids: Set<Int32> = [Int32(bitPattern: GetCurrentProcessId())]
+        var errors: [String] = []
+
+        guard let ownPath = currentExecutablePath() else {
+            errors.append("Unable to determine this Chalkboard executable's path for cross-process quiescence discovery.")
+            return (Array(pids), false, errors)
+        }
+
+        guard let snapshot = CreateToolhelp32Snapshot(DWORD(TH32CS_SNAPPROCESS), 0), snapshot != INVALID_HANDLE_VALUE else {
+            errors.append("CreateToolhelp32Snapshot failed (Win32 error \(GetLastError())) while enumerating same-session processes for quiescence discovery.")
+            return (Array(pids), false, errors)
+        }
+        defer { CloseHandle(snapshot) }
+
+        var entry = PROCESSENTRY32W()
+        entry.dwSize = DWORD(MemoryLayout<PROCESSENTRY32W>.size)
+        var hasNext = Process32FirstW(snapshot, &entry)
+        var scanned = 0
+        // A generous scan budget, not an expected limit: degrades to a
+        // discoveryError (fail-closed via the `quiescent` formula) rather
+        // than looping indefinitely against a pathological process table.
+        let scanBudget = 8192
+        while hasNext {
+            scanned += 1
+            guard scanned <= scanBudget else {
+                errors.append("Process enumeration exceeded its scan budget while looking for same-executable Chalkboard processes; the candidate list may be incomplete.")
+                break
+            }
+            if let path = processImagePath(pid: entry.th32ProcessID), path == ownPath {
+                pids.insert(Int32(bitPattern: entry.th32ProcessID))
+            }
+            entry.dwSize = DWORD(MemoryLayout<PROCESSENTRY32W>.size)
+            hasNext = Process32NextW(snapshot, &entry)
+        }
+
+        let sorted = pids.sorted()
+        let limit = 128
+        return (Array(sorted.prefix(limit)), sorted.count > limit, errors)
+    }
+
+    /// `candidates` is this sample's own discovered PID set (see
+    /// `discoverCandidateProcesses()`); a window owned by a process outside
+    /// it is not this app's concern. Returns `[(-1, -1)]` -- an impossible
+    /// sentinel PID/window -- when `EnumWindows` itself fails, mirroring the
+    /// macOS branch's identical fail-closed sentinel for a missing
+    /// WindowServer window list: an enumeration failure is unsafe, not
+    /// evidence of absence.
+    private static func visibleWindows(ownedBy candidates: Set<Int32>) -> [(Int32, Int)] {
+        final class EnumContext {
+            let candidates: Set<Int32>
+            var results: [(Int32, Int)] = []
+            init(candidates: Set<Int32>) { self.candidates = candidates }
+        }
+        let context = EnumContext(candidates: candidates)
+        let contextPointer = Unmanaged.passUnretained(context).toOpaque()
+        let lparam = LPARAM(bitPattern: UInt64(UInt(bitPattern: contextPointer)))
+
+        let callback: WNDENUMPROC = { hwnd, callbackParam in
+            guard let hwnd,
+                  let raw = UnsafeRawPointer(bitPattern: UInt(bitPattern: Int(callbackParam))) else { return true }
+            let context = Unmanaged<EnumContext>.fromOpaque(raw).takeUnretainedValue()
+
+            var ownerPID: DWORD = 0
+            _ = GetWindowThreadProcessId(hwnd, &ownerPID)
+            let candidatePID = Int32(bitPattern: ownerPID)
+            guard context.candidates.contains(candidatePID) else { return true }
+            guard IsWindowVisible(hwnd) else { return true }
+
+            var cloaked: DWORD = 0
+            let attributeResult = DwmGetWindowAttribute(hwnd, DWORD(DWMWA_CLOAKED.rawValue), &cloaked, DWORD(MemoryLayout<DWORD>.size))
+            // A failed attribute read fails closed as "assume visible" (i.e.
+            // does NOT skip the window here) -- the opposite assumption
+            // would let an unreadable cloak state silently manufacture
+            // quiescence. See the WINDOWS QUIESCENCE EVIDENCE comment above.
+            if attributeResult == S_OK && cloaked != 0 { return true }
+
+            context.results.append((candidatePID, Int(bitPattern: UInt(bitPattern: hwnd))))
+            return true
+        }
+
+        guard EnumWindows(callback, lparam) else {
+            return [(-1, -1)]
+        }
+        return context.results
+    }
+
+    private static func processImagePath(pid: DWORD) -> String? {
+        guard let handle = OpenProcess(DWORD(PROCESS_QUERY_LIMITED_INFORMATION), false, pid) else { return nil }
+        defer { CloseHandle(handle) }
+        var buffer = [UInt16](repeating: 0, count: 1024)
+        var size = DWORD(buffer.count)
+        guard QueryFullProcessImageNameW(handle, 0, &buffer, &size) else { return nil }
+        return normalizedPath(String(decoding: buffer[0..<Int(size)], as: UTF16.self))
+    }
+
+    private static func currentExecutablePath() -> String? {
+        var buffer = [UInt16](repeating: 0, count: 1024)
+        let length = GetModuleFileNameW(nil, &buffer, DWORD(buffer.count))
+        guard length > 0 else { return nil }
+        return normalizedPath(String(decoding: buffer[0..<Int(length)], as: UTF16.self))
+    }
+
+    /// Windows paths are case-insensitive; a plain lowercase compare is
+    /// enough here since both sides of every comparison this file makes come
+    /// from the same API family (`GetModuleFileNameW`/
+    /// `QueryFullProcessImageNameW`), unlike the macOS branch's
+    /// `resolvingSymlinksInPath().standardizedFileURL`, which also resolves
+    /// symlinks -- Windows reparse points are rare enough for an installed
+    /// executable that this file does not chase them.
+    private static func normalizedPath(_ raw: String) -> String {
+        raw.lowercased()
+    }
+}
+
+#endif

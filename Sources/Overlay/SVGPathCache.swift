@@ -1,5 +1,4 @@
 import Foundation
-import CoreGraphics
 
 /// Memoises `SVGPathParser.parse(_:)` results so a stored annotation's path
 /// data is tokenised at most once per distinct path string, instead of once
@@ -16,8 +15,10 @@ import CoreGraphics
 /// drawings therefore re-derived identical geometry continuously.
 ///
 /// WHY CACHING IS SAFE (and pixel-identical): `SVGPathParser.parse` is a pure
-/// function of its input string, and `CGPath` is immutable. Two calls with the
-/// same path data are therefore interchangeable. Critically, only the
+/// function of its input string, and `ChalkPath` is an immutable value type
+/// (every stored property is a `let`, and mutating operations like
+/// `transformed(by:)` return a new value rather than modifying one in place).
+/// Two calls with the same path data are therefore interchangeable. Critically, only the
 /// UNTRANSFORMED source path is cached here -- callers still apply their own
 /// per-draw `CGAffineTransform` (which varies with the screen's backing scale
 /// and view height) to a copy, exactly as before. Caching the transformed
@@ -40,7 +41,7 @@ enum SVGPathCache {
     /// Sized well under the store's own 16 MiB retained-vector-payload cap so
     /// this cache can never be the component that exhausts memory: in the
     /// worst case it holds a second copy of a subset of the path strings the
-    /// store is already retaining, plus their parsed `CGPath`s.
+    /// store is already retaining, plus their parsed `ChalkPath`s.
     static let maximumRetainedBytes = 4 * 1024 * 1024
 
     private static let lock = NSLock()
@@ -55,7 +56,7 @@ enum SVGPathCache {
     /// write; only eviction has to consider every entry, and it does so once
     /// per CALL (one ordering pass, then victims taken from the front) rather
     /// than once per evicted entry.
-    private static var entries: [String: (path: CGPath, lastUsed: UInt64)] = [:]
+    private static var entries: [String: (path: ChalkPath, lastUsed: UInt64)] = [:]
     /// Logical clock for recency ordering: the entry with the smallest
     /// `lastUsed` is the least recently used one. Wrapping would need 2^64
     /// lookups in one process lifetime, which no repaint rate reaches.
@@ -70,7 +71,7 @@ enum SVGPathCache {
     /// overlay through `draw(_:)`, verification through `MainThread.sync`),
     /// but this type must not silently become a data race if that ever
     /// changes, so it does not rely on that.
-    static func path(for pathData: String) throws -> CGPath {
+    static func path(for pathData: String) throws -> ChalkPath {
         lock.lock()
         if let cached = entries[pathData] {
             touch(pathData)

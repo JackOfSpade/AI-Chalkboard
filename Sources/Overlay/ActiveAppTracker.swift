@@ -1,9 +1,28 @@
 import Foundation
+#if os(macOS)
 import AppKit
+#elseif os(Windows)
+import WinSDK
+#endif
 
 /// Shared conservative syntax for an exact, complete bundle identifier.
 /// Three non-empty reverse-DNS components distinguish `com.apple.Safari` from
 /// vague prefixes such as `com.apple`, which must still undergo ambiguity checks.
+///
+/// PLATFORM NOTE: this helper is used verbatim by BOTH platforms' `resolve()`
+/// (below) and by the platform-neutral `DrawRequest.resolveTargetApp` (which
+/// decides whether a query that matched no running app should still be
+/// accepted verbatim as a future appId). Its "3+ dot-separated components"
+/// shape is a macOS bundle-id convention. An ordinary Windows executable name
+/// such as `"notepad.exe"` has only TWO dot-separated components and will
+/// therefore almost never satisfy it -- see the Windows `ActiveAppTracker`
+/// section below for exactly what that means for the `app` MCP parameter's
+/// contract on Windows. This type is deliberately left unmodified (not
+/// platform-forked) rather than reworked to also recognize
+/// `"name.exe"`-shaped strings, because `DrawRequest.resolveTargetApp` -- a
+/// file outside this one -- keys its own verbatim-acceptance branch off this
+/// exact helper, and changing its behavior here would silently change that
+/// unrelated file's contract without its owner's review.
 enum BundleIdentifierSyntax {
     static func looksComplete(_ value: String) -> Bool {
         let parts = value.split(separator: ".", omittingEmptySubsequences: false)
@@ -16,6 +35,13 @@ enum BundleIdentifierSyntax {
 /// A resolved application: a bundle identifier plus the human-readable name we
 /// found it under. Returned by `ActiveAppTracker.resolve(_:)` and embedded in
 /// `Annotation.appId` / `Annotation.appName`.
+///
+/// PLATFORM NOTE: `bundleId` is a real macOS bundle identifier
+/// (`"com.apple.Safari"`) on macOS, and an executable FILE NAME
+/// (`"chrome.exe"`) on Windows -- see the Windows `ActiveAppTracker` section
+/// below for the precise definition. The field is not renamed across
+/// platforms because `Annotation.appId`, the `app` MCP parameter, and every
+/// shared caller (`DrawRequest`, `MCPServer`) address it by this one name.
 public struct AppRef {
     public let bundleId: String
     public let name: String
@@ -46,6 +72,8 @@ public enum AppResolution {
     /// Nothing matched.
     case notFound
 }
+
+#if os(macOS)
 
 /// Tracks which application is frontmost so overlay annotations can be scoped
 /// to a single app: draw for DaVinci Resolve and the drawing appears only while
@@ -618,3 +646,780 @@ public final class ActiveAppTracker: NSObject {
         return "\(bundleId) (\(app.localizedName ?? "?"))"
     }
 }
+
+#elseif os(Windows)
+
+/// Tracks which application is frontmost so overlay annotations can be scoped
+/// to a single app: draw for DaVinci Resolve and the drawing appears only while
+/// DaVinci Resolve is frontmost; switch to Terminal and Terminal's own drawings
+/// appear instead.
+///
+/// STDOUT SAFETY: this process is an MCP stdio server speaking JSON-RPC over
+/// fd 1. Every diagnostic in this file goes through `Logger.shared.log`
+/// (stderr + rotating file). Never add a Swift `print` here.
+///
+/// ===========================================================================
+/// WHY THIS IS NOT A LINE-FOR-LINE PORT OF THE macOS BRANCH ABOVE
+/// ===========================================================================
+///
+/// This class exposes the IDENTICAL public/internal API the macOS branch
+/// does -- same property names, same `resolve`/`AppResolution`/`AppRef`
+/// shapes, same `currentApp`/`fallbackApp` pairing guarantee -- so every
+/// shared caller (`DrawRequest`, `MCPServer`, `AppDelegate`) works unmodified
+/// on both platforms. The MECHANISM underneath differs in two load-bearing
+/// ways documented in full where they occur below:
+///
+/// 1. IDENTITY STRING. macOS has bundle identifiers (`"com.apple.Safari"`);
+///    Windows has none. `AppRef.bundleId` here is the process's executable
+///    FILE NAME (e.g. `"chrome.exe"`) -- see `exeFileName` below for the
+///    exact definition and rationale. This is now part of the `app` MCP
+///    parameter's tool contract on Windows: `Annotation.appId` persists this
+///    string, and a caller's `app` argument is matched against it.
+///
+/// 2. EVENT GRANULARITY. `NSWorkspace.didActivateApplicationNotification` is
+///    an APPLICATION-level event -- it does not fire when focus moves between
+///    two windows of the SAME app. Win32's `EVENT_SYSTEM_FOREGROUND` is a
+///    WINDOW-level event -- it fires on every such move, and on modal dialogs
+///    stealing focus, alike. Every foreground event is therefore resolved to
+///    its owning process's identity string and folded through the same
+///    `adopt`-style exclusion logic the macOS branch uses, but the caller
+///    (`handleForegroundChanged`) only repaints the overlay when that fold
+///    reports the resolved APP IDENTITY actually changed -- never merely
+///    because *a* window-level event fired. Without that de-duplication the
+///    overlay would repaint on essentially every click.
+public final class ActiveAppTracker {
+    public static let shared = ActiveAppTracker()
+
+    /// This app's own identity string -- see `exeFileName(forProcess:)` for
+    /// exactly what that means. Hard-coded to the executable name
+    /// `Package.swift`'s `.executable(name: "AIChalkboard", ...)` product
+    /// always produces, mirroring the macOS branch's own hard-coded backstop
+    /// (there `Bundle.main.bundleIdentifier` can be nil outside an .app
+    /// bundle; here there is no bundle indirection to begin with, so the
+    /// build's fixed output name is simply reliable). `isOwnApp` additionally
+    /// cross-checks the CURRENT process's own live executable name
+    /// (`liveOwnExeName`, computed once via `GetModuleFileNameW`), so a
+    /// renamed/repackaged binary still excludes itself even if it no longer
+    /// matches this constant -- the same "hard-coded constant OR a live
+    /// self-identifier" shape the macOS branch uses, just with the live half
+    /// sourced from the OS instead of `Bundle.main`.
+    public static let ownBundleIdentifier = "AIChalkboard.exe"
+
+    // MARK: - State
+    //
+    // THREADING: `_currentAppId`/`_fallbackAppId` and friends are written from
+    // `WindowsUIThread` -- the process's single dedicated Win32 UI thread,
+    // which is where the `SetWinEventHook` callback below is delivered (see
+    // `startForegroundHook`) -- and read from the MCP server's background
+    // read queue (`draw_*` tool calls) as well as from whatever thread paints
+    // the overlay. Hence the same plain `NSLock` discipline the macOS branch
+    // uses around the cached values -- Win32 APIs carry no main-thread
+    // affinity requirement of their own (unlike AppKit), so the getters below
+    // never need a thread hop, only the lock.
+
+    private let lock = NSLock()
+
+    private var _currentAppId: String?
+    private var _currentAppName: String?
+    private var _fallbackAppId: String?
+    private var _fallbackAppName: String?
+
+    /// Identity strings we have logged an exclusion for already, so a user
+    /// tabbing between Claude and the overlay does not spam the log with the
+    /// same line hundreds of times. Keyed lower-cased, matching every other
+    /// case-insensitive identity comparison in this class.
+    private var loggedExclusions: Set<String> = []
+
+    private var isStarted = false
+
+    /// The installed hook handle, so it could be torn down with
+    /// `UnhookWinEvent` if this class ever grew a `stop()`. Currently nothing
+    /// calls that -- the hook lives for the process lifetime, same as the
+    /// macOS branch's NSWorkspace observer, which is likewise never removed.
+    private var eventHook: HWINEVENTHOOK?
+
+    /// See the macOS branch's identical property for the full contract this
+    /// mirrors exactly (frontmost app, with AI Chalkboard's own activations
+    /// ignored so the status UI never blanks every app-linked annotation
+    /// while it is open).
+    public var currentAppId: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _currentAppId
+    }
+
+    /// Display name matching `currentAppId`.
+    public var currentAppName: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _currentAppName
+    }
+
+    /// `currentAppId` and `currentAppName` as ONE consistent pair -- see the
+    /// macOS branch's identical property for why paired reads matter.
+    public var currentApp: (bundleId: String?, name: String?) {
+        lock.lock(); defer { lock.unlock() }
+        return (_currentAppId, _currentAppName)
+    }
+
+    /// See the macOS branch's identical property for the full contract this
+    /// mirrors exactly (the app an untagged `draw_*` call targets: the last
+    /// app frontmost before Claude, never Claude itself).
+    public var fallbackAppId: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _fallbackAppId
+    }
+
+    /// Display name matching `fallbackAppId`.
+    public var fallbackAppName: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _fallbackAppName
+    }
+
+    /// `fallbackAppId` and `fallbackAppName` as ONE consistent pair -- see the
+    /// macOS branch's identical property.
+    public var fallbackApp: (bundleId: String?, name: String?) {
+        lock.lock(); defer { lock.unlock() }
+        return (_fallbackAppId, _fallbackAppName)
+    }
+
+    private init() {}
+
+    // MARK: - Lifecycle
+
+    /// Seeds the initial values and installs the foreground-tracking hook.
+    /// Call once from wherever this process's Windows entry point stands in
+    /// for `applicationDidFinishLaunching`. Safe to call from any thread --
+    /// unlike the macOS branch, nothing here requires the caller's own thread
+    /// to be a particular one; the hook is installed onto `WindowsUIThread`
+    /// (starting it if needed) rather than run inline.
+    public func start() {
+        guard !isStarted else { return }
+        isStarted = true
+
+        // ORDER MATTERS, for the same reason as the macOS branch: seed FIRST,
+        // install the hook SECOND, so a foreground event delivered while the
+        // hook is coming up can never be clobbered by a seed that is older by
+        // construction than any event the hook could possibly deliver.
+        let seededHwnd = GetForegroundWindow()
+        var seedDescription = "<none>"
+        if let hwnd = seededHwnd {
+            var pid: DWORD = 0
+            GetWindowThreadProcessId(hwnd, &pid)
+            if let exeName = Self.exeFileName(forProcess: pid) {
+                let title = Self.windowTitle(hwnd)
+                seedDescription = "\(exeName) (\(title.isEmpty ? exeName : title))"
+                _ = adopt(exeName: exeName, rawDisplayName: title, source: "startup seed")
+            }
+        }
+
+        startForegroundHook()
+
+        Logger.shared.log(
+            "ActiveAppTracker: started (Windows). Installing SetWinEventHook(EVENT_SYSTEM_FOREGROUND) on WindowsUIThread, since WINEVENT_OUTOFCONTEXT delivery only happens while the installing thread calls GetMessage. Seed frontmost=\(seedDescription); current=\(currentAppId ?? "<none>"); fallback=\(fallbackAppId ?? "<none, untagged draws will be GLOBAL>").",
+            level: "INFO"
+        )
+    }
+
+    // MARK: - Foreground hook (WINDOW-level -> APP-level de-duplication)
+
+    /// Installs the hook on `WindowsUIThread` -- AI Chalkboard's single
+    /// dedicated Win32 UI thread (`Sources/Overlay/WindowsUIThread.swift`,
+    /// owned by the overlay group) -- rather than spinning up a thread of
+    /// its own.
+    ///
+    /// WHY IT MUST BE THAT SPECIFIC THREAD, AND WHY NOTHING ELSE HAS TO PUMP
+    /// FOR IT: `SetWinEventHook` with `WINEVENT_OUTOFCONTEXT` does not invoke
+    /// the callback the instant an event occurs -- per Microsoft's
+    /// documentation for `WinEventProc`, the event is queued and only
+    /// delivered "when the hooking application calls GetMessage or
+    /// PeekMessage" ON THE THREAD THAT INSTALLED THE HOOK. `WindowsUIThread
+    /// .sync` runs the installing call ON that thread (not merely from it),
+    /// so the hook attaches to the OS thread id `WindowsUIThread.runLoop()`
+    /// already pumps forever for its own window-message purposes -- delivery
+    /// is a side effect of THAT existing `GetMessageW` loop, so this class
+    /// needs no message loop, and no dispatch/filtering logic, of its own:
+    /// `handleForegroundChanged` below is simply called back on whichever
+    /// thread that loop is running on (`WindowsUIThread`'s), the same way any
+    /// other Win32 callback registered from that thread would be.
+    private func startForegroundHook() {
+        WindowsUIThread.shared.start()
+        WindowsUIThread.shared.sync { [weak self] in
+            self?.installEventHook()
+        }
+    }
+
+    private func installEventHook() {
+        // WINEVENT_SKIPOWNPROCESS: our own overlay windows are non-activating
+        // and should never legitimately become the foreground window, but
+        // this costs nothing and mirrors the macOS branch's own note that its
+        // overlay windows are "never meaningfully the app the user is looking
+        // at" -- events about this process's own windows are simply not
+        // interesting here even as a defensive matter.
+        let hook = SetWinEventHook(
+            UINT(EVENT_SYSTEM_FOREGROUND),
+            UINT(EVENT_SYSTEM_FOREGROUND),
+            nil,
+            { _, event, hwnd, idObject, idChild, _, _ in
+                // idObject/idChild filter out sub-object focus churn (e.g. a
+                // title-bar control) that is not a window-level foreground
+                // change at all -- OBJID_WINDOW/CHILDID_SELF is what a genuine
+                // "this HWND is now the foreground window" event carries.
+                guard event == UINT(EVENT_SYSTEM_FOREGROUND),
+                      idObject == 0, idChild == 0,
+                      let hwnd = hwnd else { return }
+                ActiveAppTracker.shared.handleForegroundChanged(hwnd: hwnd, source: "EVENT_SYSTEM_FOREGROUND")
+            },
+            0,
+            0,
+            DWORD(WINEVENT_OUTOFCONTEXT) | DWORD(WINEVENT_SKIPOWNPROCESS)
+        )
+
+        lock.lock()
+        eventHook = hook
+        lock.unlock()
+
+        if hook == nil {
+            Logger.shared.log(
+                "ActiveAppTracker: SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed (GetLastError=\(GetLastError())). Foreground-app tracking is DISABLED for the rest of this process's life -- currentAppId/fallbackAppId stay frozen at their startup-seed values, and no untagged draw_* call will ever retarget to a newly-frontmost app.",
+                level: "ERROR"
+            )
+        }
+    }
+
+    /// Resolves one `EVENT_SYSTEM_FOREGROUND` event's HWND to an owning
+    /// process identity, folds it through the same exclusion rules the macOS
+    /// branch's `adopt` applies, and repaints the overlay ONLY when that fold
+    /// reports the tracked identity actually changed.
+    ///
+    /// THE DE-DUPLICATION THIS EXISTS FOR: alt-tabbing between two windows of
+    /// the SAME app (two Chrome windows, two Explorer windows), or a modal
+    /// dialog taking focus within one app, fires this event with no real app
+    /// switch. `adopt` below still runs the full exclusion logic every time
+    /// (cheap, and it is what keeps `loggedExclusions`/timing correct), but
+    /// its returned `didChange` is what gates the repaint -- unlike the macOS
+    /// branch, where `appDidActivate` repaints unconditionally, because an
+    /// application-level activation notification is already close to the
+    /// granularity actually wanted. Gating unconditionally here is required,
+    /// not optional: EVENT_SYSTEM_FOREGROUND fires far more often than macOS's
+    /// notification, and repainting the overlay on every such no-op event
+    /// would make the overlay redraw continuously during ordinary use of a
+    /// multi-window app.
+    private func handleForegroundChanged(hwnd: HWND, source: String) {
+        var pid: DWORD = 0
+        GetWindowThreadProcessId(hwnd, &pid)
+        guard pid != 0, let exeName = Self.exeFileName(forProcess: pid) else { return }
+        let title = Self.windowTitle(hwnd)
+        let changed = adopt(exeName: exeName, rawDisplayName: title, source: source)
+        if changed {
+            // Same repaint call the macOS branch makes from `appDidActivate`,
+            // and the same reason it is not routed through
+            // `AnnotationStore.onStoreChanged` -- see that branch's comment.
+            OverlayWindowController.shared.refreshViews()
+        }
+    }
+
+    /// Folds a newly-foreground process's identity into `current` and
+    /// `fallback`, applying the exclusion rules for each, exactly mirroring
+    /// the macOS branch's `adopt(app:source:)` -- see its doc comment for the
+    /// full "why fallback exists" rationale, which is unchanged on Windows.
+    ///
+    /// Returns whether the tracked state actually changed, so
+    /// `handleForegroundChanged` can gate its repaint on it (see that
+    /// method's doc comment for why that gate is mandatory here and was
+    /// optional on macOS).
+    ///
+    /// UNLIKE the macOS branch, there is no `isProhibited` exclusion here:
+    /// macOS's `.prohibited` activation policy identifies XPC services and
+    /// faceless agents that can never legitimately become frontmost, but
+    /// every call to THIS method already carries an HWND that Windows itself
+    /// just reported as the foreground window -- there is no equivalent
+    /// "this process could never really be frontmost" case to filter at this
+    /// call site. (The analogous concern for `resolve()`'s broader candidate
+    /// enumeration -- where far more processes than could ever be foreground
+    /// are visible -- is handled there instead; see `runningCandidates()`.)
+    @discardableResult
+    private func adopt(exeName: String, rawDisplayName: String, source: String) -> Bool {
+        guard !exeName.isEmpty else { return false }
+        let name = rawDisplayName.isEmpty ? Self.displayNameFallback(forExeName: exeName) : rawDisplayName
+
+        let isSelf = isOwnApp(exeName)
+        let isClaude = isClaudeApp(exeName)
+        let isSystemSessionApp = Self.isSystemSessionApp(exeName)
+
+        lock.lock()
+        let previousCurrentId = _currentAppId
+        let previousFallbackId = _fallbackAppId
+        if !isSelf {
+            _currentAppId = exeName
+            _currentAppName = name
+        }
+        if !isSelf && !isClaude && !isSystemSessionApp {
+            _fallbackAppId = exeName
+            _fallbackAppName = name
+        }
+        // Snapshot for the log line while still holding the lock -- see the
+        // macOS branch's identical comment for why an unlocked read here
+        // would be a real race, not just a cosmetic one.
+        let didChange = (_currentAppId != previousCurrentId) || (_fallbackAppId != previousFallbackId)
+        let currentForLog = _currentAppId ?? "<none>"
+        let fallbackForLog = _fallbackAppId ?? "<none>"
+        let shouldLogExclusion = (isSelf || isClaude || isSystemSessionApp)
+            && loggedExclusions.insert(exeName.lowercased()).inserted
+        lock.unlock()
+
+        if shouldLogExclusion {
+            let reason: String
+            if isSelf {
+                reason = "it is AI Chalkboard itself"
+            } else if isClaude {
+                reason = "it matched the Claude/Anthropic heuristic"
+            } else {
+                reason = "it is Windows session/lock-screen UI, not an app the user can annotate"
+            }
+            Logger.shared.log(
+                "ActiveAppTracker: EXCLUDING '\(exeName)' (\(name)) from the untagged-draw fallback target because \(reason). Untagged draw_* calls will stay linked to the last app before it.",
+                level: "INFO"
+            )
+        }
+
+        // Only log when the tracked state ACTUALLY changed -- see the macOS
+        // branch's identical comment. On Windows this matters even MORE:
+        // EVENT_SYSTEM_FOREGROUND fires on every window-level focus change,
+        // not just application switches, so an unconditional log line here
+        // would churn the rotating log file far faster than on macOS.
+        if !isSelf && didChange {
+            Logger.shared.log(
+                "ActiveAppTracker: frontmost app is now '\(exeName)' (\(name)) [\(source)]. current=\(currentForLog); fallback=\(fallbackForLog).",
+                level: "DEBUG"
+            )
+        }
+        return didChange
+    }
+
+    // MARK: - Identity string
+
+    /// THE WINDOWS IDENTITY STRING -- this is now part of the `app` MCP
+    /// parameter's tool contract, so its definition is precise and fixed:
+    ///
+    ///   The FILE NAME component (everything after the final `\` or `/`,
+    ///   extension included -- e.g. `"chrome.exe"`, `"AIChalkboard.exe"`) of
+    ///   the value `QueryFullProcessImageNameW` reports for the process,
+    ///   compared and stored CASE-INSENSITIVELY (Windows paths are
+    ///   case-insensitive, so `"Chrome.exe"` and `"chrome.exe"` must be the
+    ///   same identity).
+    ///
+    /// WHY THE FILE NAME AND NOT THE FULL PATH: the full path
+    /// (`"C:\Program Files\Google\Chrome\Application\chrome.exe"`) is more
+    /// specific, but that specificity is a liability here, not an asset --
+    /// an app updating itself into a new versioned directory, a user moving
+    /// an install, or the same app installed per-user vs. machine-wide would
+    /// all mint a NEW identity string for what is, to the user, the same
+    /// application, silently orphaning every annotation stored under the old
+    /// path. The file name is exactly as stable as a macOS bundle identifier
+    /// -- tied to the app, not to where it happens to live on disk today --
+    /// which is the property `Annotation.appId` actually needs.
+    ///
+    /// WHY NOT THE STEM (dropping `.exe`): the extension is part of what the
+    /// file system actually calls the executable; trimming it buys nothing
+    /// (Windows executables are overwhelmingly `.exe`; the rare non-`.exe`
+    /// host would become ambiguous against an unrelated `.exe` of the same
+    /// stem) and would only make this identity string look more like a macOS
+    /// bundle id than it actually is.
+    ///
+    /// KNOWN CONSEQUENCE, stated precisely per this task's contract rules:
+    /// several distinct running processes can legitimately share one
+    /// identity string. Every Chromium-based app spawns many `chrome.exe` /
+    /// `msedge.exe` helper processes, and DaVinci Resolve spawns render/
+    /// worker helpers under related executable names -- `resolve()`'s
+    /// candidate de-duplication (`dedupedByBundleId`, unchanged from the
+    /// macOS branch) collapses same-identity processes into one candidate
+    /// exactly as it collapses macOS helper `NSRunningApplication` entries,
+    /// so this is not by itself a source of spurious ambiguity. It DOES mean
+    /// Windows' per-process granularity is coarser than macOS's: two
+    /// unrelated top-level windows of the same multi-process app are
+    /// indistinguishable by this identity string, which they also are on
+    /// macOS (bundle id is likewise per-app, not per-window) -- so this is a
+    /// parity property, not a regression.
+    private static func exeFileName(forProcess pid: DWORD) -> String? {
+        guard pid != 0 else { return nil }
+        guard let handle = OpenProcess(DWORD(PROCESS_QUERY_LIMITED_INFORMATION), false, pid) else {
+            return nil
+        }
+        defer { CloseHandle(handle) }
+
+        var buffer = [WCHAR](repeating: 0, count: 1024)
+        var size = DWORD(buffer.count)
+        let ok = buffer.withUnsafeMutableBufferPointer { ptr -> Bool in
+            QueryFullProcessImageNameW(handle, 0, ptr.baseAddress, &size)
+        }
+        guard ok, size > 0, size <= DWORD(buffer.count) else { return nil }
+
+        let path = String(decoding: buffer[0..<Int(size)], as: UTF16.self)
+        return fileName(fromWindowsPath: path)
+    }
+
+    /// This process's own executable file name, computed once via
+    /// `GetModuleFileNameW(nil, ...)` -- the live half of the `isOwnApp`
+    /// dual-check described on `ownBundleIdentifier` above.
+    private static let liveOwnExeName: String? = {
+        var buffer = [WCHAR](repeating: 0, count: 1024)
+        let length = buffer.withUnsafeMutableBufferPointer { ptr -> DWORD in
+            GetModuleFileNameW(nil, ptr.baseAddress, DWORD(ptr.count))
+        }
+        guard length > 0, length < DWORD(buffer.count) else { return nil }
+        let path = String(decoding: buffer[0..<Int(length)], as: UTF16.self)
+        return fileName(fromWindowsPath: path)
+    }()
+
+    private static func fileName(fromWindowsPath path: String) -> String {
+        if let idx = path.lastIndex(where: { $0 == "\\" || $0 == "/" }) {
+            return String(path[path.index(after: idx)...])
+        }
+        return path
+    }
+
+    /// Best-effort display name for an identity string that has no real
+    /// window title to show (`rawDisplayName` was empty) -- the file name
+    /// with its extension dropped, so `"notepad.exe"` reads as `"notepad"`
+    /// rather than echoing the raw identity string back verbatim. This is
+    /// NOT treated as a genuine display name by `resolve()`'s `Candidate
+    /// .hasDisplayName` (see `runningCandidates()`): it exists purely for
+    /// human-readable logging and `currentAppName`/`fallbackAppName`, mirroring
+    /// the macOS branch's `app?.localizedName ?? bundleId` fallback.
+    private static func displayNameFallback(forExeName exeName: String) -> String {
+        if let dot = exeName.lastIndex(of: "."), dot != exeName.startIndex {
+            return String(exeName[exeName.startIndex..<dot])
+        }
+        return exeName
+    }
+
+    private static func windowTitle(_ hwnd: HWND) -> String {
+        let length = GetWindowTextLengthW(hwnd)
+        guard length > 0 else { return "" }
+        var buffer = [WCHAR](repeating: 0, count: Int(length) + 1)
+        let copied = buffer.withUnsafeMutableBufferPointer { ptr -> Int32 in
+            GetWindowTextW(hwnd, ptr.baseAddress, Int32(ptr.count))
+        }
+        guard copied > 0 else { return "" }
+        return String(decoding: buffer[0..<Int(copied)], as: UTF16.self)
+    }
+
+    // MARK: - Exclusion rules
+
+    private func isOwnApp(_ exeName: String) -> Bool {
+        if exeName.caseInsensitiveCompare(Self.ownBundleIdentifier) == .orderedSame { return true }
+        if let live = Self.liveOwnExeName, exeName.caseInsensitiveCompare(live) == .orderedSame {
+            return true
+        }
+        return false
+    }
+
+    /// Whether `exeName` looks like a Claude / Anthropic client. Same
+    /// deliberately loose substring heuristic as the macOS branch's
+    /// `isClaudeApp` -- see its doc comment for the full rationale, which is
+    /// unchanged here: guessing one exact executable name would silently
+    /// break the day Claude's Windows client renames it, and the failure
+    /// mode (every annotation quietly linked to Claude) is invisible.
+    private func isClaudeApp(_ exeName: String) -> Bool {
+        let lower = exeName.lowercased()
+        return lower.contains("anthropic") || lower.contains("claude")
+    }
+
+    /// The Windows analogues of macOS's `loginwindow` -- session/lock-screen
+    /// UI that can transiently become the foreground window while the
+    /// workstation is locked and is never a usable annotation target:
+    /// `LockApp.exe` (the modern lock-screen host) and `LogonUI.exe` (the
+    /// secure-desktop credential prompt, still used for UAC and some sign-in
+    /// flows). This is a best-effort list, not an exhaustive one -- there is
+    /// no single Windows API that names "session UI" the way macOS names
+    /// `loginwindow`, so this enumerates the concrete processes actually
+    /// observed taking the foreground during a lock/sign-in, the same
+    /// empirical spirit as the macOS branch's own comment that
+    /// "activationPolicy alone cannot identify this unusable fallback
+    /// target".
+    static func isSystemSessionApp(_ exeName: String) -> Bool {
+        exeName.caseInsensitiveCompare("LockApp.exe") == .orderedSame
+            || exeName.caseInsensitiveCompare("LogonUI.exe") == .orderedSame
+    }
+
+    // MARK: - Resolution
+
+    /// Resolves a user-supplied string against the CURRENT set of running,
+    /// window-owning applications. See the macOS branch's identical entry
+    /// point for why this stays a thin wrapper around the pure overload
+    /// below -- `Candidate` construction differs completely (process
+    /// enumeration instead of `NSWorkspace`), but the matching algorithm
+    /// itself is IDENTICAL and lives in the pure `resolve(_:among:)` overload
+    /// shared in spirit (duplicated in code, per this file's platform-branch
+    /// rule) with the macOS one.
+    public func resolve(_ raw: String?) -> AppResolution {
+        guard let query = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
+            return .notFound
+        }
+        return resolve(query, among: runningCandidates())
+    }
+
+    /// Resolves a user-supplied string -- an executable name
+    /// ("chrome.exe") or a window title ("DaVinci Resolve") -- to a
+    /// concrete application, matched against `candidates`.
+    ///
+    /// THE ALGORITHM IS IDENTICAL to the macOS branch's `resolve(_:among:)`
+    /// -- same four-pass matching order, same uniqueness requirement, same
+    /// de-duplication, same `.ambiguous`/`.notFound` semantics; see that
+    /// method's extensive doc comment for the full rationale, none of which
+    /// is platform-specific. Duplicated here rather than shared via a common
+    /// helper because the two classes are entirely separate types (this
+    /// file's platform-branch rule keeps the macOS branch byte-for-byte
+    /// unchanged), and `Candidate` is constructed differently on each side.
+    ///
+    /// ONE CONTRACT DIFFERENCE, stated precisely per this task's rules: the
+    /// "a fully-qualified id that matches no running app is preserved
+    /// verbatim" step below calls the SAME `BundleIdentifierSyntax
+    /// .looksComplete` the macOS branch uses (shared, unmodified -- see its
+    /// doc comment at the top of this file). That check requires 3+
+    /// dot-separated components ("reverse-DNS shaped"), which an ordinary
+    /// Windows executable name such as `"notepad.exe"` (2 components) will
+    /// almost never satisfy. The PRACTICAL EFFECT: on Windows, `draw_*` with
+    /// an `app` argument naming an application that is NOT currently running
+    /// is rejected outright ("Could not resolve app...") rather than being
+    /// accepted verbatim and left to resolve once that app launches, unlike
+    /// macOS's bundle-id case. This gap is deliberately left open here (see
+    /// this task's `contractChanges` for the full statement) rather than
+    /// "fixed" by editing `DrawRequest.resolveTargetApp` -- a file outside
+    /// this one's ownership -- to recognize `"name.exe"`-shaped strings,
+    /// since that call site's verbatim-acceptance rule should be a decision
+    /// its own owner makes deliberately, not an incidental side effect of
+    /// this file's port.
+    func resolve(_ raw: String?, among candidates: [Candidate]) -> AppResolution {
+        guard let query = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty else {
+            return .notFound
+        }
+
+        if let hit = candidates.first(where: { $0.ref.bundleId.caseInsensitiveCompare(query) == .orderedSame }) {
+            return .resolved(hit.ref)
+        }
+        let exactNameHits = dedupedByBundleId(candidates.filter {
+            $0.canBeFrontmost
+                && $0.hasDisplayName
+                && $0.ref.name.caseInsensitiveCompare(query) == .orderedSame
+        })
+        if exactNameHits.count == 1 {
+            return .resolved(exactNameHits[0].ref)
+        }
+        if exactNameHits.count > 1 {
+            return ambiguousResolution(query: query, hits: exactNameHits)
+        }
+        if BundleIdentifierSyntax.looksComplete(query) {
+            Logger.shared.log(
+                "ActiveAppTracker: '\(query)' is a complete (reverse-DNS-shaped) identifier that matched no running application. Not attempting a fuzzy match. The caller may store it verbatim, in which case the annotation stays hidden until a process reporting that exact identity is foregrounded. NOTE: an ordinary Windows executable name like 'notepad.exe' does not satisfy this shape and will instead fall through to '.notFound' below -- see this method's doc comment.",
+                level: "INFO"
+            )
+            return .notFound
+        }
+
+        let lowered = query.lowercased()
+        let fuzzyCandidates = candidates.filter { $0.canBeFrontmost }
+
+        let bundleIdHits = dedupedByBundleId(fuzzyCandidates.filter { $0.ref.bundleId.lowercased().hasPrefix(lowered) })
+        if bundleIdHits.count == 1 {
+            return .resolved(bundleIdHits[0].ref)
+        }
+
+        let nameHits = dedupedByBundleId(fuzzyCandidates.filter { $0.hasDisplayName && $0.ref.name.lowercased().contains(lowered) })
+        if nameHits.count == 1 {
+            return .resolved(nameHits[0].ref)
+        }
+
+        var ambiguous = bundleIdHits
+        for hit in nameHits where !ambiguous.contains(where: { $0.ref.bundleId.caseInsensitiveCompare(hit.ref.bundleId) == .orderedSame }) {
+            ambiguous.append(hit)
+        }
+        if ambiguous.count > 1 {
+            return ambiguousResolution(query: query, hits: ambiguous)
+        }
+
+        Logger.shared.log("ActiveAppTracker: could not resolve app '\(query)' against \(candidates.count) running, window-owning processes.", level: "WARN")
+        return .notFound
+    }
+
+    private func ambiguousResolution(query: String, hits: [Candidate]) -> AppResolution {
+        let ordered = hits.filter { $0.isRegularApp }.map { $0.ref }
+            + hits.filter { !$0.isRegularApp }.map { $0.ref }
+        Logger.shared.log("ActiveAppTracker: app query '\(query)' is AMBIGUOUS -- it matches \(ordered.count) running, window-owning processes (\(ordered.map { $0.bundleId }.joined(separator: ", "))). Refusing to guess; the caller is told to be more specific.", level: "WARN")
+        return .ambiguous(ordered)
+    }
+
+    private func dedupedByBundleId(_ hits: [Candidate]) -> [Candidate] {
+        var seen = Set<String>()
+        var result: [Candidate] = []
+        for hit in hits where seen.insert(hit.ref.bundleId.lowercased()).inserted {
+            result.append(hit)
+        }
+        return result
+    }
+
+    /// Best-effort display name for an identity string, for diagnostics
+    /// (`list_annotations`). `nil` when no running, window-owning process
+    /// currently reports that identity.
+    public func displayName(forBundleId bundleId: String?) -> String? {
+        guard let bundleId = bundleId, !bundleId.isEmpty else { return nil }
+        return runningAppRefs().first(where: { $0.bundleId.caseInsensitiveCompare(bundleId) == .orderedSame })?.name
+    }
+
+    /// The literal current value of `GetForegroundWindow()`, with no
+    /// exclusions applied at all -- the Windows analogue of the macOS
+    /// branch's `rawFrontmostApp()`, used by the `get_active_app` tool so
+    /// Claude can see the raw truth next to the filtered values.
+    public func rawFrontmostApp() -> AppRef? {
+        guard let hwnd = GetForegroundWindow() else { return nil }
+        var pid: DWORD = 0
+        GetWindowThreadProcessId(hwnd, &pid)
+        guard pid != 0, let exeName = Self.exeFileName(forProcess: pid) else { return nil }
+        let title = Self.windowTitle(hwnd)
+        return AppRef(bundleId: exeName, name: title.isEmpty ? Self.displayNameFallback(forExeName: exeName) : title)
+    }
+
+    /// A running, window-owning process plus the two facts `resolve(_:)`
+    /// needs about it beyond its identity -- the Windows analogue of the
+    /// macOS branch's `Candidate`, same field names and roles so the shared
+    /// pure-matching algorithm above reads identically on both sides.
+    struct Candidate {
+        let ref: AppRef
+        /// False when NO window belonging to this process reported a
+        /// non-empty title, so `ref.name` is a synthesized fallback (see
+        /// `displayNameFallback`) rather than a real display name -- the
+        /// direct analogue of the macOS branch's "no `localizedName`" case,
+        /// and excluded from the name-matching passes for the identical
+        /// reason (see that branch's doc comment on why a pseudo-name must
+        /// not be matchable).
+        let hasDisplayName: Bool
+        /// Always `true` for every `Candidate` this class constructs:
+        /// `runningCandidates()` only builds one for a process that owns at
+        /// least one visible, top-level, non-tool window in the first place
+        /// (see that method's doc comment for why that filter exists at
+        /// enumeration time rather than per-pass here). Kept as a field
+        /// rather than dropped so the shared matching algorithm above stays
+        /// textually identical to the macOS branch's.
+        let canBeFrontmost: Bool
+        /// Best-effort proxy for macOS's `.regular` (an app with a Dock
+        /// icon): `true` when the window this candidate's name came from is
+        /// a normal, taskbar-visible top-level window (no `WS_EX_TOOLWINDOW`
+        /// style, or `WS_EX_APPWINDOW` forcing it back in). Windows has no
+        /// real analogue of macOS's activation-policy taxonomy; this is the
+        /// closest available signal and is used only to order the candidate
+        /// list shown when a query is ambiguous, exactly as on macOS.
+        let isRegularApp: Bool
+    }
+
+    /// One process's aggregated window information, built while walking
+    /// `EnumWindows` once (see `runningCandidates()`).
+    private struct WindowAggregate {
+        var bestTitle: String = ""
+        var isRegularApp: Bool = false
+    }
+
+    /// Builds today's app candidate list for `resolve(_:among:)`.
+    ///
+    /// TWO-PASS DESIGN, mirroring this method's own doc comment on
+    /// `runningCandidates()`'s job:
+    ///
+    ///   1. `EnumWindows` ONCE, filtered to windows that look like genuine,
+    ///      user-facing top-level windows (visible, unowned, not a
+    ///      `WS_EX_TOOLWINDOW` unless explicitly forced back in via
+    ///      `WS_EX_APPWINDOW` -- the standard "alt-tab list" heuristic),
+    ///      aggregated by owning process id into a `[DWORD: WindowAggregate]`.
+    ///      This is the Windows analogue of macOS's `.prohibited` exclusion:
+    ///      a raw process list (`CreateToolhelp32Snapshot`) alone is far
+    ///      noisier than `NSWorkspace.runningApplications` -- it includes
+    ///      every background service and helper process on the machine, none
+    ///      of which can ever legitimately be "the frontmost app" an
+    ///      annotation is scoped to. Filtering to window-owning processes
+    ///      keeps the candidate list at roughly macOS's granularity, so
+    ///      `resolve()`'s ambiguity errors do not fire on every query the way
+    ///      they would against the raw process list.
+    ///
+    ///   2. `CreateToolhelp32Snapshot`/`Process32NextW` to enumerate all
+    ///      processes and pick out their `szExeFile` (already just the base
+    ///      file name -- no path to parse), keeping only those present in the
+    ///      window-owning set from step 1, and excluding this process's own
+    ///      pid.
+    ///
+    /// LIMITATION, stated precisely per this task's contract rules: this is
+    /// a proxy, not an exact translation of macOS's `.regular`/`.accessory`/
+    /// `.prohibited` taxonomy, which has no Windows analogue. "Owns a
+    /// visible, top-level, non-tool window right now" is the closest
+    /// available signal for "could plausibly be the app the user means",
+    /// and it is what both `canBeFrontmost` (always true for a constructed
+    /// `Candidate`) and `isRegularApp` are built from.
+    private func runningCandidates() -> [Candidate] {
+        let ownPid = GetCurrentProcessId()
+
+        var windowsByPid: [DWORD: WindowAggregate] = [:]
+        withUnsafeMutablePointer(to: &windowsByPid) { ptr in
+            EnumWindows({ hwnd, lParam in
+                guard let hwnd = hwnd else { return true }
+                guard IsWindowVisible(hwnd) else { return true }
+                guard GetWindow(hwnd, UINT(GW_OWNER)) == nil else { return true }
+
+                let exStyle = UInt32(bitPattern: Int32(GetWindowLongW(hwnd, GWL_EXSTYLE)))
+                let isToolWindow = (exStyle & UInt32(WS_EX_TOOLWINDOW)) != 0
+                let isForcedAppWindow = (exStyle & UInt32(WS_EX_APPWINDOW)) != 0
+                guard !isToolWindow || isForcedAppWindow else { return true }
+
+                var pid: DWORD = 0
+                GetWindowThreadProcessId(hwnd, &pid)
+                guard pid != 0 else { return true }
+
+                let title = ActiveAppTracker.windowTitle(hwnd)
+                let aggregatesPtr = UnsafeMutableRawPointer(bitPattern: Int(lParam))!
+                    .assumingMemoryBound(to: [DWORD: WindowAggregate].self)
+                var aggregate = aggregatesPtr.pointee[pid] ?? WindowAggregate()
+                if aggregate.bestTitle.isEmpty && !title.isEmpty {
+                    aggregate.bestTitle = title
+                }
+                aggregate.isRegularApp = aggregate.isRegularApp || !isToolWindow
+                aggregatesPtr.pointee[pid] = aggregate
+                return true
+            }, LPARAM(Int(bitPattern: ptr)))
+        }
+
+        guard !windowsByPid.isEmpty else { return [] }
+
+        var result: [Candidate] = []
+        guard let snapshot = CreateToolhelp32Snapshot(DWORD(TH32CS_SNAPPROCESS), 0), snapshot != INVALID_HANDLE_VALUE else {
+            Logger.shared.log("ActiveAppTracker: CreateToolhelp32Snapshot failed (GetLastError=\(GetLastError())); resolve() will see no candidates this call.", level: "WARN")
+            return []
+        }
+        defer { CloseHandle(snapshot) }
+
+        var entry = PROCESSENTRY32W()
+        entry.dwSize = DWORD(MemoryLayout<PROCESSENTRY32W>.size)
+        guard Process32FirstW(snapshot, &entry) else { return [] }
+
+        repeat {
+            let pid = entry.th32ProcessID
+            guard pid != ownPid, let aggregate = windowsByPid[pid] else { continue }
+            let exeName = withUnsafePointer(to: entry.szExeFile) { ptr -> String in
+                ptr.withMemoryRebound(to: WCHAR.self, capacity: Int(MAX_PATH)) { wide in
+                    String(decodingCString: wide, as: UTF16.self)
+                }
+            }
+            guard !exeName.isEmpty else { continue }
+
+            let hasTitle = !aggregate.bestTitle.isEmpty
+            result.append(Candidate(
+                ref: AppRef(bundleId: exeName, name: hasTitle ? aggregate.bestTitle : Self.displayNameFallback(forExeName: exeName)),
+                hasDisplayName: hasTitle,
+                canBeFrontmost: true,
+                isRegularApp: aggregate.isRegularApp
+            ))
+        } while Process32NextW(snapshot, &entry)
+
+        return result
+    }
+
+    private func runningAppRefs() -> [AppRef] {
+        return runningCandidates().map { $0.ref }
+    }
+}
+
+#endif

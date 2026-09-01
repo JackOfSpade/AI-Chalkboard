@@ -1,7 +1,6 @@
 import Foundation
-import AppKit
 
-/// Parses the color spellings every drawing tool accepts into an `NSColor`.
+/// Parses the color spellings every drawing tool accepts into a `ChalkColor`.
 ///
 /// Lives in Support rather than in `Models/Annotation.swift`, where it used to
 /// sit: it holds no annotation state, is used by the renderer and by MCP
@@ -10,26 +9,26 @@ import AppKit
 /// coupling that does not exist.
 
 public struct ColorParser {
-    public static func parse(_ colorString: String?) -> NSColor {
+    public static func parse(_ colorString: String?) -> ChalkColor {
         guard let colorString = colorString?.trimmingCharacters(in: .whitespacesAndNewlines), !colorString.isEmpty else {
-            return NSColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9) // Default bright red
+            return ChalkColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9) // Default bright red
         }
-        
+
         let lower = colorString.lowercased()
         switch lower {
-        case "red": return NSColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9)
-        case "green": return NSColor(red: 0.2, green: 0.85, blue: 0.3, alpha: 0.9)
-        case "blue": return NSColor(red: 0.2, green: 0.5, blue: 1.0, alpha: 0.9)
-        case "yellow": return NSColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 0.9)
-        case "orange": return NSColor(red: 1.0, green: 0.5, blue: 0.0, alpha: 0.9)
-        case "purple": return NSColor(red: 0.6, green: 0.3, blue: 0.9, alpha: 0.9)
-        case "pink": return NSColor(red: 1.0, green: 0.4, blue: 0.7, alpha: 0.9)
-        case "cyan": return NSColor(red: 0.0, green: 0.8, blue: 0.9, alpha: 0.9)
-        case "white": return NSColor(white: 1.0, alpha: 0.9)
-        case "black": return NSColor(white: 0.1, alpha: 0.9)
+        case "red": return ChalkColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9)
+        case "green": return ChalkColor(red: 0.2, green: 0.85, blue: 0.3, alpha: 0.9)
+        case "blue": return ChalkColor(red: 0.2, green: 0.5, blue: 1.0, alpha: 0.9)
+        case "yellow": return ChalkColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 0.9)
+        case "orange": return ChalkColor(red: 1.0, green: 0.5, blue: 0.0, alpha: 0.9)
+        case "purple": return ChalkColor(red: 0.6, green: 0.3, blue: 0.9, alpha: 0.9)
+        case "pink": return ChalkColor(red: 1.0, green: 0.4, blue: 0.7, alpha: 0.9)
+        case "cyan": return ChalkColor(red: 0.0, green: 0.8, blue: 0.9, alpha: 0.9)
+        case "white": return ChalkColor(red: 1.0, green: 1.0, blue: 1.0, alpha: 0.9)
+        case "black": return ChalkColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 0.9)
         default: break
         }
-        
+
         var hex = lower
         if hex.hasPrefix("#") {
             hex.removeFirst()
@@ -53,7 +52,7 @@ public struct ColorParser {
         // falls through to the same red fallback other malformed strings get.
         let isPureHexDigits = !hex.isEmpty && hex.allSatisfy { "0123456789abcdef".contains($0) }
         guard isPureHexDigits, [3, 6, 8].contains(hex.count) else {
-            return NSColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9) // Invalid colour: same red fallback as wrong-length strings
+            return ChalkColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9) // Invalid colour: same red fallback as wrong-length strings
         }
 
         var intVal: UInt64 = 0
@@ -68,14 +67,14 @@ public struct ColorParser {
         case 8: // ARGB or RGBA (32-bit) -> assume RGBA
             (r, g, b, a) = (intVal >> 24, intVal >> 16 & 0xFF, intVal >> 8 & 0xFF, intVal & 0xFF)
         default:
-            return NSColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9)
+            return ChalkColor(red: 1.0, green: 0.2, blue: 0.2, alpha: 0.9)
         }
 
-        return NSColor(
-            red: CGFloat(r) / 255.0,
-            green: CGFloat(g) / 255.0,
-            blue: CGFloat(b) / 255.0,
-            alpha: CGFloat(a) / 255.0
+        return ChalkColor(
+            red: Double(r) / 255.0,
+            green: Double(g) / 255.0,
+            blue: Double(b) / 255.0,
+            alpha: Double(a) / 255.0
         )
     }
 }

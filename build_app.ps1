@@ -1,0 +1,287 @@
+# Windows equivalent of build_app.sh: release build + deployable layout.
+#
+# This is NOT a straight port of build_app.sh. macOS ships one relocatable
+# unit (a code-signed .app bundle) because Gatekeeper/TCC require it; Windows
+# has no bundle format and no equivalent of TCC privacy grants tied to a
+# signing identity, so this script's job is simpler and different in kind:
+# produce a folder containing the .exe plus every DLL it needs to run WITHOUT
+# the Swift toolchain on PATH, because that is the actual constraint Claude
+# Desktop imposes (it spawns the MCP server with its own environment, not this
+# shell's PATH).
+$ErrorActionPreference = "Stop"
+
+function Fail($message) {
+    Write-Error $message
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 1. Locate the Swift toolchain, runtime, Windows platform SDK, and MSVC
+#    environment. Same discovery strategy as swiftenv.ps1 (newest-versioned
+#    subdirectory under each of Toolchains/Runtimes/Platforms), but every
+#    lookup fails with an actionable message instead of throwing a bare
+#    "path not found" -- this script is meant to also work on a machine
+#    that has never been set up for this project before.
+# ---------------------------------------------------------------------------
+$swiftRoot = "$env:LOCALAPPDATA\Programs\Swift"
+if (-not (Test-Path $swiftRoot)) {
+    Fail "Swift toolchain not found at $swiftRoot. Install the Swift for Windows toolchain (swift.org/install) before running this script."
+}
+
+$toolchainDir = Get-ChildItem "$swiftRoot\Toolchains" -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+if (-not $toolchainDir) {
+    Fail "No Swift toolchain found under $swiftRoot\Toolchains. Install the Swift for Windows toolchain (swift.org/install)."
+}
+$toolchain = $toolchainDir.FullName
+
+$runtimeDir = Get-ChildItem "$swiftRoot\Runtimes" -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+if (-not $runtimeDir) {
+    Fail "No Swift Runtimes directory found under $swiftRoot\Runtimes. Install (or repair) the Swift for Windows runtime component."
+}
+$runtimeVer = $runtimeDir.Name
+$runtimeBin = "$swiftRoot\Runtimes\$runtimeVer\usr\bin"
+if (-not (Test-Path $runtimeBin)) {
+    Fail "Swift runtime bin directory not found at $runtimeBin. Reinstall the Swift for Windows runtime component."
+}
+
+$platformDir = Get-ChildItem "$swiftRoot\Platforms" -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+if (-not $platformDir) {
+    Fail "No Windows platform SDK found under $swiftRoot\Platforms. Install the Swift for Windows platform SDK component."
+}
+$platformVer = $platformDir.Name
+$env:SDKROOT = "$swiftRoot\Platforms\$platformVer\Windows.platform\Developer\SDKs\Windows.sdk"
+if (-not (Test-Path $env:SDKROOT)) {
+    Fail "Windows SDK not found at $env:SDKROOT. Reinstall the Swift for Windows platform SDK component."
+}
+
+$env:PATH = "$toolchain\usr\bin;$runtimeBin;$env:PATH"
+
+# Import the MSVC environment (link.exe, cl.exe headers/libs) from
+# vcvars64.bat, located via vswhere. This is required for swift build to
+# link on Windows; without it the build fails with missing link.exe / CRT
+# headers rather than anything Swift-specific.
+$vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) {
+    Fail "vswhere.exe not found at $vswhere. Install Visual Studio 2022 Build Tools with the 'Desktop development with C++' workload."
+}
+
+$vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vsPath) {
+    Fail "No Visual Studio installation with the VC.Tools.x86.x64 component was found. Install Visual Studio 2022 Build Tools with the 'Desktop development with C++' workload (and the Windows 10/11 SDK)."
+}
+
+$vcvars = "$vsPath\VC\Auxiliary\Build\vcvars64.bat"
+if (-not (Test-Path $vcvars)) {
+    Fail "vcvars64.bat not found at $vcvars. Repair the Visual Studio 2022 Build Tools installation (VC++ workload)."
+}
+
+cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+    if ($_ -match '^([^=]+)=(.*)$') {
+        $name = $matches[1]
+        $value = $matches[2]
+        if ($name -ne "PATH") {
+            Set-Item -Path "env:$name" -Value $value -ErrorAction SilentlyContinue
+        } else {
+            $env:PATH = "$toolchain\usr\bin;$runtimeBin;$value"
+        }
+    }
+}
+if (-not $env:VCToolsInstallDir) {
+    Fail "vcvars64.bat ran but did not populate the MSVC environment (VCToolsInstallDir unset). Repair the Visual Studio 2022 Build Tools installation."
+}
+
+Write-Output "Swift toolchain: $toolchain"
+Write-Output "Swift runtime:   $runtimeBin"
+Write-Output "SDKROOT:         $env:SDKROOT"
+Write-Output "VS install:      $vsPath"
+
+# ---------------------------------------------------------------------------
+# 2. Release build.
+# ---------------------------------------------------------------------------
+Write-Output "Building AI Chalkboard release binary..."
+swift build -c release
+if ($LASTEXITCODE -ne 0) {
+    Fail "swift build -c release failed (exit $LASTEXITCODE)."
+}
+
+$repoRoot = (Get-Location).Path
+
+# NOT ".build\release\AIChalkboard.exe": that path is a convenience symlink
+# SwiftPM creates alongside the real, triple-qualified output directory
+# (".build\<triple>\release"), and creating it needs either Windows
+# Developer Mode or an elevated process -- verified failing here with
+# "unable to create symbolic link ... I/O error (code: 512)" even though the
+# actual release build succeeded. `--show-bin-path` is SwiftPM's own
+# documented way to ask where a build's output actually landed, so it works
+# whether or not that symlink got created.
+$buildExe = (swift build -c release --show-bin-path 2>$null | Select-Object -Last 1).Trim()
+$buildExe = Join-Path $buildExe "AIChalkboard.exe"
+if (-not (Test-Path $buildExe)) {
+    Fail "Release build reported success but $buildExe does not exist."
+}
+
+# ---------------------------------------------------------------------------
+# 3. Build identifier. Mirrors build_app.sh: git short SHA, '-dirty' suffix
+#    when the tree has staged, unstaged, or untracked changes, 'source'
+#    fallback when Git is unavailable or the identifier is otherwise unusable.
+#    Windows has no Info.plist to embed this in (see step 5's comment on
+#    BuildMetadata.swift), so this is reported alongside the exe path instead.
+# ---------------------------------------------------------------------------
+$buildIdentifier = $env:AI_CHALKBOARD_BUILD_IDENTIFIER
+if (-not $buildIdentifier) {
+    $gitSha = $null
+    try {
+        $gitSha = (git rev-parse --short=12 HEAD 2>$null)
+        if ($LASTEXITCODE -ne 0) { $gitSha = $null }
+    } catch {
+        $gitSha = $null
+    }
+    $buildIdentifier = if ($gitSha) { $gitSha.Trim() } else { "source" }
+
+    if ($gitSha) {
+        $isRepo = $false
+        try {
+            git rev-parse --is-inside-work-tree *> $null
+            $isRepo = ($LASTEXITCODE -eq 0)
+        } catch { $isRepo = $false }
+
+        if ($isRepo) {
+            $dirty = $false
+            git diff --quiet 2>$null
+            if ($LASTEXITCODE -ne 0) { $dirty = $true }
+            git diff --cached --quiet 2>$null
+            if ($LASTEXITCODE -ne 0) { $dirty = $true }
+            $untracked = git ls-files --others --exclude-standard 2>$null
+            if ($untracked) { $dirty = $true }
+            if ($dirty) { $buildIdentifier = "$buildIdentifier-dirty" }
+        }
+    }
+}
+if ($buildIdentifier -notmatch '^[A-Za-z0-9._-]{1,128}$') {
+    Write-Warning "Invalid AI_CHALKBOARD_BUILD_IDENTIFIER; using source fallback."
+    $buildIdentifier = "source"
+}
+
+# CFBundleShortVersionString's Windows counterpart: read productVersion from
+# the same single source of truth build_app.sh uses, for the same reason
+# (drift between a hardcoded copy and BuildMetadata.swift). Fail loudly
+# rather than silently reporting an empty/malformed version.
+$buildMetadataPath = Join-Path $repoRoot "Sources\Support\BuildMetadata.swift"
+$productVersion = $null
+if (Test-Path $buildMetadataPath) {
+    $match = Select-String -Path $buildMetadataPath -Pattern '^\s*static let productVersion = "([^"]*)"' | Select-Object -First 1
+    if ($match) { $productVersion = $match.Matches[0].Groups[1].Value }
+}
+if (-not $productVersion -or $productVersion -notmatch '^[0-9]+(\.[0-9]+){1,3}$') {
+    Fail "Could not determine a valid productVersion from Sources\Support\BuildMetadata.swift (got: '$productVersion'). Expected a line there like: static let productVersion = `"2.1.0`""
+}
+
+Write-Output "Build identifier: $buildIdentifier"
+Write-Output "Product version:  $productVersion"
+
+# ---------------------------------------------------------------------------
+# 4. Assemble the deployable layout: dist\AIChalkboard\AIChalkboard.exe plus
+#    every Swift/C++ runtime DLL it transitively needs, so Claude Desktop can
+#    launch it without the Swift toolchain on PATH. Verified: running the
+#    bare .build\release\AIChalkboard.exe from a shell with a minimal PATH
+#    fails immediately with STATUS_DLL_NOT_FOUND (0xC0000135).
+#
+#    Method for determining the needed DLL set: read the PE import table
+#    with the Swift toolchain's own llvm-objdump.exe (`-p`, "DLL Name:"
+#    lines under the import table) starting from AIChalkboard.exe, and walk
+#    the dependency graph transitively -- for every imported DLL that exists
+#    in the Swift Runtimes usr\bin directory, copy it and recurse into ITS
+#    imports too (a Swift DLL can depend on other Swift/C++ redistributable
+#    DLLs, e.g. swiftCore.dll -> swiftCRT.dll -> vcruntime140.dll). Anything
+#    NOT found in that runtime directory (kernel32.dll, ntdll.dll, user32.dll,
+#    gdi32.dll, ole32.dll, oleaut32.dll, shell32.dll, shcore.dll, dwmapi.dll,
+#    gdiplus.dll, windowscodecs.dll, advapi32.dll, ws2_32.dll, bcrypt.dll,
+#    api-ms-win-*.dll, etc.) is assumed to be a base Windows component
+#    present on any target machine and is deliberately left uncopied -- this
+#    app already links those directly (see Package.swift's linkerSettings
+#    and CChalkboardWin), and they ship with Windows itself, not with Swift.
+#    This is a closure over actual PE imports, not a guessed/hardcoded list,
+#    so it stays correct if a future Swift toolchain version changes which
+#    DLLs exist or depend on which others.
+# ---------------------------------------------------------------------------
+$objdump = "$toolchain\usr\bin\llvm-objdump.exe"
+if (-not (Test-Path $objdump)) {
+    Fail "llvm-objdump.exe not found at $objdump (expected inside the Swift toolchain)."
+}
+
+function Get-ImportedDlls([string]$binaryPath) {
+    $output = & $objdump -p $binaryPath 2>$null
+    $names = @()
+    foreach ($line in $output) {
+        if ($line -match '^\s*DLL Name:\s*(\S+)\s*$') {
+            $names += $matches[1]
+        }
+    }
+    return $names
+}
+
+$runtimeDllIndex = @{}
+Get-ChildItem $runtimeBin -Filter "*.dll" | ForEach-Object {
+    $runtimeDllIndex[$_.Name.ToLowerInvariant()] = $_.FullName
+}
+
+$needed = New-Object System.Collections.Generic.HashSet[string]
+$queue = New-Object System.Collections.Generic.Queue[string]
+$queue.Enqueue($buildExe)
+$visitedBinaries = New-Object System.Collections.Generic.HashSet[string]
+
+while ($queue.Count -gt 0) {
+    $current = $queue.Dequeue()
+    $currentKey = $current.ToLowerInvariant()
+    if ($visitedBinaries.Contains($currentKey)) { continue }
+    [void]$visitedBinaries.Add($currentKey)
+
+    foreach ($dllName in (Get-ImportedDlls $current)) {
+        $key = $dllName.ToLowerInvariant()
+        if ($runtimeDllIndex.ContainsKey($key) -and -not $needed.Contains($key)) {
+            [void]$needed.Add($key)
+            $queue.Enqueue($runtimeDllIndex[$key])
+        }
+    }
+}
+
+if ($needed.Count -eq 0) {
+    Fail "Dependency scan found zero Swift runtime DLLs required by AIChalkboard.exe -- llvm-objdump likely failed silently; investigate before shipping a dist that will STATUS_DLL_NOT_FOUND on launch."
+}
+
+$distDir = Join-Path $repoRoot "dist"
+$appDir = Join-Path $distDir "AIChalkboard"
+Write-Output "Creating deployable layout at $appDir..."
+if (Test-Path $appDir) { Remove-Item -Recurse -Force $appDir }
+New-Item -ItemType Directory -Path $appDir | Out-Null
+
+Copy-Item $buildExe (Join-Path $appDir "AIChalkboard.exe")
+
+foreach ($key in $needed) {
+    Copy-Item $runtimeDllIndex[$key] (Join-Path $appDir (Split-Path $runtimeDllIndex[$key] -Leaf))
+}
+Write-Output "Copied $($needed.Count) Swift runtime DLL(s): $($needed -join ', ')"
+
+# ---------------------------------------------------------------------------
+# 5. No code-signing step here, deliberately.
+#
+#    build_app.sh signs the macOS bundle with a pinned local identity so
+#    macOS TCC treats every local rebuild as an update of the SAME app,
+#    keeping Screen Recording / Accessibility grants stable instead of
+#    re-prompting (or silently losing the grant) on every rebuild. Windows
+#    has no equivalent per-app privacy-grant system keyed off a code-signing
+#    identity -- there is nothing here for signing to stabilize. (A real
+#    Authenticode certificate would still be worth having for
+#    SmartScreen/AV reputation before wide distribution, but that is an
+#    unrelated concern from TCC grant stability and out of scope for this
+#    dev-build script.)
+# ---------------------------------------------------------------------------
+
+$exePath = Join-Path $appDir "AIChalkboard.exe"
+Write-Output ""
+Write-Output "Deployable layout created successfully at $appDir"
+Write-Output "Build identifier: $buildIdentifier | Product version: $productVersion"
+Write-Output ""
+Write-Output "Paste into claude_desktop_config.json as the MCP server 'command':"
+Write-Output "  `"$exePath`""
+Write-Output "  (as a JSON string, i.e. with backslashes escaped: `"$($exePath -replace '\\','\\')`")"

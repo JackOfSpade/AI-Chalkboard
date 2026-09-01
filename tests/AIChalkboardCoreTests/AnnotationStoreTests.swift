@@ -1,4 +1,8 @@
+#if os(macOS)
 import AppKit
+#elseif os(Windows)
+import CChalkboardWin
+#endif
 import XCTest
 @testable import AIChalkboardCore
 
@@ -13,6 +17,7 @@ final class AnnotationStoreTests: XCTestCase {
         )
     }
 
+    #if os(macOS)
     /// A minimal decodable PNG on disk, for annotations whose kind owns a
     /// raster asset. Mirrors `RasterAssetStoreTests`' fixture -- see that
     /// file for why an in-memory `NSBitmapImageRep` round-tripped through a
@@ -37,6 +42,35 @@ final class AnnotationStoreTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
         return url
     }
+    #elseif os(Windows)
+    /// Windows analogue of the macOS fixture above: a minimal decodable PNG
+    /// on disk, built via the same `chalk_image_encode_png` WIC-backed
+    /// encoder `AnnotationVerificationCompositor`'s Windows branch already
+    /// uses, rather than round-tripping through `NSBitmapImageRep` (which
+    /// does not exist on this platform). A flat, fully-opaque premultiplied
+    /// BGRA buffer is the simplest true "loadable raster" this test suite
+    /// needs -- the actual pixel content is never asserted on, only that the
+    /// file decodes.
+    private func png(width: Int = 13, height: Int = 7) throws -> URL {
+        let stride = width * 4
+        let bgra = [UInt8](repeating: 0xFF, count: stride * height)
+        var outBytes: UnsafeMutablePointer<UInt8>?
+        var outLen: Int32 = 0
+        let status: Int32 = bgra.withUnsafeBufferPointer { buf in
+            chalk_image_encode_png(buf.baseAddress, Int32(width), Int32(height), Int32(stride), &outBytes, &outLen)
+        }
+        guard status == 0, let encoded = outBytes else {
+            throw XCTSkip("chalk_image_encode_png failed with status \(status); cannot build PNG fixture")
+        }
+        let data = Data(bytes: encoded, count: Int(outLen))
+        chalk_image_free_bytes(encoded)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ai-chalkboard-store-raster-\(UUID().uuidString).png")
+        try data.write(to: url)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+    #endif
 
     /// A raster-backed annotation loaded into the SHARED `RasterAssetStore`
     /// (the same instance `AnnotationStore.releaseRasterAssets` releases

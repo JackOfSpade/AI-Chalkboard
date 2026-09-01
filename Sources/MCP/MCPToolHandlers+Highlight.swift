@@ -1,5 +1,25 @@
 import Foundation
+#if os(macOS)
 import AppKit
+#elseif os(Windows)
+import WinSDK
+#endif
+
+#if os(macOS)
+/// The process-id type `resolveRunningHighlightTarget`/`AccessibilityElementResolver.resolve`
+/// share on this platform -- unchanged from before this file gained a
+/// Windows branch.
+private typealias HighlightProcessID = pid_t
+#elseif os(Windows)
+/// `pid_t` does not exist on the Windows Swift toolchain (confirmed by a
+/// direct compile attempt: `error: cannot find type 'pid_t' in scope`).
+/// `UInt32` is both what chalkboard_win.h declares `chalk_uia_find_element`'s
+/// `process_id` parameter as and what `PROCESSENTRY32W.th32ProcessID`
+/// naturally hands back (see `processIDs(forExecutableIdentity:)` below), so
+/// it is the natural Windows analogue used throughout this file's Windows
+/// branch and by `AccessibilityElementResolver.resolve(processID:...)`.
+private typealias HighlightProcessID = UInt32
+#endif
 
 /// The outline traced around an Accessibility element's padded bounds.
 /// `.rect` is the historical, still-default behaviour; `.ellipse` and
@@ -28,7 +48,7 @@ private struct HighlightStyle {
 // MCPToolHandlers+Drawing.swift.
 func colorHasVisibleAlpha(_ color: String?) -> Bool {
     guard let color else { return false }
-    return ColorParser.parse(color).alphaComponent > 0
+    return ColorParser.parse(color).alpha > 0
 }
 
 extension MCPServer {
@@ -132,7 +152,7 @@ extension MCPServer {
         case .success(let value): style = value
         }
 
-        let target: (app: AppRef, pid: pid_t)
+        let target: (app: AppRef, pid: HighlightProcessID)
         switch resolveRunningHighlightTarget(args) {
         case .failure(let error): sendErrorResult(id: id, text: error); return
         case .success(let value): target = value
@@ -198,7 +218,8 @@ extension MCPServer {
         }
     }
 
-    private func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, pid: pid_t)> {
+    #if os(macOS)
+    private func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, pid: HighlightProcessID)> {
         if args.keys.contains("app"), !(args["app"] is String) {
             return .failure("app must be a running app's bundle id or display name when supplied.")
         }
@@ -240,7 +261,7 @@ extension MCPServer {
         // Accessibility query that follows: the process can exit, or a second
         // instance can launch, in either window. The hop is a threading
         // correction, not a TOCTOU fix.
-        let runningPIDs: [pid_t] = MainThread.sync {
+        let runningPIDs: [HighlightProcessID] = MainThread.sync {
             NSWorkspace.shared.runningApplications
                 .filter { $0.bundleIdentifier == app.bundleId && !$0.isTerminated }
                 .map { $0.processIdentifier }
@@ -252,6 +273,120 @@ extension MCPServer {
         }
         return .success((app, target))
     }
+    #elseif os(Windows)
+    /// Resolves the `app` argument to a live Windows process. Same contract
+    /// and guarantees as the macOS branch above (see its doc comments for
+    /// the "GLOBAL is not supported", ambiguity-refusal, and TOCTOU notes,
+    /// all unchanged in spirit here), with two substitutions forced by the
+    /// platform:
+    ///
+    /// (a) APP IDENTITY. Windows has no bundle-identifier concept.
+    ///     `AppRef.bundleId` is ASSUMED here to hold an executable name such
+    ///     as `"Resolve.exe"` or its extension-less stem, matched case-
+    ///     insensitively -- per this task's brief, this mirrors the Windows
+    ///     app-identity model `ActiveAppTracker` defines separately (owned
+    ///     by another change, not this one). This file does not itself
+    ///     define that identity string; it only assumes the shape above. If
+    ///     the actual `ActiveAppTracker` Windows implementation picks a
+    ///     different identity shape (e.g. a full path, or a different
+    ///     matching rule), `processIDs(forExecutableIdentity:)` below must
+    ///     be updated to match -- see contractChanges/followUps.
+    ///
+    /// (b) PID RESOLUTION. In place of `NSWorkspace.runningApplications`'s
+    ///     bundle-id filter, this enumerates every running process via
+    ///     `CreateToolhelp32Snapshot` and matches executable names --
+    ///     see `processIDs(forExecutableIdentity:)`. Like the macOS branch,
+    ///     this does NOT close the gap between resolving the app and
+    ///     enumerating processes, nor between this snapshot and the UI
+    ///     Automation query that follows: the process can exit, or a second
+    ///     instance can launch, in either window.
+    private func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, pid: HighlightProcessID)> {
+        if args.keys.contains("app"), !(args["app"] is String) {
+            return .failure("app must be a running app's executable name or display name when supplied.")
+        }
+        let app: AppRef
+        if let supplied = args["app"] as? String {
+            let raw = supplied.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !raw.isEmpty else {
+                return .failure("highlight_element cannot target GLOBAL visibility; app must resolve to one running application so its UI Automation tree can be queried.")
+            }
+            switch ActiveAppTracker.shared.resolve(raw) {
+            case .resolved(let value): app = value
+            case .ambiguous(let matches):
+                let candidates = matches.map { "'\($0.name)' [\($0.bundleId)]" }.joined(separator: ", ")
+                return .failure("App '\(raw)' is AMBIGUOUS across running applications: \(candidates). Retry with an exact executable name or display name.")
+            case .notFound:
+                return .failure("App '\(raw)' is not running or could not be resolved. highlight_element requires a running target application with a process id.")
+            }
+        } else {
+            // Paired read: the identity and the name become one AppRef, same
+            // reasoning as the macOS branch's `fallbackApp` comment.
+            let fallback = ActiveAppTracker.shared.fallbackApp
+            guard let identity = fallback.bundleId else {
+                return .failure("No fallback running app is available. Pass app with an exact running app executable name or display name; GLOBAL highlighting is not supported.")
+            }
+            app = AppRef(bundleId: identity, name: fallback.name ?? identity)
+        }
+
+        let matchingPIDs = Self.processIDs(forExecutableIdentity: app.bundleId)
+        guard matchingPIDs.count == 1, let target = matchingPIDs.first else {
+            return matchingPIDs.isEmpty
+                ? .failure("App '\(app.name)' [\(app.bundleId)] is no longer running, so its UI Automation tree cannot be queried.")
+                : .failure("App '\(app.name)' [\(app.bundleId)] has \(matchingPIDs.count) running processes. highlight_element refuses to guess which process id to inspect.")
+        }
+        return .success((app, target))
+    }
+
+    /// Enumerates every running process via `CreateToolhelp32Snapshot`
+    /// (`TH32CS_SNAPPROCESS`) and returns the process ids whose executable
+    /// file name -- or that name's extension-less stem -- case-
+    /// insensitively matches `identity`. This is the Windows substitute for
+    /// `NSWorkspace.runningApplications`'s bundle-id filter on the macOS
+    /// branch: Win32 has no bundle-identifier concept, only a per-process
+    /// executable file name (`PROCESSENTRY32W.szExeFile`), so process
+    /// identity here is that name. Matching both the full file name AND its
+    /// stem tolerates a caller (or `ActiveAppTracker`) supplying either
+    /// `"Resolve.exe"` or `"Resolve"`.
+    private static func processIDs(forExecutableIdentity identity: String) -> [HighlightProcessID] {
+        let loweredFull = identity.lowercased()
+        let loweredStem = stem(of: identity).lowercased()
+
+        guard let snapshot = CreateToolhelp32Snapshot(DWORD(TH32CS_SNAPPROCESS), 0),
+              snapshot != INVALID_HANDLE_VALUE else {
+            return []
+        }
+        defer { CloseHandle(snapshot) }
+
+        var entry = PROCESSENTRY32W()
+        entry.dwSize = DWORD(MemoryLayout<PROCESSENTRY32W>.size)
+        var matches: [HighlightProcessID] = []
+        guard Process32FirstW(snapshot, &entry) else { return [] }
+        repeat {
+            // `szExeFile` is a fixed-size WCHAR[MAX_PATH] C array, imported
+            // as a Swift tuple; reinterpret it as a UTF-16 buffer to decode
+            // it as a String, the standard idiom for a fixed C char array.
+            let exeName = withUnsafePointer(to: &entry.szExeFile) { tuplePointer -> String in
+                tuplePointer.withMemoryRebound(to: UInt16.self, capacity: 260) { wide in
+                    String(decodingCString: wide, as: UTF16.self)
+                }
+            }
+            let loweredExe = exeName.lowercased()
+            if loweredExe == loweredFull || stem(of: exeName).lowercased() == loweredStem {
+                matches.append(entry.th32ProcessID)
+            }
+        } while Process32NextW(snapshot, &entry)
+        return matches
+    }
+
+    /// The extension-less stem of a file name (`"Resolve.exe"` -> `"Resolve"`).
+    /// A tiny local helper rather than `NSString.deletingPathExtension`, to
+    /// avoid depending on Foundation's NSString bridging on this platform
+    /// for a one-line string operation.
+    private static func stem(of fileName: String) -> String {
+        guard let dotIndex = fileName.lastIndex(of: ".") else { return fileName }
+        return String(fileName[..<dotIndex])
+    }
+    #endif
 
     private func makeHighlightStyle(args: [String: Any]) -> DrawOutcome<HighlightStyle> {
         if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["padding_px", "stroke_width", "stroke_opacity", "fill_opacity"]) {

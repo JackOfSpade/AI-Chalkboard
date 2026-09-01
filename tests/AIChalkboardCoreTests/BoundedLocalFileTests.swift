@@ -1,5 +1,9 @@
-import Darwin
 import XCTest
+#if os(macOS)
+import Darwin
+#elseif os(Windows)
+import WinSDK
+#endif
 @testable import AIChalkboardCore
 
 final class BoundedLocalFileTests: XCTestCase {
@@ -37,6 +41,7 @@ final class BoundedLocalFileTests: XCTestCase {
         }
     }
 
+    #if os(macOS)
     /// A FIFO with no writer must be REJECTED, and must be rejected without
     /// blocking. This is the regression test for the open(2)-on-a-FIFO hang:
     /// with a blocking open, this test does not fail -- it never returns, and
@@ -64,6 +69,51 @@ final class BoundedLocalFileTests: XCTestCase {
         }
         wait(for: [finished], timeout: 5)
     }
+    #elseif os(Windows)
+    /// Windows equivalent of the macOS FIFO test above. Windows has no
+    /// ordinary-path equivalent of a writer-less POSIX FIFO -- named pipes
+    /// live in the separate `\\.\pipe\` namespace, and a client `CreateFileW`
+    /// against an instance a server has already created connects
+    /// immediately rather than blocking the way `open()` on a FIFO does --
+    /// so this is not a hang regression test the way the macOS one is. What
+    /// it DOES verify is the type check that stands in for the macOS
+    /// branch's `S_IFREG` guard: `GetFileType` must report the pipe as not
+    /// `FILE_TYPE_DISK`, so `BoundedLocalFile.read` rejects it. The
+    /// expectation/timeout scaffolding is kept for parity with the macOS
+    /// test and as a backstop in case that assumption about client-open
+    /// behavior is ever wrong on some Windows version.
+    func testRejectsNamedPipeWithoutBlocking() throws {
+        let pipeName = "\\\\.\\pipe\\ai-chalkboard-bounded-local-file-\(UUID().uuidString)"
+        let serverHandle: HANDLE = pipeName.withCString(encodedAs: UTF16.self) { widePipeName in
+            CreateNamedPipeW(
+                widePipeName,
+                DWORD(PIPE_ACCESS_DUPLEX),
+                DWORD(PIPE_TYPE_BYTE) | DWORD(PIPE_WAIT),
+                1,
+                0,
+                0,
+                0,
+                nil
+            )
+        }
+        guard serverHandle != INVALID_HANDLE_VALUE else {
+            throw XCTSkip("CreateNamedPipeW failed (Win32 error \(GetLastError())); cannot exercise the named-pipe path here.")
+        }
+        addTeardownBlock { CloseHandle(serverHandle) }
+
+        let finished = expectation(description: "BoundedLocalFile.read returned on a named pipe path")
+        DispatchQueue.global().async {
+            do {
+                _ = try BoundedLocalFile.read(path: pipeName, maxBytes: 1_024)
+                XCTFail("Expected a named pipe to be rejected as not-a-regular-disk-file")
+            } catch {
+                XCTAssertEqual(error as? BoundedLocalFileError, .unreadable)
+            }
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 5)
+    }
+    #endif
 
     func testRejectsRelativePath() {
         XCTAssertThrowsError(try BoundedLocalFile.read(path: "relative.bin", maxBytes: 1_024)) { error in
