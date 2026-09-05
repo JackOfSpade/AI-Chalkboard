@@ -1100,19 +1100,19 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
     /// per-user directory rather than anything derived from the cwd -- the
     /// behaviour production depends on, and the reason the guard has to
     /// reject junk rather than pass it through.
-    func testAbsentSuspensionRootOverrideLeavesTheRealPerUserDirectoryInPlace() throws {
-        // If a harness has pointed this whole process at a sandbox root, the
-        // no-override path genuinely cannot be observed from here -- skip
-        // rather than assert against the sandbox and fail spuriously.
-        try XCTSkipIf(
-            ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_ROOT"] != nil,
-            "AI_CHALKBOARD_SUSPENSION_ROOT is set for this process"
-        )
-        let coordinator = SuspensionLeaseCoordinator(
-            storageDirectory: nil,
-            bootSessionIdentifier: "test-boot",
-            instanceNonce: "test-nonce"
-        )
+    func testAbsentSuspensionRootOverrideLeavesTheRealPerUserDirectoryInPlace() {
+        // AppBehaviorTests sets this variable process-wide to isolate itself,
+        // so clear it just for this call rather than skipping -- skipping here
+        // would silently drop the only coverage of the production fallback.
+        // Only this freshly constructed instance is affected; the shared
+        // coordinator resolved its own directory long before now.
+        let coordinator = TestEnvironment.withValue("AI_CHALKBOARD_SUSPENSION_ROOT", nil) {
+            SuspensionLeaseCoordinator(
+                storageDirectory: nil,
+                bootSessionIdentifier: "test-boot",
+                instanceNonce: "test-nonce"
+            )
+        }
         XCTAssertEqual(coordinator.storageDirectory.lastPathComponent, "AIChalkboard")
         XCTAssertTrue((coordinator.storageDirectory.path as NSString).isAbsolutePath,
                       "the fallback must be absolute, never resolved against the current directory")

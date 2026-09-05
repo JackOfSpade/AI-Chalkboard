@@ -23,12 +23,6 @@ import Foundation
 ///
 /// This is a narrow, defense-in-depth guard for trusted-ish internal overrides,
 /// not a general-purpose Windows path validator.
-///
-/// NOTE: `InstanceLock` and `BoundedLocalFile` each still carry their own
-/// private `isAbsoluteWindowsPath(_:)` with logic identical to the Windows
-/// branch below. They predate this type; folding them into it is a
-/// straightforward follow-up, deliberately not bundled into the change that
-/// introduced this file.
 enum AbsolutePath {
     static func isAbsolute(_ path: String) -> Bool {
         #if os(Windows)

@@ -129,9 +129,15 @@ public enum PosixFileLockPrimitive: FileLockPrimitive {
         return .success(appDir)
     }
 
+    /// Test-only override of the lock path, deliberately narrow: the value is
+    /// honored only when it is absolute AND names `instance.lock` somewhere
+    /// under this process's own temp directory -- at any depth, not just as an
+    /// immediate child. Defense in depth for a test seam;
+    /// `AbsolutePath.isAbsolute` is not, and is not meant to be, a
+    /// general-purpose path validator.
     public static func testLockURLFromEnvironment() -> URL? {
         guard let raw = ProcessInfo.processInfo.environment["AI_CHALKBOARD_INSTANCE_LOCK_PATH"],
-              raw.hasPrefix("/") else { return nil }
+              AbsolutePath.isAbsolute(raw) else { return nil }
         let candidate = URL(fileURLWithPath: raw).standardizedFileURL
         let temporaryRoot = FileManager.default.temporaryDirectory.standardizedFileURL.path
         let parent = candidate.deletingLastPathComponent().standardizedFileURL.path
@@ -387,27 +393,15 @@ public enum Win32FileLockPrimitive: FileLockPrimitive {
         return .success(appDir)
     }
 
-    /// Windows equivalent of the macOS conformance's `raw.hasPrefix("/")`
-    /// check: is `raw` an absolute Windows path (a drive-letter path such as
-    /// `C:\...` / `C:/...`, or a UNC path such as `\\server\share\...`)?
-    /// This is intentionally a narrow, defense-in-depth guard restricting
-    /// the test-only environment override to a path under the process' own
-    /// temp directory -- not a general-purpose Windows path validator.
-    private static func isAbsoluteWindowsPath(_ raw: String) -> Bool {
-        if raw.hasPrefix("\\\\") { return true }
-        let bytes = Array(raw.utf8)
-        guard bytes.count >= 3 else { return false }
-        let drive = bytes[0]
-        let isLetter = (drive >= UInt8(ascii: "A") && drive <= UInt8(ascii: "Z"))
-            || (drive >= UInt8(ascii: "a") && drive <= UInt8(ascii: "z"))
-        return isLetter
-            && bytes[1] == UInt8(ascii: ":")
-            && (bytes[2] == UInt8(ascii: "\\") || bytes[2] == UInt8(ascii: "/"))
-    }
-
+    /// Test-only override of the lock path, deliberately narrow: the value is
+    /// honored only when it is absolute AND names `instance.lock` somewhere
+    /// under this process's own temp directory -- at any depth, not just as an
+    /// immediate child. Defense in depth for a test seam;
+    /// `AbsolutePath.isAbsolute` is not, and is not meant to be, a
+    /// general-purpose path validator.
     public static func testLockURLFromEnvironment() -> URL? {
         guard let raw = ProcessInfo.processInfo.environment["AI_CHALKBOARD_INSTANCE_LOCK_PATH"],
-              isAbsoluteWindowsPath(raw) else { return nil }
+              AbsolutePath.isAbsolute(raw) else { return nil }
         let candidate = URL(fileURLWithPath: raw).standardizedFileURL
         let temporaryRoot = FileManager.default.temporaryDirectory.standardizedFileURL.path
         let parent = candidate.deletingLastPathComponent().standardizedFileURL.path

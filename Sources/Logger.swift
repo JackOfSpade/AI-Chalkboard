@@ -191,7 +191,11 @@ public final class Logger: @unchecked Sendable {
     /// Two escapes, in priority order:
     ///
     /// * `AI_CHALKBOARD_LOG_DIR`, an absolute path -- the same override shape
-    ///   `AI_CHALKBOARD_SUSPENSION_ROOT` already uses for the lease registry.
+    ///   `AI_CHALKBOARD_SUSPENSION_ROOT` already uses for the lease registry,
+    ///   and gated by the same `AbsolutePath.isAbsolute`. Not Foundation's
+    ///   `NSString.isAbsolutePath`, which accepts the drive-relative
+    ///   `C:relative` on Windows and would then resolve it against the current
+    ///   directory -- scattering logs wherever the process happened to start.
     /// * Running under a test harness. Detected by asking whether `XCTestCase`
     ///   is loaded in this process rather than by sniffing an environment
     ///   variable: `swift test` exports neither `XCTestConfigurationFilePath`
@@ -207,7 +211,7 @@ public final class Logger: @unchecked Sendable {
     ///   able to evict a real one.
     private static func resolveLogsDirectory(_ fileManager: FileManager) -> URL {
         let environment = ProcessInfo.processInfo.environment
-        if let raw = environment["AI_CHALKBOARD_LOG_DIR"], (raw as NSString).isAbsolutePath {
+        if let raw = environment["AI_CHALKBOARD_LOG_DIR"], AbsolutePath.isAbsolute(raw) {
             return URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
         }
         #if os(macOS)

@@ -1,10 +1,76 @@
 #if os(macOS)
 import AppKit
 #endif
+import Foundation
 import XCTest
 @testable import AIChalkboardCore
 
 final class AppBehaviorTests: XCTestCase {
+    /// Absolute path of this suite's throwaway suspension registry.
+    /// `processIdentifier` rather than a UUID so a crashed run leaves one
+    /// predictable directory behind instead of an unbounded pile.
+    private static let isolatedSuspensionRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ai-chalkboard-appbehavior-\(ProcessInfo.processInfo.processIdentifier)",
+                                isDirectory: true)
+        .standardizedFileURL
+
+    /// This is the only suite that drives the process-wide
+    /// `OverlayWindowController.shared`, and that controller's presentation
+    /// state is driven in turn by `SuspensionLeaseCoordinator.shared`:
+    /// `recordAndApply` calls `setAnnotationsSuspended(_:generation:)` whenever
+    /// `controlsPresentation` is true, which is true precisely for the shared
+    /// instance (it is `storageDirectory == nil`).
+    ///
+    /// Left alone that singleton resolves to the REAL per-user registry --
+    /// `%LOCALAPPDATA%\AIChalkboard` on Windows, `~/Library/Application
+    /// Support/AIChalkboard` on macOS -- which is the very file a live AI
+    /// Chalkboard connector is using. The two processes then contend for its
+    /// lock, and when this one loses, `refreshViewsNow` fails closed and forces
+    /// `annotationsSuspended = true` in the middle of a test. That is the
+    /// intermittent failure this suite exhibited: `setAnnotationsSuspended(true)`
+    /// returning false because something else had already suspended it.
+    ///
+    /// So point the process at a throwaway root before the lazy singleton is
+    /// ever touched. The value must be absolute in the platform's own syntax
+    /// (see `AbsolutePath.isAbsolute`); until that guard was fixed this had no
+    /// effect on Windows at all.
+    override class func setUp() {
+        super.setUp()
+        // Start from an empty directory. `createDirectory` succeeds silently on
+        // an existing one without clearing it, and the name is keyed by PID --
+        // so a run that crashed before tearDown could otherwise hand its
+        // leftover registry state to a later run that Windows happened to give
+        // the same PID.
+        try? FileManager.default.removeItem(at: isolatedSuspensionRoot)
+        try? FileManager.default.createDirectory(at: isolatedSuspensionRoot,
+                                                 withIntermediateDirectories: true)
+        TestEnvironment.set("AI_CHALKBOARD_SUSPENSION_ROOT", isolatedSuspensionRoot.path)
+    }
+
+    override class func tearDown() {
+        try? FileManager.default.removeItem(at: isolatedSuspensionRoot)
+        // Clear the override too, rather than leaving the rest of the process
+        // pointed at a directory that no longer exists. Nothing later in the
+        // target reads it today, but a future test constructing a bare
+        // SuspensionLeaseCoordinator(storageDirectory: nil) would silently
+        // inherit a dangling root.
+        TestEnvironment.set("AI_CHALKBOARD_SUSPENSION_ROOT", nil)
+        super.tearDown()
+    }
+
+    /// Guards the isolation above. `SuspensionLeaseCoordinator.shared` is a
+    /// lazy `static let`, so it binds its directory at whatever moment it is
+    /// first touched. Nothing else in this target reaches it today, but if that
+    /// ever changes this fails loudly here instead of resurfacing as a rare,
+    /// confusing suspension flake somewhere else in the suite.
+    func testThisSuiteIsIsolatedFromTheRealSuspensionRegistry() {
+        XCTAssertEqual(
+            SuspensionLeaseCoordinator.shared.storageDirectory.standardizedFileURL.path,
+            Self.isolatedSuspensionRoot.path,
+            "the shared coordinator bound the real per-user registry before this suite's class setUp ran"
+        )
+    }
+
     #if os(macOS)
     // Windows-only note: the Windows `AppDelegate` builds its tray context
     // menu from raw Win32 `CreatePopupMenu`/`AppendMenuW` calls (see

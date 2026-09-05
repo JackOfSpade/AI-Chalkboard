@@ -47,7 +47,7 @@ enum BoundedLocalFile {
     ///   - maxBytes: Hard cap on both the file's declared size and the
     ///     number of bytes actually read.
     static func read(path: String, maxBytes: UInt64) throws -> Data {
-        guard path.hasPrefix("/") else { throw BoundedLocalFileError.invalidPath }
+        guard AbsolutePath.isAbsolute(path) else { throw BoundedLocalFileError.invalidPath }
         let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         guard url.isFileURL else { throw BoundedLocalFileError.invalidPath }
 
@@ -123,7 +123,7 @@ enum BoundedLocalFile {
     /// `GetFileType` to report `FILE_TYPE_DISK` -- the Windows analogue of
     /// the `S_IFREG` check.
     static func read(path: String, maxBytes: UInt64) throws -> Data {
-        guard isAbsoluteWindowsPath(path) else { throw BoundedLocalFileError.invalidPath }
+        guard AbsolutePath.isAbsolute(path) else { throw BoundedLocalFileError.invalidPath }
         let url = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
         guard url.isFileURL else { throw BoundedLocalFileError.invalidPath }
 
@@ -198,19 +198,5 @@ enum BoundedLocalFile {
         return result
     }
 
-    /// Windows equivalent of the macOS branch's `path.hasPrefix("/")` check:
-    /// is `path` an absolute Windows path (a drive-letter path such as
-    /// `C:\...` / `C:/...`, or a UNC path such as `\\server\share\...`)?
-    private static func isAbsoluteWindowsPath(_ path: String) -> Bool {
-        if path.hasPrefix("\\\\") { return true }
-        let bytes = Array(path.utf8)
-        guard bytes.count >= 3 else { return false }
-        let drive = bytes[0]
-        let isLetter = (drive >= UInt8(ascii: "A") && drive <= UInt8(ascii: "Z"))
-            || (drive >= UInt8(ascii: "a") && drive <= UInt8(ascii: "z"))
-        return isLetter
-            && bytes[1] == UInt8(ascii: ":")
-            && (bytes[2] == UInt8(ascii: "\\") || bytes[2] == UInt8(ascii: "/"))
-    }
     #endif
 }
