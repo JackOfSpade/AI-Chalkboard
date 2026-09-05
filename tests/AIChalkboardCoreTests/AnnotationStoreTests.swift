@@ -429,8 +429,17 @@ final class AnnotationStoreTests: XCTestCase {
         // programmatic tree before recursive renderer/Codable paths can see it.
         // The separate iterative asset traversal must be just as defensive,
         // because cleanup code can receive a rejected caller-owned candidate.
+        //
+        // Kept well under ~2,475 on purpose. Nothing this test exercises walks
+        // the tree recursively, but the deinit the compiler synthesizes for the
+        // `.batch([AnnotationComponent])` chain does, and it runs when this
+        // tree is released -- overflowing Windows' default 1 MB thread stack
+        // past roughly that depth, which macOS's 8 MB main thread hides. The
+        // depth only has to dwarf the cap, and 1,024 is 16x it; no client can
+        // reach even that, since Foundation's JSON parser rejects beyond ~126
+        // nested objects and the store caps retained trees at 64.
         let deepRasterTree = nestedBatch(
-            depth: 4_096,
+            depth: 1_024,
             leaf: .image(assetId: "unretained-deep-raster", x: 0, y: 0, width: 1, height: 1,
                          rotationDegrees: 0, opacity: 1)
         )
