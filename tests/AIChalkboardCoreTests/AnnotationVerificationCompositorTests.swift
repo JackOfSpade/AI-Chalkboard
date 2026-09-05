@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import XCTest
 @testable import AIChalkboardCore
 
@@ -175,6 +176,51 @@ final class AnnotationVerificationCompositorTests: XCTestCase {
             encodedBytes + AnnotationVerificationCompositor.maxTransportOverheadBytes,
             AnnotationVerificationCompositor.maxTransportResponseBytes
         )
+    }
+
+    func testOversizedImageMetadataIsRejectedBeforeDecodeArithmetic() throws {
+        // This is deliberately synthetic: creating a real 20+ megapixel
+        // bitmap would allocate the very resource this preflight protects.
+        // The helper is the exact branch `loadScreenshot` runs before asking
+        // ImageIO to decode a CGImage.
+        let oversized: [CFString: Any] = [
+            kCGImagePropertyPixelWidth: NSNumber(value: AnnotationVerificationCompositor.maxImagePixels + 1),
+            kCGImagePropertyPixelHeight: NSNumber(value: 1)
+        ]
+        let oversizedDimensions = try XCTUnwrap(AnnotationVerificationCompositor.usableMetadataDimensions(oversized))
+        XCTAssertFalse(AnnotationVerificationCompositor.imageDimensionsFitImageLimit(
+            width: oversizedDimensions.width, height: oversizedDimensions.height
+        ))
+
+        let boundary: [CFString: Any] = [
+            kCGImagePropertyPixelWidth: NSNumber(value: AnnotationVerificationCompositor.maxImagePixels),
+            kCGImagePropertyPixelHeight: NSNumber(value: 1)
+        ]
+        let boundaryDimensions = try XCTUnwrap(AnnotationVerificationCompositor.usableMetadataDimensions(boundary))
+        XCTAssertTrue(AnnotationVerificationCompositor.imageDimensionsFitImageLimit(
+            width: boundaryDimensions.width, height: boundaryDimensions.height
+        ))
+        XCTAssertFalse(AnnotationVerificationCompositor.imageDimensionsFitImageLimit(width: Int.max, height: 2),
+                       "overflow-safe division must reject dimensions without multiplying them")
+        XCTAssertNil(AnnotationVerificationCompositor.usableMetadataDimensions([:]),
+                     "missing metadata must not authorize a decode")
+        let overflowing: [CFString: Any] = [
+            kCGImagePropertyPixelWidth: NSNumber(value: UInt64.max),
+            kCGImagePropertyPixelHeight: NSNumber(value: 1)
+        ]
+        XCTAssertNil(AnnotationVerificationCompositor.usableMetadataDimensions(overflowing),
+                     "unrepresentable metadata must not authorize a decode")
+
+        for invalidWidth: NSNumber in [
+            NSNumber(value: 1.5), NSNumber(value: Double.nan), NSNumber(value: Double.infinity), NSNumber(value: true)
+        ] {
+            let invalid: [CFString: Any] = [
+                kCGImagePropertyPixelWidth: invalidWidth,
+                kCGImagePropertyPixelHeight: NSNumber(value: 1)
+            ]
+            XCTAssertNil(AnnotationVerificationCompositor.usableMetadataDimensions(invalid),
+                         "non-integral/non-finite/boolean metadata must not authorize a decode: \(invalidWidth)")
+        }
     }
 
     func testAspectMismatchRejectsCroppedOrWindowScreenshot() throws {

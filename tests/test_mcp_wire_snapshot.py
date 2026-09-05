@@ -36,8 +36,6 @@ class CanonicalizationMaskingTests(unittest.TestCase):
                 "annotations": [{
                     "id": "11111111-2222-3333-4444-555555555555",
                     "createdAt": 774238998.5,
-                    "expiresAt": "2025-07-15T12:00:00.000Z",
-                    "remainingSeconds": 42.25,
                     "appId": "com.example.Foo",
                     "appName": "Foo App",
                 }],
@@ -52,16 +50,47 @@ class CanonicalizationMaskingTests(unittest.TestCase):
         self.assertNotIn("com.example.Foo", blob)
         self.assertNotIn("11111111-2222-3333-4444-555555555555", blob)
         self.assertNotIn("774238998.5", blob)
-        self.assertNotIn("2025-07-15T12:00:00.000Z", blob)
-        self.assertNotIn("42.25", blob)
         self.assertIn("<APP>", blob)
         self.assertIn("<APPID>", blob)
         self.assertIn("<UUID>", blob)
         self.assertIn("<TIME>", blob)
-        self.assertIn("<TTL>", blob)
         # count is a legitimate, non-volatile signal (how many annotations
         # actually exist) and must survive untouched.
         self.assertIn('"count": 1', blob)
+
+    def test_expiry_or_eviction_fields_are_not_masked(self):
+        # Annotations are permanent until explicit clear. Canonicalising a
+        # reintroduced deadline or eviction report would make a before/after
+        # wire capture look equivalent precisely when it must fail loudly.
+        before = {
+            "call_list_annotations": _text_result(json.dumps({
+                "annotations": [{"id": "11111111-2222-3333-4444-555555555555", "createdAt": 1}],
+            })),
+            "call_draw_shape": _text_result("Created free-draw shape annotation: 11111111-2222-3333-4444-555555555555"),
+        }
+        after = {
+            "call_list_annotations": _text_result(json.dumps({
+                "annotations": [{
+                    "id": "11111111-2222-3333-4444-555555555555",
+                    "createdAt": 2,
+                    "expiresAt": "2026-01-01T00:00:00Z",
+                    "remainingSeconds": 30,
+                }],
+            })),
+            "call_draw_shape": _text_result(
+                "Created free-draw shape annotation: 11111111-2222-3333-4444-555555555555; "
+                "1 older annotation(s) were dropped"
+            ),
+        }
+
+        canonical_before = snap.canonicalize_capture(before)
+        canonical_after = snap.canonicalize_capture(after)
+        after_blob = json.dumps(canonical_after)
+
+        self.assertIn("expiresAt", after_blob)
+        self.assertIn("remainingSeconds", after_blob)
+        self.assertIn("older annotation(s) were dropped", after_blob)
+        self.assertNotEqual(snap.diff_captures(canonical_before, canonical_after), [])
 
     def test_generic_name_keys_outside_the_app_identity_schema_are_not_touched(self):
         # tools/list entries use a bare "name" key for the tool's own name,

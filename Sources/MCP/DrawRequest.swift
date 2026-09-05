@@ -381,6 +381,8 @@ struct DrawRequest {
             return .failure("The annotation was not stored because retained vector/text payload would become \(attempted) bytes, exceeding the \(limit)-byte session limit. Clear old annotations or use smaller geometry.")
         case .rejected(.primitiveCount(let limit, let attempted)):
             return .failure("The annotation was not stored because retained primitive count would become \(attempted), exceeding the \(limit)-primitive session limit. Clear old annotations or use a smaller batch.")
+        case .rejected(.batchNestingDepth(let limit, let attempted)):
+            return .failure("The annotation was not stored because its batch nesting depth is \(attempted), exceeding the \(limit)-level safety limit. Flatten nested batches and retry.")
         case .rejected(.annotationCount(let limit, let attempted)):
             return .failure("The annotation was not stored because the store would hold \(attempted) annotations, exceeding the \(limit)-annotation session limit. Clear annotations you no longer need and retry.")
         }

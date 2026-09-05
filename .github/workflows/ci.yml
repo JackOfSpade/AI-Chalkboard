@@ -203,7 +203,7 @@ jobs:
         run: test -d tests/AIChalkboardCoreTests
 
   build:
-    name: swift build (debug + release) + app bundle (act-local only)
+    name: swift build (debug + release) + app bundle
     runs-on: macos-latest
     # macos-latest runners bill at 10x on a private repo, which is exactly why every
     # check above that does NOT need AppKit/the Swift toolchain lives in the cheap
@@ -222,6 +222,18 @@ jobs:
 
       - name: swift build (release)
         run: swift build -c release
+
+      # Every macOS runner can exercise .app assembly with the explicit,
+      # test-only ad-hoc-signing mode. It is deliberately opt-in and is never a
+      # release fallback: the normal build_app.sh path below remains fail-closed.
+      - name: Assemble and verify test .app bundle (clean-mac safe)
+        run: bash tests/test_deployment_layout.sh --assemble-test-bundle
+
+      - name: MCP remains responsive with undrained stderr
+        # The test launches the fresh isolated `.test-dist` bundle above and
+        # deliberately never consumes the child's stderr pipe. It proves
+        # diagnostics cannot fill that pipe and stall JSON-RPC replies.
+        run: python3 -m unittest tests/test_logger_stderr_backpressure.py
 
       # LOCAL-ONLY, deliberately: build_app.sh codesigns with a pinned local
       # identity (SHA-1 65B98DF…, "AI Chalkboard Local Code Signing") and FAILS
@@ -249,23 +261,6 @@ jobs:
       - name: Assemble .app bundle (act-local CI only — needs the local signing identity)
         if: ${{ env.ACT == 'true' }}
         run: bash build_app.sh
-
-      # Verifies the artifact the step above produces (and calls codesign
-      # --verify on it), so the two are gated identically — both local-only.
-      # Without the same `if:`, this step would fail on a GitHub-hosted runner
-      # looking for a bundle that was never assembled there.
-      - name: Verify bundle contents (act-local CI only — verifies the step above)
-        if: ${{ env.ACT == 'true' }}
-        run: |
-          set -euo pipefail
-          app=dist/AIChalkboard.app
-          plist="$app/Contents/Info.plist"
-          test -x "$app/Contents/MacOS/AIChalkboard"
-          test -f "$plist"
-          plutil -lint "$plist"
-          test "$(plutil -extract NSHighResolutionCapable raw -o - "$plist")" = true
-          test "$(plutil -extract NSHighResolutionMagnifyAllowed raw -o - "$plist")" = false
-          codesign --verify --deep --strict --verbose=2 "$app"
 
       # SwiftPM owns `.build` and may replace it during a subsequent build.
       # The configured MCP executable is instead the signed bundle in `dist/`;

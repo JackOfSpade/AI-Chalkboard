@@ -90,6 +90,32 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         XCTAssertNotNil(bootstrap.error)
     }
 
+    /// AppDelegate starts MCP from the asynchronous bootstrap completion, so
+    /// a bad registry must still invoke that hand-off.  Otherwise a secure
+    /// fail-closed startup would turn into an invisible process that never
+    /// reads its stdio transport at all.
+    func testAsyncBootstrapCompletionRunsForFailClosedRegistry() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardAsyncBootstrapFailureTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("not a directory".utf8).write(to: root)
+
+        let coordinator = SuspensionLeaseCoordinator(storageDirectory: root)
+        let completion = expectation(description: "async bootstrap completes even on registry failure")
+        var completedSnapshot: SuspensionLeaseSnapshot?
+        coordinator.bootstrapAndReconcileAsynchronously { snapshot in
+            XCTAssertTrue(Thread.isMainThread)
+            completedSnapshot = snapshot
+            completion.fulfill()
+        }
+        wait(for: [completion], timeout: 2)
+
+        let snapshot = try XCTUnwrap(completedSnapshot)
+        XCTAssertFalse(snapshot.isBootstrapped)
+        XCTAssertTrue(snapshot.annotationsSuspended)
+        XCTAssertNotNil(snapshot.error)
+    }
+
     func testExpiryCreatesTombstoneAndCannotLeaveLeaseSuspended() throws {
         try withTemporaryCoordinator { coordinator, _ in
             _ = coordinator.bootstrapAndReconcile()
@@ -432,6 +458,84 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         XCTAssertTrue(nextPermit?.annotationsSuspended == true,
                       "the next permit must deny presentation after the acquire persisted")
         _ = acquirer.releaseLease(token: token)
+    }
+
+    /// A peer can hold the durable lock while it is atomically committing a
+    /// lease.  That must never turn an AppKit repaint, timer tick, or
+    /// distributed-notification handler into the old one-second main-thread
+    /// sleep loop.  A busy permit is deliberately a fail-closed answer: the
+    /// caller may order windows out, but cannot order one front until a later
+    /// durable permit proves no acquisition crossed its decision.
+    func testMainThreadPermitAndReconciliationSchedulingDoNotWaitForHeldPeerLock() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardPermitNonblockingTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let presenter = SuspensionLeaseCoordinator(storageDirectory: directory, instanceNonce: "presenter")
+        XCTAssertFalse(presenter.bootstrapAndReconcile().annotationsSuspended)
+
+        let peerHasLock = DispatchSemaphore(value: 0)
+        let releasePeer = DispatchSemaphore(value: 0)
+        let peerFinished = expectation(description: "peer mutation finishes after lock release")
+        let resultLock = NSLock()
+        var peerResult: SuspensionLeaseOperationResult?
+        let peer = SuspensionLeaseCoordinator(
+            storageDirectory: directory,
+            instanceNonce: "peer",
+            storagePrecommitHook: {
+                peerHasLock.signal()
+                _ = releasePeer.wait(timeout: .now() + 3)
+            }
+        )
+        DispatchQueue.global().async {
+            let result = peer.acquireLease(seconds: 60)
+            resultLock.lock(); peerResult = result; resultLock.unlock()
+            peerFinished.fulfill()
+        }
+        XCTAssertEqual(peerHasLock.wait(timeout: .now() + 2), .success,
+                       "the test must exercise a genuinely held flock")
+        XCTAssertTrue(Thread.isMainThread, "XCTest invokes this presentation test on AppKit's main thread")
+
+        let permitStarted = ProcessInfo.processInfo.systemUptime
+        var bodySnapshot: SuspensionLeaseSnapshot?
+        let permit = presenter.withPresentationPermit { bodySnapshot = $0 }
+        let permitElapsed = ProcessInfo.processInfo.systemUptime - permitStarted
+        XCTAssertLessThan(permitElapsed, 0.25,
+                          "a busy main-thread permit must fail immediately, not retry for one second")
+        XCTAssertNotNil(permit.error)
+        XCTAssertTrue(permit.annotationsSuspended)
+        XCTAssertEqual(bodySnapshot, permit, "the fail-closed snapshot reaches the ordering closure")
+
+        // The failed permit itself schedules one background repair worker.
+        // Every subsequent timer/notification wake-up folds into it while the
+        // peer still owns flock.  The scheduler does no directory I/O or
+        // synchronous lock retry here, and prevents a notification flood from
+        // queuing an unbounded number of reconciliation tasks.
+        let scheduleStarted = ProcessInfo.processInfo.systemUptime
+        XCTAssertFalse(presenter.reconcileAsynchronously(),
+                       "the busy permit must already have enqueued its one repair worker")
+        for generation in 1...32 {
+            XCTAssertFalse(presenter.reconcileAsynchronously(announcedGeneration: UInt64(generation)))
+        }
+        let schedulingElapsed = ProcessInfo.processInfo.systemUptime - scheduleStarted
+        XCTAssertLessThan(schedulingElapsed, 0.25,
+                          "coalescing a held-lock reconciliation must return to the main run loop promptly")
+
+        releasePeer.signal()
+        wait(for: [peerFinished], timeout: 5)
+        resultLock.lock(); let result = peerResult; resultLock.unlock()
+        XCTAssertTrue(result?.success == true)
+        let reconciliationDeadline = Date().addingTimeInterval(2)
+        while !presenter.snapshot().annotationsSuspended && Date() < reconciliationDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertTrue(presenter.snapshot().annotationsSuspended,
+                      "the coalesced worker must eventually apply the peer's durable lease")
+        if let token = result?.leaseToken {
+            _ = peer.releaseLease(token: token)
+        }
     }
 
     func testReleaseFinalSettleReturnsConcurrentNewerAcquire() throws {

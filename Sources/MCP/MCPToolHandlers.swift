@@ -16,6 +16,15 @@ extension MCPServer {
 
         log(redactedArgumentSummary(name: name, args: args))
 
+        // Reject misspelled or cross-tool arguments before dispatch. Several
+        // handlers intentionally default omitted values (notably clear's
+        // active-app selector), so treating an unrecognised key as omission
+        // could otherwise turn a typo into a destructive or misplaced action.
+        if let error = MCPToolCatalog.validateArguments(toolName: name, args: args) {
+            sendErrorResult(id: id, text: error)
+            return
+        }
+
         switch name {
         case "get_screens":
             let screens = OverlayWindowController.shared.screenSnapshot().screens

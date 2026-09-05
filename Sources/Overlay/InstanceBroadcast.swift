@@ -91,6 +91,12 @@ private enum BroadcastKey {
     static let appName = "appName"
     static let visible = "visible"
     static let generation = "generation"
+    /// A random per-process marker lets a sender ignore only its own
+    /// self-delivered suspension wake-up.  This is not an authentication
+    /// token -- DNC hints are deliberately untrusted -- it merely prevents a
+    /// just-committed local mutation from contending with its own next
+    /// presentation permit before it records the local snapshot.
+    static let origin = "origin"
 }
 
 /// Canonical encoding and application of a clear broadcast. Keeping payload
@@ -192,6 +198,10 @@ public final class InstanceBroadcast: NSObject {
     /// twice per broadcast). `registerObservers()` is only called once today,
     /// but this makes it safe to call defensively.
     private var isRegistered = false
+
+    /// See `BroadcastKey.origin`. Immutable, so it is safe to read from the
+    /// background mutation path that posts suspension invalidations too.
+    private let suspensionInvalidationOrigin = UUID().uuidString
 
     /// Set by the quit handler so the poster-side watchdog below can tell
     /// "the broadcast came back to me and I'm already terminating" from
@@ -349,7 +359,10 @@ public final class InstanceBroadcast: NSObject {
         DistributedNotificationCenter.default().postNotificationName(
             .chalkboardSuspensionInvalidated,
             object: nil,
-            userInfo: [BroadcastKey.generation: String(generation)],
+            userInfo: [
+                BroadcastKey.generation: String(generation),
+                BroadcastKey.origin: suspensionInvalidationOrigin,
+            ],
             deliverImmediately: true
         )
     }
@@ -464,8 +477,29 @@ public final class InstanceBroadcast: NSObject {
     @objc private func handleSuspensionInvalidatedBroadcast(_ notification: Notification) {
         let generation = (notification.userInfo?[BroadcastKey.generation] as? String).flatMap(UInt64.init)
         // A malformed or hostile hint is harmless: reconcile reads canonical
-        // state and never executes a desired state supplied by DNC.
-        _ = SuspensionLeaseCoordinator.shared.reconcile(announcedGeneration: generation)
+        // state and never executes a desired state supplied by DNC.  DNC
+        // commonly delivers on the main thread, so only enqueue/coalesce here;
+        // secure-directory I/O and a peer-lock wait run on the coordinator's
+        // background reconciliation queue.
+        //
+        // A process receives its own notification too. Ignore only the
+        // marker minted by this exact process: the state may be broadcast as
+        // soon as it is durably committed, before its sender completes a
+        // potentially main-thread-bound local application. Peer wake-up is
+        // therefore never delayed by a sluggish sender, while the sender's
+        // next presentation permit does not race a redundant self-read.
+        if (notification.userInfo?[BroadcastKey.origin] as? String) == suspensionInvalidationOrigin {
+            return
+        }
+        // Do not skip a local fail-closed state: equal generation is
+        // specifically how a later canonical read repairs that state.
+        if let generation {
+            let current = SuspensionLeaseCoordinator.shared.snapshot()
+            if current.isBootstrapped && current.generation >= generation {
+                return
+            }
+        }
+        _ = SuspensionLeaseCoordinator.shared.reconcileAsynchronously(announcedGeneration: generation)
     }
 
     @objc private func handleQuitAllBroadcast(_ notification: Notification) {

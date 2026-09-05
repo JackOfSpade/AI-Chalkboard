@@ -39,6 +39,48 @@ final class AccessibilityElementResolverTests: XCTestCase {
         XCTAssertFalse(AccessibilityElementResolver.labelMatches("Color", query: "Fusion", mode: .contains))
     }
 
+    func testValueMatchPublishesTheQueryNotSurroundingEditableContent() {
+        // `contains` only establishes that the query occurs somewhere in an
+        // editable field. The raw AXValue may contain a document, password,
+        // or other user content on either side, none of which may reach the
+        // annotation label or MCP result.
+        let rawValue = "Private draft before needle and private draft after"
+        let label = AccessibilityElementResolver.publishedMatchLabel(
+            attribute: kAXValueAttribute,
+            value: rawValue,
+            query: "needle"
+        )
+        XCTAssertEqual(label, "needle")
+        XCTAssertFalse(label.contains("Private"))
+        XCTAssertFalse(label.contains("before"))
+        XCTAssertFalse(label.contains("after"))
+    }
+
+    func testPublishedMatchedLabelIsBoundedWithoutSplittingUnicode() {
+        let rawTitle = String(repeating: "😀", count: AccessibilityElementResolver.maxPublishedLabelCharacters + 10)
+        let label = AccessibilityElementResolver.publishedMatchLabel(
+            attribute: kAXTitleAttribute,
+            value: rawTitle,
+            query: "unused"
+        )
+        XCTAssertEqual(label.count, AccessibilityElementResolver.maxPublishedLabelCharacters)
+        XCTAssertTrue(label.hasSuffix("…"))
+        XCTAssertFalse(label.contains("�"))
+    }
+
+    func testLongValueQueryIsAlsoBoundedBeforeItCanBeStoredOrReturned() {
+        let query = String(repeating: "x", count: AccessibilityElementResolver.maxPublishedLabelCharacters + 10)
+        let label = AccessibilityElementResolver.publishedMatchLabel(
+            attribute: kAXValueAttribute,
+            value: "prefix \(query) suffix",
+            query: query
+        )
+        XCTAssertEqual(label.count, AccessibilityElementResolver.maxPublishedLabelCharacters)
+        XCTAssertTrue(label.hasSuffix("…"))
+        XCTAssertFalse(label.contains("prefix"))
+        XCTAssertFalse(label.contains("suffix"))
+    }
+
     func testPrimaryDisplayAccessibilityFrameConvertsToLocalBackingPixels() throws {
         let primary = screen(
             id: "main",

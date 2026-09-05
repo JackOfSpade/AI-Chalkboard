@@ -48,6 +48,54 @@ enum DrawingDefaults {
     static let textColor = "#FFFFFF"
     static let maxTextCharacters = 20_000
 
+    /// `OverlayView` measures text with an unwrapped AppKit layout.  A valid
+    /// string combined with the broad generic style caps can otherwise ask
+    /// AppKit/Core Graphics to measure or paint an enormous virtual surface
+    /// (for example, 20,000 characters at a 100,000-pixel font size).  Keep
+    /// this policy independent of AppKit so requests are rejected before
+    /// they reach a layout engine.
+    ///
+    /// The estimates intentionally over-approximate a one-line layout: four
+    /// ems per Unicode scalar for width and two ems for line height.  The
+    /// resulting extent and area bounds protect both glyph layout and the
+    /// optional padded background while retaining normal labels and sizeable
+    /// text blocks.  Newlines are charged as if all text shared one line;
+    /// that conservative treatment avoids needing a second parser that might
+    /// drift from AppKit's line-break rules.
+    static let maxEstimatedTextRenderExtentPx = 2_000_000.0
+    static let maxEstimatedTextRenderAreaPx = 64_000_000.0
+    static let textGlyphAdvanceEstimate = 4.0
+    static let textLineHeightEstimate = 2.0
+
+    /// Returns whether finite, already range-checked text styling stays
+    /// within the renderer's conservative layout and paint budget. This is
+    /// deliberately pure so creation, batch items, and in-place updates use
+    /// exactly the same pre-storage gate without instantiating AppKit text.
+    static func isWithinTextRenderBudget(text: String, fontSizePx: Double, paddingPx: Double) -> Bool {
+        let scalarCount = text.unicodeScalars.count
+        guard scalarCount > 0, scalarCount <= maxTextCharacters,
+              fontSizePx.isFinite, fontSizePx > 0, fontSizePx <= maxStyleDimensionPx,
+              paddingPx.isFinite, paddingPx >= 0, paddingPx <= maxStyleDimensionPx else {
+            return false
+        }
+
+        let count = Double(scalarCount)
+        let estimatedTextWidth = count * fontSizePx * textGlyphAdvanceEstimate
+        let estimatedLineHeight = fontSizePx * textLineHeightEstimate
+        let horizontalPadding = paddingPx * 2
+        let verticalPadding = paddingPx * 2
+        let estimatedWidth = estimatedTextWidth + horizontalPadding
+        let estimatedHeight = estimatedLineHeight + verticalPadding
+        guard estimatedTextWidth.isFinite, estimatedLineHeight.isFinite,
+              estimatedWidth.isFinite, estimatedHeight.isFinite,
+              estimatedWidth <= maxEstimatedTextRenderExtentPx,
+              estimatedHeight <= maxEstimatedTextRenderExtentPx else {
+            return false
+        }
+        let estimatedArea = estimatedWidth * estimatedHeight
+        return estimatedArea.isFinite && estimatedArea <= maxEstimatedTextRenderAreaPx
+    }
+
     /// `highlight_element`'s `label` argument, matched against Accessibility
     /// title/description/value strings rather than rendered as drawn text.
     /// Bounded far below `maxTextCharacters` because it is a lookup key, not
@@ -63,6 +111,14 @@ enum DrawingDefaults {
     /// Atomic batches are intentionally broad enough for diagrams but bounded
     /// because every component is redrawn together on every repaint.
     static let maxBatchItems = 100
+
+    /// `AnnotationKind.batch` is indirect, so in-process callers and decoded
+    /// persisted data can construct batches inside batches even though the MCP
+    /// API only creates one level. Rendering and Codable walk that structure
+    /// recursively. Keep a deliberately generous, explicit ceiling at the
+    /// store boundary so no retained annotation can turn those downstream
+    /// traversals into an unbounded stack or work request.
+    static let maxAnnotationBatchNestingDepth = 64
 
     /// Raster items have a second, stricter batch budget.  Vector components
     /// remain limited solely by `maxBatchItems`; decoded bitmap memory is what

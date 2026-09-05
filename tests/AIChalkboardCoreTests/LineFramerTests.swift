@@ -100,14 +100,27 @@ final class LineFramerTests: XCTestCase {
         )
     }
 
-    func testFeedingContinuesToReportOverflowAfterTheCapIsExceeded() {
-        // Per the type's doc comment: feed() stays safe to call after
-        // overflow is reported; it is the CALLER's responsibility to stop
-        // (MCPServer.readLoop treats this as fatal). Confirm feed() itself
-        // does not silently self-heal on the very next call.
+    func testOverflowIsTerminalAfterAnUnterminatedFlood() {
+        // `MCPServer` stops on overflow, but the framer itself must not
+        // silently recover if another caller accidentally keeps feeding it.
         var framer = LineFramer()
         _ = framer.feed(Data(repeating: UInt8(ascii: "x"), count: LineFramer.maxBufferBytes + 1))
         let again = framer.feed(Data("y".utf8))
         XCTAssertTrue(again.overflow)
+        XCTAssertTrue(again.lines.isEmpty)
+    }
+
+    func testOverflowIsTerminalAfterACompleteOversizedLine() {
+        // This was the missing counterpart to the unterminated-flood case:
+        // the old implementation removed the oversized line, then accepted a
+        // later request if a caller continued feeding after the fatal result.
+        var framer = LineFramer()
+        let oversized = Data(repeating: UInt8(ascii: "x"), count: LineFramer.maxBufferBytes + 1)
+            + Data("\n".utf8)
+        XCTAssertTrue(framer.feed(oversized).overflow)
+
+        let later = framer.feed(Data("{\"method\":\"tools/call\"}\n".utf8))
+        XCTAssertTrue(later.overflow)
+        XCTAssertTrue(later.lines.isEmpty, "no request may be emitted after a terminal framing violation")
     }
 }

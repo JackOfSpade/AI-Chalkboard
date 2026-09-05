@@ -11,6 +11,27 @@ import XCTest
 /// stdout — which matters, because stdout is the live JSON-RPC transport.
 final class MCPPureHelperTests: XCTestCase {
 
+    // MARK: - Text render budget
+
+    func testTextRenderBudgetAcceptsNormalAndReasonablyLargeText() {
+        XCTAssertTrue(DrawingDefaults.isWithinTextRenderBudget(
+            text: "A useful label", fontSizePx: 24, paddingPx: 8
+        ))
+        XCTAssertTrue(DrawingDefaults.isWithinTextRenderBudget(
+            text: String(repeating: "x", count: 10_000), fontSizePx: 12, paddingPx: 8
+        ))
+    }
+
+    func testTextRenderBudgetRejectsPathologicalFontPaddingAndInlineExtent() {
+        XCTAssertFalse(DrawingDefaults.isWithinTextRenderBudget(
+            text: "x", fontSizePx: 100_000, paddingPx: 100_000
+        ), "a single giant glyph plus background must not reach AppKit")
+        XCTAssertFalse(DrawingDefaults.isWithinTextRenderBudget(
+            text: String(repeating: "x", count: DrawingDefaults.maxTextCharacters),
+            fontSizePx: 100_000, paddingPx: 0
+        ), "a legal string/style pair can still have an unsafe unwrapped extent")
+    }
+
     // MARK: - truncateUTF8
 
     func testTruncateLeavesShortStringUntouched() {

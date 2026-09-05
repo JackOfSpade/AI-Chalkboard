@@ -119,7 +119,11 @@ enum SVGPathParser {
             case .close: path.closeSubpath()
             }
         }
-        return path.copy()!
+        // `path` is local and is returned as the immutable `CGPath` base type;
+        // nothing retains a mutable reference after this function returns.
+        // Avoiding `copy()` also removes an unnecessary allocation and its
+        // theoretically fallible Objective-C bridge.
+        return path
     }
 
     private struct Parser {

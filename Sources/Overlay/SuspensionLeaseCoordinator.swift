@@ -164,6 +164,22 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     let storagePrecommitHook: (() -> Void)?
     private let controlsPresentation: Bool
     private let stateLock = NSLock()
+    /// Serializes only scheduling bookkeeping.  The actual durable read stays
+    /// on `reconciliationQueue`, so a 2 Hz timer or a burst of distributed
+    /// notifications cannot put filesystem work on AppKit's main thread or
+    /// build an unbounded queue of duplicate reads.
+    private let reconciliationScheduleLock = NSLock()
+    private let reconciliationQueue = DispatchQueue(
+        label: "com.aichalkboard.suspension-reconciliation",
+        qos: .utility
+    )
+    private var reconciliationWorkerScheduled = false
+    private var reconciliationPending = false
+    private var pendingReconciliationGeneration: UInt64?
+    /// A launch-only readiness hand-off.  It is deliberately one slot rather
+    /// than a growing completion list: ordinary timer/DNC calls do not need a
+    /// callback, and MCP has exactly one startup gate per process.
+    private var bootstrapCompletion: ((Snapshot) -> Void)?
     private var lastAppliedGeneration: UInt64 = 0
     private var hasAppliedGeneration = false
     /// The `instanceEpoch` the high-water mark above belongs to. See
@@ -205,6 +221,64 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
 
     @discardableResult
     public func bootstrapAndReconcile() -> Snapshot { reconcile() }
+
+    /// Starts the first durable reconciliation without blocking AppKit launch.
+    /// The completion runs on the main thread only after that background read
+    /// has applied its snapshot through the normal generation gate.  It runs
+    /// even for a fail-closed result so an unavailable registry cannot leave
+    /// the MCP transport permanently unstarted.
+    public func bootstrapAndReconcileAsynchronously(completion: @escaping (Snapshot) -> Void) {
+        _ = enqueueReconciliation(announcedGeneration: nil, bootstrapCompletion: completion)
+    }
+
+    /// Coalesces an ordinary registry refresh onto a serial background queue.
+    ///
+    /// This is the entry point for run-loop timers and distributed
+    /// notification wake-up hints.  It intentionally returns before opening
+    /// the secure registry directory or attempting `flock`; those can have
+    /// filesystem latency and must never make an AppKit callback wait.  At
+    /// most one worker is running or queued at a time.  A hint which arrives
+    /// while that worker runs is folded into one follow-up pass rather than
+    /// creating another task for every timer tick/notification.
+    ///
+    /// `true` means this call created the worker; `false` means an existing
+    /// worker absorbed it.  The value is mainly useful to deterministic tests
+    /// and diagnostics; callers normally ignore it.
+    @discardableResult
+    public func reconcileAsynchronously(announcedGeneration: UInt64? = nil) -> Bool {
+        enqueueReconciliation(announcedGeneration: announcedGeneration, bootstrapCompletion: nil)
+    }
+
+    /// Merges a wake-up into at most one running/queued worker.  The optional
+    /// completion is reserved for launch readiness; allowing arbitrary
+    /// completions here would turn a notification storm into an unbounded
+    /// retained callback list, the very failure this coalescer prevents.
+    @discardableResult
+    private func enqueueReconciliation(announcedGeneration: UInt64?,
+                                       bootstrapCompletion: ((Snapshot) -> Void)?) -> Bool {
+        reconciliationScheduleLock.lock()
+        if let bootstrapCompletion {
+            precondition(self.bootstrapCompletion == nil,
+                         "Suspension bootstrap completion may be installed only once")
+            self.bootstrapCompletion = bootstrapCompletion
+        }
+        reconciliationPending = true
+        if let announcedGeneration,
+           pendingReconciliationGeneration.map({ $0 < announcedGeneration }) ?? true {
+            pendingReconciliationGeneration = announcedGeneration
+        }
+        guard !reconciliationWorkerScheduled else {
+            reconciliationScheduleLock.unlock()
+            return false
+        }
+        reconciliationWorkerScheduled = true
+        reconciliationScheduleLock.unlock()
+
+        reconciliationQueue.async { [weak self] in
+            self?.runScheduledReconciliation()
+        }
+        return true
+    }
 
     @discardableResult
     public func acquireLease(seconds: Int, idempotencyKey: String? = nil) -> OperationResult {
@@ -283,6 +357,45 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Runs on `reconciliationQueue`.  Keep scheduling state separate from
+    /// the registry lock: `reconcile()` may wait for a peer operation, while
+    /// callers on the main run loop need only a short in-process mutex to
+    /// merge their wake-up hint.
+    private func runScheduledReconciliation() {
+        reconciliationScheduleLock.lock()
+        let announcedGeneration = pendingReconciliationGeneration
+        pendingReconciliationGeneration = nil
+        reconciliationPending = false
+        reconciliationScheduleLock.unlock()
+
+        let snapshot = reconcile(announcedGeneration: announcedGeneration)
+
+        reconciliationScheduleLock.lock()
+        let completion = bootstrapCompletion
+        bootstrapCompletion = nil
+        let scheduleFollowUp = reconciliationPending
+        if !scheduleFollowUp {
+            reconciliationWorkerScheduled = false
+        }
+        reconciliationScheduleLock.unlock()
+
+        if scheduleFollowUp {
+            // Keep the ownership flag set while queuing the single follow-up:
+            // callers racing this hand-off coalesce into that task instead of
+            // enqueueing their own work item.
+            reconciliationQueue.async { [weak self] in
+                self?.runScheduledReconciliation()
+            }
+        }
+        if let completion {
+            // `reconcile` already marshalled its generation-gated AppKit
+            // application synchronously before returning.  Enqueue the
+            // transport start behind that work, without ever making the
+            // background registry worker wait for a launch callback.
+            MainThread.enqueue { completion(snapshot) }
+        }
+    }
+
     /// Executes one AppKit ordering decision under the same durable-operation
     /// lock that serializes lease mutations.
     ///
@@ -318,6 +431,9 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         defer { threadDictionary.removeObject(forKey: key) }
 
         do {
+            // Unlike background lease mutations, this is an AppKit-main-thread
+            // fence.  It must be immediate: on any busy/unavailable lock the
+            // catch below runs the caller's fail-closed ordering closure.
             let permit = try withLockedPresentationState(body)
             if permit.didPersist {
                 // Notifications are wake-up hints, not part of the permit.
@@ -329,6 +445,14 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         } catch {
             let failed = installFailure(error.localizedDescription)
             body(failed)
+            // A peer may have held flock only for its own short presentation
+            // fence, which performs no durable write and therefore emits no
+            // DNC wake-up.  Do not leave this process hidden until the 0.5 s
+            // timer notices: queue one ordinary background reconciliation as
+            // soon as the nonblocking main-thread permit fails.  The queue's
+            // coalescer keeps a burst of repaints at one worker, and this
+            // call itself opens no files or retries flock on main.
+            _ = reconcileAsynchronously()
             return failed
         }
     }
@@ -474,6 +598,10 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         guard let bootSessionIdentifier else {
             throw CoordinatorError.unavailable("AI Chalkboard could not determine the current macOS boot session; overlays remain hidden.")
         }
+        // The storage helper automatically selects an immediate attempt when
+        // this synchronous API is called from AppKit's main thread.  Ordinary
+        // production reconciliation uses `reconcileAsynchronously`, so its
+        // worker may use the bounded background wait instead.
         let held = try acquireLock()
         defer { held.release() }
         try validateHeldLock(held)
@@ -511,7 +639,10 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         guard let bootSessionIdentifier else {
             throw CoordinatorError.unavailable("AI Chalkboard could not determine the current macOS boot session; overlays remain hidden.")
         }
-        let held = try acquireLock()
+        // Presentation can only use a nonblocking lock attempt.  The caller
+        // is on AppKit's main thread and will order every overlay out if a
+        // peer currently owns the durable operation lock.
+        let held = try acquireLock(waitForAvailability: false)
         defer { held.release() }
 
         try validateHeldLock(held)

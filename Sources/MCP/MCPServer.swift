@@ -165,8 +165,8 @@ public final class MCPServer: @unchecked Sendable {
             }
 
             if result.overflow {
-                log("LineFramer's unterminated buffer exceeded \(LineFramer.maxBufferBytes) bytes without a newline; the peer is not framing JSON-RPC messages correctly. Treating this as a fatal protocol error rather than growing the buffer without bound.")
-                terminationReason = "MCP stdin framing overflow (peer sent \(LineFramer.maxBufferBytes)+ bytes with no newline)"
+                log("LineFramer rejected an MCP request line larger than \(LineFramer.maxBufferBytes) bytes, whether newline-terminated or unfinished. The peer is not framing JSON-RPC messages within the protocol limit; treating this as a fatal protocol error rather than retaining unbounded input.")
+                terminationReason = "MCP stdin framing overflow (peer sent an MCP request line larger than \(LineFramer.maxBufferBytes) bytes)"
                 break
             }
 

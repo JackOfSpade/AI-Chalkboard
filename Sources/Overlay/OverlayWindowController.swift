@@ -50,9 +50,10 @@ public final class OverlayWindowController: NSObject {
     /// hide one for longer than it was going to live.) Every mutation goes through `setAnnotationsSuspended(_:)`, which
     /// synchronously hops to AppKit's main thread before acknowledging an MCP
     /// request or a broadcast.
-    // Fail closed until `SuspensionLeaseCoordinator.bootstrapAndReconcile()`
-    // synchronously reads the shared lease registry during launch. A new MCP
-    // process must never flash an overlay while another process owns a lease.
+    // Fail closed until the coalesced launch reconciliation applies a durable
+    // generation on the main thread. A new MCP process must never flash an
+    // overlay while another process owns a lease, but launch also must not
+    // stall AppKit behind that peer's filesystem/lock operation.
     // internal (not private): read/written from OverlayWindowController+Presentation.swift
     // and OverlayWindowController+Diagnostics.swift.
     var annotationsSuspended = true

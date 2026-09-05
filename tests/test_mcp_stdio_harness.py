@@ -16,6 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import test_mcp_stdio as harness  # noqa: E402
 
 
+# These tests spawn a fresh Python interpreter for each framing fixture. Its
+# startup is unrelated to the behavior under test and can be slow on a loaded
+# macOS worker, so keep a comfortably bounded startup-inclusive deadline.
+CHILD_FIXTURE_TIMEOUT_SECONDS = 5
+
+
 class MCPLineReaderTests(unittest.TestCase):
     def start_child(self, source):
         return subprocess.Popen(
@@ -42,8 +48,8 @@ class MCPLineReaderTests(unittest.TestCase):
         )
         try:
             reader = harness.MCPLineReader(proc)
-            self.assertEqual(reader.read_line("first", 0.5), '{"id":1}')
-            self.assertEqual(reader.read_line("second", 0.5), '{"id":2}')
+            self.assertEqual(reader.read_line("first", CHILD_FIXTURE_TIMEOUT_SECONDS), '{"id":1}')
+            self.assertEqual(reader.read_line("second", CHILD_FIXTURE_TIMEOUT_SECONDS), '{"id":2}')
         finally:
             self.stop_child(proc)
 
@@ -67,7 +73,7 @@ class MCPLineReaderTests(unittest.TestCase):
         try:
             reader = harness.MCPLineReader(proc)
             with self.assertRaisesRegex(RuntimeError, "Partial response"):
-                reader.read_line("tools/list", 0.5)
+                reader.read_line("tools/list", CHILD_FIXTURE_TIMEOUT_SECONDS)
         finally:
             self.stop_child(proc)
 
@@ -78,7 +84,10 @@ class MCPLineReaderTests(unittest.TestCase):
         try:
             reader = harness.MCPLineReader(proc, max_response_bytes=16)
             with self.assertRaisesRegex(RuntimeError, "transport limit without a newline"):
-                reader.read_line("tools/list", 0.5)
+                # Process startup can exceed the former half-second budget on
+                # a loaded macOS CI worker; the assertion is about framing,
+                # not startup latency.
+                reader.read_line("tools/list", CHILD_FIXTURE_TIMEOUT_SECONDS)
         finally:
             self.stop_child(proc)
 
@@ -88,7 +97,7 @@ class MCPLineReaderTests(unittest.TestCase):
         proc = self.start_child("import os, time; os.write(1, b'123456789012345\\n'); time.sleep(2)")
         try:
             reader = harness.MCPLineReader(proc, max_response_bytes=16)
-            self.assertEqual(reader.read_line("tools/list", 0.5), "123456789012345")
+            self.assertEqual(reader.read_line("tools/list", CHILD_FIXTURE_TIMEOUT_SECONDS), "123456789012345")
         finally:
             self.stop_child(proc)
 
@@ -102,7 +111,7 @@ class MCPLineReaderTests(unittest.TestCase):
         try:
             reader = harness.MCPLineReader(proc, max_response_bytes=16)
             with self.assertRaisesRegex(RuntimeError, "transport limit without a newline"):
-                reader.read_line("tools/list", 0.5)
+                reader.read_line("tools/list", CHILD_FIXTURE_TIMEOUT_SECONDS)
         finally:
             self.stop_child(proc)
 

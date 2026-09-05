@@ -40,13 +40,20 @@ struct LineFramer {
     }
 
     private var buffer = Data()
+    /// An oversized request is a terminal protocol violation for this input
+    /// stream.  `MCPServer` tears the connection down immediately, but latching
+    /// the state here keeps the boundary safe if a future caller accidentally
+    /// continues feeding after receiving `overflow: true`.
+    private var overflowed = false
 
     /// Appends `data` to the internal buffer and extracts every complete
     /// line now available. Empty lines (e.g. a bare "\n" keep-alive) are
-    /// silently dropped. Safe to keep calling after an overflow is reported;
-    /// callers that want to treat overflow as fatal (as `MCPServer` does)
-    /// should stop calling `feed` and tear the connection down instead.
+    /// silently dropped. Once an overflow is reported, all later calls report
+    /// the same terminal condition and never yield a line.
     mutating func feed(_ data: Data) -> FeedResult {
+        guard !overflowed else {
+            return FeedResult(lines: [], overflow: true)
+        }
         buffer.append(data)
 
         var lines: [Data] = []
@@ -69,7 +76,7 @@ struct LineFramer {
             // preceding destructive request cannot be processed before the
             // fatal protocol violation is noticed.
             guard lineData.count <= Self.maxBufferBytes else {
-                return FeedResult(lines: [], overflow: true)
+                return terminalOverflow()
             }
 
             if lineData.last == UInt8(ascii: "\r") {
@@ -89,8 +96,17 @@ struct LineFramer {
         // transport down. That is surprising at best and unsafe for a chunk
         // containing a destructive tool call.
         guard buffer.count <= Self.maxBufferBytes else {
-            return FeedResult(lines: [], overflow: true)
+            return terminalOverflow()
         }
         return FeedResult(lines: lines, overflow: false)
+    }
+
+    /// Transitions into the one-way overflow state and releases any retained
+    /// request bytes.  Keeping this in one helper ensures every overflow path
+    /// has identical, terminal behavior.
+    private mutating func terminalOverflow() -> FeedResult {
+        overflowed = true
+        buffer.removeAll(keepingCapacity: false)
+        return FeedResult(lines: [], overflow: true)
     }
 }

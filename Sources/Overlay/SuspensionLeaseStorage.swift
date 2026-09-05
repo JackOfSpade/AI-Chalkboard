@@ -83,9 +83,18 @@ extension SuspensionLeaseCoordinator {
 
     // MARK: - Hardened storage
 
+    /// Acquires the durable operation lock.
+    ///
+    /// Background lease mutations and synchronous background reconciliation
+    /// may wait briefly for a peer because their caller has asked for a
+    /// durable answer.  AppKit-main-thread paths use an immediate attempt
+    /// (the default selects it from `Thread.isMainThread`, and presentation
+    /// passes it explicitly): a transparent, full-display overlay is safer
+    /// ordered out than leaving the UI stalled behind another process's lease
+    /// operation.  In particular, never add a retry loop to that mode.
     // internal: called by SuspensionLeaseCoordinator.swift's withLockedState
     // and withLockedPresentationState.
-    func acquireLock() throws -> HeldLock {
+    func acquireLock(waitForAvailability: Bool = !Thread.isMainThread) throws -> HeldLock {
         let opened = try openSecureDirectory()
         let parentFD = opened.parentFD
         let directoryFD = opened.directoryFD
@@ -99,6 +108,15 @@ extension SuspensionLeaseCoordinator {
                     close(descriptor)
                     descriptor = -1
                     throw CoordinatorError.unavailable("AI Chalkboard could not lock suspension state (errno \(error)).")
+                }
+                // A main-thread caller must never spin or sleep waiting for a
+                // peer's flock.  Presentation falls closed immediately, while
+                // AppDelegate's ordinary reconciliation is coalesced onto a
+                // background queue by SuspensionLeaseCoordinator.
+                guard waitForAvailability else {
+                    close(descriptor)
+                    descriptor = -1
+                    throw CoordinatorError.unavailable("Another annotation suspension operation is still in progress.")
                 }
                 if DispatchTime.now().uptimeNanoseconds >= deadline {
                     close(descriptor)

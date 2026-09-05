@@ -6,6 +6,10 @@ final class BuildMetadataTests: XCTestCase {
         XCTAssertEqual(BuildMetadata.productVersion, "2.1.0")
     }
 
+    func testBundleVersionStartsAtTheFirstDistributedBuild() {
+        XCTAssertEqual(BuildMetadata.bundleVersion, "1")
+    }
+
     func testBuildIdentifierUsesBundledValueWhenPresent() {
         XCTAssertEqual(
             BuildMetadata.buildIdentifier(infoDictionary: [

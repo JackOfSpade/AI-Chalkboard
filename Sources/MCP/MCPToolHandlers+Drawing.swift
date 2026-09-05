@@ -217,6 +217,9 @@ extension MCPServer {
               opacity.isFinite, (0...1).contains(opacity), opacity > 0 else {
             return .failure("Text geometry must be finite; font_size must be 0...\(Int(DrawingDefaults.maxStyleDimensionPx)); padding_px must be 0...\(Int(DrawingDefaults.maxStyleDimensionPx)); and opacity values must be between 0 and 1 (text opacity > 0).")
         }
+        guard DrawingDefaults.isWithinTextRenderBudget(text: text, fontSizePx: fontSize, paddingPx: padding) else {
+            return .failure("Text render extent exceeds the safe layout budget. Reduce text length, font_size, or padding_px.")
+        }
         let textColor = (args["color"] as? String) ?? DrawingDefaults.textColor
         let backgroundColor = args["background_color"] as? String
         guard colorHasVisibleAlpha(textColor)
@@ -404,6 +407,8 @@ extension MCPServer {
             sendErrorResult(id: id, text: "The update was not applied because retained vector/text payload would become \(attempted) bytes, exceeding the \(limit)-byte session limit. The existing annotation was left unchanged.")
         case .rejected(.primitiveCount(let limit, let attempted)):
             sendErrorResult(id: id, text: "The update was not applied because retained primitive count would become \(attempted), exceeding the \(limit)-primitive session limit. The existing annotation was left unchanged.")
+        case .rejected(.batchNestingDepth(let limit, let attempted)):
+            sendErrorResult(id: id, text: "The update was not applied because its batch nesting depth is \(attempted), exceeding the \(limit)-level safety limit. Flatten nested batches and retry; the existing annotation was left unchanged.")
         case .rejected(.annotationCount(let limit, let attempted)):
             // `updateWithOutcome` replaces an existing annotation in place, so
             // the store's total count never actually changes across an
@@ -492,6 +497,11 @@ extension MCPServer {
                   nextBackgroundOpacity >= 0, nextBackgroundOpacity <= 1,
                   nextPadding >= 0, nextPadding <= DrawingDefaults.maxStyleDimensionPx else {
                 return .failure("Updated text must be non-empty; x/y must be within ±\(Int(DrawingDefaults.maxCoordinateMagnitudePx)); font_size must be 0...\(Int(DrawingDefaults.maxStyleDimensionPx)); background_opacity must be 0...1; padding_px must be 0...\(Int(DrawingDefaults.maxStyleDimensionPx)).")
+            }
+            guard DrawingDefaults.isWithinTextRenderBudget(
+                text: nextText, fontSizePx: nextFont, paddingPx: nextPadding
+            ) else {
+                return .failure("Text render extent exceeds the safe layout budget. Reduce text length, font_size, or padding_px.")
             }
             let nextBackground: String?
             if let supplied = args["background_color"] as? String {

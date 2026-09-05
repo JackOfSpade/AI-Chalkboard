@@ -270,7 +270,11 @@ public enum AccessibilityElementResolver {
     /// memory; label length is capped separately because a very long title
     /// reads as document content rather than a control name.
     static let maxExposedSampleCount = 64
-    static let maxExposedSampleLabelCharacters = 128
+    /// Every AX label retained in a successful match or no-match sample uses
+    /// this one shared bound. AX attributes belong to another process and a
+    /// title/description can be arbitrarily large, so this keeps annotation
+    /// labels and subsequent MCP responses independently bounded.
+    static let maxPublishedLabelCharacters = 128
 
     /// Checks trust without prompting by default.  macOS can display a system
     /// prompt only when the caller deliberately opts in; an MCP lookup should
@@ -417,7 +421,11 @@ public enum AccessibilityElementResolver {
                             frame: elementFrame,
                             candidate: AccessibilityElementCandidate(
                                 matchedAttribute: labelMatch.attribute,
-                                matchedLabel: labelMatch.value,
+                                matchedLabel: publishedMatchLabel(
+                                    attribute: labelMatch.attribute,
+                                    value: labelMatch.value,
+                                    query: normalized.label
+                                ),
                                 role: role
                             )
                         )
@@ -580,6 +588,30 @@ public enum AccessibilityElementResolver {
         case .contains:
             return candidate.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
         }
+    }
+
+    /// Produces the label that may leave the resolver in an annotation or MCP
+    /// payload, after the full AX value has already been used for matching.
+    ///
+    /// `kAXValue` frequently contains editable document or form content. In
+    /// particular, a `contains` lookup only proves that the query occurred
+    /// somewhere in that value; returning the full value would disclose the
+    /// surrounding user text. The caller already knows its query, so use that
+    /// as the stable public description for all value matches. Titles and
+    /// descriptions may also be unexpectedly large, so cap every published
+    /// label to one predictable Unicode-character budget.
+    static func publishedMatchLabel(attribute: String, value: String, query: String) -> String {
+        let publicValue = attribute == kAXValueAttribute ? query : value
+        return boundedPublishedLabel(publicValue)
+    }
+
+    /// Keeps a valid Unicode prefix within the published-label budget. The
+    /// marker makes it clear that this is a display/safety summary rather than
+    /// necessarily the complete AX attribute.
+    static func boundedPublishedLabel(_ value: String) -> String {
+        guard value.count > maxPublishedLabelCharacters else { return value }
+        let prefixCount = maxPublishedLabelCharacters - 1
+        return String(value.prefix(prefixCount)) + "…"
     }
 
     /// Pure monotonic-clock boundary helper.  Keeping it independent from AX
@@ -784,7 +816,8 @@ public enum AccessibilityElementResolver {
     /// read for matching purposes: an AXValue is frequently the user's own
     /// document content (e.g. text typed into a field), and echoing it back
     /// inside an MCP error message would turn a UI-discovery hint into
-    /// content disclosure.
+    /// content disclosure. A matching kAXValue is likewise published only as
+    /// the caller's query via `publishedMatchLabel`, never as the raw value.
     private static func matchLabel(on element: AXUIElement, query: String,
                                    mode: AccessibilityLabelMatchMode)
     -> (match: (attribute: String, value: String)?, sampled: [(attribute: String, value: String)]) {
@@ -816,7 +849,7 @@ public enum AccessibilityElementResolver {
     ) {
         guard sample.count < maxExposedSampleCount else { return }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count <= maxExposedSampleLabelCharacters else { return }
+        guard !trimmed.isEmpty, trimmed.count <= maxPublishedLabelCharacters else { return }
         guard seen.insert(ExposedSampleKey(label: trimmed, role: role)).inserted else { return }
         sample.append(AccessibilityElementCandidate(matchedAttribute: attribute, matchedLabel: trimmed, role: role))
     }

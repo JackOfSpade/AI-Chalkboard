@@ -97,19 +97,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         // annotation of a session land on the wrong app (or on none).
         ActiveAppTracker.shared.start()
 
-        // Fail closed until this synchronous registry read completes. A newly
-        // launched sibling must not briefly put a full-screen overlay back on
-        // WindowServer while another client still owns a suspension lease.
-        let suspensionBootstrap = SuspensionLeaseCoordinator.shared.bootstrapAndReconcile()
-        if let error = suspensionBootstrap.error {
-            Logger.shared.log("Suspension lease bootstrap failed; overlays remain ordered out: \(error)", level: "ERROR")
-        }
-        startSuspensionLeaseReconciliation()
-
         // The overlay is the entire reason the MCP server exists (it's what
         // draw_path/draw_image/draw_batch actually render into), so it must be set up in
-        // BOTH modes, never skipped.
+        // BOTH modes, never skipped. Construct this main-thread singleton
+        // before starting a background reconciliation: otherwise that worker
+        // can win its lazy initialization, then wait to apply a generation on
+        // main while this launch callback waits for the singleton's init lock.
+        // Its initial state is fail-closed, so constructing it first cannot
+        // flash an overlay while a peer owns a lease.
         OverlayWindowController.shared.setup()
+
+        // The first worker is queued only after this launch callback returns
+        // to AppKit's run loop; see `startSuspensionBootstrapAfterLaunch`.
+        // Until then the overlay constructed above remains fail-closed.
+        startSuspensionBootstrapAfterLaunch()
 
         // Assigned unconditionally (not inside `setupStatusMenu()`) so a
         // process that starts as secondary and is later promoted to primary
@@ -120,8 +121,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         OverlayWindowController.shared.onCaptureVisibleChanged = { [weak self] visible in
             self?.applyCaptureIndicator(visible: visible)
         }
-
-        MCPServer.shared.start()
 
         // The status-bar item is gated to the primary instance only (see
         // InstanceLock). In MCP mode there is no Dock icon, so for the primary
@@ -144,14 +143,39 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
             startPrimaryElectionRetry()
         }
 
-        MCPServer.shared.log("AI Chalkboard background agent initialized.")
+    }
+
+    /// Starts the first lease read on the next main-queue turn, after
+    /// `applicationDidFinishLaunching` has returned.  A background
+    /// reconciliation applies its snapshot through `MainThread.sync`; starting
+    /// it inside this launch callback races that sync hop against AppKit's own
+    /// initialization locks.  Deferring the *scheduling* (not the UI) removes
+    /// that inversion: the already-created overlay remains ordered out, so
+    /// there is no visible unsuspended interval.
+    ///
+    /// The MCP read loop starts only after this first snapshot applies.  Input
+    /// written by the host meanwhile stays in its pipe, which makes the first
+    /// `initialize` observe a definitive bootstrapped/fail-closed registry
+    /// state instead of a transient "not yet read" state.
+    private func startSuspensionBootstrapAfterLaunch() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            SuspensionLeaseCoordinator.shared.bootstrapAndReconcileAsynchronously { snapshot in
+                if let error = snapshot.error {
+                    Logger.shared.log("Suspension lease bootstrap failed; overlays remain ordered out: \(error)", level: "ERROR")
+                }
+                MCPServer.shared.start()
+                MCPServer.shared.log("AI Chalkboard background agent initialized.")
+            }
+            self.startSuspensionLeaseReconciliation()
+        }
     }
 
     private func startSuspensionLeaseReconciliation() {
         guard suspensionLeaseReconcileTimer == nil else { return }
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] timer in
             guard self != nil else { timer.invalidate(); return }
-            _ = SuspensionLeaseCoordinator.shared.reconcile()
+            _ = SuspensionLeaseCoordinator.shared.reconcileAsynchronously()
         }
         RunLoop.main.add(timer, forMode: .common)
         suspensionLeaseReconcileTimer = timer
