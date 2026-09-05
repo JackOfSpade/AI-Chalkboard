@@ -210,6 +210,38 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
                                           activeLeaseCount: 0, isBootstrapped: false,
                                           nextExpiryInSeconds: nil, error: nil)
 
+    /// Resolves the optional `AI_CHALKBOARD_SUSPENSION_ROOT` override into a
+    /// storage directory, or nil when it is absent or unusable.
+    ///
+    /// Pure over its input -- the same shape as
+    /// `BuildMetadata.buildIdentifier(sidecarDirectory:)` -- so both
+    /// platforms' absolute-path rules stay unit-testable without mutating
+    /// this process's environment.
+    ///
+    /// The override must be ABSOLUTE. A relative value would resolve against
+    /// whatever directory the process happened to launch from, scattering the
+    /// shared lease registry somewhere unpredictable instead of the sandbox
+    /// the caller asked for.
+    ///
+    /// This used to test `raw.hasPrefix("/")`, which only recognises a POSIX
+    /// absolute path. On Windows an absolute path is `C:\...`, `C:/...`, or a
+    /// UNC `\\server\share`, so every Windows override was silently ignored
+    /// and the process fell back to the real per-user registry under
+    /// `%LOCALAPPDATA%` -- the same one a live connector uses. That cost
+    /// `tests/test_suspension_two_process.py` and `test_mcp_stdio.py` the
+    /// isolation they both ask for by setting this variable to a `mkdtemp`
+    /// directory.
+    ///
+    /// `AbsolutePath.isAbsolute` is the platform-correct test. Foundation's
+    /// `NSString.isAbsolutePath` is deliberately NOT used: on Windows it
+    /// accepts the drive-relative form `C:relative`, which
+    /// `URL(fileURLWithPath:)` then resolves against the current directory --
+    /// precisely the outcome this guard exists to prevent.
+    static func overrideStorageDirectory(fromEnvironmentValue raw: String?) -> URL? {
+        guard let raw, AbsolutePath.isAbsolute(raw) else { return nil }
+        return URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
+    }
+
     /// Production reads its optional root override exactly once at launch.
     /// Tests can inject both an isolated directory and a stable boot id.
     public init(storageDirectory: URL? = nil, bootSessionIdentifier: String? = nil,
@@ -218,8 +250,9 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         controlsPresentation = storageDirectory == nil
         if let storageDirectory {
             self.storageDirectory = storageDirectory.standardizedFileURL
-        } else if let raw = ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_ROOT"], raw.hasPrefix("/") {
-            self.storageDirectory = URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
+        } else if let override = Self.overrideStorageDirectory(
+            fromEnvironmentValue: ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_ROOT"]) {
+            self.storageDirectory = override
         } else if let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
             self.storageDirectory = support.appendingPathComponent("AIChalkboard", isDirectory: true)
         } else {

@@ -1056,4 +1056,65 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
                            "the boot identity must not vary between samples within one boot")
         }
     }
+
+    // MARK: - AI_CHALKBOARD_SUSPENSION_ROOT override
+
+    /// The override exists so a harness can point the shared registry at a
+    /// throwaway directory. `test_mcp_stdio.py` and
+    /// `test_suspension_two_process.py` both rely on it, handing over whatever
+    /// `tempfile.mkdtemp()` returned -- a `C:\...` path on Windows. The guard
+    /// used to be `hasPrefix("/")`, so on Windows every such value was
+    /// rejected and those harnesses silently ran against the REAL per-user
+    /// registry that a live connector shares, instead of their sandbox.
+    func testAbsoluteSuspensionRootOverrideIsHonoredInThisPlatformsPathSyntax() {
+        #if os(Windows)
+        // Raw literal: a Windows path is all backslashes, and escaping them
+        // here would obscure the exact shape mkdtemp actually hands over.
+        let root = #"C:\Users\example\AppData\Local\Temp\ai-chalkboard-suspension-it-abc123"#
+        #else
+        let root = "/tmp/ai-chalkboard-suspension-it-abc123"
+        #endif
+        let resolved = SuspensionLeaseCoordinator.overrideStorageDirectory(fromEnvironmentValue: root)
+        XCTAssertEqual(resolved,
+                       URL(fileURLWithPath: root, isDirectory: true).standardizedFileURL,
+                       "a mkdtemp-shaped absolute path in this platform's own syntax must be honored")
+    }
+
+    /// A relative override would resolve against whatever directory the
+    /// process happened to launch from, putting the shared registry somewhere
+    /// unpredictable. Rejecting non-absolute values is the whole point of the
+    /// guard, so widening it for Windows must not have widened it to these.
+    func testNonAbsoluteSuspensionRootOverridesAreRejected() {
+        XCTAssertNil(SuspensionLeaseCoordinator.overrideStorageDirectory(fromEnvironmentValue: nil))
+        XCTAssertNil(SuspensionLeaseCoordinator.overrideStorageDirectory(fromEnvironmentValue: ""))
+        XCTAssertNil(SuspensionLeaseCoordinator.overrideStorageDirectory(fromEnvironmentValue: "relative/dir"))
+        XCTAssertNil(SuspensionLeaseCoordinator.overrideStorageDirectory(fromEnvironmentValue: "./relative"))
+        #if os(Windows)
+        // "C:relative" is drive-RELATIVE (relative to the current directory on
+        // drive C:), not absolute, and must not be mistaken for the former.
+        XCTAssertNil(SuspensionLeaseCoordinator.overrideStorageDirectory(fromEnvironmentValue: "C:relative"))
+        #endif
+    }
+
+    /// With no override set, the coordinator must fall back to the real
+    /// per-user directory rather than anything derived from the cwd -- the
+    /// behaviour production depends on, and the reason the guard has to
+    /// reject junk rather than pass it through.
+    func testAbsentSuspensionRootOverrideLeavesTheRealPerUserDirectoryInPlace() throws {
+        // If a harness has pointed this whole process at a sandbox root, the
+        // no-override path genuinely cannot be observed from here -- skip
+        // rather than assert against the sandbox and fail spuriously.
+        try XCTSkipIf(
+            ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_ROOT"] != nil,
+            "AI_CHALKBOARD_SUSPENSION_ROOT is set for this process"
+        )
+        let coordinator = SuspensionLeaseCoordinator(
+            storageDirectory: nil,
+            bootSessionIdentifier: "test-boot",
+            instanceNonce: "test-nonce"
+        )
+        XCTAssertEqual(coordinator.storageDirectory.lastPathComponent, "AIChalkboard")
+        XCTAssertTrue((coordinator.storageDirectory.path as NSString).isAbsolutePath,
+                      "the fallback must be absolute, never resolved against the current directory")
+    }
 }
