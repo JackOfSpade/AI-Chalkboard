@@ -376,15 +376,72 @@ enum AnnotationVerificationCompositor {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               CGImageSourceGetCount(source) == 1,
               let type = CGImageSourceGetType(source) as String?,
-              ["public.png", "public.jpeg", "public.heic", "public.tiff"].contains(type),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+              ["public.png", "public.jpeg", "public.heic", "public.tiff"].contains(type) else {
             throw AnnotationVerificationError.unsupportedImage
         }
-        guard image.width > 0, image.height > 0,
-              image.width <= maxImagePixels / image.height else {
+
+        // ImageIO defers the expensive bitmap decode until
+        // `CGImageSourceCreateImageAtIndex`. Read the container dimensions
+        // first so a tiny compressed image that declares a huge raster is
+        // rejected without allocating its decoded pixels. Missing or malformed
+        // dimensions fail closed; valid metadata is still not a security
+        // boundary, so keep the same check after decode for inconsistent
+        // containers.
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        guard let metadataDimensions = usableMetadataDimensions(properties) else {
+            // A decoder cannot safely authorize an allocation when its own
+            // width/height metadata is absent, non-integral, or outside Swift
+            // integer range. This has the same caller-facing meaning as any
+            // other unsupported/unreadable image container.
+            throw AnnotationVerificationError.unsupportedImage
+        }
+        guard imageDimensionsFitImageLimit(width: metadataDimensions.width, height: metadataDimensions.height) else {
+            throw AnnotationVerificationError.imageTooLarge
+        }
+
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw AnnotationVerificationError.unsupportedImage
+        }
+        guard imageDimensionsFitImageLimit(width: image.width, height: image.height) else {
             throw AnnotationVerificationError.imageTooLarge
         }
         return image
+    }
+
+    /// Pure dimension arithmetic used by the ImageIO metadata preflight and
+    /// post-decode defense-in-depth check. Division avoids multiplying
+    /// attacker-controlled dimensions, so the pixel-limit test cannot
+    /// overflow before it rejects an oversized image.
+    static func imageDimensionsFitImageLimit(width: Int, height: Int) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        return width <= maxImagePixels / height
+    }
+
+    /// Returns the declared positive dimensions only when ImageIO supplied
+    /// both as representable integers. The decode path treats `nil` as an
+    /// unsupported image rather than guessing or allocating first.
+    static func usableMetadataDimensions(_ properties: [CFString: Any]?) -> (width: Int, height: Int)? {
+        guard let properties,
+              let width = imageDimension(properties[kCGImagePropertyPixelWidth]),
+              let height = imageDimension(properties[kCGImagePropertyPixelHeight]),
+              width > 0, height > 0 else {
+            return nil
+        }
+        return (width, height)
+    }
+
+    private static func imageDimension(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              // `stringValue` preserves NSNumber's integer spelling, so
+              // `Int` accepts only an exact, in-range integer. In contrast,
+              // `int64Value` silently truncates 1.5 and clamps non-finite or
+              // out-of-range floating values, which could authorize a decode
+              // under dimensions ImageIO did not actually declare.
+              let dimension = Int(number.stringValue) else {
+            return nil
+        }
+        return dimension
     }
 
     private static func makeBitmap(width: Int, height: Int) -> NSBitmapImageRep? {

@@ -98,14 +98,14 @@ enum MCPToolCatalog {
     ]
 
     private static let textProperties: [String: Any] = [
-        "text": ["type": "string", "minLength": 1, "maxLength": DrawingDefaults.maxTextCharacters, "description": "Text to draw; line breaks are supported."],
+        "text": ["type": "string", "minLength": 1, "maxLength": DrawingDefaults.maxTextCharacters, "description": "Text to draw; line breaks are supported. The combined text length, font_size, and padding_px must fit the renderer's conservative layout budget."],
         "x": ["type": "number", "description": "Top-left X in the selected coordinate space."],
         "y": ["type": "number", "description": "Top-left Y in the selected coordinate space."],
-        "font_size": ["type": "number", "exclusiveMinimum": 0, "description": "System font size in backing pixels."],
+        "font_size": ["type": "number", "exclusiveMinimum": 0, "description": "System font size in backing pixels. Combined with text length and padding_px, it must fit the renderer's layout budget."],
         "color": ["type": "string", "description": "Text color name or hex; defaults to white."],
         "background_color": ["type": "string", "description": "Optional background color name or hex."],
         "background_opacity": ["type": "number", "minimum": 0, "maximum": 1, "description": "Background opacity; default 1."],
-        "padding_px": ["type": "number", "minimum": 0, "description": "Padding around the text in backing pixels; default 0."],
+        "padding_px": ["type": "number", "minimum": 0, "description": "Padding around the text in backing pixels; default 0. Combined with text length and font_size, it must fit the renderer's layout budget."],
         "opacity": ["type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Text opacity; default 1."]
     ]
 
@@ -215,7 +215,93 @@ enum MCPToolCatalog {
         return properties
     }()
 
-    static let tools: [[String: Any]] = [
+    /// The catalog is the one source of truth for the public argument
+    /// surface.  Keep the runtime boundary derived from it too: maintaining a
+    /// second hand-written allow-list next to these schemas is how a newly
+    /// documented argument would eventually be rejected (or, worse, a removed
+    /// argument silently accepted) by the server.
+    static func validateArguments(toolName: String, args: [String: Any]) -> String? {
+        guard let allowed = allowedArgumentKeys(for: toolName) else {
+            // Preserve the normal dispatcher's more useful unknown-tool error.
+            return nil
+        }
+
+        // This parameter was deliberately retired rather than ignored. Check
+        // it before generic unknown-key validation so existing callers retain
+        // the actionable migration error that says nothing was drawn.
+        if toolsRejectingRetiredDuration.contains(toolName),
+           let message = DrawRequest.rejectDurationSecondsIfSupplied(args: args) {
+            return message
+        }
+
+        if let message = unknownArgumentMessage(
+            unknownKeys: Set(args.keys).subtracting(allowed),
+            context: toolName,
+            allowedKeys: allowed
+        ) {
+            return message
+        }
+
+        guard toolName == "draw_batch",
+              let items = args["items"] as? [[String: Any]] else {
+            // The handler supplies the established type/size error for an
+            // absent or malformed items value.
+            return nil
+        }
+        for (index, item) in items.enumerated() {
+            if let message = DrawRequest.rejectDurationSecondsIfSupplied(args: item) {
+                return "items[\(index)]: \(message)"
+            }
+            guard let type = (item["type"] as? String)?.lowercased(),
+                  let itemAllowed = batchItemAllowedKeysByType[type] else {
+                // The handler retains responsibility for the established
+                // missing/invalid type error.
+                continue
+            }
+            if let message = unknownArgumentMessage(
+                unknownKeys: Set(item.keys).subtracting(itemAllowed),
+                context: "items[\(index)] (type '\(type)')",
+                allowedKeys: itemAllowed
+            ) {
+                return message
+            }
+        }
+        return nil
+    }
+
+    private static let toolsRejectingRetiredDuration: Set<String> = [
+        "draw_path", "draw_shape", "draw_image", "draw_text", "draw_batch", "highlight_element"
+    ]
+
+    private static let batchItemAllowedKeysByType: [String: Set<String>] = [
+        "path": Set(pathProperties.keys).union(["type"]),
+        "image": Set(imageProperties.keys).union(["type"]),
+        "text": Set(textProperties.keys).union(["type"]),
+        "shape": Set(pathStyleProperties.keys).union(shapeProperties.keys).union(["type"])
+    ]
+
+    private static func allowedArgumentKeys(for toolName: String) -> Set<String>? {
+        guard let tool = tools.first(where: { $0["name"] as? String == toolName }),
+              let schema = tool["inputSchema"] as? [String: Any],
+              let properties = schema["properties"] as? [String: Any] else {
+            return nil
+        }
+        return Set(properties.keys)
+    }
+
+    private static func unknownArgumentMessage(unknownKeys: Set<String>,
+                                               context: String,
+                                               allowedKeys: Set<String>) -> String? {
+        guard !unknownKeys.isEmpty else { return nil }
+        let unknown = unknownKeys.sorted().map { "'\($0)'" }.joined(separator: ", ")
+        guard !allowedKeys.isEmpty else {
+            return "\(context) accepts no arguments; remove \(unknown)."
+        }
+        return "Unknown argument(s) for \(context): \(unknown). Allowed arguments: \(allowedKeys.sorted().joined(separator: ", "))."
+    }
+
+    static let tools: [[String: Any]] = {
+        let definitions: [[String: Any]] = [
         [
             "name": "get_screens",
             "description": "Returns current display IDs and exact backing-pixel geometry. Call before drawing. If measuring from an uncropped full-display screenshot, use coordinate_space=screenshot_pixels with that exact measured image version's dimensions; do not copy resized-image coordinates into backing_pixels.",
@@ -303,7 +389,12 @@ enum MCPToolCatalog {
                         "items": [
                             "type": "object",
                             "properties": batchItemProperties,
-                            "required": ["type"]
+                            "required": ["type"],
+                            // The published flat schema admits the union of
+                            // all item keys; validateArguments further
+                            // narrows that union by each item's type before
+                            // any raster decoding or annotation mutation.
+                            "additionalProperties": false
                         ]
                     ]
                 ]]),
@@ -385,5 +476,13 @@ enum MCPToolCatalog {
             "description": "Applies legacy capture eligibility/exclusion and per-app debug filtering locally before responding, then broadcasts the request to sibling instances. External capture programs retain independent filters; this flag auto-reverts after five minutes.",
             "inputSchema": ["type": "object", "properties": ["visible": ["type": "boolean"]], "required": ["visible"]]
         ]
-    ]
+        ]
+        return definitions.map { tool in
+            var strictTool = tool
+            var schema = strictTool["inputSchema"] as? [String: Any] ?? [:]
+            schema["additionalProperties"] = false
+            strictTool["inputSchema"] = schema
+            return strictTool
+        }
+    }()
 }

@@ -27,6 +27,8 @@ final class MCPToolCatalogTests: XCTestCase {
         for tool in MCPToolCatalog.tools {
             XCTAssertFalse((tool["description"] as? String ?? "").isEmpty)
             XCTAssertEqual(inputSchema(tool)["type"] as? String, "object")
+            XCTAssertEqual(inputSchema(tool)["additionalProperties"] as? Bool, false,
+                           "\(tool["name"] as? String ?? "<unnamed>") must reject undocumented arguments")
         }
     }
 
@@ -104,6 +106,7 @@ final class MCPToolCatalogTests: XCTestCase {
         // actually select shape: "shape".
         let batchItemsArray = try XCTUnwrap(properties(try XCTUnwrap(toolsByName["draw_batch"]))["items"] as? [String: Any])
         let batchItemSchema = try XCTUnwrap(batchItemsArray["items"] as? [String: Any])
+        XCTAssertEqual(batchItemSchema["additionalProperties"] as? Bool, false)
         let itemProperties = batchItemSchema["properties"] as? [String: Any] ?? [:]
         XCTAssertEqual((itemProperties["shape"] as? [String: Any])?["enum"] as? [String], ["circle", "ellipse", "rect"])
         XCTAssertEqual((itemProperties["type"] as? [String: Any])?["enum"] as? [String], ["path", "image", "text", "shape"])

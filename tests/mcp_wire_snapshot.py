@@ -55,10 +55,12 @@ CANONICALISATION -- the part that matters most:
     FROM THE CAPTURE ITSELF (see `_harvest_identities`) and every occurrence
     of each harvested string is masked, longest-first so a short name never
     partially eats a longer one that contains it (see `_mask_string`).
-  * "Cleared N annotation(s)", the eviction count, and an AMBIGUOUS app
-    query's candidate list are count/environment-dependent (which apps
-    happen to be running, in what order) even between two captures moments
-    apart on the same machine, so those are normalised structurally too.
+  * "Cleared N annotation(s)" and an AMBIGUOUS app query's candidate list
+    are count/environment-dependent (which apps happen to be running, in
+    what order) even between two captures moments apart on the same machine,
+    so those are normalised structurally too. Annotation expiry and eviction
+    are deliberately NOT normalised: drawings persist until an explicit
+    clear, so either field or message returning is a real regression.
   * A tool result whose `text` is itself a JSON document (get_screens,
     list_annotations, get_active_app) is PARSED and re-emitted as structured
     data rather than compared as an opaque string. Swift's
@@ -145,11 +147,34 @@ _TOOL_CALLS: list[tuple[str, str, dict[str, Any]]] = [
         "path_data": "M 10 10 C 20 0 30 20 40 10 Z", "stroke_color": "blue",
         "stroke_width": 4, "stroke_opacity": 0.6, "fill_color": "cyan",
         "fill_opacity": 0.2, "dash": [8, 4], "z_index": 3,
-        "app": "", "duration_seconds": 60,
+        "app": "",
     }),
     ("call_path_normalized_ok", "draw_path", {
         "path_data": "M 0.1 0.2 L 0.8 0.7", "coordinate_space": "normalized",
         "stroke_width": 4, "app": "",
+    }),
+    # `duration_seconds` is a retired parameter that is REJECTED rather than
+    # ignored, so the refusal text is part of the wire contract an agent sees.
+    # It is captured here because several entries in this list silently carried
+    # the parameter after it was retired: what were meant to be the successful
+    # draw_path/draw_text captures were really capturing this error, so the
+    # snapshot compared two error responses and the success coverage they exist
+    # to provide was gone without any test turning red.
+    ("call_path_duration_seconds_rejected", "draw_path", {
+        "path_data": "M 1 1 L 2 2", "app": "", "duration_seconds": 60,
+    }),
+    # First-class geometry succeeds without a TCC prompt and is deliberately
+    # followed by list_annotations below, which pins that it is stored as a
+    # normal durable vector path. Supplying the retired lifetime parameter
+    # must reject the call rather than quietly create an expiring shape.
+    ("call_shape_circle_ok", "draw_shape", {
+        "shape": "circle", "center_x": 240, "center_y": 160, "radius": 36,
+        "stroke_color": "magenta", "stroke_width": 3, "fill_color": "cyan",
+        "fill_opacity": 0.25, "dash": [6, 3], "app": "",
+    }),
+    ("call_shape_duration_seconds_rejected", "draw_shape", {
+        "shape": "circle", "center_x": 240, "center_y": 160, "radius": 36,
+        "app": "", "duration_seconds": 60,
     }),
     ("call_path_screenshot_missing_dimensions", "draw_path", {
         "path_data": "M 10 20 L 40 80", "coordinate_space": "screenshot_pixels", "app": "",
@@ -177,7 +202,7 @@ _TOOL_CALLS: list[tuple[str, str, dict[str, Any]]] = [
     ("call_text_ok", "draw_text", {
         "text": "Fusion", "x": 120, "y": 80, "font_size": 22,
         "color": "white", "background_color": "#202020", "background_opacity": 0.8,
-        "opacity": 0.9, "z_index": 4, "app": "", "duration_seconds": 60,
+        "opacity": 0.9, "z_index": 4, "app": "",
     }),
     ("call_batch_empty", "draw_batch", {"items": []}),
     ("call_batch_unknown_type", "draw_batch", {"items": [{"type": "circle"}], "app": ""}),
@@ -336,18 +361,13 @@ def run_capture(binary_path: str, out_path: Path, timeout: float = DEFAULT_TIMEO
     canonicalised result to `out_path`."""
     if not math.isfinite(timeout) or timeout <= 0:
         raise CaptureValidationError("--timeout must be a finite number greater than zero")
-    # `spawn_mcp_child` starts a `StderrDrain` (test_mcp_stdio.py) on the
-    # child immediately, before any request is sent, and nothing else reads
-    # that pipe until the child exits. `MCPServer.handleToolsCall` logs one
-    # line per call, synchronously BEFORE the tool body runs, and this
-    # function sends every fixture in `_TOP_LEVEL_REQUESTS` + `_TOOL_CALLS`
-    # into one child -- so it is the CUMULATIVE stderr of the whole run that
-    # would fill the 64 KB macOS pipe and block the child's write(2), wedging
-    # the JSON-RPC response too and looking, from this script's side,
-    # indistinguishable from the server simply hanging. No single line can do
-    # it: `redactedArgumentSummary` (Sources/MCP/MCPToolHandlers.swift) caps
-    # each rendered argument list at 2 KiB. See StderrDrain's own doc comment
-    # for the full story.
+    # `spawn_mcp_child` starts the shared bounded `StderrDrain` immediately.
+    # It provides ordinary-host behavior and a useful failure tail while this
+    # one child receives every fixture. The server does not rely on it for
+    # progress: Logger bounds complete stderr records to 512 bytes and either
+    # writes non-blockingly (macOS) or submits to a bounded background worker
+    # (Windows), dropping under sustained backpressure rather than wedging a
+    # JSON-RPC response.
     #
     # The child is also put in a private, disposable suspension domain (see
     # `isolated_suspension_env`'s doc comment for what each key does). That is
@@ -419,7 +439,6 @@ def run_capture(binary_path: str, out_path: Path, timeout: float = DEFAULT_TIMEO
 
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _CLEARED_COUNT_RE = re.compile(r"Cleared \d+ annotation\(s\)")
-_EVICTED_COUNT_RE = re.compile(r"\d+ older annotation\(s\) were dropped")
 # Matches the volatile candidate list inside the AMBIGUOUS app-resolution
 # error text (see DrawRequest.resolveTargetApp's `.ambiguous` branch), up to
 # (but not including) the literal ". Nothing was drawn" that always follows
@@ -496,7 +515,6 @@ def _mask_plain_text(text: str, ids_longest_first: list[str], names_longest_firs
     for value in names_longest_first:
         masked = masked.replace(value, "<APP>")
     masked = _CLEARED_COUNT_RE.sub("Cleared <N> annotation(s)", masked)
-    masked = _EVICTED_COUNT_RE.sub("<N> older annotation(s) were dropped", masked)
     masked = _AMBIGUOUS_LIST_RE.sub("matches <N> running applications: <CANDIDATES>", masked)
     return masked
 
@@ -532,10 +550,6 @@ def _mask_value(node: Any, ids_longest_first: list[str], names_longest_first: li
                 # regex could key off, so this has to be a key-based
                 # replacement rather than a pattern in _mask_plain_text.
                 out[key] = "<TIME>"
-            elif key == "expiresAt" and value is not None:
-                out[key] = "<TIME>"
-            elif key == "remainingSeconds" and value is not None:
-                out[key] = "<TTL>"
             elif key == "windowNumber" and value is not None:
                 # A WindowServer-assigned window id, emitted by
                 # verify_presentation and by get_overlay_state (via

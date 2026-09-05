@@ -113,6 +113,12 @@ private enum BroadcastKey {
     static let appName = "appName"
     static let visible = "visible"
     static let generation = "generation"
+    /// A random per-process marker lets a sender ignore only its own
+    /// self-delivered suspension wake-up.  This is not an authentication
+    /// token -- DNC hints are deliberately untrusted -- it merely prevents a
+    /// just-committed local mutation from contending with its own next
+    /// presentation permit before it records the local snapshot.
+    static let origin = "origin"
 }
 
 /// Canonical encoding and application of a clear broadcast. Keeping payload
@@ -179,10 +185,11 @@ private enum BroadcastMessage {
     /// See `Notification.Name.chalkboardSetCaptureVisible`'s doc comment.
     case setCaptureVisible(Bool)
     /// See `Notification.Name.chalkboardSuspensionInvalidated`'s doc comment.
-    /// `nil` only ever occurs on the RECEIVE side, for a malformed or
-    /// pre-this-field payload -- every poster always supplies a real
-    /// generation (see `InstanceBroadcast.postSuspensionInvalidation`).
-    case suspensionInvalidated(generation: UInt64?)
+    /// Either value may be `nil` on the RECEIVE side for a malformed or
+    /// pre-this-field payload. Every current poster supplies both a real
+    /// generation and its random process-local origin marker (see
+    /// `InstanceBroadcast.postSuspensionInvalidation`).
+    case suspensionInvalidated(generation: UInt64?, origin: String?)
     /// See `QuitScope`'s doc comment for what `nil` vs. a launch mode means.
     case quit(scope: String?)
 }
@@ -243,11 +250,30 @@ private func applySetCaptureVisibleBroadcast(_ visible: Bool) {
 }
 
 /// Applies a received durable-suspension-invalidation wake-up hint.
-private func applySuspensionInvalidatedBroadcast(generation: UInt64?) {
+private func applySuspensionInvalidatedBroadcast(generation: UInt64?, origin: String?,
+                                                 localOrigin: String) {
     // A malformed or hostile hint is harmless: reconcile reads canonical
     // state and never executes a desired state supplied by the broadcast
-    // channel.
-    _ = SuspensionLeaseCoordinator.shared.reconcile(announcedGeneration: generation)
+    // channel. Only enqueue/coalesce here: the macOS transport commonly
+    // delivers on the main thread, and the Windows transport uses its message
+    // pump thread; neither should perform secure-directory I/O or wait for a
+    // peer lock.
+    //
+    // Every transport self-delivers. Ignore only the marker minted by this
+    // exact process: a durable mutation is broadcast before its sender may
+    // finish applying the local presentation snapshot, so a redundant
+    // self-read could otherwise contend with that hand-off. The marker is a
+    // de-duplication hint, not authentication; periodic reconciliation still
+    // repairs a malicious or malformed broadcast.
+    if origin == localOrigin { return }
+
+    // Do not suppress peer hints by comparing generation alone. A securely
+    // recreated registry receives a new instance epoch and restarts its
+    // generation counter, so a peer holding generation 100 from the old epoch
+    // must still reconcile a generation-1 hint from the new registry. The
+    // coalescer below makes redundant hints cheap, and the durable read remains
+    // the only authority.
+    _ = SuspensionLeaseCoordinator.shared.reconcileAsynchronously(announcedGeneration: generation)
 }
 
 /// Whether THIS process should act on a received QUIT broadcast that
@@ -346,6 +372,10 @@ public final class InstanceBroadcast: NSObject, BroadcastTransport {
     /// twice per broadcast). `registerObservers()` is only called once today,
     /// but this makes it safe to call defensively.
     private var isRegistered = false
+
+    /// See `BroadcastKey.origin`. Immutable, so it is safe to read from the
+    /// background mutation path that posts suspension invalidations too.
+    private let suspensionInvalidationOrigin = UUID().uuidString
 
     /// Set by the quit handler so the poster-side watchdog below can tell
     /// "the broadcast came back to me and I'm already terminating" from
@@ -490,7 +520,10 @@ public final class InstanceBroadcast: NSObject, BroadcastTransport {
     /// Broadcasts only a durable-state wake-up hint. It deliberately contains
     /// no requested presentation state and needs no ACK transport.
     public func postSuspensionInvalidation(generation: UInt64) {
-        post(.suspensionInvalidated(generation: generation))
+        post(.suspensionInvalidated(
+            generation: generation,
+            origin: suspensionInvalidationOrigin
+        ))
     }
 
     /// Posts "quit" to every instance, including this one.
@@ -583,7 +616,12 @@ public final class InstanceBroadcast: NSObject, BroadcastTransport {
 
     @objc private func handleSuspensionInvalidatedBroadcast(_ notification: Notification) {
         let generation = (notification.userInfo?[BroadcastKey.generation] as? String).flatMap(UInt64.init)
-        applySuspensionInvalidatedBroadcast(generation: generation)
+        let origin = notification.userInfo?[BroadcastKey.origin] as? String
+        applySuspensionInvalidatedBroadcast(
+            generation: generation,
+            origin: origin,
+            localOrigin: suspensionInvalidationOrigin
+        )
     }
 
     @objc private func handleQuitAllBroadcast(_ notification: Notification) {
@@ -664,8 +702,11 @@ private extension BroadcastMessage {
             return request.userInfo
         case .setCaptureVisible(let visible):
             return [BroadcastKey.visible: visible ? "true" : "false"]
-        case .suspensionInvalidated(let generation):
-            return generation.map { [BroadcastKey.generation: String($0)] }
+        case .suspensionInvalidated(let generation, let origin):
+            var payload: [String: String] = [:]
+            if let generation { payload[BroadcastKey.generation] = String(generation) }
+            if let origin { payload[BroadcastKey.origin] = origin }
+            return payload.isEmpty ? nil : payload
         case .quit:
             return nil
         }
@@ -701,6 +742,7 @@ private struct WindowsBroadcastEnvelope: Codable {
     let appName: String?
     let visible: Bool?
     let generation: String?
+    let origin: String?
 }
 
 /// The `WNDPROC` for `InstanceBroadcast`'s Windows message-only broadcast
@@ -917,6 +959,11 @@ public final class InstanceBroadcast: BroadcastTransport {
     private var isRegistered = false
     private var isQuitting = false
 
+    /// Random process-local marker used to suppress only this instance's own
+    /// suspension invalidation. Immutable, so pump/posting threads may read it
+    /// without joining the mutable transport state guarded by `stateLock`.
+    private let suspensionInvalidationOrigin = UUID().uuidString
+
     /// Payloads queued by `deliverLocally` and not yet consumed by
     /// `consumeLocalDelivery`. `WM_APP`-range `LPARAM`s are not OS-marshaled
     /// (unlike `WM_COPYDATA`) and this message is receivable from ANY
@@ -1123,7 +1170,10 @@ public final class InstanceBroadcast: BroadcastTransport {
     /// branch: no requested presentation state travels here, and no ACK
     /// transport is needed -- see that branch's identical doc comment.
     public func postSuspensionInvalidation(generation: UInt64) {
-        post(.suspensionInvalidated(generation: generation))
+        post(.suspensionInvalidated(
+            generation: generation,
+            origin: suspensionInvalidationOrigin
+        ))
     }
 
     /// Posts "quit" to every instance, including this one. See the macOS
@@ -1437,8 +1487,12 @@ public final class InstanceBroadcast: BroadcastTransport {
             applyClearBroadcast(request)
         case .setCaptureVisible(let visible):
             applySetCaptureVisibleBroadcast(visible)
-        case .suspensionInvalidated(let generation):
-            applySuspensionInvalidatedBroadcast(generation: generation)
+        case .suspensionInvalidated(let generation, let origin):
+            applySuspensionInvalidatedBroadcast(
+                generation: generation,
+                origin: origin,
+                localOrigin: suspensionInvalidationOrigin
+            )
         case .quit(let scope):
             handleQuitAllBroadcast(senderScope: scope)
         }
@@ -1482,13 +1536,13 @@ private extension BroadcastMessage {
     var windowsEnvelope: WindowsBroadcastEnvelope {
         switch self {
         case .clear(let request):
-            return WindowsBroadcastEnvelope(kind: .clear, scope: request.scope.rawValue, appId: request.appId, appName: request.appName, visible: nil, generation: nil)
+            return WindowsBroadcastEnvelope(kind: .clear, scope: request.scope.rawValue, appId: request.appId, appName: request.appName, visible: nil, generation: nil, origin: nil)
         case .setCaptureVisible(let visible):
-            return WindowsBroadcastEnvelope(kind: .setCaptureVisible, scope: nil, appId: nil, appName: nil, visible: visible, generation: nil)
-        case .suspensionInvalidated(let generation):
-            return WindowsBroadcastEnvelope(kind: .suspensionInvalidated, scope: nil, appId: nil, appName: nil, visible: nil, generation: generation.map(String.init))
+            return WindowsBroadcastEnvelope(kind: .setCaptureVisible, scope: nil, appId: nil, appName: nil, visible: visible, generation: nil, origin: nil)
+        case .suspensionInvalidated(let generation, let origin):
+            return WindowsBroadcastEnvelope(kind: .suspensionInvalidated, scope: nil, appId: nil, appName: nil, visible: nil, generation: generation.map(String.init), origin: origin)
         case .quit(let scope):
-            return WindowsBroadcastEnvelope(kind: .quit, scope: scope, appId: nil, appName: nil, visible: nil, generation: nil)
+            return WindowsBroadcastEnvelope(kind: .quit, scope: scope, appId: nil, appName: nil, visible: nil, generation: nil, origin: nil)
         }
     }
 }
@@ -1509,7 +1563,10 @@ private extension WindowsBroadcastEnvelope {
         case .setCaptureVisible:
             return .setCaptureVisible(visible == true)
         case .suspensionInvalidated:
-            return .suspensionInvalidated(generation: generation.flatMap(UInt64.init))
+            return .suspensionInvalidated(
+                generation: generation.flatMap(UInt64.init),
+                origin: origin
+            )
         case .quit:
             return .quit(scope: scope)
         }

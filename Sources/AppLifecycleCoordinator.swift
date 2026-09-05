@@ -125,7 +125,7 @@ public final class AppLifecycleCoordinator {
     public func startSuspensionLeaseReconciliation() {
         guard suspensionLeaseReconcileTimer == nil, let host else { return }
         suspensionLeaseReconcileTimer = host.scheduleRepeatingCallback(interval: Self.suspensionLeaseReconcileInterval) {
-            _ = SuspensionLeaseCoordinator.shared.reconcile()
+            _ = SuspensionLeaseCoordinator.shared.reconcileAsynchronously()
         }
     }
 

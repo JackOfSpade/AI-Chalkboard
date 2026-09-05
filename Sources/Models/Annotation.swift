@@ -48,18 +48,30 @@ public enum AnnotationKind: Codable {
         }
     }
 
-    /// Raster assets recursively owned by this kind. AnnotationStore releases
-    /// these when the containing annotation is removed, replaced, or cleared
-    /// -- there is no other way for a raster-owning annotation to go away.
+    /// Raster assets owned by this kind. AnnotationStore releases these when
+    /// the containing annotation is removed, replaced, or cleared -- there is
+    /// no other way for a raster-owning annotation to go away.
+    ///
+    /// This deliberately walks batches iteratively. AnnotationStore rejects
+    /// retained trees deeper than `maxAnnotationBatchNestingDepth`, but this
+    /// helper also runs while rejecting or cleaning up caller-owned candidates;
+    /// it must remain safe for arbitrary programmatic input on its own.
     var rasterAssetIds: [String] {
-        switch self {
-        case .image(let assetId, _, _, _, _, _, _):
-            return [assetId]
-        case .batch(let items):
-            return items.flatMap { $0.kind.rasterAssetIds }
-        default:
-            return []
+        var assetIDs: [String] = []
+        var stack = [self]
+        while let kind = stack.popLast() {
+            switch kind {
+            case .image(let assetId, _, _, _, _, _, _):
+                assetIDs.append(assetId)
+            case .batch(let items):
+                // LIFO stack: reverse before pushing to retain the source
+                // order callers received from the former recursive flatMap.
+                stack.append(contentsOf: items.reversed().map(\.kind))
+            case .vectorPath, .text:
+                break
+            }
         }
+        return assetIDs
     }
 }
 

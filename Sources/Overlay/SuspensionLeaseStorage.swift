@@ -46,7 +46,7 @@ import WinSDK
 /// The minimal filesystem primitive surface the durable suspension-lease
 /// registry's policy (below, as a `LeaseStorageBackend` extension) is built
 /// on: opening/validating the storage directory and its ownership, taking
-/// the exclusive per-directory lock, reading a file, comparing directory/file
+    /// the exclusive per-directory lock, reading a file, comparing directory/file
 /// identity, and atomically replacing a file. `SuspensionLeaseCoordinator`
 /// itself never talks to a conformance directly -- it calls the thin,
 /// per-platform wrapper methods in the `SuspensionLeaseCoordinator` extension
@@ -73,7 +73,8 @@ protocol LeaseStorageBackend {
     /// Opens (creating if necessary) and validates the storage directory's
     /// identity and ownership, then opens (creating if necessary), locks
     /// (waiting up to a short bounded timeout for a concurrent holder to
-    /// release it), and validates `lockName` within it as a safe regular
+    /// release it when `waitForAvailability` is true), and validates
+    /// `lockName` within it as a safe regular
     /// file to trust. Returns both already-locked and ready to use, or
     /// throws with every resource opened along the way cleaned up.
     ///
@@ -85,7 +86,8 @@ protocol LeaseStorageBackend {
     /// never be closed by an individual lock attempt) that forcing one
     /// shared retry/cleanup skeleton over both would risk leaking a handle
     /// on one platform or double-closing it on the other.
-    func acquireDirectoryAndLockedFile(named lockName: String) throws -> (Directory, Handle)
+    func acquireDirectoryAndLockedFile(named lockName: String,
+                                       waitForAvailability: Bool) throws -> (Directory, Handle)
 
     /// Releases a lock handle returned by `acquireDirectoryAndLockedFile`,
     /// unlocking and closing it and (on platforms that do not cache the
@@ -161,10 +163,27 @@ extension SuspensionLeaseCoordinator {
     enum CoordinatorError: LocalizedError {
         case unavailable(String)
         case malformedState
+        /// The caller asked for something the registry refused -- an
+        /// idempotency key owned by another process, a lease budget already
+        /// spent, a token this boot never issued. The registry was read
+        /// successfully and NOTHING was written, so the durable state is
+        /// exactly as trustworthy after the refusal as before it.
+        ///
+        /// Distinct from `.unavailable` because the two demand opposite
+        /// reactions, and conflating them was a real defect: every one of these
+        /// refusals reached `mutate`'s catch, which fails closed -- it ordered
+        /// every overlay in the refusing process off screen, logged "suspension
+        /// registry unavailable" about a registry that was perfectly healthy,
+        /// and cleared `bootstrapped`. So an agent that released an already-
+        /// stale token, or reused a peer's idempotency key, blanked the user's
+        /// annotations until the next reconcile tick swept them back. Hiding
+        /// the drawing is the safe answer to "I do not know the state"; it is
+        /// the wrong answer to "your argument was bad".
+        case rejected(String)
 
         var errorDescription: String? {
             switch self {
-            case .unavailable(let message): return message
+            case .unavailable(let message), .rejected(let message): return message
             case .malformedState:
                 return "AI Chalkboard's suspension lease registry is invalid or exceeds its safety limits; annotations remain hidden until it is repaired."
             }
@@ -208,8 +227,12 @@ extension LeaseStorageBackend {
     /// `acquireDirectoryAndLockedFile(named:)`, then validates the resulting
     /// directory and lock file's identity before handing back a `HeldLock`.
     /// On any failure after the lock is held, releases it before rethrowing.
-    func acquireHeldLock(lockName: String) throws -> SuspensionLeaseCoordinator.HeldLock<Self> {
-        let (directory, file) = try acquireDirectoryAndLockedFile(named: lockName)
+    func acquireHeldLock(lockName: String, waitForAvailability: Bool) throws
+    -> SuspensionLeaseCoordinator.HeldLock<Self> {
+        let (directory, file) = try acquireDirectoryAndLockedFile(
+            named: lockName,
+            waitForAvailability: waitForAvailability
+        )
         do {
             try validateDirectoryIdentity(directory)
             try validateFileIdentity(file, named: lockName, in: directory)
@@ -235,7 +258,8 @@ extension LeaseStorageBackend {
     /// between the macOS and Windows branches of this file -- built on top
     /// of `readFile(named:in:maxBytes:)`, the one platform primitive it
     /// needs.
-    func readRegistryState(named stateName: String, bootSessionIdentifier: String, maxBytes: Int,
+    func readRegistryState(named stateName: String, bootSessionIdentifier: String,
+                            legacyBootSeconds: Double?, maxBytes: Int,
                             in directory: Directory) throws -> SuspensionLeaseCoordinator.StateRead {
         typealias StateRead = SuspensionLeaseCoordinator.StateRead
         typealias PersistedState = SuspensionLeaseCoordinator.PersistedState
@@ -266,7 +290,11 @@ extension LeaseStorageBackend {
             // registry file about to overwrite a different one, so mint its
             // identity now rather than leaving peers unable to tell the
             // replacement apart from the state it replaced.
-            if state.bootSessionIdentifier != bootSessionIdentifier {
+            if !SuspensionLeaseCoordinator.isSameBootSession(
+                stored: state.bootSessionIdentifier,
+                current: bootSessionIdentifier,
+                legacyBootSeconds: legacyBootSeconds
+            ) {
                 return StateRead(state: PersistedState(bootSessionIdentifier: bootSessionIdentifier,
                                                        instanceEpoch: UUID().uuidString),
                                  needsRewrite: true)
@@ -282,7 +310,11 @@ extension LeaseStorageBackend {
                           ownerInstanceNonce: $0.ownerInstanceNonce ?? "legacy-\($0.token)",
                           expiresAtUptime: $0.expiresAtUptime, idempotencyKey: $0.idempotencyKey)
                 }
-                try SuspensionLeaseCoordinator.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
+                try SuspensionLeaseCoordinator.validateState(
+                    state,
+                    bootSessionIdentifier: bootSessionIdentifier,
+                    legacyBootSeconds: legacyBootSeconds
+                )
                 return StateRead(state: state, needsRewrite: true)
             }
             // An EXISTING same-boot file whose optional `instanceEpoch`
@@ -297,10 +329,18 @@ extension LeaseStorageBackend {
             // it and mints a real UUID.
             if state.instanceEpoch == nil {
                 state.instanceEpoch = UUID().uuidString
-                try SuspensionLeaseCoordinator.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
+                try SuspensionLeaseCoordinator.validateState(
+                    state,
+                    bootSessionIdentifier: bootSessionIdentifier,
+                    legacyBootSeconds: legacyBootSeconds
+                )
                 return StateRead(state: state, needsRewrite: true)
             }
-            try SuspensionLeaseCoordinator.validateState(state, bootSessionIdentifier: bootSessionIdentifier)
+            try SuspensionLeaseCoordinator.validateState(
+                state,
+                bootSessionIdentifier: bootSessionIdentifier,
+                legacyBootSeconds: legacyBootSeconds
+            )
             return StateRead(state: state, needsRewrite: false)
         } catch let error as CoordinatorError { throw error
         } catch { throw CoordinatorError.malformedState }
@@ -348,7 +388,8 @@ struct POSIXLeaseStorageBackend: LeaseStorageBackend {
 
     // MARK: LeaseStorageBackend
 
-    func acquireDirectoryAndLockedFile(named lockName: String) throws -> (Directory, Int32) {
+    func acquireDirectoryAndLockedFile(named lockName: String,
+                                       waitForAvailability: Bool) throws -> (Directory, Int32) {
         let opened = try openSecureDirectory()
         let parentFD = opened.parentFD
         let directoryFD = opened.directoryFD
@@ -362,6 +403,15 @@ struct POSIXLeaseStorageBackend: LeaseStorageBackend {
                     close(descriptor)
                     descriptor = -1
                     throw SuspensionLeaseCoordinator.CoordinatorError.unavailable("AI Chalkboard could not lock suspension state (errno \(error)).")
+                }
+                // A main-thread caller must never spin or sleep waiting for a
+                // peer's flock.  Presentation falls closed immediately, while
+                // AppDelegate's ordinary reconciliation is coalesced onto a
+                // background queue by SuspensionLeaseCoordinator.
+                guard waitForAvailability else {
+                    close(descriptor)
+                    descriptor = -1
+                    throw SuspensionLeaseCoordinator.CoordinatorError.unavailable("Another annotation suspension operation is still in progress.")
                 }
                 if DispatchTime.now().uptimeNanoseconds >= deadline {
                     close(descriptor)
@@ -586,7 +636,8 @@ struct Win32LeaseStorageBackend: LeaseStorageBackend {
     // life (see `openSecureDirectory()` below). `descriptor` is the
     // per-operation handle to the lock file, opened and byte-range-locked
     // fresh by every call, exactly like the POSIX conformance's descriptor.
-    func acquireDirectoryAndLockedFile(named lockName: String) throws -> (HANDLE, HANDLE) {
+    func acquireDirectoryAndLockedFile(named lockName: String,
+                                       waitForAvailability: Bool) throws -> (HANDLE, HANDLE) {
         let directoryHandle = try openSecureDirectory()
         let descriptor = try openValidatedRegularFile(named: lockName, create: true)
         let deadline = DispatchTime.now().uptimeNanoseconds + 1_000_000_000
@@ -603,6 +654,12 @@ struct Win32LeaseStorageBackend: LeaseStorageBackend {
             guard lastError == DWORD(ERROR_LOCK_VIOLATION) else {
                 CloseHandle(descriptor)
                 throw SuspensionLeaseCoordinator.CoordinatorError.unavailable("AI Chalkboard could not lock suspension state (Win32 error \(lastError)).")
+            }
+            // A UI-thread presentation permit must fail closed immediately;
+            // only background operations may use the bounded retry window.
+            guard waitForAvailability else {
+                CloseHandle(descriptor)
+                throw SuspensionLeaseCoordinator.CoordinatorError.unavailable("Another annotation suspension operation is still in progress.")
             }
             if DispatchTime.now().uptimeNanoseconds >= deadline {
                 CloseHandle(descriptor)
@@ -1024,11 +1081,19 @@ extension SuspensionLeaseCoordinator {
     /// not held here.
     private var backend: PlatformBackend { PlatformBackend(storageDirectory: storageDirectory) }
 
+    /// Acquires the durable operation lock. Background mutations and
+    /// reconciliation may wait for the short bounded retry window, while a
+    /// UI-thread presentation fence must return immediately and fail closed
+    /// if a peer currently owns the lock.
+    //
     // internal: SuspensionLeaseCoordinator.swift's withLockedState and
     // withLockedPresentationState hold the returned `HeldLock` across their
     // body closures and read its `.directoryFD`.
-    func acquireLock() throws -> HeldLock<PlatformBackend> {
-        try backend.acquireHeldLock(lockName: Self.lockName)
+    func acquireLock(waitForAvailability: Bool = !MainThread.isCurrentUIThread) throws -> HeldLock<PlatformBackend> {
+        try backend.acquireHeldLock(
+            lockName: Self.lockName,
+            waitForAvailability: waitForAvailability
+        )
     }
 
     // internal: SuspensionLeaseCoordinator.swift's withLockedState and
@@ -1042,6 +1107,7 @@ extension SuspensionLeaseCoordinator {
     // withLockedPresentationState.
     func readState(in directory: PlatformBackend.Directory, bootSessionIdentifier: String) throws -> StateRead {
         try backend.readRegistryState(named: Self.stateName, bootSessionIdentifier: bootSessionIdentifier,
+                                      legacyBootSeconds: legacyBootSeconds,
                                       maxBytes: Self.maximumSerializedBytes, in: directory)
     }
 
@@ -1055,64 +1121,180 @@ extension SuspensionLeaseCoordinator {
 #if os(macOS)
     // internal: SuspensionLeaseCoordinator.init() calls this when no boot
     // session id override is supplied.
+    //
+    /// BUG FIX (a self-sustaining cross-process registry ping-pong that wiped
+    /// live suspension leases and filled the whole log):
+    ///
+    /// This used to return `"\(tv_sec).\(tv_usec)"` from `kern.boottime`. That
+    /// sysctl is not a stored constant -- the kernel DERIVES it as "wall clock
+    /// now minus uptime" -- so every time the system clock is disciplined (NTP,
+    /// `settimeofday`, waking from sleep) the answer moves by a few hundred
+    /// microseconds while the machine has plainly not rebooted. Two Chalkboard
+    /// processes that sampled it either side of such an adjustment therefore
+    /// computed DIFFERENT identities for the SAME boot. Each then read the
+    /// shared registry as one written before the last reboot, took the
+    /// reboot-recovery path in `readState` -- which replaces the state with an
+    /// empty one, DESTROYING every live lease -- and rewrote the file. The
+    /// rewrite broadcast a suspension invalidation, the peer reconciled,
+    /// re-detected a foreign identity, and reset it straight back. Measured in
+    /// production at roughly 150 registry generations per second across three
+    /// processes, which wrote 30,091 identical presentation lines into a 5 MB
+    /// log and rotated the entire real diagnostic history out of existence.
+    /// While it ran, `suspend_annotations` could report success and then have
+    /// its lease silently dropped, bringing the overlays back under a caller
+    /// that had been told the desktop was clear to click.
+    ///
+    /// `kern.bootsessionuuid` is the right primitive: a random identity minted
+    /// once at boot and never recomputed, so it cannot drift by construction.
+    /// The `kern.boottime` reading is kept only as a fallback and, per
+    /// `isSameBootSession`, as the way a registry written by the previous build
+    /// is still recognised as belonging to this boot.
     static func currentBootSessionIdentifier() -> String? {
+        if let uuid = bootSessionUUID(), !uuid.isEmpty { return uuid }
+        guard let seconds = currentBootTimeSeconds() else { return nil }
+        // Seconds only: the microsecond field is exactly the part that drifts.
+        return String(Int64(seconds.rounded()))
+    }
+
+    /// The largest `kern.boottime` movement that is still read as clock
+    /// discipline rather than a reboot. Observed drift is sub-millisecond; a
+    /// machine cannot complete a reboot cycle in anything close to two seconds,
+    /// so no real reboot can hide inside this window.
+    private static let bootSessionDriftTolerance: Double = 2.0
+
+    /// Decides whether a registry's stored boot identity names the boot
+    /// `current` names.
+    ///
+    /// Deliberately NOT plain string equality. A registry written by a build
+    /// that identified the boot by `kern.boottime` stores a number, while this
+    /// build stores `kern.bootsessionuuid`; comparing those literally would
+    /// make a routine app upgrade indistinguishable from a reboot and drop a
+    /// suspension lease that is still live.
+    ///
+    /// `legacyBootSeconds` is the numeric identity of the boot `current` names,
+    /// and is nil when that cannot be known -- see the property of the same
+    /// name. It is a PARAMETER rather than a fresh `kern.boottime` reading
+    /// because reading the clock here silently ignored `current`: a stored
+    /// number was matched against the real machine's boot time even for a
+    /// coordinator that had been handed a different identity entirely. In
+    /// production both describe the same boot so the answer was right, but the
+    /// coupling made reboot behaviour untestable -- a test that injected a
+    /// post-reboot identity was told "same boot" by the live clock, and a
+    /// convergence test written against it passed without exercising the path
+    /// it named. Threading the anchor through keeps the comparison honest
+    /// about which boot it is actually reasoning over.
+    // internal: SuspensionLeaseCoordinator.swift's validateState and this
+    // file's readState use this instead of `==`.
+    static func isSameBootSession(stored: String, current: String,
+                                  legacyBootSeconds: Double?) -> Bool {
+        if stored == current { return true }
+        guard let storedSeconds = Double(stored), storedSeconds > 0 else { return false }
+        // Both sides are boottime-derived: they can be compared directly, which
+        // is the two-old-builds case that produced the original ping-pong.
+        if let currentSeconds = Double(current), currentSeconds > 0 {
+            return abs(storedSeconds - currentSeconds) <= bootSessionDriftTolerance
+        }
+        // `current` is an opaque per-boot identity that carries no time, so only
+        // the boot we actually measured can vouch for the stored number.
+        guard let anchor = legacyBootSeconds else { return false }
+        return abs(storedSeconds - anchor) <= bootSessionDriftTolerance
+    }
+
+    /// `kern.boottime` as a single fractional-seconds value.
+    // internal: SuspensionLeaseCoordinator.init() captures this as the boot
+    // anchor when it derives its own identity.
+    static func currentBootTimeSeconds() -> Double? {
         var bootTime = timeval()
         var size = MemoryLayout<timeval>.size
-        guard sysctlbyname("kern.boottime", &bootTime, &size, nil, 0) == 0, size == MemoryLayout<timeval>.size else { return nil }
+        guard sysctlbyname("kern.boottime", &bootTime, &size, nil, 0) == 0,
+              size == MemoryLayout<timeval>.size else { return nil }
+        return Double(bootTime.tv_sec) + Double(bootTime.tv_usec) / 1_000_000
+    }
+
+    /// The kernel's per-boot random identity, as a string. Absent on platforms
+    /// or configurations that do not publish it, hence the optional.
+    private static func bootSessionUUID() -> String? {
+        var size = 0
+        guard sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 0, size <= 256 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("kern.bootsessionuuid", &buffer, &size, nil, 0) == 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+#if DEBUG
+    /// The exact identifier shape the previous build persisted, so the upgrade
+    /// path can be tested against a real registry rather than a literal.
+    static func testOnlyLegacyBoottimeIdentifier() -> String? {
+        var bootTime = timeval()
+        var size = MemoryLayout<timeval>.size
+        guard sysctlbyname("kern.boottime", &bootTime, &size, nil, 0) == 0,
+              size == MemoryLayout<timeval>.size else { return nil }
         return "\(bootTime.tv_sec).\(bootTime.tv_usec)"
     }
+#endif
+
 #elseif os(Windows)
-    // internal: SuspensionLeaseCoordinator.init() calls this when no boot
-    // session id override is supplied.
-    //
-    // REBOOT-SESSION IDENTITY -- WEAKER THAN macOS, DOCUMENTED PRECISELY:
-    // kern.boottime is read directly from the XNU kernel and is exact: two
-    // processes started minutes or days apart, in the same boot, always read
-    // back the identical value, and a genuine reboot always changes it.
-    // Windows has no equivalent syscall. The closest approximation is
-    // `now - uptime`, computed from GetTickCount64() (milliseconds since
-    // boot; monotonic, but not guaranteed by Microsoft to include every
-    // sleep/hibernate interval on every Windows version) and the current
-    // wall-clock time. Two processes computing this at different real
-    // moments within the SAME boot can get slightly different raw results,
-    // because the wall clock can be nudged by NTP discipline between their
-    // two measurements even though the boot itself never changed -- this is
-    // the ambiguity rounding to a coarse bucket exists to absorb.
-    //
-    // FAILURE DIRECTION IS DELIBERATELY SAFE: a computed value that drifts
-    // across the bucket boundary for the SAME boot does not honour a stale
-    // lease -- it does the opposite. `readState()`'s
-    // `state.bootSessionIdentifier != bootSessionIdentifier` branch treats
-    // ANY identifier mismatch, spurious or genuine, identically: replace the
-    // registry with a fresh, EMPTY, unsuspended state (see that branch's
-    // comment). So every ambiguity here degrades to "treat the existing
-    // lease as stale, restore the annotations," which is always the safe
-    // direction for a tool whose entire purpose is to guarantee overlays are
-    // never left stuck hidden. It is never able to do the unsafe thing --
-    // honour a lease that should have died with the previous boot -- as a
-    // result of clock jitter.
-    //
-    // The 2-second bucket width is chosen to make the UNSAFE direction --
-    // two DIFFERENT boots computing the SAME rounded identifier, which
-    // WOULD let a stale pre-reboot lease be wrongly honoured -- vanishingly
-    // unlikely: it would require the machine's wall-clock-minus-uptime value
-    // to land in the same 2-second bucket across two genuinely separate
-    // boots, which in practice requires the two boot instants themselves to
-    // coincide within about 2 seconds. The cost of choosing a narrow bucket
-    // is only ever paid in the safe direction: it tolerates less wall-clock
-    // jitter before two same-boot computations diverge and trigger the
-    // harmless extra reset described above.
+    // Windows has no stable per-boot UUID syscall. Approximate the boot instant
+    // as wall-clock time minus monotonic uptime and bucket it to two seconds so
+    // ordinary sampling jitter does not make two same-boot processes disagree.
+    // A disagreement fails toward restoring annotations, never toward keeping
+    // a stale lease hidden across a reboot.
     static func currentBootSessionIdentifier() -> String? {
+        guard let bootSeconds = currentBootTimeSeconds() else { return nil }
+        let bootEpochMillis = UInt64(bootSeconds * 1_000)
+        let bucketWidthMillis: UInt64 = 2_000
+        let bucketed = (bootEpochMillis / bucketWidthMillis) * bucketWidthMillis
+        return "winboot-\(bucketed)"
+    }
+
+    /// The Windows analogue of the legacy macOS boot-time anchor. Keeping the
+    /// unbucketed estimate lets the shared migration tests and tolerant numeric
+    /// comparison reason about the boot named by this process, while normal
+    /// Windows registries continue to store the `winboot-...` identifier above.
+    static func currentBootTimeSeconds() -> Double? {
         let tickMillis = GetTickCount64()
         var fileTime = FILETIME()
         GetSystemTimeAsFileTime(&fileTime)
         let hundredNanosSinceEpoch = (UInt64(fileTime.dwHighDateTime) << 32) | UInt64(fileTime.dwLowDateTime)
         let nowMillisSinceEpoch = hundredNanosSinceEpoch / 10_000
         guard nowMillisSinceEpoch > tickMillis else { return nil }
-        let bootEpochMillis = nowMillisSinceEpoch - tickMillis
-        let bucketWidthMillis: UInt64 = 2_000
-        let bucketed = (bootEpochMillis / bucketWidthMillis) * bucketWidthMillis
-        return "winboot-\(bucketed)"
+        return Double(nowMillisSinceEpoch - tickMillis) / 1_000
     }
+
+    private static let bootSessionDriftTolerance: Double = 2.0
+
+    private static func windowsBootEpochMillis(_ identifier: String) -> UInt64? {
+        let prefix = "winboot-"
+        guard identifier.hasPrefix(prefix) else { return nil }
+        return UInt64(identifier.dropFirst(prefix.count))
+    }
+
+    static func isSameBootSession(stored: String, current: String,
+                                  legacyBootSeconds: Double?) -> Bool {
+        if stored == current { return true }
+        // Two live processes can sample the estimated boot instant on opposite
+        // sides of the two-second bucket boundary. Treat adjacent buckets as
+        // the same boot; exact string comparison alone would make those peers
+        // repeatedly replace one another's registry and drop live leases.
+        if let storedMillis = windowsBootEpochMillis(stored),
+           let currentMillis = windowsBootEpochMillis(current) {
+            let difference = storedMillis >= currentMillis
+                ? storedMillis - currentMillis
+                : currentMillis - storedMillis
+            return difference <= UInt64(bootSessionDriftTolerance * 1_000)
+        }
+        guard let storedSeconds = Double(stored), storedSeconds > 0 else { return false }
+        if let currentSeconds = Double(current), currentSeconds > 0 {
+            return abs(storedSeconds - currentSeconds) <= bootSessionDriftTolerance
+        }
+        guard let anchor = legacyBootSeconds else { return false }
+        return abs(storedSeconds - anchor) <= bootSessionDriftTolerance
+    }
+
+#if DEBUG
+    static func testOnlyLegacyBoottimeIdentifier() -> String? {
+        currentBootTimeSeconds().map(String.init)
+    }
+#endif
 #endif
 }

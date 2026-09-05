@@ -189,14 +189,14 @@ jobs:
         run: bash tests/test_auto_merge_logic.sh
 
       - name: MCP stdio harness syntax + framing/timeout tests
-        # The full integration script launches AppKit and still requires an Aqua GUI
-        # session, but its protocol framing and deadline behavior are pure Python and
-        # must be exercised here rather than merely syntax-checked. tests/test_suspension_two_process.py
-        # launches AppKit too (twice, opt-in only via its own env-var gate -- see its
-        # module docstring) and needs the same Aqua session, so it gets the same
-        # syntax-check-only treatment as test_mcp_stdio.py above rather than a `swift
-        # test`-style real run; without this it was py_compile'd nowhere, so even a
-        # trivial typo in it would go unnoticed until someone ran it by hand.
+        # The full integration script needs macOS AppKit/Aqua plus live screenshot
+        # and presentation conditions that this cheap Ubuntu job cannot provide, but
+        # its protocol framing and deadline behavior are pure Python and must be
+        # exercised here rather than merely syntax-checked. The macOS build job below
+        # separately launches the packaged app for its headless ping/backpressure
+        # slice. tests/test_suspension_two_process.py launches the full app twice
+        # (opt-in only via its own env-var gate -- see its module docstring), so it gets
+        # syntax-check-only treatment here; without this it was py_compile'd nowhere.
         run: |
           python3 -m py_compile test_mcp_stdio.py tests/test_mcp_stdio_harness.py tests/test_suspension_two_process.py
           python3 -m unittest tests/test_mcp_stdio_harness.py
@@ -239,7 +239,7 @@ jobs:
         run: test -d tests/AIChalkboardCoreTests
 
   build:
-    name: swift build (debug + release) + app bundle (act-local only)
+    name: swift build (debug + release) + app bundle
     runs-on: macos-latest
     # macos-latest runners bill at 10x on a private repo, which is exactly why every
     # check above that does NOT need AppKit/the Swift toolchain lives in the cheap
@@ -258,6 +258,18 @@ jobs:
 
       - name: swift build (release)
         run: swift build -c release
+
+      # Every macOS runner can exercise .app assembly with the explicit,
+      # test-only ad-hoc-signing mode. It is deliberately opt-in and is never a
+      # release fallback: the normal build_app.sh path below remains fail-closed.
+      - name: Assemble and verify test .app bundle (clean-mac safe)
+        run: bash tests/test_deployment_layout.sh --assemble-test-bundle
+
+      - name: MCP remains responsive with undrained stderr
+        # The test launches the fresh isolated `.test-dist` bundle above and
+        # deliberately never consumes the child's stderr pipe. It proves
+        # diagnostics cannot fill that pipe and stall JSON-RPC replies.
+        run: python3 -m unittest tests/test_logger_stderr_backpressure.py
 
       # LOCAL-ONLY, deliberately: build_app.sh codesigns with a pinned local
       # identity (SHA-1 65B98DF…, "AI Chalkboard Local Code Signing") and FAILS
@@ -285,23 +297,6 @@ jobs:
       - name: Assemble .app bundle (act-local CI only — needs the local signing identity)
         if: ${{ env.ACT == 'true' }}
         run: bash build_app.sh
-
-      # Verifies the artifact the step above produces (and calls codesign
-      # --verify on it), so the two are gated identically — both local-only.
-      # Without the same `if:`, this step would fail on a GitHub-hosted runner
-      # looking for a bundle that was never assembled there.
-      - name: Verify bundle contents (act-local CI only — verifies the step above)
-        if: ${{ env.ACT == 'true' }}
-        run: |
-          set -euo pipefail
-          app=dist/AIChalkboard.app
-          plist="$app/Contents/Info.plist"
-          test -x "$app/Contents/MacOS/AIChalkboard"
-          test -f "$plist"
-          plutil -lint "$plist"
-          test "$(plutil -extract NSHighResolutionCapable raw -o - "$plist")" = true
-          test "$(plutil -extract NSHighResolutionMagnifyAllowed raw -o - "$plist")" = false
-          codesign --verify --deep --strict --verbose=2 "$app"
 
       # SwiftPM owns `.build` and may replace it during a subsequent build.
       # The configured MCP executable is instead the signed bundle in `dist/`;
@@ -359,6 +354,17 @@ jobs:
 
       - name: swift build (release)
         run: swift build -c release
+
+      - name: MCP remains responsive with undrained stderr (Windows)
+        shell: pwsh
+        run: |
+          $binaryDirectory = swift build -c release --show-bin-path | Select-Object -Last 1
+          $binaryPath = Join-Path $binaryDirectory.Trim() "AIChalkboard.exe"
+          if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+            throw "Release executable is missing at $binaryPath"
+          }
+          $env:AI_CHALKBOARD_LOGGER_TEST_BINARY = $binaryPath
+          python -m unittest tests/test_logger_stderr_backpressure.py
 
       - name: swift test
         run: swift test

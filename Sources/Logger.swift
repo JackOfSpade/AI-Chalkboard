@@ -39,8 +39,14 @@ public final class Logger: @unchecked Sendable {
 
     // Serializes each log line's format-timestamp + build-line +
     // write-to-stderr sequence (see log()/logSync()), plus every other
-    // FileHandle.standardError.write below (all of which go through
-    // Logger.writeStderr()).
+    // stderr attempt below. On macOS every stderr record is deliberately no
+    // larger than PIPE_BUF, so the one non-blocking write is atomic on a pipe:
+    // a healthy stderr gets complete, ordered lines; a full stderr drops a
+    // whole diagnostic rather than stalling or corrupting the MCP transport.
+    // Windows cannot safely retrofit overlapped I/O onto an arbitrary inherited
+    // handle, so this lock serializes submission to the bounded background
+    // writer below instead; the MCP caller still never performs the blocking
+    // write itself.
     //
     // BUG FIX (interleaved stderr writes corrupt the diagnostic stream):
     // FileHandle.standardError.write is a raw write(2) with no serialization
@@ -73,6 +79,74 @@ public final class Logger: @unchecked Sendable {
     // synchronous block with no dispatch inside it -- see the call sites.
     private static let stderrLock = NSLock()
 
+    #if os(Windows)
+    /// Windows cannot make an arbitrary inherited stderr handle nonblocking.
+    /// Isolate the potentially blocking Foundation write on one serial worker
+    /// and bound everything waiting behind it. If the first write wedges on an
+    /// undrained pipe, at most this many complete records/bytes stay retained;
+    /// later diagnostics are dropped without delaying their caller.
+    private final class WindowsStderrWriter: @unchecked Sendable {
+        private static let maxPendingRecords = 64
+        private static let maxPendingBytes = maxPendingRecords * Logger.maxStderrRecordBytes
+
+        private let queue = DispatchQueue(label: "com.aichalkboard.logger.stderr", qos: .utility)
+        private let lock = NSLock()
+        private var pendingRecords = 0
+        private var pendingBytes = 0
+
+        func enqueue(_ data: Data) {
+            lock.lock()
+            guard pendingRecords < Self.maxPendingRecords,
+                  pendingBytes + data.count <= Self.maxPendingBytes else {
+                lock.unlock()
+                return
+            }
+            pendingRecords += 1
+            pendingBytes += data.count
+            lock.unlock()
+
+            queue.async { [self] in
+                defer { complete(byteCount: data.count) }
+                do {
+                    try FileHandle.standardError.write(contentsOf: data)
+                } catch {
+                    // Nowhere left to report a stderr failure, by definition.
+                }
+            }
+        }
+
+        private func complete(byteCount: Int) {
+            lock.lock()
+            pendingRecords -= 1
+            pendingBytes -= byteCount
+            lock.unlock()
+        }
+    }
+
+    private static let windowsStderrWriter = WindowsStderrWriter()
+    #endif
+
+    /// POSIX only promises this much atomic pipe capacity. Keeping every
+    /// stderr record at or below it means a non-blocking write either emits
+    /// the entire line or returns EAGAIN; it can never leave a partial line
+    /// interleaved with a later diagnostic. The retained file log still gets
+    /// the normal 16 KiB record below.
+    static let maxStderrRecordBytes = 512
+
+    #if os(macOS)
+    /// A full, undrained stderr pipe used to block the MCP read loop because
+    /// FileHandle.standardError.write performs a blocking write(2). Configure
+    /// this process's inherited stderr descriptor once, before any log write,
+    /// so diagnostic delivery is always best effort. If stderr is an unusual
+    /// descriptor which cannot be made non-blocking, dropping its diagnostics
+    /// is safer than risking a protocol deadlock.
+    private static let stderrIsNonBlocking: Bool = {
+        let flags = fcntl(STDERR_FILENO, F_GETFL)
+        guard flags != -1 else { return false }
+        return fcntl(STDERR_FILENO, F_SETFL, flags | O_NONBLOCK) != -1
+    }()
+    #endif
+
     // Rotates at 5 MB per file (roughly 10 MB total with one backup, plus at
     // most the bounded record that crosses the threshold).
     private let maxFileSizeBytes: UInt64 = 5 * 1024 * 1024
@@ -83,9 +157,19 @@ public final class Logger: @unchecked Sendable {
     /// timestamp/PID/level framing adds a small fixed number of bytes.
     static let maxMessageBytes = 16 * 1024
 
+    /// File logging is asynchronous, but a serial DispatchQueue alone does
+    /// not bound queued closures. Cap the retained work so a stuck disk or
+    /// rotation cannot turn diagnostic traffic into unbounded process memory.
+    private static let maxPendingFileWriteRecords = 64
+    private static let maxPendingFileWriteBytes = 1 * 1024 * 1024
+    private let pendingFileWritesLock = NSLock()
+    private var pendingFileWriteCount = 0
+    private var pendingFileWriteBytes = 0
+
     /// When an over-cap file cannot be rotated, stop appending to that file
-    /// until a later rotation attempt succeeds. stderr logging continues. This
-    /// keeps growth bounded near the nominal 10 MB retention budget even
+    /// until a later rotation attempt succeeds. stderr delivery continues on a
+    /// best-effort basis. This keeps growth bounded near the nominal 10 MB
+    /// retention budget even
     /// when rename/removal permissions are broken for an extended period.
     private var suppressFileWritesUntilRotationSucceeds = false
 
@@ -99,9 +183,72 @@ public final class Logger: @unchecked Sendable {
     private var lastRotationFailure: Date?
     private let rotationFailureCooldown: TimeInterval = 60
 
+    /// Where this process writes its log.
+    ///
+    /// Normally `~/Library/Logs/AIChalkboard`, the location a user is asked for
+    /// when reporting a problem.
+    ///
+    /// Two escapes, in priority order:
+    ///
+    /// * `AI_CHALKBOARD_LOG_DIR`, an absolute path -- the same override shape
+    ///   `AI_CHALKBOARD_SUSPENSION_ROOT` already uses for the lease registry.
+    /// * Running under a test harness. Detected by asking whether `XCTestCase`
+    ///   is loaded in this process rather than by sniffing an environment
+    ///   variable: `swift test` exports neither `XCTestConfigurationFilePath`
+    ///   nor `XCTestBundlePath` (verified on this toolchain), so the env-var
+    ///   check alone silently failed to redirect anything. The class lookup is
+    ///   true exactly when a test bundle has been loaded, under both the
+    ///   command-line runner and Xcode. The unit suite exercises real rejection
+    ///   and resolution paths, so it emits genuine WARN records ("Drawing
+    ///   rejected: ... targetScreenId=test-screen", "could not resolve app
+    ///   'Ghost App'"); those were landing in the user's production log,
+    ///   interleaved with real diagnostics and counting toward the 5 MB
+    ///   rotation budget that retains them. Synthetic records must never be
+    ///   able to evict a real one.
+    private static func resolveLogsDirectory(_ fileManager: FileManager) -> URL {
+        let environment = ProcessInfo.processInfo.environment
+        if let raw = environment["AI_CHALKBOARD_LOG_DIR"], (raw as NSString).isAbsolutePath {
+            return URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
+        }
+        #if os(macOS)
+        let isTestHarness = NSClassFromString("XCTestCase") != nil
+            || environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+        #elseif os(Windows)
+        // Objective-C runtime class lookup is not available on Windows.
+        // Preserve the environment-based detection supported by XCTest there.
+        let isTestHarness = environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+        #endif
+        if isTestHarness {
+            return fileManager.temporaryDirectory
+                .appendingPathComponent("AIChalkboardTestLogs", isDirectory: true)
+        }
+        #if os(macOS)
+        return applicationLogsDirectory(
+            libraryDirectory: fileManager.urls(for: .libraryDirectory, in: .userDomainMask).first,
+            homeDirectory: fileManager.homeDirectoryForCurrentUser
+        )
+        #elseif os(Windows)
+        return PlatformPaths.logDirectory
+        #endif
+    }
+
+    /// Resolves the normal user-facing log location without assuming
+    /// Foundation can always enumerate the user's Library directory. The
+    /// fallback preserves the documented `~/Library/Logs/AIChalkboard`
+    /// location for restricted or unusual process environments.
+    static func applicationLogsDirectory(libraryDirectory: URL?, homeDirectory: URL) -> URL {
+        let libraryDirectory = libraryDirectory
+            ?? homeDirectory.appendingPathComponent("Library", isDirectory: true)
+        return libraryDirectory
+            .appendingPathComponent("Logs", isDirectory: true)
+            .appendingPathComponent("AIChalkboard", isDirectory: true)
+    }
+
     private init() {
         let fileManager = FileManager.default
-        let logsDir = PlatformPaths.logDirectory
+        let logsDir = Logger.resolveLogsDirectory(fileManager)
 
         try? fileManager.createDirectory(at: logsDir, withIntermediateDirectories: true)
 
@@ -128,6 +275,15 @@ public final class Logger: @unchecked Sendable {
 
         log("==================================================")
         log("AI Chalkboard Logger Initialized (PID: \(ProcessInfo.processInfo.processIdentifier))")
+        // WHICH BUILD IS THIS? The log could not previously answer that, so
+        // confirming that a restarted process had actually picked up a new
+        // bundle meant reading the running image's inode out of `lsof` and
+        // comparing it against the file on disk. The identity was already known
+        // -- `BuildMetadata.buildIdentifier` is reported over MCP in the
+        // initialize response and in get_overlay_state -- it was just missing
+        // from the one artifact a person actually reads when diagnosing.
+        // `source` here means a bare SwiftPM binary rather than a built bundle.
+        log("Build: \(BuildMetadata.productVersion) (\(BuildMetadata.buildIdentifier)) at \(Bundle.main.executableURL?.path ?? "<unknown executable>")")
         log("Log File: \(logFileURL.path)")
         log("Log Retention: rotates at 5 MB, keeps one backup, caps messages at 16 KiB, and pauses file writes if rotation fails")
         log("==================================================")
@@ -156,10 +312,11 @@ public final class Logger: @unchecked Sendable {
     private static func openAppendHandle(at url: URL) -> FileHandle? {
         let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
         guard fd != -1 else {
-            // A logging failure must never take down the MCP server. Report to
-            // stderr only and continue with fileHandle == nil; log() already
-            // writes to stderr unconditionally, so output isn't fully lost.
-            let msg = "[Logger] Failed to open log file at \(url.path) (errno \(errno)). Logging to stderr only.\n"
+            // A logging failure must never take down the MCP server. Retain no
+            // file handle and continue. Future records still make a
+            // best-effort non-blocking stderr attempt, but may be dropped
+            // under backpressure.
+            let msg = "[Logger] Failed to open log file at \(url.path) (errno \(errno)). Retained file logging is unavailable; stderr is best effort.\n"
             stderrLock.lock()
             Logger.writeStderr(msg)
             stderrLock.unlock()
@@ -255,15 +412,12 @@ public final class Logger: @unchecked Sendable {
     }
     #endif
 
-    // Encodes `line` as UTF-8 and writes it to stderr, returning the encoded
-    // bytes (whether or not the stderr write itself succeeded -- see the
-    // write below). log()/logSync() reuse that returned Data for their
-    // own (separate, async-queued) write to the log file instead of
-    // re-encoding the same string a second time. Returns nil, writing
-    // nothing, if UTF-8 encoding fails -- effectively impossible for a
-    // native Swift String, but matches every call site's existing tolerance
-    // for silently dropping a diagnostic line rather than crashing the MCP
-    // server over a logging failure.
+    // Encodes `line` as UTF-8, makes a bounded best-effort stderr attempt,
+    // and returns the full encoded bytes for the separate retained file log.
+    // Returns nil, writing nothing, if UTF-8 encoding fails -- effectively
+    // impossible for a native Swift String, but matches every call site's
+    // existing tolerance for dropping a diagnostic rather than crashing the
+    // MCP server over logging.
     //
     // Deliberately does NOT take stderrLock itself. log()/logSync() need the
     // lock to also cover the timestamp-format + line-build step that
@@ -277,20 +431,29 @@ public final class Logger: @unchecked Sendable {
     @discardableResult
     private static func writeStderr(_ line: String) -> Data? {
         guard let data = line.data(using: .utf8) else { return nil }
-        // Throwing `write(contentsOf:)`, never the legacy non-throwing
-        // `write(_:)`, for exactly the reason spelled out on writeToFile
-        // below: the legacy API raises an UNCATCHABLE Objective-C exception
-        // on failure, and EPIPE here is routine rather than exotic -- the MCP
-        // host closes our stderr pipe during teardown while SIGPIPE is
-        // ignored (see the launcher), so a clean shutdown would abort the
-        // process mid-log. Swallowing the error still returns `data`, so
-        // log()/logSync() go on to write the line to the log file even when
-        // stderr is dead.
-        do {
-            try FileHandle.standardError.write(contentsOf: data)
-        } catch {
-            // Nowhere left to report a stderr failure to, by definition.
+        #if os(macOS)
+        guard stderrIsNonBlocking else { return data }
+        let stderrLine = boundedStderrLine(line)
+        guard let stderrData = stderrLine.data(using: .utf8) else { return data }
+
+        // Do not retry partial writes: for a pipe this bounded write is
+        // all-or-nothing, and on an unusual descriptor a retry could block or
+        // splice two diagnostics together. stderr is supplementary; the
+        // bounded retained file queue below preserves what it can.
+        stderrData.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            _ = Darwin.write(STDERR_FILENO, baseAddress, rawBuffer.count)
         }
+        #elseif os(Windows)
+        // Win32 does not offer a safe way to retrofit overlapped/nonblocking
+        // semantics onto an arbitrary inherited standard-error handle. Bound
+        // the record and hand it to a bounded serial worker: that worker may
+        // wait on a full pipe, but an MCP caller never does and the waiting
+        // queue cannot grow without limit.
+        let stderrLine = boundedStderrLine(line)
+        guard let stderrData = stderrLine.data(using: .utf8) else { return data }
+        windowsStderrWriter.enqueue(stderrData)
+        #endif
         return data
     }
 
@@ -313,17 +476,49 @@ public final class Logger: @unchecked Sendable {
         Logger.stderrLock.unlock()
         guard let data = data else { return }
 
-        // Write to log file asynchronously with size-cap rotation.
+        enqueueFileWrite(data)
+    }
+
+    /// Adds one line to a bounded in-memory handoff for file logging. Each
+    /// accepted record gets one serial-queue closure, and both that closure
+    /// count and their captured bytes are bounded before submission. This
+    /// preserves the queue's FIFO relationship with logSync: a fatal record
+    /// cannot overtake an earlier accepted ordinary diagnostic.
+    private func enqueueFileWrite(_ data: Data) {
+        pendingFileWritesLock.lock()
+        if pendingFileWriteCount >= Self.maxPendingFileWriteRecords
+            || pendingFileWriteBytes + data.count > Self.maxPendingFileWriteBytes {
+            pendingFileWritesLock.unlock()
+            return
+        }
+
+        pendingFileWriteCount += 1
+        pendingFileWriteBytes += data.count
+        pendingFileWritesLock.unlock()
+
         queue.async { [weak self] in
-            guard let self = self else { return }
-            let currentSize = self.reopenIfRotatedAwayFromUnderUs()
-            self.rotateIfNeeded(currentSize: currentSize)
-            self.writeToFile(data)
+            guard let self else { return }
+            defer { self.completePendingFileWrite(byteCount: data.count) }
+            self.writeRecordToFile(data)
         }
     }
 
+    private func completePendingFileWrite(byteCount: Int) {
+        pendingFileWritesLock.lock()
+        pendingFileWriteCount -= 1
+        pendingFileWriteBytes -= byteCount
+        pendingFileWritesLock.unlock()
+    }
+
     // Writes pre-encoded line data to the current file handle, degrading to
-    // stderr-only on any failure rather than crashing the MCP server.
+    // best-effort stderr reporting on any failure rather than crashing the
+    // MCP server.
+    private func writeRecordToFile(_ data: Data) {
+        let currentSize = reopenIfRotatedAwayFromUnderUs()
+        rotateIfNeeded(currentSize: currentSize)
+        writeToFile(data)
+    }
+
     private func writeToFile(_ data: Data) {
         guard !suppressFileWritesUntilRotationSucceeds,
               let handle = fileHandle else { return }
@@ -348,7 +543,7 @@ public final class Logger: @unchecked Sendable {
             // high-value writes: the rotation banner (rotateIfNeeded) and
             // the synchronous FATAL path (logSync).
         } catch {
-            let msg = "[Logger] File write failed: \(error). Logging to stderr only for this line.\n"
+            let msg = "[Logger] File write failed: \(error). The stderr diagnostic attempt may be dropped under backpressure.\n"
             // Safe to take stderrLock here: writeToFile() only ever runs
             // inside `queue` (from log()'s queue.async or logSync()'s
             // queue.sync), and nothing holds stderrLock while waiting on
@@ -519,8 +714,8 @@ public final class Logger: @unchecked Sendable {
         guard fileHandle != nil else { return }
         guard let currentSize = currentSize ?? Logger.fileSize(atPath: logFileURL.path) else {
             // If the live path cannot be measured, continuing to append would
-            // make the retention limit unknowable. Keep stderr diagnostics and
-            // retry the file path on a later record.
+            // make the retention limit unknowable. Keep attempting bounded
+            // stderr diagnostics and retry the file path on a later record.
             suppressFileWritesUntilRotationSucceeds = true
             return
         }
@@ -676,7 +871,8 @@ public final class Logger: @unchecked Sendable {
             Logger.stderrLock.unlock()
             // The handle remains available for a later retry, but routine file
             // writes are suppressed meanwhile so this oversized file cannot
-            // grow without bound. stderr remains live for every log record.
+            // grow without bound. stderr continues only as bounded,
+            // best-effort delivery and may drop a record when its pipe is full.
             return
         }
 
@@ -727,15 +923,16 @@ public final class Logger: @unchecked Sendable {
         }
     }
 
-    // Synchronously logs `message` to stderr and to the log file, bypassing
-    // the normal `queue.async` path, then fsyncs. Intended for the rare
+    // Synchronously attempts `message` on stderr and writes it to the log
+    // file, bypassing the normal `queue.async` path, then fsyncs. Intended
+    // for the rare
     // call sites where the process may terminate (abort(), a re-raised
     // signal, etc.) before an async closure enqueued by log() would ever
     // get a chance to run -- e.g. NSSetUncaughtExceptionHandler in
     // the launcher entry point, whose handler runs immediately before the runtime calls
     // abort(). Without this, the one log line explaining a crash could be
-    // lost from the file (it would still reach stderr, since that part of
-    // log()'s formatting is already synchronous).
+    // lost from the file (stderr is also only a non-blocking best-effort
+    // diagnostic and can be full during a crash).
     //
     // MUST NOT be called from a closure already running on `queue` (i.e.
     // from within rotateIfNeeded/writeToFile/reopenIfRotatedAwayFromUnderUs,
@@ -814,5 +1011,27 @@ public final class Logger: @unchecked Sendable {
             end = next
         }
         return String(message[..<end]) + suffix
+    }
+
+    /// Produces one line that can be emitted atomically to a non-blocking
+    /// stderr pipe. Unlike `boundedMessage`, this includes the line's prefix
+    /// and newline in its byte budget, which is what makes the one-write
+    /// all-or-nothing guarantee apply to the complete diagnostic record.
+    static func boundedStderrLine(_ line: String) -> String {
+        guard line.utf8.count > maxStderrRecordBytes else { return line }
+
+        let terminator = line.hasSuffix("\n") ? "\n" : ""
+        let suffix = "... <stderr truncated>\(terminator)"
+        let prefixBudget = max(0, maxStderrRecordBytes - suffix.utf8.count)
+        var used = 0
+        var end = line.startIndex
+        while end < line.endIndex {
+            let next = line.index(after: end)
+            let count = line[end..<next].utf8.count
+            guard used + count <= prefixBudget else { break }
+            used += count
+            end = next
+        }
+        return String(line[..<end]) + suffix
     }
 }

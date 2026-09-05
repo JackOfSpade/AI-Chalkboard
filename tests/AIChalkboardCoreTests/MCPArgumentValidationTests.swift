@@ -192,6 +192,56 @@ final class MCPArgumentValidationTests: XCTestCase {
         }
     }
 
+    // MARK: - Catalog-derived strict argument boundary
+
+    func testUnknownTopLevelArgumentIsRejectedBeforeDispatch() throws {
+        let error = try XCTUnwrap(MCPToolCatalog.validateArguments(
+            toolName: "clear", args: ["annotation_iid": "mistyped"]
+        ))
+        XCTAssertTrue(error.contains("annotation_iid"))
+        XCTAssertTrue(error.contains("annotation_id"))
+    }
+
+    func testUnknownDrawingArgumentIsRejectedInsteadOfFallingBackToDefaults() throws {
+        let error = try XCTUnwrap(MCPToolCatalog.validateArguments(
+            toolName: "draw_path",
+            args: ["path_data": "M 0 0 L 1 1", "coordinate_spce": "normalized"]
+        ))
+        XCTAssertTrue(error.contains("coordinate_spce"))
+        XCTAssertTrue(error.contains("coordinate_space"))
+    }
+
+    func testRetiredDurationKeepsItsSpecificMigrationErrorAheadOfUnknownKeyValidation() throws {
+        let error = try XCTUnwrap(MCPToolCatalog.validateArguments(
+            toolName: "draw_shape",
+            args: ["duration_seconds": 1]
+        ))
+        XCTAssertTrue(error.contains("duration_seconds is no longer supported"))
+        XCTAssertTrue(error.contains("Nothing was drawn"))
+    }
+
+    func testBatchItemsRejectCrossTypeAndUnknownArgumentsBeforeAnyItemIsLoaded() throws {
+        let crossType = try XCTUnwrap(MCPToolCatalog.validateArguments(
+            toolName: "draw_batch",
+            args: ["items": [["type": "path", "path_data": "M 0 0 L 1 1", "image_path": "/tmp/a.png"]]]
+        ))
+        XCTAssertTrue(crossType.contains("items[0]"))
+        XCTAssertTrue(crossType.contains("image_path"))
+
+        let typo = try XCTUnwrap(MCPToolCatalog.validateArguments(
+            toolName: "draw_batch",
+            args: ["items": [["type": "shape", "shape": "circle", "center_x": 1, "center_y": 1, "radius": 1, "raduis": 1]]]
+        ))
+        XCTAssertTrue(typo.contains("raduis"))
+
+        let duration = try XCTUnwrap(MCPToolCatalog.validateArguments(
+            toolName: "draw_batch",
+            args: ["items": [["type": "text", "duration_seconds": 1]]]
+        ))
+        XCTAssertTrue(duration.contains("items[0]"))
+        XCTAssertTrue(duration.contains("duration_seconds is no longer supported"))
+    }
+
     // MARK: - Coordinate transform safety
 
     private func testScreen(width: Int = 3_024, height: Int = 1_964) -> ScreenInfo {

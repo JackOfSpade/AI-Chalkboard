@@ -43,10 +43,14 @@ final class AccessibilityElementResolverTests: XCTestCase {
 
     // Windows-only note: every test below through
     // `testZeroOriginAnchorIsUsedEvenWhenItIsNeitherScreensFirstNorIsMain`
-    // encodes macOS-specific coordinate-space semantics that do not hold on
-    // Windows, confirmed by actually running this suite on Windows (all
-    // five failed with wrong numbers/unexpected nils before this guard was
-    // added, not merely a hypothesized difference):
+    // exercises macOS AX-only publishing behavior or coordinate-space
+    // semantics. The first three tests use AX attribute constants and the
+    // macOS resolver's `publishedMatchLabel`; Windows UIA never returns the
+    // matched provider value to Swift and publishes the caller's query
+    // instead, so there is no raw surrounding value to test there. The five
+    // coordinate tests do not hold on Windows, confirmed by actually running
+    // this suite there (all five failed with wrong numbers/unexpected nils
+    // before this guard was added, not merely a hypothesized difference):
     //   * macOS AX reports element frames in POINTS, which `backingRect`
     //     must multiply by `backingScaleFactor` to reach physical backing
     //     pixels -- these fixtures build a `scale: 2` screen and an AX
@@ -73,6 +77,48 @@ final class AccessibilityElementResolverTests: XCTestCase {
     //     "missing anchor" / "anchor is not first/main" scenarios to
     //     exercise there.
     #if os(macOS)
+    func testValueMatchPublishesTheQueryNotSurroundingEditableContent() {
+        // `contains` only establishes that the query occurs somewhere in an
+        // editable field. The raw AXValue may contain a document, password,
+        // or other user content on either side, none of which may reach the
+        // annotation label or MCP result.
+        let rawValue = "Private draft before needle and private draft after"
+        let label = AccessibilityElementResolver.publishedMatchLabel(
+            attribute: kAXValueAttribute,
+            value: rawValue,
+            query: "needle"
+        )
+        XCTAssertEqual(label, "needle")
+        XCTAssertFalse(label.contains("Private"))
+        XCTAssertFalse(label.contains("before"))
+        XCTAssertFalse(label.contains("after"))
+    }
+
+    func testPublishedMatchedLabelIsBoundedWithoutSplittingUnicode() {
+        let rawTitle = String(repeating: "😀", count: AccessibilityElementResolver.maxPublishedLabelCharacters + 10)
+        let label = AccessibilityElementResolver.publishedMatchLabel(
+            attribute: kAXTitleAttribute,
+            value: rawTitle,
+            query: "unused"
+        )
+        XCTAssertEqual(label.count, AccessibilityElementResolver.maxPublishedLabelCharacters)
+        XCTAssertTrue(label.hasSuffix("…"))
+        XCTAssertFalse(label.contains("�"))
+    }
+
+    func testLongValueQueryIsAlsoBoundedBeforeItCanBeStoredOrReturned() {
+        let query = String(repeating: "x", count: AccessibilityElementResolver.maxPublishedLabelCharacters + 10)
+        let label = AccessibilityElementResolver.publishedMatchLabel(
+            attribute: kAXValueAttribute,
+            value: "prefix \(query) suffix",
+            query: query
+        )
+        XCTAssertEqual(label.count, AccessibilityElementResolver.maxPublishedLabelCharacters)
+        XCTAssertTrue(label.hasSuffix("…"))
+        XCTAssertFalse(label.contains("prefix"))
+        XCTAssertFalse(label.contains("suffix"))
+    }
+
     func testPrimaryDisplayAccessibilityFrameConvertsToLocalBackingPixels() throws {
         let primary = screen(
             id: "main",

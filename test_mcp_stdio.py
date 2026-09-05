@@ -6,7 +6,7 @@ import math
 import subprocess
 import json
 import os
-import select
+import queue
 import shutil
 import struct
 import sys
@@ -119,13 +119,11 @@ def parse_args():
 def stderr_diagnostics(drain):
     """Returns any stderr this harness's `StderrDrain` has collected from the
     child, formatted for appending to a failure message -- or "" if there is
-    none. This used to read the child's stderr pipe directly, once, after the
-    process had already exited; that is exactly the post-mortem-only read
-    `StderrDrain`'s own doc comment explains is unsafe (a large enough
-    synchronous log line can wedge the child on a full pipe before it ever
-    gets that far). Draining continuously throughout the run instead, via
-    `drain`, is the fix; this function's job is now just formatting whatever
-    tail `drain` already collected.
+    none. Draining continuously gives ordinary host-like behavior and captures
+    useful diagnostics before teardown. The server itself no longer depends on
+    the drain for progress: macOS stderr writes are bounded and non-blocking,
+    while Windows submits bounded writes to a bounded background worker. This
+    function only formats the bounded tail already collected by `drain`.
     """
     output = drain.join_and_get_tail(timeout=SHUTDOWN_TIMEOUT_SECONDS).strip()
     if not output:
@@ -162,28 +160,14 @@ def terminate_child(proc):
 class StderrDrain:
     """Continuously drains a child process's stderr on a background thread.
 
-    WHY THIS EXISTS: the risk is AGGREGATE, not per-call.
-    `MCPServer.handleToolsCall` logs one line per call, synchronously BEFORE
-    the tool body runs, and this harness used to read the child's stderr only
-    once, at the very end, after the process had already exited (the old
-    `stderr_diagnostics`). Nothing therefore drained the pipe while the child
-    was running, so the CUMULATIVE stderr of a run -- a harness sends dozens
-    of tools/call requests, and the child also logs outside the dispatch path
-    -- eventually fills the 64 KB macOS pipe buffer, at which point the
-    child's next write(2) blocks indefinitely. Because that logging happens
-    ahead of the tool body, a wedged log wedges the JSON-RPC response too --
-    indistinguishable, from this script's side, from the server simply
-    hanging. No SINGLE line can do this any more: the argument rendering goes
-    through `redactedArgumentSummary` (Sources/MCP/MCPToolHandlers.swift),
-    whose `capped()` helper truncates to 2 KiB, so even a 100-item
-    `draw_batch` or a path near the 200,000-character cap logs ~2 KiB. It is
-    the sum across a run that overruns the buffer. Continuously draining
-    stderr throughout the run, as any reasonable MCP host's stdio transport
-    would, is the actual fix; keeping only a bounded tail (not an unbounded
-    read) keeps the fix itself from becoming an unbounded-memory version of
-    the same problem. Every harness in this repo that spawns an MCP child
-    uses this same drain now (see `spawn_mcp_child`), not just the one where
-    the bug was first noticed.
+    This mirrors an ordinary MCP host and retains a useful diagnostic tail
+    during a long run. It is not a transport-progress requirement: Logger
+    limits every stderr attempt to 512 bytes and either writes non-blockingly
+    (macOS) or submits to a bounded background worker (Windows), dropping
+    records under sustained backpressure. Keep only a bounded tail so the
+    harness's diagnostics collection cannot become unbounded memory itself.
+    Every harness in this repo that spawns an MCP child uses this helper (see
+    `spawn_mcp_child`) for consistent failure reporting.
     """
 
     def __init__(self, proc):
@@ -242,7 +226,17 @@ def write_solid_png(path, width, height, rgba=(36, 42, 52, 255)):
 
 
 class MCPLineReader:
-    """Deadline- and size-bound newline framing over child stdout."""
+    """Deadline- and size-bound newline framing over child stdout.
+
+    A background reader is used on every platform because Python's
+    ``select()`` accepts anonymous subprocess pipes on POSIX but only sockets
+    on Windows. The queue is bounded to roughly one maximum-size response, so
+    a broken child still cannot turn eager stdout draining into unbounded
+    harness memory.
+    """
+
+    _read_chunk_bytes = 65_536
+    _eof = object()
 
     def __init__(self, proc, max_response_bytes=MAX_MCP_RESPONSE_BYTES):
         if proc.stdout is None:
@@ -253,6 +247,22 @@ class MCPLineReader:
         self.fd = proc.stdout.fileno()
         self.buffer = bytearray()
         self.max_response_bytes = max_response_bytes
+        queue_capacity = max(2, (max_response_bytes // self._read_chunk_bytes) + 2)
+        self._chunks = queue.Queue(maxsize=queue_capacity)
+        self._reader_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        self._reader_thread.start()
+
+    def _read_stdout(self):
+        while True:
+            try:
+                chunk = os.read(self.fd, self._read_chunk_bytes)
+            except OSError as error:
+                self._chunks.put(error)
+                return
+            if not chunk:
+                self._chunks.put(self._eof)
+                return
+            self._chunks.put(chunk)
 
     def _ensure_buffer_within_transport_limit(self, method):
         """Rejects any complete or partial buffered line beyond the wire cap.
@@ -307,14 +317,20 @@ class MCPLineReader:
                     f"{self.proc.pid}).{partial}"
                 )
 
-            ready, _, _ = select.select([self.fd], [], [], remaining)
-            if not ready:
+            try:
+                chunk = self._chunks.get(timeout=remaining)
+            except queue.Empty:
                 continue
 
-            chunk = os.read(self.fd, 65536)
-            if chunk:
+            if isinstance(chunk, bytes):
                 self.buffer.extend(chunk)
                 continue
+            if isinstance(chunk, OSError):
+                partial = f" Partial response: {bytes(self.buffer)!r}." if self.buffer else ""
+                raise RuntimeError(
+                    f"Failed to read MCP child stdout while waiting for {method}: "
+                    f"{chunk}.{partial}"
+                ) from chunk
 
             exit_code = self.proc.poll()
             status = f"exit code {exit_code}" if exit_code is not None else "stdout EOF"
@@ -362,10 +378,10 @@ def send_request(proc, reader, request, timeout_seconds):
 
 def spawn_mcp_child(binary_path, extra_env=None):
     """Launches `binary_path --mcp` with stdio pipes, wraps its stdout in an
-    MCPLineReader, and starts a StderrDrain on it immediately -- before this
-    function returns, and therefore before any request is ever sent -- so a
-    large synchronous log line (see StderrDrain's doc comment) can never
-    wedge the child while nothing is listening to its stderr. Returns
+    MCPLineReader, and starts a StderrDrain before returning. The drain keeps
+    normal-host behavior and bounded failure diagnostics. Logger keeps protocol
+    progress independent of the drain on both platforms: direct non-blocking
+    writes on macOS, a bounded writer handoff on Windows. Returns
     `(proc, reader, drain)`.
 
     This same ~10-line Popen call was duplicated three times across this
@@ -563,7 +579,7 @@ def main():
         }, args.timeout)
         tools = [t["name"] for t in list_res["result"]["tools"]]
         print("Available tools:", tools, flush=True)
-        assert {"draw_path", "draw_image", "draw_text", "draw_batch", "suspend_annotations", "resume_annotations", "verify_annotation", "verify_presentation"}.issubset(tools)
+        assert {"draw_path", "draw_shape", "draw_image", "draw_text", "draw_batch", "suspend_annotations", "resume_annotations", "verify_annotation", "verify_presentation"}.issubset(tools)
         assert not {"draw_circle", "draw_arrow", "draw_box", "draw_label", "draw_grid"}.intersection(tools)
 
         print("\n3. Testing SVG 'draw_path' for a free-drawn circle...", flush=True)
@@ -587,6 +603,35 @@ def main():
         path_text = path_res["result"]["content"][0]["text"]
         path_annotation_id = path_text.split("annotation: ", 1)[1].split()[0]
 
+        print("\n3a. Testing first-class 'draw_shape' storage and permanent-annotation rejection...", flush=True)
+        shape_res = send_request(proc, reader, {
+            "jsonrpc": "2.0",
+            "id": _next_id(),
+            "method": "tools/call",
+            "params": {
+                "name": "draw_shape",
+                "arguments": {
+                    "shape": "circle", "center_x": 240, "center_y": 160, "radius": 36,
+                    "stroke_color": "#FF00FF", "stroke_width": 3,
+                    "fill_color": "#00FFFF", "fill_opacity": 0.25,
+                    "dash": [6, 3], "app": "",
+                },
+            },
+        }, args.timeout)
+        shape_text = shape_res["result"]["content"][0]["text"]
+        print("draw_shape response:", shape_text, flush=True)
+        shape_annotation_id = shape_text.split("annotation: ", 1)[1].split()[0]
+
+        retired_duration_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_shape", "arguments": {
+                "shape": "circle", "center_x": 320, "center_y": 160, "radius": 24,
+                "app": "", "duration_seconds": 1,
+            }},
+        }, args.timeout)
+        assert retired_duration_res["result"].get("isError") is True
+        assert "duration_seconds is no longer supported" in retired_duration_res["result"]["content"][0]["text"]
+
         print("\n4. Testing arbitrary raster 'draw_image'...", flush=True)
         asset_png = tempfile.NamedTemporaryFile(prefix="ai-chalkboard-asset-", suffix=".png", delete=False)
         asset_png.close()
@@ -604,7 +649,6 @@ def main():
                     "rotation_degrees": 12,
                     "opacity": 0.8,
                     "app": "",
-                    "duration_seconds": 60,
                 }
             }
         }, args.timeout)
@@ -618,12 +662,38 @@ def main():
                 "x": 120, "y": 80, "font_size": 22,
                 "color": "#FFFFFF", "background_color": "#000000",
                 "background_opacity": 0.7, "padding_px": 4, "opacity": 0.9,
-                "app": "", "duration_seconds": 60,
+                "app": "",
             }},
         }, args.timeout)
         text_draw_message = text_res["result"]["content"][0]["text"]
         print("draw_text response:", text_draw_message, flush=True)
         text_annotation_id = text_draw_message.split("annotation: ", 1)[1].split()[0]
+
+        # Validation is intentionally before AppKit layout. This request is
+        # syntactically valid but would otherwise ask the unwrapped renderer
+        # for a pathological text/background surface.
+        excessive_text_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_text", "arguments": {
+                "text": "x", "x": 120, "y": 80,
+                "font_size": 100000, "padding_px": 100000, "app": "",
+            }},
+        }, args.timeout)
+        assert excessive_text_res["result"].get("isError") is True, excessive_text_res
+        assert "Text render extent exceeds the safe layout budget" in excessive_text_res["result"]["content"][0]["text"]
+
+        # Updates rebuild text independently of draw_text, so pin the same
+        # budget gate there and ensure a rejected patch leaves the existing
+        # normal-size annotation available for later verification.
+        excessive_text_update_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "update_annotation", "arguments": {
+                "annotation_id": text_annotation_id,
+                "font_size": 100000, "padding_px": 100000,
+            }},
+        }, args.timeout)
+        assert excessive_text_update_res["result"].get("isError") is True, excessive_text_update_res
+        assert "Text render extent exceeds the safe layout budget" in excessive_text_update_res["result"]["content"][0]["text"]
 
         batch_res = send_request(proc, reader, {
             "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
@@ -636,6 +706,19 @@ def main():
             }},
         }, args.timeout)
         assert "atomic free-draw batch (2 items)" in batch_res["result"]["content"][0]["text"]
+
+        excessive_batch_text_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_batch", "arguments": {
+                "app": "",
+                "items": [{
+                    "type": "text", "text": "x", "x": 10, "y": 20,
+                    "font_size": 100000, "padding_px": 100000,
+                }],
+            }},
+        }, args.timeout)
+        assert excessive_batch_text_res["result"].get("isError") is True, excessive_batch_text_res
+        assert "Text render extent exceeds the safe layout budget" in excessive_batch_text_res["result"]["content"][0]["text"]
 
         print("\n6. Testing 'list_annotations'...", flush=True)
         ann_res = send_request(proc, reader, {
@@ -652,12 +735,35 @@ def main():
         annotations = json.loads(annotations_text)["annotations"]
         image_annotation = next((a for a in annotations if a.get("type") == "image"), None)
         assert image_annotation is not None
-        assert isinstance(image_annotation.get("expiresAt"), str)
-        assert image_annotation.get("remainingSeconds", 0) > 0
+        # Annotations persist until an explicit clear, so their public wire
+        # representation must not revive the removed expiry/TTL fields.
+        assert "expiresAt" not in image_annotation
+        assert "remainingSeconds" not in image_annotation
         text_annotation = next((a for a in annotations if a.get("id") == text_annotation_id), None)
         assert text_annotation is not None
         assert text_annotation.get("type") == "text"
         assert any(a.get("type") == "batch" for a in annotations)
+        shape_annotation = next((a for a in annotations if a.get("id") == shape_annotation_id), None)
+        assert shape_annotation is not None, "a successful draw_shape must be retained until clear"
+        assert shape_annotation.get("type") == "path"
+        assert shape_annotation.get("scope") == "global"
+        assert shape_annotation.get("appId") is None
+        assert "expiresAt" not in shape_annotation
+        assert "remainingSeconds" not in shape_annotation
+        shape_vector = shape_annotation.get("kind", {}).get("vectorPath")
+        assert isinstance(shape_vector, dict), shape_annotation
+        assert shape_vector.get("data") == (
+            "M 204.0 160.0 A 36.0 36.0 0 1 0 276.0 160.0 "
+            "A 36.0 36.0 0 1 0 204.0 160.0 Z"
+        )
+        assert shape_vector.get("strokeColorHex") == "#FF00FF"
+        assert shape_vector.get("strokeWidth") == 3
+        assert shape_vector.get("fillColorHex") == "#00FFFF"
+        assert shape_vector.get("fillOpacity") == 0.25
+        assert shape_vector.get("dash") == [6, 3]
+        assert shape_vector.get("usesEvenOddFillRule") is False
+        assert shape_vector.get("coordinateScaleX") == 1
+        assert shape_vector.get("coordinateScaleY") == 1
 
         print("\n6a. Testing temporary annotation suspension preserves the draw state...", flush=True)
         # The implementation broadcasts suspension to sibling Chalkboard
@@ -728,7 +834,7 @@ def main():
             suspended_text = next((a for a in suspended_annotations if a.get("id") == text_annotation_id), None)
             assert suspended_text is not None, "suspension must not clear an annotation or mint it a new ID"
             assert suspended_text.get("type") == "text"
-            assert suspended_text.get("remainingSeconds", 0) > 0, "suspension must not discard a live annotation's TTL"
+            assert "remainingSeconds" not in suspended_text, "annotations have no TTL to preserve during suspension"
         finally:
             if suspension_token is not None:
                 resume_res = resume_annotations_with_retry(
@@ -828,6 +934,43 @@ def main():
         assert verify_metadata["screenshotPixels"] == {"width": preview_width, "height": preview_height}
         print("verify_annotation metadata:", json.dumps(verify_metadata, sort_keys=True), flush=True)
 
+        # A misspelled exact-ID selector used to be ignored, causing `clear`
+        # to fall back to its active-app/default behavior. The durable global
+        # shape is a deliberately visible sentinel: if the malformed request
+        # ever reaches that fallback, it is deleted. This is an end-to-end
+        # proof that protocol validation runs before annotation mutation.
+        typo_clear_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "clear", "arguments": {"annotation_iid": shape_annotation_id}},
+        }, args.timeout)
+        assert typo_clear_res["result"].get("isError") is True, typo_clear_res
+        assert "annotation_iid" in typo_clear_res["result"]["content"][0]["text"]
+        after_typo_clear_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "list_annotations", "arguments": {}},
+        }, args.timeout)
+        after_typo_clear = json.loads(after_typo_clear_res["result"]["content"][0]["text"])["annotations"]
+        assert any(annotation.get("id") == shape_annotation_id for annotation in after_typo_clear), (
+            "a malformed clear request must not delete its sentinel annotation"
+        )
+
+        # Clear the confirmed-live sentinel by exact ID before the following
+        # app-target clear, which intentionally also clears global drawings.
+        # Doing this afterwards could only prove that clear tolerates an
+        # already-missing ID, not that exact undo removed this shape.
+        shape_clear_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "clear", "arguments": {"annotation_id": shape_annotation_id}},
+        }, args.timeout)
+        assert not shape_clear_res["result"].get("isError", False), shape_clear_res
+        assert shape_clear_res["result"]["content"][0]["text"] == f"Cleared annotation {shape_annotation_id}"
+        shape_after_clear_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "list_annotations", "arguments": {}},
+        }, args.timeout)
+        shape_after_clear = json.loads(shape_after_clear_res["result"]["content"][0]["text"])["annotations"]
+        assert not any(annotation.get("id") == shape_annotation_id for annotation in shape_after_clear)
+
         clear_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
             "id": _next_id(),
@@ -852,7 +995,7 @@ def main():
         assert not any(annotation.get("appId") == "com.example.ClearTarget" for annotation in after_clear)
         assert any(annotation.get("appId") == "com.example.PreserveTarget" for annotation in after_clear)
 
-        print("\nAll draw, suspension/resume, expiry-metadata, annotation-list, image-verification, and explicit-clear MCP tests PASSED!", flush=True)
+        print("\nAll draw, shape, suspension/resume, persistence-metadata, annotation-list, image-verification, and explicit-clear MCP tests PASSED!", flush=True)
     except Exception:
         failed = True
         raise

@@ -23,6 +23,13 @@ import WinSDK
 /// `source` identifier rather than pretending to know a Git revision.
 enum BuildMetadata {
     static let productVersion = "2.1.0"
+
+    /// `CFBundleVersion` for distributed bundles. Increment this before every
+    /// distribution, independently of the user-facing product version. Apple
+    /// accepts one to three period-separated non-negative integer components;
+    /// `1` is the initial distributed build number.
+    static let bundleVersion = "1"
+
     static let buildIdentifierInfoKey = "AIChalkboardBuildIdentifier"
     static let sourceBuildIdentifier = "source"
     /// Name of the sidecar file build_app.ps1 writes next to the .exe. Must

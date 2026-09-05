@@ -85,6 +85,18 @@ final class AnnotationStoreTests: XCTestCase {
         )
     }
 
+    /// Builds an indirect batch tree without recursive test helpers. `depth`
+    /// is the number of `.batch` containers from root to its leaf, matching
+    /// AnnotationStore's intake definition exactly.
+    private func nestedBatch(depth: Int, leaf: AnnotationKind) -> AnnotationKind {
+        precondition(depth >= 0)
+        var kind = leaf
+        for _ in 0..<depth {
+            kind = .batch(items: [AnnotationComponent(kind: kind)])
+        }
+        return kind
+    }
+
     func testClearVisibleReturnsLiveRemovalCountAndPreservesRemainder() {
         let store = AnnotationStore()
         store.add(annotation(id: "global", appId: nil))
@@ -384,6 +396,108 @@ final class AnnotationStoreTests: XCTestCase {
         XCTAssertEqual(limit, DrawingDefaults.maxRetainedAnnotationPrimitives)
         XCTAssertEqual(attempted, DrawingDefaults.maxRetainedAnnotationPrimitives + 1)
         XCTAssertTrue(store.getAll().isEmpty)
+    }
+
+    func testBatchNestingAtSafetyLimitIsStoredAndCodable() throws {
+        let store = AnnotationStore()
+        let candidate = Annotation(
+            id: "deep-but-safe", screenId: "1",
+            kind: nestedBatch(
+                depth: DrawingDefaults.maxAnnotationBatchNestingDepth,
+                leaf: annotation(id: "leaf", appId: nil).kind
+            )
+        )
+
+        XCTAssertEqual(store.addWithOutcome(candidate), .added)
+        let stored = try XCTUnwrap(store.get(id: candidate.id))
+        XCTAssertNoThrow(try JSONEncoder().encode(stored),
+                          "the store cap keeps public Codable/list exposure safely bounded")
+        XCTAssertEqual(
+            store.retainedResourceUsage.primitiveCount,
+            DrawingDefaults.maxAnnotationBatchNestingDepth,
+            "one direct/nested component remains one work unit, preserving ordinary batch accounting"
+        )
+    }
+
+    func testOverdeepBatchAddIsRejectedWithoutMutationOrStackGrowth() {
+        let store = AnnotationStore()
+        let existing = annotation(id: "existing", appId: nil)
+        XCTAssertEqual(store.addWithOutcome(existing), .added)
+        let beforeUsage = store.retainedResourceUsage
+
+        // Much deeper than the cap proves the iterative intake walk rejects a
+        // programmatic tree before recursive renderer/Codable paths can see it.
+        // The separate iterative asset traversal must be just as defensive,
+        // because cleanup code can receive a rejected caller-owned candidate.
+        let deepRasterTree = nestedBatch(
+            depth: 4_096,
+            leaf: .image(assetId: "unretained-deep-raster", x: 0, y: 0, width: 1, height: 1,
+                         rotationDegrees: 0, opacity: 1)
+        )
+        XCTAssertEqual(deepRasterTree.rasterAssetIds, ["unretained-deep-raster"])
+        let candidate = Annotation(
+            id: "too-deep", screenId: "1",
+            kind: deepRasterTree
+        )
+        let outcome = store.addWithOutcome(candidate)
+        guard case .rejected(.batchNestingDepth(let limit, let attempted)) = outcome else {
+            return XCTFail("expected nesting-depth rejection, got \(outcome)")
+        }
+        XCTAssertEqual(limit, DrawingDefaults.maxAnnotationBatchNestingDepth)
+        XCTAssertEqual(attempted, DrawingDefaults.maxAnnotationBatchNestingDepth + 1)
+        XCTAssertEqual(store.getAll().map(\.id), [existing.id])
+        XCTAssertEqual(store.retainedResourceUsage, beforeUsage)
+    }
+
+    func testOverdeepBatchUpdateIsRejectedAndKeepsExistingRasterOwnership() throws {
+        let store = AnnotationStore()
+        let initial = try rasterBackedAnnotation(id: "raster-target")
+        let assetID = try XCTUnwrap(initial.kind.rasterAssetIds.first)
+        XCTAssertEqual(store.addWithOutcome(initial), .added)
+
+        let replacement = Annotation(
+            id: initial.id, screenId: initial.screenId,
+            kind: nestedBatch(depth: DrawingDefaults.maxAnnotationBatchNestingDepth + 1, leaf: initial.kind),
+            createdAt: initial.createdAt
+        )
+        let outcome = store.updateWithOutcome(id: initial.id, with: replacement)
+        guard case .rejected(.batchNestingDepth(let limit, let attempted)) = outcome else {
+            return XCTFail("expected nesting-depth rejection, got \(outcome)")
+        }
+        XCTAssertEqual(limit, DrawingDefaults.maxAnnotationBatchNestingDepth)
+        XCTAssertEqual(attempted, DrawingDefaults.maxAnnotationBatchNestingDepth + 1)
+        XCTAssertEqual(store.get(id: initial.id)?.kind.typeName, "image")
+        XCTAssertNotNil(RasterAssetStore.shared.descriptor(for: assetID),
+                        "a rejected replacement must not release the raster still owned by the old annotation")
+
+        XCTAssertEqual(store.clearAll(), 1)
+        XCTAssertNil(RasterAssetStore.shared.descriptor(for: assetID),
+                     "the original raster remains owned until its stored annotation is explicitly removed")
+    }
+
+    func testNestedEmptyBatchComponentsCountTowardRetainedWorkBudget() {
+        let store = AnnotationStore()
+        let emptyBatch = AnnotationKind.batch(items: [])
+        let nestedEmpty = AnnotationKind.batch(items: Array(
+            repeating: AnnotationComponent(kind: emptyBatch),
+            count: DrawingDefaults.maxBatchItems
+        ))
+        let broadTree = Annotation(
+            id: "broad-empty-tree", screenId: "1",
+            kind: .batch(items: Array(
+                repeating: AnnotationComponent(kind: nestedEmpty),
+                count: DrawingDefaults.maxBatchItems
+            ))
+        )
+
+        let outcome = store.addWithOutcome(broadTree)
+        guard case .rejected(.primitiveCount(let limit, let attempted)) = outcome else {
+            return XCTFail("expected retained-work rejection, got \(outcome)")
+        }
+        XCTAssertEqual(limit, DrawingDefaults.maxRetainedAnnotationPrimitives)
+        XCTAssertEqual(attempted, DrawingDefaults.maxBatchItems * (DrawingDefaults.maxBatchItems + 1))
+        XCTAssertTrue(store.getAll().isEmpty,
+                      "container-only trees must not bypass the aggregate work cap")
     }
 
     // MARK: - Incremental running-total accounting

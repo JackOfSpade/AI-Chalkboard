@@ -129,6 +129,32 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
     }
     #endif
 
+    /// AppDelegate starts MCP from the asynchronous bootstrap completion, so
+    /// a bad registry must still invoke that hand-off on the platform UI
+    /// thread. Otherwise a secure fail-closed startup would turn into an
+    /// invisible process that never reads its stdio transport at all.
+    func testAsyncBootstrapCompletionRunsForFailClosedRegistry() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardAsyncBootstrapFailureTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("not a directory".utf8).write(to: root)
+
+        let coordinator = SuspensionLeaseCoordinator(storageDirectory: root)
+        let completion = expectation(description: "async bootstrap completes even on registry failure")
+        var completedSnapshot: SuspensionLeaseSnapshot?
+        coordinator.bootstrapAndReconcileAsynchronously { snapshot in
+            XCTAssertTrue(MainThread.isCurrentUIThread)
+            completedSnapshot = snapshot
+            completion.fulfill()
+        }
+        wait(for: [completion], timeout: 2)
+
+        let snapshot = try XCTUnwrap(completedSnapshot)
+        XCTAssertFalse(snapshot.isBootstrapped)
+        XCTAssertTrue(snapshot.annotationsSuspended)
+        XCTAssertNotNil(snapshot.error)
+    }
+
     func testExpiryCreatesTombstoneAndCannotLeaveLeaseSuspended() throws {
         try withTemporaryCoordinator { coordinator, _ in
             _ = coordinator.bootstrapAndReconcile()
@@ -510,6 +536,90 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         _ = acquirer.releaseLease(token: token)
     }
 
+    /// A peer can hold the durable lock while it is atomically committing a
+    /// lease. That must never turn a platform-UI repaint, timer tick, or
+    /// cross-process notification handler into the old one-second UI-thread
+    /// sleep loop. A busy permit is deliberately a fail-closed answer: the
+    /// caller may order windows out, but cannot order one front until a later
+    /// durable permit proves no acquisition crossed its decision.
+    func testMainThreadPermitAndReconciliationSchedulingDoNotWaitForHeldPeerLock() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardPermitNonblockingTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let presenter = SuspensionLeaseCoordinator(storageDirectory: directory, instanceNonce: "presenter")
+        XCTAssertFalse(presenter.bootstrapAndReconcile().annotationsSuspended)
+
+        let peerHasLock = DispatchSemaphore(value: 0)
+        let releasePeer = DispatchSemaphore(value: 0)
+        let peerFinished = expectation(description: "peer mutation finishes after lock release")
+        let resultLock = NSLock()
+        var peerResult: SuspensionLeaseOperationResult?
+        let peer = SuspensionLeaseCoordinator(
+            storageDirectory: directory,
+            instanceNonce: "peer",
+            storagePrecommitHook: {
+                peerHasLock.signal()
+                _ = releasePeer.wait(timeout: .now() + 3)
+            }
+        )
+        DispatchQueue.global().async {
+            let result = peer.acquireLease(seconds: 60)
+            resultLock.lock(); peerResult = result; resultLock.unlock()
+            peerFinished.fulfill()
+        }
+        XCTAssertEqual(peerHasLock.wait(timeout: .now() + 2), .success,
+                       "the test must exercise a genuinely held flock")
+
+        var bodySnapshot: SuspensionLeaseSnapshot?
+        var permitElapsed = 0.0
+        let permit = runOnPlatformUIThread {
+            XCTAssertTrue(MainThread.isCurrentUIThread)
+            let permitStarted = ProcessInfo.processInfo.systemUptime
+            let result = presenter.withPresentationPermit { bodySnapshot = $0 }
+            permitElapsed = ProcessInfo.processInfo.systemUptime - permitStarted
+            return result
+        }
+        XCTAssertLessThan(permitElapsed, 0.25,
+                          "a busy main-thread permit must fail immediately, not retry for one second")
+        XCTAssertNotNil(permit.error)
+        XCTAssertTrue(permit.annotationsSuspended)
+        XCTAssertEqual(bodySnapshot, permit, "the fail-closed snapshot reaches the ordering closure")
+
+        // The failed permit itself schedules one background repair worker.
+        // Every subsequent timer/notification wake-up folds into it while the
+        // peer still owns flock.  The scheduler does no directory I/O or
+        // synchronous lock retry here, and prevents a notification flood from
+        // queuing an unbounded number of reconciliation tasks.
+        let scheduleStarted = ProcessInfo.processInfo.systemUptime
+        XCTAssertFalse(presenter.reconcileAsynchronously(),
+                       "the busy permit must already have enqueued its one repair worker")
+        for generation in 1...32 {
+            XCTAssertFalse(presenter.reconcileAsynchronously(announcedGeneration: UInt64(generation)))
+        }
+        let schedulingElapsed = ProcessInfo.processInfo.systemUptime - scheduleStarted
+        XCTAssertLessThan(schedulingElapsed, 0.25,
+                          "coalescing a held-lock reconciliation must return to the main run loop promptly")
+
+        releasePeer.signal()
+        wait(for: [peerFinished], timeout: 5)
+        resultLock.lock(); let result = peerResult; resultLock.unlock()
+        XCTAssertTrue(result?.success == true)
+        let reconciliationDeadline = Date().addingTimeInterval(2)
+        while !presenter.snapshot().annotationsSuspended && Date() < reconciliationDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertTrue(presenter.snapshot().annotationsSuspended,
+                      "the coalesced worker must eventually apply the peer's durable lease")
+        if let token = result?.leaseToken {
+            _ = peer.releaseLease(token: token)
+        }
+    }
+
     func testReleaseFinalSettleReturnsConcurrentNewerAcquire() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AIChalkboardLeaseRaceTests-\(UUID().uuidString)", isDirectory: true)
@@ -617,5 +727,333 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         XCTAssertFalse(result.success)
         XCTAssertTrue(result.annotationsSuspended)
         XCTAssertNotNil(result.error)
+    }
+
+    // MARK: - Refusals are not registry failures
+
+    /// A refused ARGUMENT must not be reported as a broken REGISTRY.
+    ///
+    /// Every refusal inside a mutation used to throw `.unavailable`, which
+    /// landed in the fail-closed catch: the process ordered its overlays off
+    /// screen, logged "suspension registry unavailable" about a registry it had
+    /// just read successfully, and dropped `isBootstrapped`. Releasing an
+    /// already-stale token -- an ordinary, expected thing for an agent to do --
+    /// therefore blanked the user's annotations until a reconcile tick swept
+    /// them back. Caught in the two-process integration log, where a
+    /// deliberately-rejected cross-process idempotency key produced an ERROR
+    /// line in an otherwise passing run.
+    func testRefusedArgumentsDoNotFailTheRegistryClosed() throws {
+        try withTemporaryCoordinator { coordinator, _ in
+            XCTAssertFalse(coordinator.bootstrapAndReconcile().annotationsSuspended)
+            let live = coordinator.acquireLease(seconds: 60)
+            let liveToken = try XCTUnwrap(live.leaseToken)
+            XCTAssertTrue(live.annotationsSuspended)
+
+            // An unknown token is a bad argument, not a broken registry.
+            let unknown = coordinator.releaseLease(token: String(repeating: "B", count: 43))
+            XCTAssertFalse(unknown.success)
+            XCTAssertNotNil(unknown.error)
+            XCTAssertTrue(unknown.annotationsSuspended,
+                          "the live lease still owns the presentation after an unrelated refusal")
+            XCTAssertEqual(unknown.activeLeaseCount, 1, "a refusal must not report the registry as empty")
+
+            let afterRefusal = coordinator.snapshot()
+            XCTAssertTrue(afterRefusal.isBootstrapped,
+                          "a refused argument must not mark the registry unbootstrapped")
+            XCTAssertNil(afterRefusal.error, "a refusal is not a registry error")
+            XCTAssertEqual(afterRefusal.activeLeaseCount, 1)
+
+            // The real lease is untouched and still releasable.
+            let released = coordinator.releaseLease(token: liveToken)
+            XCTAssertTrue(released.success)
+            XCTAssertFalse(released.alreadyReleased)
+            XCTAssertFalse(released.annotationsSuspended)
+        }
+    }
+
+    func testRefusalImmediatelyAppliesANewerPeerLease() throws {
+        try withTemporaryCoordinator { coordinator, directory in
+            XCTAssertFalse(coordinator.bootstrapAndReconcile().annotationsSuspended)
+
+            let peer = SuspensionLeaseCoordinator(storageDirectory: directory, instanceNonce: "peer")
+            let key = "b1c2d3e4-f5a6-4b7c-8d9e-0f1a2b3c4d5e"
+            let acquired = peer.acquireLease(seconds: 60, idempotencyKey: key)
+            let token = try XCTUnwrap(acquired.leaseToken)
+            XCTAssertTrue(acquired.success)
+            XCTAssertTrue(acquired.annotationsSuspended)
+
+            // This coordinator has not reconciled the peer's mutation yet.
+            XCTAssertFalse(coordinator.snapshot().annotationsSuspended)
+
+            let refused = coordinator.acquireLease(seconds: 60, idempotencyKey: key)
+            XCTAssertFalse(refused.success)
+            XCTAssertNotNil(refused.error)
+            XCTAssertTrue(refused.annotationsSuspended,
+                          "the clean refusal read must still update presentation from canonical state")
+            XCTAssertEqual(refused.activeLeaseCount, 1)
+            XCTAssertTrue(coordinator.snapshot().annotationsSuspended)
+
+            _ = peer.releaseLease(token: token)
+        }
+    }
+
+    /// The counterpart: a genuine storage failure must STILL fail closed.
+    func testGenuineRegistryFailureStillFailsClosed() throws {
+        try withTemporaryCoordinator { coordinator, _ in
+            XCTAssertFalse(coordinator.bootstrapAndReconcile().annotationsSuspended)
+            let failed = coordinator.testOnlyInstallFailure("simulated storage failure")
+            XCTAssertTrue(failed.annotationsSuspended, "an unknown state must hide the overlays")
+            XCTAssertFalse(failed.isBootstrapped)
+            XCTAssertNotNil(failed.error)
+        }
+    }
+
+    // MARK: - Boot session identity
+
+    #if os(Windows)
+    func testWindowsAdjacentBootBucketsPreserveLiveLeaseAndConverge() throws {
+        XCTAssertTrue(SuspensionLeaseCoordinator.isSameBootSession(
+            stored: "winboot-100000", current: "winboot-102000", legacyBootSeconds: nil
+        ))
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardWindowsBootBucketTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let owner = SuspensionLeaseCoordinator(
+            storageDirectory: directory, bootSessionIdentifier: "winboot-100000"
+        )
+        let adjacent = SuspensionLeaseCoordinator(
+            storageDirectory: directory, bootSessionIdentifier: "winboot-102000"
+        )
+        let acquired = owner.acquireLease(seconds: 60)
+        XCTAssertTrue(acquired.success)
+        XCTAssertTrue(acquired.annotationsSuspended)
+
+        let peer = adjacent.reconcile()
+        XCTAssertTrue(peer.annotationsSuspended)
+        XCTAssertEqual(peer.activeLeaseCount, 1)
+        let settledGeneration = peer.generation
+        XCTAssertEqual(owner.reconcile().generation, settledGeneration)
+        XCTAssertEqual(adjacent.reconcile().generation, settledGeneration)
+
+        if let token = acquired.leaseToken {
+            _ = owner.releaseLease(token: token)
+        }
+    }
+    #endif
+
+    /// `kern.boottime` is DERIVED (wall clock minus uptime), not stored, so its
+    /// microsecond field shifts by a few hundred microseconds every time the
+    /// system clock is disciplined -- while `tv_sec` and the boot itself stay
+    /// put. When the boot identity embedded that microsecond field, two live
+    /// processes that sampled it either side of an NTP adjustment computed
+    /// DIFFERENT identities for the SAME boot, and each read the other's
+    /// registry as "written before the last reboot". The reboot-recovery path
+    /// then replaced it with an empty state -- destroying every live lease --
+    /// and rewrote the file, which broadcast a suspension invalidation, which
+    /// made the peer reconcile, re-detect a foreign identity, and reset it
+    /// straight back. Observed in production as a self-sustaining cross-process
+    /// ping-pong that wrote ~150 registry generations per second and filled the
+    /// entire 5 MB log with one repeated line.
+    func testBootSessionIdentitySurvivesBoottimeMicrosecondDrift() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootDriftTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // The exact pair observed on the reporting machine: same boot second,
+        // 455 microseconds of clock-discipline drift between the two samples.
+        let owner = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                               bootSessionIdentifier: "1787827823.287935")
+        let drifted = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                 bootSessionIdentifier: "1787827823.287480")
+
+        let acquired = owner.acquireLease(seconds: 60)
+        XCTAssertTrue(acquired.success)
+        XCTAssertTrue(acquired.annotationsSuspended)
+        XCTAssertEqual(acquired.activeLeaseCount, 1)
+
+        let peer = drifted.reconcile()
+        XCTAssertTrue(peer.annotationsSuspended,
+                      "a peer whose boottime microseconds drifted must not read a live registry as a prior boot")
+        XCTAssertEqual(peer.activeLeaseCount, 1, "the drifted peer destroyed another process's live lease")
+
+        // ...and the two must converge instead of rewriting the registry at
+        // each other forever. Generations advance only on a real state change.
+        let settled = drifted.reconcile().generation
+        XCTAssertEqual(drifted.reconcile().generation, settled, "the drifted peer keeps rewriting the registry")
+        XCTAssertEqual(owner.reconcile().generation, settled, "the two processes are ping-ponging the registry")
+        XCTAssertEqual(drifted.reconcile().generation, settled)
+        XCTAssertTrue(owner.reconcile().annotationsSuspended)
+    }
+
+    /// A genuinely different boot must still be recovered from -- the drift
+    /// tolerance above must not swallow a real reboot.
+    func testRegistryFromAGenuinelyDifferentBootIsStillReset() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootResetTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let previousBoot = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                      bootSessionIdentifier: "1787827823.287935")
+        let previousLease = previousBoot.acquireLease(seconds: 60)
+        XCTAssertTrue(previousLease.success)
+        XCTAssertTrue(previousLease.annotationsSuspended)
+        XCTAssertEqual(previousLease.activeLeaseCount, 1)
+
+        // A reboot moves `kern.boottime` by far more than clock discipline can.
+        let afterReboot = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                     bootSessionIdentifier: "1787913344.100000")
+        let recovered = afterReboot.bootstrapAndReconcile()
+        XCTAssertFalse(recovered.annotationsSuspended,
+                       "a lease from a previous boot must never keep this boot's overlays hidden")
+        XCTAssertEqual(recovered.activeLeaseCount, 0)
+    }
+
+    /// The upgrade path on a machine that is already running: the registry on
+    /// disk was written by the previous build, so it stores a `kern.boottime`
+    /// NUMBER, while this build identifies the boot by `kern.bootsessionuuid`.
+    /// A literal comparison would read that as a reboot on the very first read
+    /// after the update and drop a suspension lease that is still live, so a
+    /// stored number is matched against this boot's actual boot time instead.
+    func testLegacyBoottimeRegistryIsAdoptedByTheUUIDIdentityWithoutAReset() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootUpgradeTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Exactly what the previous build wrote: "<tv_sec>.<tv_usec>" for the
+        // boot this test process is itself running in.
+        let legacyIdentifier = try XCTUnwrap(SuspensionLeaseCoordinator.testOnlyLegacyBoottimeIdentifier())
+        let previousBuild = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                       bootSessionIdentifier: legacyIdentifier)
+        let acquired = previousBuild.acquireLease(seconds: 60)
+        let token = try XCTUnwrap(acquired.leaseToken)
+        XCTAssertTrue(acquired.annotationsSuspended)
+
+        // The updated build takes its identity from `kern.bootsessionuuid`.
+        let updatedBuild = SuspensionLeaseCoordinator(storageDirectory: directory)
+        let afterUpgrade = updatedBuild.bootstrapAndReconcile()
+        XCTAssertTrue(afterUpgrade.annotationsSuspended,
+                      "the update must not read its own boot's registry as a prior boot")
+        XCTAssertEqual(afterUpgrade.activeLeaseCount, 1)
+
+        // The lease stays addressable across the identity change.
+        let released = updatedBuild.releaseLease(token: token)
+        XCTAssertTrue(released.success)
+        XCTAssertFalse(released.alreadyReleased)
+        XCTAssertFalse(released.annotationsSuspended)
+    }
+
+    /// The legacy identity is ADOPTED for the rest of the boot, not upgraded in
+    /// place -- a same-boot write preserves whatever identifier the file already
+    /// carries. So the number stays on disk until something genuinely replaces
+    /// the registry, and the question that matters is whether it ever leaves.
+    /// It does: the next reboot takes the replacement path, which stamps the
+    /// running process's own identity. Pins that the tolerant comparison is a
+    /// migration, not a permanent dependence on parsing numbers.
+    func testTheLegacyIdentifierIsReplacedByThisBuildsOwnIdentityAtTheNextReboot() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootHealTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stateURL = directory.appendingPathComponent("annotations-suspension-v3.json")
+
+        func storedIdentifier() throws -> String {
+            let raw = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: stateURL)) as? [String: Any])
+            return try XCTUnwrap(raw["bootSessionIdentifier"] as? String)
+        }
+
+        // A registry left by the previous build, for the boot we are in.
+        let legacyIdentifier = try XCTUnwrap(SuspensionLeaseCoordinator.testOnlyLegacyBoottimeIdentifier())
+        let previousBuild = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                       bootSessionIdentifier: legacyIdentifier)
+        XCTAssertTrue(previousBuild.acquireLease(seconds: 60).success)
+        XCTAssertEqual(try storedIdentifier(), legacyIdentifier)
+
+        // This build adopts it and, because a same-boot write keeps the stored
+        // identifier, deliberately leaves the number in place.
+        let updated = SuspensionLeaseCoordinator(storageDirectory: directory)
+        XCTAssertTrue(updated.bootstrapAndReconcile().annotationsSuspended)
+        XCTAssertTrue(updated.acquireLease(seconds: 60).success)
+        XCTAssertEqual(try storedIdentifier(), legacyIdentifier,
+                       "a same-boot write must not churn the stored identity")
+
+        // A reboot replaces the registry, and the replacement carries THIS
+        // build's identity -- so the legacy number does not outlive the boot.
+        let afterReboot = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                                     bootSessionIdentifier: "boot-after-restart")
+        XCTAssertFalse(afterReboot.bootstrapAndReconcile().annotationsSuspended)
+        XCTAssertTrue(afterReboot.acquireLease(seconds: 60).success)
+        XCTAssertEqual(try storedIdentifier(), "boot-after-restart",
+                       "the replacement must stamp the running process's own identity")
+    }
+
+    /// The residual worry after making the comparison tolerant: what if the
+    /// stored anchor is EVENTUALLY left behind, by drift larger than the
+    /// tolerance? That must cost exactly one replacement and then settle --
+    /// never the self-sustaining rewrite loop the tolerance exists to prevent.
+    /// Convergence is the real property; the tolerance only makes it rare.
+    func testDriftBeyondToleranceCostsOneReplacementAndThenConverges() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AIChalkboardBootConvergeTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if os(macOS)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        #endif
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A stored anchor far enough away that no tolerance can absorb it.
+        let stale = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                               bootSessionIdentifier: "1787827823.287935")
+        XCTAssertTrue(stale.acquireLease(seconds: 60).success)
+
+        // Two peers that agree with each other but not with the stored anchor:
+        // the shape a fleet of Chalkboard processes has after any replacement.
+        let peerA = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                               bootSessionIdentifier: "shared-identity")
+        let peerB = SuspensionLeaseCoordinator(storageDirectory: directory,
+                                               bootSessionIdentifier: "shared-identity")
+
+        // First read replaces the registry once. Assert the replacement really
+        // happened -- without this the test can pass by never taking the path
+        // it is named after, which is exactly how its first version passed.
+        let afterReplacement = peerA.bootstrapAndReconcile()
+        XCTAssertFalse(afterReplacement.annotationsSuspended,
+                       "the stale anchor's lease must not survive the replacement")
+        XCTAssertEqual(afterReplacement.activeLeaseCount, 0)
+        let replaced = afterReplacement.generation
+        // After that, neither peer may write again: reconcile alternated
+        // between them is exactly the loop that used to run at 150 Hz.
+        for _ in 0..<12 {
+            XCTAssertEqual(peerB.reconcile().generation, replaced, "peer B is rewriting the registry")
+            XCTAssertEqual(peerA.reconcile().generation, replaced, "peer A is rewriting the registry")
+        }
+    }
+
+    /// The identity itself must be stable when sampled repeatedly, which is the
+    /// property the production defect violated.
+    func testCurrentBootSessionIdentifierIsStableAcrossSamples() throws {
+        let first = try XCTUnwrap(SuspensionLeaseCoordinator.currentBootSessionIdentifier())
+        XCTAssertFalse(first.isEmpty)
+        for _ in 0..<25 {
+            XCTAssertEqual(SuspensionLeaseCoordinator.currentBootSessionIdentifier(), first,
+                           "the boot identity must not vary between samples within one boot")
+        }
     }
 }

@@ -41,6 +41,10 @@ public struct AnnotationStoreResourceUsage: Equatable, Sendable {
 public enum AnnotationStoreResourceLimit: Equatable, Sendable {
     case payloadBytes(limit: Int, attempted: Int)
     case primitiveCount(limit: Int, attempted: Int)
+    /// A nested batch would make renderer and Codable recursion unsafe. This
+    /// is a per-annotation structural limit rather than an aggregate session
+    /// budget, so it carries the candidate's observed depth.
+    case batchNestingDepth(limit: Int, attempted: Int)
     /// Inserting would exceed `DrawingDefaults.maxStoredAnnotations`. Unlike
     /// the other two cases, this one is about COUNT, not aggregate payload
     /// size -- an insertion can be rejected here while both the byte and
@@ -188,6 +192,9 @@ public final class AnnotationStore: @unchecked Sendable {
     /// which is the inconsistency this resolves.
     @discardableResult
     public func addWithOutcome(_ annotation: Annotation) -> AnnotationStoreAddResult {
+        if let rejection = Self.batchNestingLimit(for: annotation.kind) {
+            return .rejected(rejection)
+        }
         var storedAnnotation = annotation
 
         let rejection: AnnotationStoreResourceLimit? = withLock {
@@ -274,6 +281,9 @@ public final class AnnotationStore: @unchecked Sendable {
             }
             let old = annotations[index]
             var storedReplacement = Self.preservingIdentity(replacement, id: id)
+            if let rejection = Self.batchNestingLimit(for: storedReplacement.kind) {
+                return (nil, rejection, false)
+            }
             // O(1): subtract `old`'s usage and add the normalized replacement's
             // instead of re-walking the whole store. A rejection below must leave the
             // real running total untouched, so this is a projection only.
@@ -660,33 +670,66 @@ public final class AnnotationStore: @unchecked Sendable {
     }
 
     /// Iterative rather than recursive to keep a programmatically constructed
-    /// nested batch from consuming the process stack before its primitive cap
-    /// can reject it.
+    /// nested batch from consuming the process stack before its nesting or
+    /// aggregate-work cap can reject it. A direct batch's primitive children
+    /// retain their historical one-unit-per-item accounting. A nested batch
+    /// itself is represented by an item in its parent, so that item counts as
+    /// work even when the nested batch is empty; broad container-only trees
+    /// therefore cannot evade the retained-work cap.
     private static func addKindUsage(_ usage: inout AnnotationStoreResourceUsage, _ root: AnnotationKind) {
-        var stack = [root]
-        while let kind = stack.popLast() {
+        var stack: [(kind: AnnotationKind, isBatchComponent: Bool)] = [(root, false)]
+        while let entry = stack.popLast() {
+            let kind = entry.kind
             switch kind {
             case .vectorPath(let data, let strokeColor, _, _, let fillColor, _, _, _, _, _):
-                addPrimitive(&usage)
+                if !entry.isBatchComponent { addPrimitive(&usage) }
                 addPayload(&usage, data)
                 addPayload(&usage, strokeColor)
                 addPayload(&usage, fillColor)
             case .image(let assetId, _, _, _, _, _, _):
-                addPrimitive(&usage)
+                if !entry.isBatchComponent { addPrimitive(&usage) }
                 addPayload(&usage, assetId)
             case .text(let text, _, _, _, let textColor, let backgroundColor, _, _, _):
-                addPrimitive(&usage)
+                if !entry.isBatchComponent { addPrimitive(&usage) }
                 addPayload(&usage, text)
                 addPayload(&usage, textColor)
                 addPayload(&usage, backgroundColor)
             case .batch(let items):
                 for item in items {
+                    // A component is exactly one retained renderer work unit.
+                    // For primitive items this preserves the old accounting;
+                    // for nested batches it charges their container even when
+                    // they carry no leaf primitive of their own.
+                    addPrimitive(&usage)
                     addPayload(&usage, item.colorHex)
                     addPayload(&usage, item.label)
-                    stack.append(item.kind)
+                    stack.append((item.kind, true))
                 }
             }
         }
+    }
+
+    /// Iteratively finds the deepest batch container in a candidate. This is
+    /// intentionally separate from resource accounting: structural safety is
+    /// a mandatory intake invariant, while payload/work are aggregate session
+    /// budgets. Returning on the first over-limit branch keeps pathological
+    /// programmatic trees cheap to reject.
+    private static func batchNestingLimit(for root: AnnotationKind) -> AnnotationStoreResourceLimit? {
+        var stack: [(kind: AnnotationKind, depth: Int)] = [(root, 0)]
+        while let entry = stack.popLast() {
+            guard case .batch(let items) = entry.kind else { continue }
+            let depth = entry.depth + 1
+            if depth > DrawingDefaults.maxAnnotationBatchNestingDepth {
+                return .batchNestingDepth(
+                    limit: DrawingDefaults.maxAnnotationBatchNestingDepth,
+                    attempted: depth
+                )
+            }
+            for item in items {
+                stack.append((item.kind, depth))
+            }
+        }
+        return nil
     }
 
     private static func addPayload(_ usage: inout AnnotationStoreResourceUsage, _ value: String?) {
