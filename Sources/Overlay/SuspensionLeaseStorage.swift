@@ -1293,7 +1293,12 @@ extension SuspensionLeaseCoordinator {
 
 #if DEBUG
     static func testOnlyLegacyBoottimeIdentifier() -> String? {
-        currentBootTimeSeconds().map(String.init)
+        // Applied call, not the unapplied `String.init`, which is ambiguous
+        // between the LosslessStringConvertible and `describing:` overloads.
+        // isSameBootSession reads this identifier back with `Double(stored)`,
+        // so the lossless overload -- the one that round-trips -- is the
+        // correct pick, and the applied form is what pins it.
+        currentBootTimeSeconds().map { String($0) }
     }
 #endif
 #endif
