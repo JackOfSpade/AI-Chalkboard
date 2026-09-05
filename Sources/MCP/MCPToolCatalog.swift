@@ -33,6 +33,18 @@ enum MCPToolCatalog {
     /// value to accept.
     static let highlightAppParamDescription = "Running target app bundle id or display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."
 
+    /// The macOS ambiguity error renders a numbered per-candidate list with
+    /// each candidate's role and resolved backing-pixel bounds (see
+    /// AccessibilityElementResolver's `.ambiguous`). Windows UI Automation
+    /// reports only a match COUNT at that layer, so this sentence is
+    /// platform-split: promising a Windows caller a list that never arrives
+    /// would leave it waiting for output that cannot exist and then guessing
+    /// occurrence blind -- the exact failure the list exists to prevent.
+    static let highlightAmbiguityDescription = "ambiguous labels are rejected with a numbered candidate list carrying each candidate's role and resolved on-screen bounds, so the right occurrence can be chosen by geometry instead of guessed"
+
+    /// Platform-split for the same reason as `highlightAmbiguityDescription`.
+    static let occurrenceAmbiguityDetail = "the ambiguity error numbers its candidates with the occurrence that selects each"
+
     static let captureRequestPermissionDescription = "For capture_source=chalkboard only: explicitly request Screen Recording permission if absent; default false."
 
     static let presentationCheckDescription = "Checks the retained overlay/view pair and WindowServer registration/on-screen state for one drawing, including bounded WindowServer-display-bounds alignment. presentationReady catches missing, hidden, detached, transparent, wrong-level/frame/display, or unregistered windows. It is drawable-state evidence, not raw framebuffer or occlusion proof."
@@ -55,6 +67,16 @@ enum MCPToolCatalog {
     /// process, so "global" is not a valid value here either.
     static let highlightAppParamDescription = "Running target app executable name (for example \"chrome.exe\", matched case-insensitively) or window/display name. Omit for the normal fallback app; empty/global is invalid because a PID is required."
 
+    /// See the macOS counterpart: the Windows resolver's `.ambiguous` carries
+    /// only a match COUNT (`chalk_uia_find_element` hands back no
+    /// per-candidate preview), so this variant tells the caller the truth --
+    /// iterate occurrence and verify -- instead of promising a list that
+    /// never arrives.
+    static let highlightAmbiguityDescription = "an ambiguous label is rejected with a match COUNT only -- Windows UI Automation reports no per-candidate preview -- so try occurrence from 1 upward and confirm each placement with verify_annotation"
+
+    /// Platform-split for the same reason as `highlightAmbiguityDescription`.
+    static let occurrenceAmbiguityDetail = "the ambiguity error reports a match count only (no per-candidate preview), so try occurrence from 1 upward"
+
     /// Windows has no capture-permission model to request: any process that
     /// can run code in this session can already capture the screen (see
     /// ScreenCaptureProvider's Windows permissionStatus() doc comment).
@@ -70,9 +92,9 @@ enum MCPToolCatalog {
     private static let sharedDrawProperties: [String: Any] = [
         "screen_id": ["type": "string", "maxLength": 128, "description": "Current screen ID/index from get_screens; omitted/blank defaults to main, while an unknown explicit value is rejected instead of falling back to another display."],
         "app": ["type": "string", "description": appParamDescription],
-        "coordinate_space": ["type": "string", "enum": ["backing_pixels", "normalized", "screenshot_pixels"], "description": "Position/geometry space. When coordinates were measured from a screenshot, use screenshot_pixels with the exact dimensions of that same image version (after any model/client resize). It must be an uncropped full-display image; a detectable crop/window aspect mismatch is rejected because it has no safe display origin. A same-aspect crop is inherently indistinguishable from a downsampled full-display image, so callers remain responsible for full-display provenance. backing_pixels is the default, normalized is 0...1 of the selected display. NOTE for normalized specifically: unlike screenshot_pixels it carries no evidence of WHICH display it was measured against, so nothing can detect a mismatch on your behalf -- pass screen_id explicitly whenever you measured a display other than the main one. Style dimensions stay in backing pixels."],
-        "screenshot_width": ["type": "integer", "minimum": 1, "description": "Exact integer pixel width of the uncropped full-display image version used to measure coordinates when coordinate_space=screenshot_pixels; do not use its pre-resize/original width if the measured image was resized."],
-        "screenshot_height": ["type": "integer", "minimum": 1, "description": "Exact integer pixel height of the uncropped full-display image version used to measure coordinates when coordinate_space=screenshot_pixels; do not use its pre-resize/original height if the measured image was resized."],
+        "coordinate_space": ["type": "string", "enum": ["backing_pixels", "normalized", "screenshot_pixels"], "description": "Position/geometry space. When coordinates were measured from a screenshot, use screenshot_pixels with the exact dimensions of that same image version (after any model/client resize). It must be an uncropped full-display image; a detectable crop/window aspect mismatch is rejected because it has no safe display origin. A same-aspect crop is inherently indistinguishable from a downsampled full-display image, so callers remain responsible for full-display provenance. backing_pixels is the default, normalized is 0...1 of the selected display. NOTE for normalized specifically: unlike screenshot_pixels it carries no evidence of WHICH display it was measured against, so nothing can detect a mismatch on your behalf -- pass screen_id explicitly whenever you measured a display other than the main one. Style dimensions stay in backing pixels. In EVERY space, coordinates are relative to the SELECTED display's own top-left corner -- (0,0) is that display's top-left, never the virtual desktop -- so never add get_screens' appKitFrame/windowServerFrame desktop offsets to any coordinate."],
+        "screenshot_width": ["type": "integer", "minimum": 1, "description": "Exact integer pixel width of the uncropped full-display image version used to measure coordinates when coordinate_space=screenshot_pixels; do not use its pre-resize/original width if the measured image was resized. Only valid with coordinate_space='screenshot_pixels': supplying it under any other coordinate_space is rejected rather than silently ignored."],
+        "screenshot_height": ["type": "integer", "minimum": 1, "description": "Exact integer pixel height of the uncropped full-display image version used to measure coordinates when coordinate_space=screenshot_pixels; do not use its pre-resize/original height if the measured image was resized. Only valid with coordinate_space='screenshot_pixels': supplying it under any other coordinate_space is rejected rather than silently ignored."],
         "z_index": ["type": "integer", "description": "Paint order; higher values appear above lower values. Default 0; equal values retain creation order."]
     ]
 
@@ -304,7 +326,7 @@ enum MCPToolCatalog {
         let definitions: [[String: Any]] = [
         [
             "name": "get_screens",
-            "description": "Returns current display IDs and exact backing-pixel geometry. Call before drawing. If measuring from an uncropped full-display screenshot, use coordinate_space=screenshot_pixels with that exact measured image version's dimensions; do not copy resized-image coordinates into backing_pixels.",
+            "description": "Returns current display IDs and exact backing-pixel geometry. Call before drawing. If measuring from an uncropped full-display screenshot, use coordinate_space=screenshot_pixels with that exact measured image version's dimensions; do not copy resized-image coordinates into backing_pixels. Drawing coordinates are always relative to the selected display's OWN top-left corner; the returned appKitFrame/windowServerFrame describe only where a display sits on the desktop and must never be added to drawing coordinates.",
             "inputSchema": ["type": "object", "properties": [:]]
         ],
         [
@@ -357,17 +379,17 @@ enum MCPToolCatalog {
         ],
         [
             "name": "highlight_element",
-            "description": "Finds one running app's Accessibility element by label and draws a vector highlight around its live bounds -- rect (default), ellipse, or circle; see shape. Matching is exact by default; ambiguous labels are rejected unless occurrence is supplied. The resolved frame is anchored at creation time, not continuously tracked as the UI moves.",
+            "description": "Finds one running app's Accessibility element by label and draws a vector highlight around its live bounds -- rect (default), ellipse, or circle; see shape. This is the most accurate way to ring a UI element: the bounds come from the app itself, not from coordinates measured off a screenshot. Matching is exact by default; \(highlightAmbiguityDescription). The resolved frame is anchored at creation time, not continuously tracked as the UI moves.",
             "inputSchema": ["type": "object", "properties": [
                 "label": ["type": "string", "minLength": 1, "maxLength": DrawingDefaults.maxHighlightLabelCharacters, "description": "Accessibility title, description, or value to match."],
                 "app": ["type": "string", "description": highlightAppParamDescription],
                 "role": ["type": "string", "description": "Optional raw Accessibility role, for example AXButton."],
                 "match": ["type": "string", "enum": ["exact", "contains"], "description": "Label matching mode; exact is the default."],
-                "occurrence": ["type": "integer", "minimum": 1, "description": "One-based candidate index, required when a label is ambiguous."],
+                "occurrence": ["type": "integer", "minimum": 1, "description": "One-based match index in breadth-first discovery order (outermost elements first, NOT visual order), required when a label is ambiguous; \(occurrenceAmbiguityDetail). Supplying it short-circuits the walk at the Nth match and disables whole-tree ambiguity detection -- the result never proves the label was unique (the response says so via searchWasShortCircuited: true), so confirm placement with verify_annotation."],
                 "max_nodes": ["type": "integer", "minimum": 1, "maximum": AccessibilityElementResolver.absoluteMaxNodes, "description": "Accessibility elements to visit before giving up; default \(AccessibilityElementResolver.defaultMaxNodes). The search is breadth-first and visits every element regardless of label/role, so this -- not a narrower query -- is what makes a large hierarchy reachable. Raise it together with timeout_seconds."],
                 "timeout_seconds": ["type": "number", "minimum": AccessibilityElementResolver.minTraversalTimeoutSeconds, "maximum": AccessibilityElementResolver.maxTraversalTimeoutSeconds, "description": "Wall-clock budget for the whole traversal; default \(AccessibilityElementResolver.defaultTraversalTimeoutSeconds). A large app walks roughly 5,000 elements per second, so raising max_nodes without raising this just trades a node-cap error for a timeout."],
-                "shape": ["type": "string", "enum": ["rect", "ellipse", "circle"], "description": "Highlight outline shape; default rect. ellipse is inscribed in the padded bounds (tangent to all four padded edges). circle is concentric with the padded bounds but sized to CIRCUMSCRIBE them (radius = max(width,height)/2) rather than inscribe them, so it rings a wide element -- most buttons and icons are wider than tall -- without clipping its ends."],
-                "padding_px": ["type": "number", "minimum": 0, "description": "Outward rectangle padding in backing pixels; default 8."],
+                "shape": ["type": "string", "enum": ["rect", "ellipse", "circle"], "description": "Highlight outline shape; default rect. ellipse is inscribed in the padded bounds (tangent to all four padded edges), so it traces a round or pill-shaped control's silhouette -- on a RECTANGULAR element it clips the corners, so use rect or circle when the whole element must be enclosed. circle FULLY ENCLOSES the element: it is concentric with it and its radius is half the element's diagonal plus padding_px, so no corner of the element sticks out of the ring."],
+                "padding_px": ["type": "number", "minimum": 0, "description": "Outward rectangle padding in backing pixels; default 8. The stroke is centered on the outline, so ink extends stroke_width/2 INSIDE the traced path; keep padding_px at or above stroke_width/2 when the ink must not touch the element."],
                 "stroke_color": ["type": "string", "description": "Rectangle stroke color; color is accepted as an alias. Defaults to orange."],
                 "color": ["type": "string", "description": "Alias for stroke_color; do not supply conflicting values."],
                 "stroke_width": ["type": "number", "exclusiveMinimum": 0, "description": "Rectangle stroke width in backing pixels; default 4."],
@@ -403,13 +425,15 @@ enum MCPToolCatalog {
         ],
         [
             "name": "update_annotation",
-            "description": "Moves/restyles a live annotation without changing its ID. offset_x/offset_y are absolute backing-pixel offsets; supply at least one patch field. Text-only and path-only style fields are rejected for image/batch annotations rather than silently ignored.",
+            "description": "Moves/restyles a live annotation without changing its ID. offset_x/offset_y are absolute backing-pixel offsets; supply at least one patch field. Text-only and path-only style fields are rejected for image/batch annotations rather than silently ignored. EVERY positional patch field is absolute BACKING PIXELS on the annotation's own display, regardless of the coordinate_space the original draw call used -- coordinates measured on a screenshot must be converted (multiply by the display's widthPx/screenshot_width) before patching, or the annotation teleports to the raw values.",
             "inputSchema": ["type": "object", "properties": merged([[
                 "annotation_id": ["type": "string"],
                 "offset_x": ["type": "number"], "offset_y": ["type": "number"],
                 "opacity": ["type": "number", "minimum": 0, "maximum": 1],
                 "z_index": ["type": "integer"],
-                "text": ["type": "string"], "x": ["type": "number"], "y": ["type": "number"],
+                "text": ["type": "string"],
+                "x": ["type": "number", "description": "Text annotations only: new top-left X in absolute backing pixels on the annotation's own display -- NOT in the coordinate_space the original draw call used."],
+                "y": ["type": "number", "description": "Text annotations only: new top-left Y in absolute backing pixels on the annotation's own display -- NOT in the coordinate_space the original draw call used."],
                 "font_size": ["type": "number", "exclusiveMinimum": 0], "color": ["type": "string"],
                 "background_color": ["type": "string"], "background_opacity": ["type": "number", "minimum": 0, "maximum": 1],
                 "padding_px": ["type": "number", "minimum": 0],
@@ -452,10 +476,11 @@ enum MCPToolCatalog {
         ],
         [
             "name": "verify_annotation",
-            "description": "Uses the exact live renderer to composite one drawing into either a supplied clean screenshot or a Chalkboard-owned \(captureBackendName) image, returning a tight PNG crop. Chalkboard capture is single-flight and times out after 30 seconds. screenshot_path and capture_source are mutually exclusive. This verifies placement against UI pixels, not raw framebuffer presentation or occlusion.",
+            "description": "Uses the exact live renderer to composite one drawing into either a supplied clean screenshot or a Chalkboard-owned \(captureBackendName) image, returning a tight PNG crop. The metadata's paintedBoundsScreenshotPx is the painted annotation's top-left-origin bounds in the FULL screenshot's pixels -- compare it against where the target element sits in that same screenshot to measure placement error, then correct with update_annotation in backing pixels. The returned image is a CROP: never reuse the crop's own dimensions as screenshot_width/height on a later draw call; only full-display image dimensions are valid there. Chalkboard capture is single-flight and times out after 30 seconds. screenshot_path and capture_source are mutually exclusive. This verifies placement against UI pixels, not raw framebuffer presentation or occlusion.",
             "inputSchema": ["type": "object", "properties": [
                 "annotation_id": ["type": "string"],
                 "screenshot_path": ["type": "string", "description": "Absolute path to a clean uncropped full-display raster screenshot."],
+                "screenshot_screen_id": ["type": "string", "description": "Display the screenshot_path image was captured from; required when the image could plausibly be a full-display capture (native or downsampled -- never upscaled) of MORE THAN ONE connected display. Must match the annotation's own display. Supplying it with capture_source is rejected rather than silently ignored, because Chalkboard capture always photographs the annotation's own display."],
                 "capture_source": ["type": "string", "enum": ["chalkboard"], "description": "Use Chalkboard's in-memory \(captureBackendName) capture. Required when screenshot_path is omitted."],
                 "request_permission": ["type": "boolean", "description": captureRequestPermissionDescription],
                 "padding_px": ["type": "number", "minimum": 0, "maximum": AnnotationVerificationCompositor.maxPaddingPx]

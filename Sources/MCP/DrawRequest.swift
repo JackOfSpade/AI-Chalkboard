@@ -213,6 +213,58 @@ struct DrawRequest {
             return .failure("coordinate_space must be 'backing_pixels', 'normalized', or 'screenshot_pixels' when supplied.")
         }
         let space = (args["coordinate_space"] as? String)?.lowercased() ?? "backing_pixels"
+
+        // `screenshot_width`/`screenshot_height` are read by the
+        // "screenshot_pixels" branch and NOWHERE ELSE, so supplying them in
+        // any other space used to be a silent no-op: a caller that measured a
+        // control on a client-resized screenshot, passed that image's exact
+        // dimensions, and left `coordinate_space` at its "backing_pixels"
+        // default had its numbers taken as backing pixels. On a 3840x2160
+        // display measured from a 1512x850 image, a circle meant for backing
+        // (1930, 1080) r=76 landed at (760, 425) r=30 -- roughly 1200 px away
+        // and 2.5x too small -- and the tool answered with an ordinary
+        // success string, so nothing in the loop could tell the agent its
+        // frame of reference had been discarded. Supplying the dimensions is
+        // unambiguous evidence of the space the caller MEANT, which makes the
+        // contradiction a rejection rather than a reinterpretation -- the same
+        // reject-rather-than-silently-do-something-else rule as
+        // `rejectDurationSecondsIfSupplied`.
+        //
+        // DELIBERATELY LIMITED to the two spaces that really do ignore the
+        // dimensions, and placed after the type check but before the switch,
+        // so an unrecognised `coordinate_space` still reaches the
+        // unknown-space error in `default` below: a typo'd space name is the
+        // caller's actual problem, and telling it the coordinates "were
+        // interpreted as <typo>" would be both untrue and unactionable.
+        //
+        // A JSON `null` does NOT count as supplied here, for exactly the
+        // reason `makeShapeKind`'s rect branch spells out
+        // (MCPToolHandlers+Shape.swift): `JSONSerialization` materialises it
+        // as a real `NSNull` entry, and a schema-driven client that
+        // serialises every declared property and nulls the ones it is not
+        // using is a completely ordinary way to build a request -- rejecting
+        // that caller would name arguments it never meaningfully sent.
+        //
+        // Sitting in `coordinateTransform` covers draw_path, draw_shape,
+        // draw_image, draw_text AND draw_batch: `handleDrawBatch` resolves ONE
+        // transform from the batch's TOP-LEVEL arguments via
+        // `resolveDrawContext` and hands that same transform to every item, so
+        // there is no second, per-item coordinate space that could slip past
+        // this check.
+        if space == "backing_pixels" || space == "normalized" {
+            func isSupplied(_ key: String) -> Bool {
+                guard let value = args[key] else { return false }
+                return !(value is NSNull)
+            }
+            if isSupplied("screenshot_width") || isSupplied("screenshot_height") {
+                Logger.shared.log(
+                    "Drawing rejected: reason=screenshot_dimensions_ignored_in_space coordinateSpace=\(space) explicitSpace=\(args.keys.contains("coordinate_space"))",
+                    level: "WARN"
+                )
+                return .failure("screenshot_width/screenshot_height were supplied but coordinate_space is '\(space)', so the screenshot dimensions would have been IGNORED and your coordinates interpreted as \(space). Nothing was drawn; pass coordinate_space='screenshot_pixels' if these coordinates were measured on that screenshot, or remove screenshot_width/screenshot_height.")
+            }
+        }
+
         switch space {
         case "backing_pixels":
             return .success(CoordinateTransform(scaleX: 1, scaleY: 1))
@@ -241,14 +293,26 @@ struct DrawRequest {
             }
             // Which of the CURRENTLY CONNECTED displays could this image
             // actually be a full-display screenshot of? Computed once and
-            // used by both guards below.
+            // used by both the mismatch hint and the ambiguity guard below.
+            //
+            // "Could actually be" is `isPlausibleFullDisplayCapture` -- a
+            // uniform mapping AND no upscale -- not the bare
+            // `fullDisplayScale` the TARGET-screen guard below uses. The
+            // target guard answers a different question ("can these declared
+            // dimensions be mapped onto the display the caller is drawing
+            // on"), where the scale merely converts units. Here the question
+            // is which display the image is a PICTURE of, and no screenshot
+            // pipeline upscales: counting a same-aspect smaller sibling as a
+            // candidate would flag a native capture of a larger display as
+            // ambiguous when it identifies its display beyond reasonable
+            // doubt. See that helper's doc comment.
             let accepting = candidateScreens.filter {
-                ScreenshotGeometry.fullDisplayScale(
+                ScreenshotGeometry.isPlausibleFullDisplayCapture(
                     screenshotWidth: width,
                     screenshotHeight: height,
                     screenWidth: Double($0.widthPx),
                     screenHeight: Double($0.heightPx)
-                ) != nil
+                )
             }
 
             guard ScreenshotGeometry.fullDisplayScale(

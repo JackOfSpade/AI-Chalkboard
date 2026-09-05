@@ -17,6 +17,19 @@ enum AnnotationVerificationError: LocalizedError {
     case unsupportedImage
     case imageTooLarge
     case aspectRatioMismatch(scaleX: Double, scaleY: Double)
+    /// The supplied screenshot's dimensions are accepted by MORE THAN ONE
+    /// currently-connected display, and the caller did not say which display
+    /// it actually photographed. Kept separate from `.aspectRatioMismatch`
+    /// because the two mean opposite things: that one says the image fits NO
+    /// plausible full-display capture of the annotation's screen, this one
+    /// says it fits SEVERAL displays equally well and identity, not geometry,
+    /// is the missing evidence.
+    case ambiguousScreenshotDisplay(
+        screenshotWidth: Int,
+        screenshotHeight: Int,
+        acceptingScreenIds: [String],
+        annotationScreenId: String
+    )
     case renderFailed
     /// The renderer ran to completion and produced a valid bitmap, it just
     /// contains no non-transparent pixel.  Kept separate from `renderFailed`
@@ -45,6 +58,8 @@ enum AnnotationVerificationError: LocalizedError {
                 format: "The screenshot does not look like a full-display capture of the annotation's screen (x scale %.6f, y scale %.6f). Supply the uncropped full-display screenshot; cropped/window screenshots cannot be mapped safely.",
                 scaleX, scaleY
             )
+        case .ambiguousScreenshotDisplay(let screenshotWidth, let screenshotHeight, let acceptingScreenIds, let annotationScreenId):
+            return "Ambiguous verification screenshot rejected: source=\(screenshotWidth)x\(screenshotHeight) px matches \(acceptingScreenIds.count) connected displays (ids: \(acceptingScreenIds.joined(separator: ", "))) and no screenshot_screen_id was supplied. The annotation lives on display \(annotationScreenId), but a screenshot is the image of one specific display and its dimensions cannot say which, so this image may be of a different display entirely -- verifying against it would show the annotation over unrelated UI and report a placement error that does not exist. Nothing was verified; retry with screenshot_screen_id naming the display the screenshot was really taken from, or use capture_source='chalkboard' to have Chalkboard capture display \(annotationScreenId) itself."
         case .renderFailed:
             return "Failed to render the annotation verification image."
         case .annotationPaintedNothing(let screenWidthPx, let screenHeightPx):
@@ -113,12 +128,24 @@ enum AnnotationVerificationCompositor {
     /// floor-to-a-multiple-of-four calculation.
     static let maxRawPNGBytes = ((maxTransportResponseBytes - maxTransportOverheadBytes) / 4) * 3
 
+    /// - Parameter ambiguityCandidateScreens: the currently-connected displays
+    ///   this image's dimensions must be checked against for
+    ///   which-display ambiguity, or EMPTY when the caller has already
+    ///   established which display it is of. See
+    ///   `ambiguousDisplayRejection(...)`. It is deliberately a parameter of
+    ///   the SCREENSHOT-PATH entry point only: the image's real dimensions are
+    ///   not known until it is decoded, and this is the layer that decodes it
+    ///   -- a probe in the MCP handler would have to open the file a second
+    ///   time and could then disagree with the decode that actually renders
+    ///   (the same second-open TOCTOU gap `loadScreenshot`'s Windows note
+    ///   documents).
     static func composite(
         annotation: Annotation,
         screen: ScreenInfo,
         screenshotPath: String,
         paddingPx: Double = defaultPaddingPx,
-        rasterLease: RasterAssetStore.Lease? = nil
+        rasterLease: RasterAssetStore.Lease? = nil,
+        ambiguityCandidateScreens: [ScreenInfo] = []
     ) throws -> AnnotationVerificationComposite {
         #if os(macOS)
         let screenshot = try loadScreenshot(path: screenshotPath)
@@ -127,7 +154,8 @@ enum AnnotationVerificationCompositor {
             screen: screen,
             screenshot: screenshot,
             paddingPx: paddingPx,
-            rasterLease: rasterLease
+            rasterLease: rasterLease,
+            ambiguityCandidateScreens: ambiguityCandidateScreens
         )
         #elseif os(Windows)
         let decoded = try loadScreenshot(path: screenshotPath)
@@ -163,7 +191,8 @@ enum AnnotationVerificationCompositor {
         )
         return try compositeCore(
             annotation: annotation, screen: screen, screenshot: buffer,
-            paddingPx: paddingPx, rasterLease: rasterLease
+            paddingPx: paddingPx, rasterLease: rasterLease,
+            ambiguityCandidateScreens: ambiguityCandidateScreens
         )
         #endif
     }
@@ -173,12 +202,20 @@ enum AnnotationVerificationCompositor {
     /// Keeping it on the same implementation as the path-based overload means
     /// the crop, coordinate validation, and exact OverlayView renderer cannot
     /// drift between external and internal verification sources.
+    ///
+    /// `ambiguityCandidateScreens` defaults to EMPTY here because the
+    /// in-memory caller this overload exists for is Chalkboard-owned
+    /// ScreenCaptureKit capture, which captures the annotation's own display
+    /// by construction and so has no which-display question to answer. The
+    /// path-based overload above forwards the handler's connected-screen list
+    /// through it.
     static func composite(
         annotation: Annotation,
         screen: ScreenInfo,
         screenshot: CGImage,
         paddingPx: Double = defaultPaddingPx,
-        rasterLease: RasterAssetStore.Lease? = nil
+        rasterLease: RasterAssetStore.Lease? = nil,
+        ambiguityCandidateScreens: [ScreenInfo] = []
     ) throws -> AnnotationVerificationComposite {
         let imageWidth = screenshot.width
         let imageHeight = screenshot.height
@@ -192,6 +229,18 @@ enum AnnotationVerificationCompositor {
             screenHeight: Double(screen.heightPx)
         ) else {
             throw AnnotationVerificationError.aspectRatioMismatch(scaleX: scaleX, scaleY: scaleY)
+        }
+        // AFTER the scale check, exactly as the draw path orders its two
+        // screenshot guards: an image that fits NO display is a mismatch
+        // (unchanged behavior), and only an image that fits the annotation's
+        // own display can go on to be ambiguous between it and another.
+        if let ambiguous = ambiguousDisplayRejection(
+            screenshotWidth: imageWidth,
+            screenshotHeight: imageHeight,
+            annotationScreenId: screen.id,
+            candidates: ambiguityCandidateScreens
+        ) {
+            throw ambiguous
         }
 
         // Rendering the annotation onto its own transparent layer genuinely
@@ -248,7 +297,16 @@ enum AnnotationVerificationCompositor {
                 [annotation],
                 into: drawingContext,
                 canvasSize: sourceSize,
-                scaleFactor: CGFloat(screen.backingScaleFactor)
+                // The SAME definition `OverlayView.draw(_:)` (the live macOS
+                // overlay) reads -- see
+                // `OverlayDrawingMetrics.rendererScaleFactor`. A verification
+                // rendered at any other scale than the live overlay's would
+                // report a placement nothing ever painted. On macOS this
+                // resolves to the backing scale, exactly as this line always
+                // did against this same point canvas.
+                scaleFactor: OverlayDrawingMetrics.rendererScaleFactor(
+                    displayBackingScaleFactor: CGFloat(screen.backingScaleFactor)
+                )
             ) { assetId in
                 lease.image(id: assetId).map(NSImageRasterHandle.init)
             }
@@ -357,7 +415,14 @@ enum AnnotationVerificationCompositor {
             ),
             "cropClippedAtScreenEdge": clipped,
             "verificationKind": "synthetic-composite",
-            "verificationNote": "This image uses the live OverlayView renderer composited into the selected clean screenshot source. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that WindowServer presented the separate overlay window."
+            // The note NAMES the display (already carried structurally as
+            // `screenId` above -- stated here too rather than added as a
+            // second field) because that is the one assumption a verification
+            // image cannot show: the screenshot was INTERPRETED as a
+            // full-display capture of this display, and a screenshot of any
+            // other display would compose a convincing picture that proves
+            // nothing. See `ambiguousDisplayRejection`.
+            "verificationNote": "This image uses the live OverlayView renderer composited into the selected clean screenshot source, interpreted as a full-display image of display \(annotation.screenId) (see screenId) -- the display this annotation lives on, and the only display whose screenshot can prove or refute its placement. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that WindowServer presented the separate overlay window."
         ]
 
         return AnnotationVerificationComposite(pngData: pngData, metadata: metadata)
@@ -552,7 +617,12 @@ enum AnnotationVerificationCompositor {
         )
         return try compositeCore(
             annotation: annotation, screen: screen, screenshot: buffer,
-            paddingPx: paddingPx, rasterLease: rasterLease
+            paddingPx: paddingPx, rasterLease: rasterLease,
+            // No which-display candidates, for the same reason the macOS
+            // CGImage overload defaults to none: `chalk_capture_monitor`
+            // captured THIS annotation's own display, so its identity is
+            // already established rather than inferred from dimensions.
+            ambiguityCandidateScreens: []
         )
     }
 
@@ -587,7 +657,8 @@ enum AnnotationVerificationCompositor {
         screen: ScreenInfo,
         screenshot: RawScreenshotBuffer,
         paddingPx: Double,
-        rasterLease: RasterAssetStore.Lease?
+        rasterLease: RasterAssetStore.Lease?,
+        ambiguityCandidateScreens: [ScreenInfo]
     ) throws -> AnnotationVerificationComposite {
         let imageWidth = screenshot.width
         let imageHeight = screenshot.height
@@ -602,6 +673,16 @@ enum AnnotationVerificationCompositor {
             screenHeight: Double(screen.heightPx)
         ) else {
             throw AnnotationVerificationError.aspectRatioMismatch(scaleX: scaleX, scaleY: scaleY)
+        }
+        // Same ordering as the macOS branch above (and as the draw path's own
+        // pair of screenshot guards): mismatch first, ambiguity second.
+        if let ambiguous = ambiguousDisplayRejection(
+            screenshotWidth: imageWidth,
+            screenshotHeight: imageHeight,
+            annotationScreenId: screen.id,
+            candidates: ambiguityCandidateScreens
+        ) {
+            throw ambiguous
         }
 
         // Same point-space canvas AnnotationRenderer always draws in on both
@@ -632,7 +713,23 @@ enum AnnotationVerificationCompositor {
         func drawAnnotationOnly() {
             AnnotationRenderer.drawAnnotations(
                 [annotation], into: renderContext, canvasSize: sourceSize,
-                scaleFactor: CGFloat(screen.backingScaleFactor)
+                // THE BUG THIS LINE USED TO BE: it passed
+                // `CGFloat(screen.backingScaleFactor)` while the live Windows
+                // overlay (`WindowsOverlayWindow.repaint`) paints the same
+                // physical-pixel canvas at 1.0, because on this platform
+                // `widthPt`/`heightPt` ARE `widthPx`/`heightPx` (see
+                // `ScreenSnapshot.swift`'s Windows `buildScreenInfos()`), so
+                // `sourceSize` above is a PHYSICAL-PIXEL canvas, not a point
+                // canvas like macOS's. On a 150%-DPI monitor that shrank and
+                // displaced every verified annotation by the whole DPI factor
+                // -- a circle drawn live at (1920, 1080) r=200 was composited
+                // at (1280, 720) r=133 -- so the agent "corrected" a correct
+                // annotation and made it wrong. Reading the shared definition
+                // is what makes that class of drift impossible; see
+                // `OverlayDrawingMetrics.rendererScaleFactor`.
+                scaleFactor: OverlayDrawingMetrics.rendererScaleFactor(
+                    displayBackingScaleFactor: CGFloat(screen.backingScaleFactor)
+                )
             ) { assetId in lease.image(id: assetId) }
         }
 
@@ -733,7 +830,9 @@ enum AnnotationVerificationCompositor {
             ),
             "cropClippedAtScreenEdge": clipped,
             "verificationKind": "synthetic-composite",
-            "verificationNote": "This image uses the live AnnotationRenderer -- the same renderer code the live overlay uses -- composited into the selected clean screenshot source. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that the desktop compositor presented the separate overlay window. Rendered through GDI+ on this platform (not Core Graphics), so pixels are not bit-identical to a macOS verification image of the same annotation."
+            // Names the display for the same reason the macOS branch does --
+            // see that branch's comment on this field.
+            "verificationNote": "This image uses the live AnnotationRenderer -- the same renderer code the live overlay uses -- composited into the selected clean screenshot source, interpreted as a full-display image of display \(annotation.screenId) (see screenId) -- the display this annotation lives on, and the only display whose screenshot can prove or refute its placement. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that the desktop compositor presented the separate overlay window. Rendered through GDI+ on this platform (not Core Graphics), so pixels are not bit-identical to a macOS verification image of the same annotation."
         ]
 
         return AnnotationVerificationComposite(pngData: pngData, metadata: metadata)
@@ -802,6 +901,91 @@ enum AnnotationVerificationCompositor {
         return CGRect(x: CGFloat(minX), y: CGFloat(minY), width: CGFloat(maxX - minX + 1), height: CGFloat(maxY - minY + 1))
     }
     #endif
+
+    /// Refuses to GUESS which display a caller-supplied screenshot is of when
+    /// its dimensions fit several connected displays equally well. Pure
+    /// arithmetic, shared by both platform branches (and callable directly
+    /// from tests), so the two cannot answer this differently.
+    ///
+    /// WHY THIS EXISTS: the only geometric evidence a screenshot carries is
+    /// its dimensions, and `ScreenshotGeometry.fullDisplayScale` -- the sole
+    /// check that used to stand here -- compares them against ONE screen's
+    /// size and carries no display identity whatsoever. On the standard
+    /// dual-identical-monitor editing setup, a screenshot of the WRONG
+    /// display therefore passed at scale 1.0, the annotation was composited
+    /// over unrelated UI, and the agent "corrected" a correctly-placed
+    /// annotation. This is the verification-side mirror of
+    /// `DrawRequest.coordinateTransform`'s ambiguity guard -- deliberately the
+    /// same philosophy and the same wording shape: one extra round trip beats
+    /// a confidently-wrong picture, and the message names the candidates so
+    /// the correction is a single argument away.
+    ///
+    /// EMPTY `candidates` means the caller has already established which
+    /// display the image is of, so there is nothing to disambiguate:
+    /// Chalkboard-owned capture (inherently of the annotation's own display)
+    /// and an explicit, already-verified `screenshot_screen_id` both pass
+    /// nothing here. Zero or one accepting display is likewise unambiguous --
+    /// and zero is `.aspectRatioMismatch`, which every caller checks FIRST so
+    /// that error keeps its exact previous meaning.
+    ///
+    /// A candidate counts only when the image could PLAUSIBLY be a capture
+    /// of it -- `isPlausibleFullDisplayCapture`, i.e. uniform mapping AND no
+    /// upscale -- not merely when its aspect ratio fits at some enlargement.
+    /// Aspect-only counting made this guard reject a NATIVE capture of the
+    /// annotation's 4K display because a same-aspect QHD sibling also "fit"
+    /// at scale 1.5, an enlargement no screenshot pipeline produces; that
+    /// turned a formerly-valid, genuinely unambiguous verification into an
+    /// error. See that helper's doc comment for the full reasoning.
+    static func ambiguousDisplayRejection(
+        screenshotWidth: Int,
+        screenshotHeight: Int,
+        annotationScreenId: String,
+        candidates: [ScreenInfo]
+    ) -> AnnotationVerificationError? {
+        guard !candidates.isEmpty else { return nil }
+        let accepting = candidates.filter {
+            ScreenshotGeometry.isPlausibleFullDisplayCapture(
+                screenshotWidth: Double(screenshotWidth),
+                screenshotHeight: Double(screenshotHeight),
+                screenWidth: Double($0.widthPx),
+                screenHeight: Double($0.heightPx)
+            )
+        }
+        guard accepting.count > 1 else { return nil }
+        return .ambiguousScreenshotDisplay(
+            screenshotWidth: screenshotWidth,
+            screenshotHeight: screenshotHeight,
+            acceptingScreenIds: accepting.map(\.id),
+            annotationScreenId: annotationScreenId
+        )
+    }
+
+    /// The other half of the same question, for the case where the caller DID
+    /// say which display its screenshot is of: returns the refusal text when
+    /// that display is not the one the annotation lives on, or `nil` when the
+    /// two agree.
+    ///
+    /// Kept here beside `ambiguousDisplayRejection` (rather than inline in
+    /// `handleVerifyAnnotation`) so both "which display is this a picture
+    /// of?" refusals state the same thing in the same voice and are both
+    /// reachable from tests with no MCP transport -- the same pure-static,
+    /// returns-the-message shape `DrawRequest.rejectDurationSecondsIfSupplied`
+    /// uses.
+    ///
+    /// WHY REFUSE RATHER THAN VERIFY ANYWAY: a screenshot of a different
+    /// display is not weak evidence about this annotation's placement, it is
+    /// none at all. Compositing into it would return a perfectly convincing
+    /// image of unrelated UI, and the agent would then "correct" a
+    /// correctly-placed annotation -- the amplifying loop this whole tool
+    /// exists to close.
+    static func screenshotDisplayMismatchRejection(
+        annotationId: String,
+        annotationScreenId: String,
+        screenshotScreenId: String
+    ) -> String? {
+        guard annotationScreenId != screenshotScreenId else { return nil }
+        return "Annotation \(annotationId) lives on display \(annotationScreenId), and a screenshot of display \(screenshotScreenId) cannot prove or refute its placement. Nothing was verified; screenshot display \(annotationScreenId) instead (passing screenshot_screen_id='\(annotationScreenId)'), or use capture_source='chalkboard' to have Chalkboard capture that display itself."
+    }
 
     /// Pure transport accounting used by the encoder and unit tests.  The
     /// encoded length rounds up to a whole four-byte base64 quantum.

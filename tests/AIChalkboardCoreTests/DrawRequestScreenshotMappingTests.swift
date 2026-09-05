@@ -51,6 +51,51 @@ final class DrawRequestScreenshotMappingTests: XCTestCase {
         }
     }
 
+    /// The ambiguity guard's candidate filter requires a PLAUSIBLE capture
+    /// (uniform mapping AND no upscale -- see
+    /// `ScreenshotGeometry.isPlausibleFullDisplayCapture`), not a bare
+    /// aspect-ratio fit. A native 4K image "fits" a same-aspect QHD sibling
+    /// only via a 1.5x enlargement no screenshot pipeline produces, so it
+    /// identifies its display beyond reasonable doubt and must not be
+    /// rejected -- aspect-only counting flagged exactly this setup.
+    func testNativeDimensionsAreNotAmbiguousAgainstASameAspectSmallerSibling() {
+        let selected = screen(id: "display-A", width: 3_840, height: 2_160, isMain: true)
+        let sibling = screen(id: "display-B", width: 2_560, height: 1_440)
+        let request = DrawRequest(screen: selected, candidateScreens: [selected, sibling], screenIsDetermined: false)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": 3_840,
+            "screenshot_height": 2_160
+        ]) {
+        case .success(let transform):
+            XCTAssertEqual(transform.scaleX, 1)
+            XCTAssertEqual(transform.scaleY, 1)
+        case .failure(let message):
+            XCTFail("A native-size screenshot can only be an upscale of the smaller sibling; it must map unambiguously: \(message)")
+        }
+    }
+
+    /// The counterpart boundary: a downsample that is plausible for SEVERAL
+    /// displays (native for one, half-resolution of another) really is
+    /// ambiguous and must still refuse to guess.
+    func testDownsampledDimensionsPlausibleForSeveralDisplaysAreStillAmbiguous() {
+        let a = screen(id: "display-A", width: 3_840, height: 2_160, isMain: true)
+        let b = screen(id: "display-B", width: 7_680, height: 4_320)
+        let request = DrawRequest(screen: a, candidateScreens: [a, b], screenIsDetermined: false)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": 3_840,
+            "screenshot_height": 2_160
+        ]) {
+        case .success:
+            XCTFail("An image that is a plausible capture of two displays must not silently default to one of them.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("Ambiguous screenshot mapping rejected"), message)
+            XCTAssertTrue(message.contains("display-A"), message)
+            XCTAssertTrue(message.contains("display-B"), message)
+        }
+    }
+
     func testIdenticalDisplaysWithExplicitScreenIdSucceedUnambiguously() {
         let a = screen(id: "display-A", width: 3_840, height: 2_160, isMain: true)
         let b = screen(id: "display-B", width: 3_840, height: 2_160)
@@ -177,6 +222,141 @@ final class DrawRequestScreenshotMappingTests: XCTestCase {
             XCTAssertEqual(transform.scaleX, 3_840)
             XCTAssertEqual(transform.scaleY, 2_160)
             XCTAssertTrue(transform.requiresUnitInterval)
+        }
+    }
+
+    // MARK: - Screenshot dimensions supplied in a space that ignores them
+
+    /// The silent-misplacement bug this guard exists for: the dimensions are
+    /// only read by the `screenshot_pixels` branch, so a caller that measured
+    /// on a 1512x850 image and named `backing_pixels` had them dropped and its
+    /// coordinates scaled 1:1 against a 3840x2160 display -- roughly 1200 px
+    /// off, reported as success.
+    func testExplicitBackingPixelsWithScreenshotWidthIsRejected() {
+        let only = screen(id: "only", width: 3_840, height: 2_160, isMain: true)
+        let request = DrawRequest(screen: only)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "backing_pixels",
+            "screenshot_width": 1_512
+        ]) {
+        case .success:
+            XCTFail("Screenshot dimensions that would be silently ignored must be rejected, not dropped.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("would have been IGNORED"), message)
+            XCTAssertTrue(message.contains("coordinate_space is 'backing_pixels'"), message)
+            XCTAssertTrue(message.contains("Nothing was drawn"), message)
+        }
+    }
+
+    /// The commonest shape of the bug in practice: `coordinate_space` omitted
+    /// entirely, so it DEFAULTS to `backing_pixels` while the caller believed
+    /// supplying the dimensions was enough to select the screenshot space.
+    func testOmittedCoordinateSpaceWithBothScreenshotDimensionsIsRejected() {
+        let only = screen(id: "only", width: 3_840, height: 2_160, isMain: true)
+        let request = DrawRequest(screen: only)
+        switch request.coordinateTransform(args: [
+            "screenshot_width": 1_512,
+            "screenshot_height": 850
+        ]) {
+        case .success:
+            XCTFail("An omitted coordinate_space defaults to backing_pixels and must not silently ignore the dimensions.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("would have been IGNORED"), message)
+            XCTAssertTrue(message.contains("coordinate_space is 'backing_pixels'"), message)
+        }
+    }
+
+    func testNormalizedWithScreenshotHeightIsRejected() {
+        let only = screen(id: "only", width: 3_840, height: 2_160, isMain: true)
+        let request = DrawRequest(screen: only)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "normalized",
+            "screenshot_height": 850
+        ]) {
+        case .success:
+            XCTFail("normalized also ignores the screenshot dimensions, so supplying them must be rejected.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("would have been IGNORED"), message)
+            XCTAssertTrue(message.contains("coordinate_space is 'normalized'"), message)
+        }
+    }
+
+    /// A JSON `null` is ABSENCE, not a supplied value -- a schema-driven
+    /// client that serialises every declared property and nulls the unused
+    /// ones is ordinary, and `JSONSerialization` hands those over as real
+    /// `NSNull` entries. Same rule, same reason as `makeShapeKind`'s rect
+    /// branch.
+    func testBackingPixelsWithNullScreenshotWidthIsNotRejected() {
+        let only = screen(id: "only", width: 3_840, height: 2_160, isMain: true)
+        let request = DrawRequest(screen: only)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "backing_pixels",
+            "screenshot_width": NSNull(),
+            "screenshot_height": NSNull()
+        ]) {
+        case .failure(let message):
+            XCTFail("A null screenshot dimension means the caller supplied nothing: \(message)")
+        case .success(let transform):
+            XCTAssertEqual(transform.scaleX, 1)
+            XCTAssertEqual(transform.scaleY, 1)
+        }
+    }
+
+    /// ORDERING PIN: the new guard covers only the two spaces that genuinely
+    /// ignore the dimensions, so a misspelled `coordinate_space` must still
+    /// produce the unknown-space error naming the three valid values --
+    /// telling that caller its coordinates "were interpreted as bakcing_pixels"
+    /// would be both untrue and unactionable.
+    func testUnknownCoordinateSpaceWithScreenshotDimensionsStillReportsTheUnknownSpace() {
+        let only = screen(id: "only", width: 3_840, height: 2_160, isMain: true)
+        let request = DrawRequest(screen: only)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "bakcing_pixels",
+            "screenshot_width": 1_512,
+            "screenshot_height": 850
+        ]) {
+        case .success:
+            XCTFail("An unrecognised coordinate_space must never succeed.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("coordinate_space must be 'backing_pixels', 'normalized', or 'screenshot_pixels'"), message)
+            XCTAssertFalse(message.contains("would have been IGNORED"), message)
+        }
+    }
+
+    /// The type check on `coordinate_space` also stays ahead of the new
+    /// guard: a non-string space is a type error, not an ignored-dimensions
+    /// error.
+    func testNonStringCoordinateSpaceWithScreenshotDimensionsStillReportsTheTypeError() {
+        let only = screen(id: "only", width: 3_840, height: 2_160, isMain: true)
+        let request = DrawRequest(screen: only)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": 3,
+            "screenshot_width": 1_512
+        ]) {
+        case .success:
+            XCTFail("A non-string coordinate_space must never succeed.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("must be 'backing_pixels', 'normalized', or 'screenshot_pixels' when supplied"), message)
+            XCTAssertFalse(message.contains("would have been IGNORED"), message)
+        }
+    }
+
+    /// The guard must not disturb the space the dimensions are FOR: this is
+    /// the same mapping `testSingleDisplayLegitimateFullDisplayDownsampleSucceedsWithExpectedScales`
+    /// asserts, restated here as the positive half of the new rejection.
+    func testScreenshotPixelsWithDimensionsStillMapsAsBefore() {
+        let only = screen(id: "only", width: 3_840, height: 2_160, isMain: true)
+        let request = DrawRequest(screen: only)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": 1_512,
+            "screenshot_height": 850
+        ]) {
+        case .failure(let message):
+            XCTFail("screenshot_pixels is where these dimensions belong and must keep working: \(message)")
+        case .success(let transform):
+            XCTAssertEqual(transform.scaleX, 3_840.0 / 1_512.0, accuracy: 1e-9)
+            XCTAssertEqual(transform.scaleY, 2_160.0 / 850.0, accuracy: 1e-9)
         }
     }
 }

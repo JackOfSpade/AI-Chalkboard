@@ -76,11 +76,38 @@ public struct AccessibilityElementCandidate: Codable, Equatable {
     public let matchedAttribute: String
     public let matchedLabel: String
     public let role: String?
+    /// Where this candidate actually IS, in screen-local backing pixels --
+    /// the single most important field for picking an `occurrence`, and the
+    /// reason this struct is no longer label/role only.
+    ///
+    /// Without it, five identically-labelled candidates render as five
+    /// IDENTICAL strings, so a caller choosing between them is guessing: a
+    /// measured session ringed a menu-bar item roughly 4,000 backing pixels
+    /// away from the Inspector row it meant, then fell back to eyeballing a
+    /// screenshot -- the exact misplacement path element anchoring exists to
+    /// avoid. The BFS already holds this rect at match time, so carrying it
+    /// here costs no extra cross-process IPC at all.
+    ///
+    /// `AccessibilityBackingRect?` rather than five loose optional numbers
+    /// because that type ALREADY is exactly (screenId, x, y, width, height)
+    /// in exactly these units, and because it is literally the same value
+    /// `resolvedMatch` publishes if this candidate is the one selected --
+    /// so the ambiguity list previews the rect that would really be drawn,
+    /// not a separately-derived approximation of it.
+    ///
+    /// Optional for two distinct, genuinely reachable reasons: exposed-label
+    /// SAMPLE entries (the `.noMatches` preview) describe nodes whose frame
+    /// was never read at all, and a real match's frame can still fail to map
+    /// onto one display (see `backingRect`'s straddling-display rejection),
+    /// which is worth showing in the list rather than hiding.
+    public let backingFrame: AccessibilityBackingRect?
 
-    public init(matchedAttribute: String, matchedLabel: String, role: String?) {
+    public init(matchedAttribute: String, matchedLabel: String, role: String?,
+                backingFrame: AccessibilityBackingRect? = nil) {
         self.matchedAttribute = matchedAttribute
         self.matchedLabel = matchedLabel
         self.role = role
+        self.backingFrame = backingFrame
     }
 }
 
@@ -151,6 +178,20 @@ public enum AccessibilityElementResolverError: LocalizedError, Equatable {
     /// .recordExposedSample`); it is empty when the tree published nothing
     /// sample-worthy at all.
     case noMatches(label: String, role: String?, exposedSample: [AccessibilityElementCandidate])
+    /// The label WAS found, under one or more roles -- just never under the
+    /// `role` the caller supplied. Split out of `.noMatches` because the two
+    /// need opposite advice and `.noMatches`'s "the UI may not expose that
+    /// control to macOS Accessibility" is flatly FALSE here: the control is
+    /// exposed, the role string simply did not match.
+    ///
+    /// Role comparison is verbatim `String` equality against the app's own
+    /// `kAXRole` value, with no case folding and no "AX" prefixing, so
+    /// `role: "button"` matches nothing at all against a live `AXButton` --
+    /// the measured shape of this bug. Telling a caller in that situation
+    /// that the UI lacks Accessibility metadata teaches it to abandon element
+    /// anchoring entirely and eyeball a screenshot, which is precisely the
+    /// misplacement path this tool exists to remove.
+    case labelSeenUnderOtherRoles(label: String, requestedRole: String, seenRoles: [String])
     case ambiguous(matches: [AccessibilityElementCandidate])
     /// `framelessMatchCount` is how many ADDITIONAL elements matched the
     /// label but were skipped for publishing no usable screen frame (see
@@ -194,9 +235,15 @@ public enum AccessibilityElementResolverError: LocalizedError, Equatable {
             // identical failure every time. Name the two budgets that
             // actually move, and be honest that for some applications no
             // bounded read is enough.
-            return "Stopped after inspecting \(limit) accessibility elements without finishing the tree. This cap counts elements VISITED, not candidates, so narrowing label or role does not lower it. Try supplying occurrence FIRST (e.g. occurrence: 1): the walk only keeps going past a match in order to PROVE uniqueness, so an explicit occurrence returns the first highlightable match immediately instead of finishing the tree -- measured at 0.01-1.3s against a large DaVinci Resolve accessibility tree versus a 4.2s node-cap failure with no occurrence supplied. If ambiguity detection across the whole tree is actually required, raise max_nodes (up to \(AccessibilityElementResolver.absoluteMaxNodes)) together with timeout_seconds (up to \(Int(AccessibilityElementResolver.maxTraversalTimeoutSeconds))), since a longer walk also needs longer to run. Some applications publish hierarchies far larger than any bounded read can enumerate -- a measured DaVinci Resolve session exceeded 60,000 elements in 11 seconds without completing -- and for those, element anchoring is not available at all: measure from an uncropped full-display screenshot instead and confirm the result with verify_annotation."
+            //
+            // The uniqueness caveat is attached to the occurrence advice
+            // rather than left implicit: this message TELLS the caller to
+            // short-circuit the walk, and a short-circuited walk provably
+            // never learns whether a second element shares the label, so the
+            // advice must ship with the check that covers what it gave up.
+            return "Stopped after inspecting \(limit) accessibility elements without finishing the tree. This cap counts elements VISITED, not candidates, so narrowing label or role does not lower it. Try supplying occurrence FIRST (e.g. occurrence: 1): the walk only keeps going past a match in order to PROVE uniqueness, so an explicit occurrence returns the first highlightable match immediately instead of finishing the tree -- measured at 0.01-1.3s against a large DaVinci Resolve accessibility tree versus a 4.2s node-cap failure with no occurrence supplied. Then confirm the result with verify_annotation, because occurrence short-circuits uniqueness checking: you get the first highlightable match, never a guarantee that it is the only one. If ambiguity detection across the whole tree is actually required, raise max_nodes (up to \(AccessibilityElementResolver.absoluteMaxNodes)) together with timeout_seconds (up to \(Int(AccessibilityElementResolver.maxTraversalTimeoutSeconds))), since a longer walk also needs longer to run. Some applications publish hierarchies far larger than any bounded read can enumerate -- a measured DaVinci Resolve session exceeded 60,000 elements in 11 seconds without completing -- and for those, element anchoring is not available at all: measure from an uncropped full-display screenshot instead and confirm the result with verify_annotation."
         case .traversalTimedOut(let seconds):
-            return "Stopped accessibility lookup after \(String(format: "%.1f", seconds)) seconds without finishing the tree. The deadline bounds the whole breadth-first walk, so narrowing label or role does not help. Try supplying occurrence FIRST (e.g. occurrence: 1): the walk only keeps going past a match in order to PROVE uniqueness, so an explicit occurrence returns the first highlightable match immediately instead of finishing the tree -- measured at 0.01-1.3s against a large DaVinci Resolve accessibility tree versus a 4.2s node-cap failure with no occurrence supplied. If ambiguity detection across the whole tree is actually required, raise timeout_seconds (up to \(Int(AccessibilityElementResolver.maxTraversalTimeoutSeconds))), and raise max_nodes with it if the walk is also hitting that cap. If the target application publishes a very large hierarchy, element anchoring may not be reachable at any allowed budget -- measure from an uncropped full-display screenshot instead and confirm the result with verify_annotation."
+            return "Stopped accessibility lookup after \(String(format: "%.1f", seconds)) seconds without finishing the tree. The deadline bounds the whole breadth-first walk, so narrowing label or role does not help. Try supplying occurrence FIRST (e.g. occurrence: 1): the walk only keeps going past a match in order to PROVE uniqueness, so an explicit occurrence returns the first highlightable match immediately instead of finishing the tree -- measured at 0.01-1.3s against a large DaVinci Resolve accessibility tree versus a 4.2s node-cap failure with no occurrence supplied. Then confirm the result with verify_annotation, because occurrence short-circuits uniqueness checking: you get the first highlightable match, never a guarantee that it is the only one. If ambiguity detection across the whole tree is actually required, raise timeout_seconds (up to \(Int(AccessibilityElementResolver.maxTraversalTimeoutSeconds))), and raise max_nodes with it if the walk is also hitting that cap. If the target application publishes a very large hierarchy, element anchoring may not be reachable at any allowed budget -- measure from an uncropped full-display screenshot instead and confirm the result with verify_annotation."
         case .noMatches(let label, let role, let exposedSample):
             let roleNote = role.map { " with role '\($0)'" } ?? ""
             guard !exposedSample.isEmpty else {
@@ -219,10 +266,23 @@ public enum AccessibilityElementResolverError: LocalizedError, Equatable {
                 .joined(separator: ", ")
             let more = ranked.count > 8 ? " (and \(ranked.count - 8) more)" : ""
             return "No accessibility element matched label '\(label)'\(roleNote). Labels that ARE exposed here include: \(preview)\(more). Retry with one of those labels (optionally adding a role) instead of falling back to screen coordinates."
+        case .labelSeenUnderOtherRoles(let label, let requestedRole, let seenRoles):
+            let roleList = seenRoles.map { "'\($0)'" }.joined(separator: ", ")
+            return "No accessibility element matched label '\(label)' with role '\(requestedRole)', but that label IS exposed here under \(seenRoles.count == 1 ? "role" : "roles"): \(roleList). The role argument is compared VERBATIM against the app's own AXRole string -- no case folding, no automatic 'AX' prefix -- so 'button' never matches 'AXButton'. Retry without role, or with one of the role strings listed above; do not fall back to screen coordinates, because this control is exposed to macOS Accessibility."
         case .ambiguous(let matches):
-            let preview = matches.prefix(8).map { "'\($0.matchedLabel)' [\($0.role ?? "unknown role")] via \($0.matchedAttribute)" }.joined(separator: ", ")
+            // Each entry is prefixed with the exact `occurrence` value that
+            // selects it, and carries that candidate's backing-pixel rect,
+            // because without both a caller choosing between identically-
+            // labelled candidates is choosing between identical STRINGS --
+            // see `AccessibilityElementCandidate.backingFrame`. `; ` rather
+            // than the old `, ` separator: the geometry itself contains a
+            // comma ("at 4200,600"), so a comma-separated list would read as
+            // twice as many entries as it has.
+            let preview = matches.prefix(8).enumerated().map { index, candidate in
+                "occurrence \(index + 1): '\(candidate.matchedLabel)' [\(candidate.role ?? "unknown role")] via \(candidate.matchedAttribute)\(Self.geometryNote(for: candidate))"
+            }.joined(separator: "; ")
             let more = matches.count > 8 ? " (and \(matches.count - 8) more)" : ""
-            return "Accessibility lookup is ambiguous across \(matches.count) elements: \(preview)\(more). Add a role or supply a one-based occurrence."
+            return "Accessibility lookup is ambiguous across \(matches.count) elements: \(preview)\(more). Add a role or supply a one-based occurrence. OCCURRENCE INDEXES BREADTH-FIRST DISCOVERY ORDER (outermost/earliest-visited element first), not visual top-to-bottom or left-to-right order, so choose it from the numbered list above -- and from the listed geometry, not from where the control appears on screen."
         case .occurrenceOutOfRange(let requested, let available, let framelessMatchCount):
             // The frameless note is appended only when it applies: a caller
             // who requested occurrence 3 against a tree with no frameless
@@ -250,6 +310,29 @@ public enum AccessibilityElementResolverError: LocalizedError, Equatable {
         let lowercasedLabel = label.lowercased()
         return lowercasedLabel.contains(lowercasedQuery) || lowercasedQuery.contains(lowercasedLabel)
     }
+
+    /// Renders one ambiguity candidate's backing-pixel rect for the
+    /// `.ambiguous` preview.  Internal (not private) so the exact rendering
+    /// can be pinned headlessly -- the whole point of this string is that a
+    /// caller reads a number out of it and passes the matching `occurrence`
+    /// back, so a silent formatting regression here reintroduces blind
+    /// occurrence guessing.
+    ///
+    /// `%.0f` on purpose: these are already whole backing pixels in practice,
+    /// and "at 4200,600 240x36" is something a model can compare across eight
+    /// candidates at a glance while "at 4200.0,600.0 240.0x36.0" is not.
+    /// Sub-pixel precision would not change which occurrence anyone picks.
+    static func geometryNote(for candidate: AccessibilityElementCandidate) -> String {
+        guard let frame = candidate.backingFrame else {
+            // Reachable: a match CAN publish a usable AX frame that still
+            // fits on no single display (straddling, or off-desktop). Say so
+            // rather than printing a gap, since selecting that occurrence
+            // would go on to fail with `frameCannotBeMapped`.
+            return " -- does not map onto a single display"
+        }
+        func px(_ value: Double) -> String { String(format: "%.0f", value) }
+        return " -- screen \(frame.screenId) at \(px(frame.x)),\(px(frame.y)) \(px(frame.width))x\(px(frame.height))"
+    }
 }
 
 /// Read-only bridge from a running application's AX hierarchy to Chalkboard's
@@ -271,6 +354,14 @@ public enum AccessibilityElementResolver {
     /// memory; label length is capped separately because a very long title
     /// reads as document content rather than a control name.
     static let maxExposedSampleCount = 64
+    /// Bound on the distinct AXRole strings remembered for a label the
+    /// caller's `role` filter rejected (see `.labelSeenUnderOtherRoles`).
+    /// Small on purpose: this list is read by a human or a model choosing a
+    /// replacement role string, and a label genuinely published under more
+    /// than eight different roles tells that reader nothing useful -- while
+    /// an unbounded list would let a pathological tree grow an error message
+    /// without limit.
+    static let maxRolesSeenForLabel = 8
     /// Every AX label retained in a successful match or no-match sample uses
     /// this one shared bound. AX attributes belong to another process and a
     /// title/description can be arbitrarily large, so this keeps annotation
@@ -354,6 +445,16 @@ public enum AccessibilityElementResolver {
         var framelessMatchCount = 0
         var exposedSample: [AccessibilityElementCandidate] = []
         var exposedSampleSeen: Set<ExposedSampleKey> = []
+        // Distinct AXRole strings under which the requested LABEL was seen
+        // while the caller's `role` filter rejected the node. Recorded
+        // separately from `exposedSample` rather than reconstructed from it,
+        // because the sample deliberately omits kAXValue content (privacy --
+        // see `matchLabel`) and is capped at 64 entries, so a role-mismatch
+        // deep in a large tree would be invisible in it. Insertion-ordered
+        // (BFS discovery order) via a plain array plus a seen-set; the array
+        // is the published order and the set only de-duplicates.
+        var rolesSeenForLabel: [String] = []
+        var rolesSeenForLabelSet: Set<String> = []
         var traversalWasTruncated = false
         appendBounded(
             initial,
@@ -381,22 +482,55 @@ public enum AccessibilityElementResolver {
             configureMessagingTimeout(element)
 
             let role = stringAttribute(kAXRoleAttribute, of: element)
-            if normalized.role == nil || normalized.role == role {
-                let inspection = matchLabel(on: element, query: normalized.label, mode: normalized.matchMode)
-                // `inspection.sampled` is exactly the title/description
-                // reads `matchLabel` already performed while looking for a
-                // match on THIS node -- recording them costs no extra IPC.
-                // This runs whether or not the node matched, because the
-                // overall traversal's outcome (a clean match vs. eventual
-                // `.noMatches`) is not yet known; if any match is found
-                // anywhere, `exposedSample` is simply never read.
-                for sampled in inspection.sampled {
-                    recordExposedSample(
-                        attribute: sampled.attribute, value: sampled.value, role: role,
-                        into: &exposedSample, seen: &exposedSampleSeen
-                    )
-                }
-                if let labelMatch = inspection.match {
+            // THE LABEL INSPECTION IS UNCONDITIONAL; ONLY MATCH SELECTION IS
+            // ROLE-GATED. This inspection used to sit inside the role gate
+            // together with everything below, which made a wrong or
+            // mis-cased `role` silently suppress the exposed-label sample as
+            // well: role comparison is verbatim `String` equality against
+            // the app's own kAXRole (no case folding, no automatic "AX"
+            // prefix), so `role: "button"` rejects every node against a live
+            // "AXButton", `exposedSample` -- which is written nowhere else --
+            // stayed empty, and the resulting `.noMatches` rendered "The UI
+            // may not expose that control to macOS Accessibility". That is
+            // FALSE, and it teaches a caller to abandon element anchoring
+            // and eyeball a screenshot: the dominant misplacement path. The
+            // sample must describe what the app actually publishes,
+            // independent of the caller's role guess.
+            //
+            // COST. `matchLabel`'s own work (two/three string comparisons)
+            // is free; its ATTRIBUTE READS are not -- each is a cross-process
+            // AX IPC round trip, up to three per node (title, description,
+            // value), against a walk that already spends two (role,
+            // children). So this can add roughly 1.5x to a walk's IPC count
+            // -- but ONLY when a `role` was supplied AND does not match the
+            // node, because with `role == nil` the gate was already open for
+            // every node and nothing changes at all. That narrow extra cost
+            // is bought on exactly the paths that currently return a WRONG
+            // answer (role rejected everything, or role-filtered ambiguity),
+            // never on the common unfiltered lookup, and it stays bounded by
+            // the same `maxNodes`/`timeoutSeconds` budgets as before.
+            let inspection = matchLabel(on: element, query: normalized.label, mode: normalized.matchMode)
+            // `inspection.sampled` is exactly the title/description reads
+            // `matchLabel` already performed while looking for a match on
+            // THIS node -- recording them costs no extra IPC. This runs
+            // whether or not the node matched, because the overall
+            // traversal's outcome (a clean match vs. eventual `.noMatches`)
+            // is not yet known; if any match is found anywhere,
+            // `exposedSample` is simply never read.
+            for sampled in inspection.sampled {
+                recordExposedSample(
+                    attribute: sampled.attribute, value: sampled.value, role: role,
+                    into: &exposedSample, seen: &exposedSampleSeen
+                )
+            }
+            if let labelMatch = inspection.match {
+                // The role gate sits HERE and nowhere else. It decides only
+                // which matches are SELECTABLE -- never what gets inspected
+                // (above) or whether this node's children get walked
+                // (below); short-circuiting the loop here would silently
+                // prune whole subtrees whose ancestor happened to share the
+                // label under an unrequested role.
+                if normalized.role == nil || normalized.role == role {
                     // A matched label is not yet a usable RESULT: this
                     // element must also publish a frame, since
                     // `highlight_element` exists to draw a shape around an
@@ -418,6 +552,17 @@ public enum AccessibilityElementResolver {
                     // different layout than the one that actually matched.
                     configureMessagingTimeout(element)
                     if let elementFrame = frame(of: element) {
+                        // Convert to backing pixels HERE, once, and carry
+                        // the result on the match. This is pure arithmetic
+                        // against the already-captured `screens` -- no IPC,
+                        // no AX call -- and it serves three call sites with
+                        // ONE value: `resolvedMatch`'s published
+                        // `backingFrame`, its `frameCannotBeMapped` check,
+                        // and (the reason it moved here) the geometry an
+                        // `.ambiguous` candidate shows so `occurrence` is
+                        // chosen from real coordinates rather than guessed.
+                        // Deriving it once also makes the ambiguity preview
+                        // provably the same rect that would be drawn.
                         let match = InternalMatch(
                             frame: elementFrame,
                             candidate: AccessibilityElementCandidate(
@@ -427,7 +572,10 @@ public enum AccessibilityElementResolver {
                                     value: labelMatch.value,
                                     query: normalized.label
                                 ),
-                                role: role
+                                role: role,
+                                backingFrame: backingRect(
+                                    forAccessibilityFrame: elementFrame, screens: screens
+                                )
                             )
                         )
                         matches.append(match)
@@ -441,8 +589,8 @@ public enum AccessibilityElementResolver {
                         // IPC (and a much larger traversal) once that
                         // requested match is found.
                         if let occurrence = normalized.occurrence, matches.count == occurrence {
-                            return try resolvedMatch(match, screens: screens, startedAt: startedAt,
-                                                         timeout: normalized.timeoutSeconds)
+                            return try resolvedMatch(match, startedAt: startedAt,
+                                                     timeout: normalized.timeoutSeconds)
                         }
                     } else {
                         // No usable bounds: this element can never be
@@ -455,6 +603,19 @@ public enum AccessibilityElementResolver {
                         // selectable.
                         framelessMatchCount += 1
                     }
+                } else {
+                    // The label IS published here, just not under the role
+                    // the caller guessed. Remember which role, so the
+                    // eventual no-match error can NAME it rather than claim
+                    // the control is not exposed at all.
+                    //
+                    // Deliberately NOT counted in `framelessMatchCount` and
+                    // NOT appended to `matches`: role filtering must keep
+                    // selecting exactly the elements it selected before this
+                    // change. Only the ERROR MESSAGE gets richer.
+                    recordRoleSeenForLabel(
+                        role, into: &rolesSeenForLabel, seen: &rolesSeenForLabelSet
+                    )
                 }
             }
 
@@ -494,6 +655,16 @@ public enum AccessibilityElementResolver {
             if framelessMatchCount > 0 {
                 throw AccessibilityElementResolverError.matchesHaveNoUsableFrame(matchCount: framelessMatchCount)
             }
+            // Checked AFTER `framelessMatchCount`, which can only be
+            // non-zero when the role filter DID match something (it is
+            // incremented inside the role gate): if a role-matching element
+            // was found and merely lacked bounds, "matched but
+            // unhighlightable" is the accurate story, not "wrong role".
+            if let requestedRole = normalized.role, !rolesSeenForLabel.isEmpty {
+                throw AccessibilityElementResolverError.labelSeenUnderOtherRoles(
+                    label: normalized.label, requestedRole: requestedRole, seenRoles: rolesSeenForLabel
+                )
+            }
             throw AccessibilityElementResolverError.noMatches(
                 label: normalized.label, role: normalized.role, exposedSample: exposedSample
             )
@@ -514,7 +685,7 @@ public enum AccessibilityElementResolver {
             selected = matches[0]
         }
 
-        return try resolvedMatch(selected, screens: screens, startedAt: startedAt,
+        return try resolvedMatch(selected, startedAt: startedAt,
                                  timeout: normalized.timeoutSeconds)
     }
 
@@ -765,6 +936,16 @@ public enum AccessibilityElementResolver {
     private struct InternalMatch {
         let frame: AccessibilityScreenRect
         let candidate: AccessibilityElementCandidate
+
+        /// The one backing-pixel conversion of `frame`, computed once in the
+        /// BFS loop against the screen snapshot the whole lookup uses. Nil
+        /// means the frame fits on no single connected display, which is
+        /// `frameCannotBeMapped` if this match is SELECTED and a rendered
+        /// note if it merely appears in an ambiguity list. Reading it off
+        /// `candidate` rather than storing a second copy keeps the two
+        /// provably identical -- the ambiguity preview a caller reads and
+        /// the rect a highlight would be drawn at cannot drift apart.
+        var backingFrame: AccessibilityBackingRect? { candidate.backingFrame }
     }
 
     /// De-duplication key for the `.noMatches` exposed-label sample.  Two
@@ -855,6 +1036,22 @@ public enum AccessibilityElementResolver {
         sample.append(AccessibilityElementCandidate(matchedAttribute: attribute, matchedLabel: trimmed, role: role))
     }
 
+    /// Records one AXRole under which the requested LABEL was found while the
+    /// caller's `role` filter rejected it, for `.labelSeenUnderOtherRoles`.
+    /// Deliberately shaped like `recordExposedSample` above -- cap checked
+    /// FIRST so a saturated list does no further work, de-duplicated through
+    /// a companion set, insertion order (which is BFS discovery order) kept
+    /// by the array. A nil role is dropped rather than rendered as "unknown":
+    /// this list exists to be COPIED BACK into a retry's `role` argument, and
+    /// a placeholder is not a value anyone can retry with.
+    private static func recordRoleSeenForLabel(
+        _ role: String?, into roles: inout [String], seen: inout Set<String>
+    ) {
+        guard roles.count < maxRolesSeenForLabel, let role else { return }
+        guard seen.insert(role).inserted else { return }
+        roles.append(role)
+    }
+
     private static func stringAttribute(_ attribute: String, of element: AXUIElement) -> String? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
@@ -923,7 +1120,6 @@ public enum AccessibilityElementResolver {
     }
 
     private static func resolvedMatch(_ selected: InternalMatch,
-                                      screens: [ScreenInfo],
                                       startedAt: TimeInterval,
                                       timeout: TimeInterval) throws -> AccessibilityElementMatch {
         // `selected.frame` was already read (and confirmed usable) back in
@@ -932,12 +1128,16 @@ public enum AccessibilityElementResolver {
         // IPC happens once per LABEL MATCH, not again per selection) and
         // more correct (no TOCTOU gap between "this element matched" and
         // "this is the frame we drew a highlight around"). There is nothing
-        // left to re-read here.
+        // left to re-read here -- and, since the BFS loop now also performs
+        // the (pure) backing-pixel conversion at the same moment so an
+        // ambiguity list can show each candidate's geometry, nothing left to
+        // re-convert either. `screens` is therefore no longer a parameter:
+        // there is exactly one conversion per match, at match time.
         if traversalDeadlineExceeded(startedAt: startedAt, now: ProcessInfo.processInfo.systemUptime,
                                      timeout: timeout) {
             throw AccessibilityElementResolverError.traversalTimedOut(seconds: timeout)
         }
-        guard let backingFrame = backingRect(forAccessibilityFrame: selected.frame, screens: screens) else {
+        guard let backingFrame = selected.backingFrame else {
             throw AccessibilityElementResolverError.frameCannotBeMapped
         }
         return AccessibilityElementMatch(
@@ -1071,11 +1271,25 @@ public struct AccessibilityElementCandidate: Codable, Equatable {
     public let matchedAttribute: String
     public let matchedLabel: String
     public let role: String?
+    /// ALWAYS NIL ON WINDOWS, and declared anyway for the same reason `role`
+    /// is: this type's shape is shared API, and a caller (or a shared test)
+    /// written against the macOS `AccessibilityElementCandidate` must
+    /// compile and behave identically here. On macOS this carries the
+    /// backing-pixel rect of each AMBIGUITY candidate so `occurrence` is
+    /// chosen from real coordinates instead of guessed; on Windows this
+    /// struct only ever describes `chalk_uia_sample_names` entries, which
+    /// report a name and nothing else -- `chalk_uia_find_element` does not
+    /// hand back a per-candidate bounding rectangle at all (see
+    /// `.ambiguous`, which carries only a count). Closing that gap needs a
+    /// shim change; see this port's contractChanges/followUps.
+    public let backingFrame: AccessibilityBackingRect?
 
-    public init(matchedAttribute: String, matchedLabel: String, role: String?) {
+    public init(matchedAttribute: String, matchedLabel: String, role: String?,
+                backingFrame: AccessibilityBackingRect? = nil) {
         self.matchedAttribute = matchedAttribute
         self.matchedLabel = matchedLabel
         self.role = role
+        self.backingFrame = backingFrame
     }
 }
 
@@ -1200,6 +1414,18 @@ public enum AccessibilityElementResolverError: LocalizedError, Equatable {
     /// this case whenever `request.role` is non-nil. This is a genuine,
     /// disclosed capability gap versus macOS's native `kAXRoleAttribute`
     /// filtering -- see contractChanges.
+    ///
+    /// THIS IS ALSO WHY macOS's `.labelSeenUnderOtherRoles` has no Windows
+    /// counterpart, and why it needs none. That case exists because a macOS
+    /// `role` is compared verbatim against the app's own AXRole string, so a
+    /// wrong or mis-cased guess ("button" vs. "AXButton") silently matches
+    /// nothing while the label is in fact published -- a failure this
+    /// platform cannot reach, because a supplied role never gets as far as
+    /// filtering anything: it is refused here, up front, by name. Case-set
+    /// divergence between the two branches is established practice in this
+    /// file (macOS's `.traversalTimedOut` likewise has no counterpart here);
+    /// the requirement is that each platform's set be complete for its own
+    /// reachable failures, not that the two sets be equal.
     case roleFilterNotSupported
     /// NO MACOS ANALOGUE. Maps `CHALK_ERR_UIA_ACCESS_DENIED`: the target
     /// process is elevated (running as administrator) and AI Chalkboard is
@@ -1224,7 +1450,7 @@ public enum AccessibilityElementResolverError: LocalizedError, Equatable {
         case .applicationBusy:
             return "The target app did not answer its UI Automation request within the messaging timeout. This is usually transient (the app was busy), not a missing UI Automation implementation; retry the lookup rather than assuming the UI is not exposed to UI Automation."
         case .traversalLimitReached(let limit):
-            return "Stopped after inspecting \(limit) UI Automation elements without finishing the tree. This cap counts elements VISITED, not candidates, so narrowing label does not lower it. Try supplying occurrence FIRST (e.g. occurrence: 1): the walk only keeps going past a match in order to PROVE uniqueness, so an explicit occurrence returns the first highlightable match immediately instead of finishing the tree. If ambiguity detection across the whole tree is actually required, raise max_nodes (up to \(AccessibilityElementResolver.absoluteMaxNodes)) together with timeout_seconds (up to \(Int(AccessibilityElementResolver.maxTraversalTimeoutSeconds))). Some applications publish hierarchies far larger than any bounded read can enumerate; for those, element anchoring is not available at all -- measure from an uncropped full-display screenshot instead and confirm the result with verify_annotation."
+            return "Stopped after inspecting \(limit) UI Automation elements without finishing the tree. This cap counts elements VISITED, not candidates, so narrowing label does not lower it. Try supplying occurrence FIRST (e.g. occurrence: 1): the walk only keeps going past a match in order to PROVE uniqueness, so an explicit occurrence returns the first highlightable match immediately instead of finishing the tree. Then confirm the result with verify_annotation, because occurrence short-circuits uniqueness checking: you get the first highlightable match, never a guarantee that it is the only one. If ambiguity detection across the whole tree is actually required, raise max_nodes (up to \(AccessibilityElementResolver.absoluteMaxNodes)) together with timeout_seconds (up to \(Int(AccessibilityElementResolver.maxTraversalTimeoutSeconds))). Some applications publish hierarchies far larger than any bounded read can enumerate; for those, element anchoring is not available at all -- measure from an uncropped full-display screenshot instead and confirm the result with verify_annotation."
         case .noMatches(let label, let role, let exposedSample):
             let roleNote = role.map { " with role '\($0)'" } ?? ""
             guard !exposedSample.isEmpty else {
@@ -1239,7 +1465,14 @@ public enum AccessibilityElementResolverError: LocalizedError, Equatable {
             let more = ranked.count > 8 ? " (and \(ranked.count - 8) more)" : ""
             return "No UI Automation element matched name '\(label)'\(roleNote). Names that ARE exposed here include: \(preview)\(more). Retry with one of those names instead of falling back to screen coordinates."
         case .ambiguous(let matchCount):
-            return "UI Automation lookup is ambiguous across \(matchCount) elements. Windows UI Automation does not report a per-element preview for this case (unlike macOS); supply a one-based occurrence to disambiguate."
+            // The occurrence-ordering sentence is worded identically to the
+            // macOS `.ambiguous` case on purpose: the ordering claim is a
+            // property of a breadth-first walk, which BOTH platforms perform
+            // (`chalk_uia_find_element` walks the ControlView breadth-first
+            // shim-side), and a caller must not have to learn two different
+            // rules for the same argument. What genuinely differs is that
+            // there is no numbered candidate list to read it off here.
+            return "UI Automation lookup is ambiguous across \(matchCount) elements. Windows UI Automation does not report a per-element preview for this case (unlike macOS); supply a one-based occurrence to disambiguate. OCCURRENCE INDEXES BREADTH-FIRST DISCOVERY ORDER (outermost/earliest-visited element first), not visual top-to-bottom or left-to-right order, so try occurrence 1 upward and confirm each placement with verify_annotation rather than inferring an index from where the control appears on screen."
         case .occurrenceOutOfRange(let requested, let available, let framelessMatchCount):
             let framelessNote = framelessMatchCount > 0
                 ? " \(framelessMatchCount) additional element(s) also matched the name but were skipped because they published no usable bounding rectangle, so they could not be assigned an occurrence."
@@ -1442,6 +1675,20 @@ public enum AccessibilityElementResolver {
     /// in physical pixels too, matching `chalk_capture_monitor`'s own pixel
     /// space. If either side of that assumption changes, this conversion
     /// must change with it -- see contractChanges/followUps.
+    ///
+    /// WHERE (a) IS ACTUALLY VERIFIED AT RUNTIME, so this comment is not the
+    /// only thing standing behind it: `OverlayWindowController.ensureProcess
+    /// DpiAwareness()` sets PER_MONITOR_AWARE_V2 once per process before any
+    /// window exists and, when that call fails (it legitimately does when
+    /// `Launcher/main.swift` already set it), reads the real state back with
+    /// `GetThreadDpiAwarenessContext()` + `AreDpiAwarenessContextsEqual` and
+    /// logs an ERROR if -- and only if -- the process is genuinely NOT
+    /// per-monitor-v2 aware. Every path through that function therefore ends
+    /// either in the awareness this conversion needs or in a logged ERROR
+    /// naming its absence, which is why no second, per-lookup DPI probe is
+    /// duplicated here: it would re-ask a question already answered once,
+    /// authoritatively, at the only point in the process's life where the
+    /// answer can still be changed.
     public static func backingRect(
         forAccessibilityFrame frame: AccessibilityScreenRect,
         screens: [ScreenInfo]

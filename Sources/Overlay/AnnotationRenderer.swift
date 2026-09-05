@@ -48,6 +48,56 @@ enum OverlayDrawingMetrics {
         )
     }
 
+    /// THE one definition of the `scaleFactor` that
+    /// `AnnotationRenderer.drawAnnotations` must be given for a canvas
+    /// covering one whole display. All FOUR full-display call sites read it:
+    /// the two LIVE overlays (`OverlayView.draw(_:)` on macOS,
+    /// `WindowsOverlayWindow.repaint(annotations:imageForAssetId:)` on
+    /// Windows) and BOTH platform branches of
+    /// `AnnotationVerificationCompositor`.
+    ///
+    /// WHY IT IS PLATFORM-CONDITIONAL AT ALL: MCP coordinates are always
+    /// physical backing pixels, but the two platforms hand the renderer
+    /// canvases measured in different units, so the divisor that converts one
+    /// into the other differs.
+    ///   * macOS overlays draw on a POINT canvas (`NSScreen.frame` points;
+    ///     the verifier scales that same point canvas into the screenshot),
+    ///     so MCP backing pixels DIVIDE by the display's backing scale.
+    ///   * Windows overlays draw on a PHYSICAL-PIXEL canvas whose coordinates
+    ///     already ARE the MCP coordinates (see `ScreenSnapshot.swift`'s
+    ///     Windows `buildScreenInfos()` note and `GDIPlusDrawingContext`'s
+    ///     coordinate contract), so the divisor is exactly 1 no matter what
+    ///     DPI that monitor runs at.
+    ///
+    /// WHY ONE SHARED DEFINITION AND NOT A LITERAL PER CALL SITE: a
+    /// verification rendered at a different scale than the live overlay
+    /// reports a placement NOTHING EVER PAINTED, and the agent loop then
+    /// AMPLIFIES that error by "correcting" a correct annotation. That is
+    /// precisely what the Windows verifier used to do -- it passed the
+    /// display's `backingScaleFactor` against the same physical-pixel canvas
+    /// the live window paints 1:1. On a 150%-DPI monitor, a circle drawn live
+    /// at (1920, 1080) r=200 composited into the verification image at
+    /// (1280, 720) r=133: displaced and undersized by the whole DPI factor,
+    /// in a picture whose entire job is to be believed. The live path and the
+    /// verification path must therefore resolve the SAME number from the SAME
+    /// code, not from two literals that agree only until one is edited.
+    ///
+    /// - Parameter displayBackingScaleFactor: the display's
+    ///   `ScreenInfo.backingScaleFactor`. IGNORED on Windows, where the answer
+    ///   is the constant 1 above; a Windows caller that has no `ScreenInfo` in
+    ///   hand at paint time may therefore pass anything (see
+    ///   `WindowsOverlayWindow.repaint`, which does exactly that and says so).
+    static func rendererScaleFactor(displayBackingScaleFactor: CGFloat) -> CGFloat {
+        #if os(Windows)
+        return 1.0
+        #else
+        // No clamping of a non-positive scale here: `drawAnnotations`
+        // already substitutes 1.0 for one, and giving the same input two
+        // separate places to be corrected is how the two drift apart.
+        return displayBackingScaleFactor
+        #endif
+    }
+
     /// Clamps a caller-supplied opacity into the 0...1 alpha range every
     /// drawing backend expects.
     ///

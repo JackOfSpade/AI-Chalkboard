@@ -42,10 +42,23 @@ extension MCPServer {
             sendErrorResult(id: id, text: "request_permission must be a boolean when supplied.")
             return
         }
+        if args.keys.contains("screenshot_screen_id"), !(args["screenshot_screen_id"] is String) {
+            sendErrorResult(id: id, text: "screenshot_screen_id must be a string when supplied.")
+            return
+        }
         let screenshotPath = (args["screenshot_path"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let captureSource = (args["capture_source"] as? String)?.lowercased()
+        // The caller's ASSERTION of which display the supplied
+        // `screenshot_path` image was captured from -- identity evidence a
+        // raster image simply does not carry (see
+        // `AnnotationVerificationCompositor.ambiguousDisplayRejection`).
+        let screenshotScreenId = (args["screenshot_screen_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard screenshotPath?.isEmpty != true else {
             sendErrorResult(id: id, text: "screenshot_path cannot be empty when supplied.")
+            return
+        }
+        guard screenshotScreenId?.isEmpty != true else {
+            sendErrorResult(id: id, text: "screenshot_screen_id cannot be empty when supplied.")
             return
         }
         guard !(screenshotPath != nil && captureSource != nil) else {
@@ -65,6 +78,17 @@ extension MCPServer {
         }
         if screenshotPath != nil, args.keys.contains("request_permission") {
             sendErrorResult(id: id, text: "request_permission is only valid with capture_source='chalkboard'.")
+            return
+        }
+        // The mirror image of the guard immediately above, and rejected rather
+        // than ignored for the same reason: a caller that supplies
+        // `screenshot_screen_id` alongside `capture_source` believes it is
+        // steering which display gets verified. It is not -- Chalkboard
+        // capture photographs the annotation's OWN display by construction --
+        // so silently dropping the argument would leave that belief intact
+        // and untested.
+        if screenshotPath == nil, screenshotScreenId != nil {
+            sendErrorResult(id: id, text: "screenshot_screen_id is only meaningful with screenshot_path: capture_source='chalkboard' captures the annotation's own display, so there is no other display the image could be of. Nothing was verified; remove screenshot_screen_id.")
             return
         }
         if MCPArgument.hasInvalidSuppliedDouble(args, key: "padding_px") {
@@ -87,13 +111,60 @@ extension MCPServer {
             return
         }
 
+        // Which connected displays must the caller's screenshot be
+        // disambiguated against? EMPTY whenever that question is already
+        // answered -- by `capture_source='chalkboard'` (Chalkboard captures
+        // the annotation's own display) or by a `screenshot_screen_id` that
+        // has been checked against the annotation's display just below. Only
+        // the "a screenshot arrived and nobody said what it is a picture of"
+        // case hands the compositor the full connected-screen list, because
+        // only that case can be ambiguous. The check itself lives in the
+        // compositor, next to the decode that learns the image's real
+        // dimensions -- see `AnnotationVerificationCompositor.composite`'s
+        // `ambiguityCandidateScreens` parameter for why probing them here
+        // instead would open a second-open TOCTOU gap.
+        var ambiguityCandidateScreens: [ScreenInfo] = []
+        if screenshotPath != nil {
+            if let screenshotScreenId {
+                // Resolved through the SAME `ScreenSnapshot.resolve` every
+                // `screen_id` goes through (exact display id first, then an
+                // in-bounds positional index), so a caller can spell this
+                // argument exactly as it spells `screen_id` on the draw call
+                // that created the annotation.
+                guard let assertedScreen = snapshot.resolve(screenshotScreenId) else {
+                    sendErrorResult(id: id, text: "Unknown screenshot_screen_id. Nothing was verified; call get_screens and use a current display id or in-bounds index, naming the display the screenshot was actually taken from.")
+                    return
+                }
+                // The whole point of the argument. The refusal text itself
+                // lives beside the ambiguity guard it belongs with (see
+                // `AnnotationVerificationCompositor
+                // .screenshotDisplayMismatchRejection`), which is also what
+                // makes it testable without MCP transport.
+                if let mismatch = AnnotationVerificationCompositor.screenshotDisplayMismatchRejection(
+                    annotationId: annotationId,
+                    annotationScreenId: screen.id,
+                    screenshotScreenId: assertedScreen.id
+                ) {
+                    Logger.shared.log(
+                        "Verification rejected: reason=screenshot_display_mismatch annotationScreenId=\(screen.id) screenshotScreenId=\(assertedScreen.id)",
+                        level: "WARN"
+                    )
+                    sendErrorResult(id: id, text: mismatch)
+                    return
+                }
+            } else {
+                ambiguityCandidateScreens = snapshot.screens
+            }
+        }
+
         do {
             let composite: AnnotationVerificationComposite
             var sourceMetadata: [String: Any] = [:]
             if let screenshotPath {
                 composite = try AnnotationVerificationCompositor.composite(
                     annotation: annotation, screen: screen, screenshotPath: screenshotPath,
-                    paddingPx: padding, rasterLease: renderSnapshot.rasterLease
+                    paddingPx: padding, rasterLease: renderSnapshot.rasterLease,
+                    ambiguityCandidateScreens: ambiguityCandidateScreens
                 )
                 sourceMetadata["captureSource"] = "caller_screenshot_path"
             } else {
@@ -174,6 +245,15 @@ extension MCPServer {
                 case .annotationPaintedNothing(let width, let height):
                     Logger.shared.log(
                         "Verification rejected: reason=annotation_painted_nothing screenWidth=\(width) screenHeight=\(height)",
+                        level: "WARN"
+                    )
+                case .ambiguousScreenshotDisplay(let width, let height, let acceptingScreenIds, _):
+                    // Display ids and pixel counts only -- no caller path, no
+                    // UI labels -- keeping this line inside the same
+                    // fixed-reason-code discipline as the two above. Mirrors
+                    // the draw path's `reason=ambiguous_screenshot_display`.
+                    Logger.shared.log(
+                        "Verification rejected: reason=ambiguous_screenshot_display screenshotWidth=\(width) screenshotHeight=\(height) acceptingScreenCount=\(acceptingScreenIds.count) annotationScreenId=\(screen.id)",
                         level: "WARN"
                     )
                 default:

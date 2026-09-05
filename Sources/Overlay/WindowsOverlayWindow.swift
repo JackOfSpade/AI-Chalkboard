@@ -326,8 +326,25 @@ final class WindowsOverlayWindow {
             // this type's class-level doc comment and
             // `ScreenSnapshot.swift`'s Windows `buildScreenInfos()` comment
             // for the full reasoning.
+            //
+            // Routed through `OverlayDrawingMetrics.rendererScaleFactor`
+            // rather than written as a bare `1.0`: that function is the ONE
+            // definition of this divisor, and `AnnotationVerificationCompositor`
+            // reads the same one, which is what stops a verification image
+            // from being rendered at a scale this live overlay never used --
+            // the verifier used to pass the monitor's `backingScaleFactor`
+            // against a physical-pixel canvas exactly like this one, so on a
+            // 150%-DPI display it showed the circle this line paints at
+            // (1920, 1080) r=200 sitting at (1280, 720) r=133 instead.
+            //
+            // The argument is IGNORED on this platform, by that function's
+            // documented contract: this window holds no `ScreenInfo` at paint
+            // time (`init` takes only a screenId and a physical-pixel rect),
+            // and the literal below is therefore NOT a claim about this
+            // monitor's DPI -- the canvas is physical pixels, so the divisor
+            // is 1 whatever that DPI is.
             canvasSize: CGSize(width: pixelWidth, height: pixelHeight),
-            scaleFactor: 1.0,
+            scaleFactor: OverlayDrawingMetrics.rendererScaleFactor(displayBackingScaleFactor: 1),
             imageForAssetId: imageForAssetId
         )
         present()

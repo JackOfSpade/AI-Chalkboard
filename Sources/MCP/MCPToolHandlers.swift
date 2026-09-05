@@ -48,13 +48,25 @@ extension MCPServer {
             // about what widthPx actually is. The MECHANISM and the numbers are
             // the same on both platforms (top-left-origin physical pixels); only
             // the API these values are sourced from differs.
+            //
+            // The ORIGIN half of each string is not documentation padding: an
+            // agent that read a secondary display's appKitFrame.x = 1512,
+            // concluded drawing coordinates were desktop-global, and added
+            // that offset drew 1512 px off the intended control -- and nothing
+            // downstream can reject it, because a coordinate that has had a
+            // display offset added to it is still a perfectly valid in-bounds
+            // coordinate on the selected display. Stating the screen-LOCAL
+            // contract here, next to the frame fields that invite the mistake,
+            // is the only place it can be caught. The field names are the
+            // emitted wire-format keys (ScreenInfo is one Codable struct for
+            // both platforms) and must be named exactly as sent.
             #if os(macOS)
-            let coordinateSpaceNote = "AppKit backing pixels: widthPx/heightPx are NSScreen.frame point dimensions multiplied by that same screen's NSScreen.backingScaleFactor. Drawing uses this same scale source."
+            let coordinateSpaceNote = "AppKit backing pixels: widthPx/heightPx are NSScreen.frame point dimensions multiplied by that same screen's NSScreen.backingScaleFactor. Drawing uses this same scale source. All drawing coordinates are relative to the SELECTED display's OWN top-left corner: (0,0) is that display's top-left and widthPx/heightPx are its extent. appKitFrame (AppKit points, bottom-left desktop origin) and windowServerFrame (CGDisplayBounds, global top-left points -- the same space as kCGWindowBounds, NOT backing pixels) only describe where the display sits on the desktop, in OTHER units; they must NEVER be added to drawing coordinates."
             let backingScaleSource = "NSScreen.backingScaleFactor"
             let captureOnNote = "Capture-debug mode is ON: overlay windows request sharingType=.readOnly and render every annotation. A capture tool may still omit these windows through its own app/window filter. Call set_capture_visible(false) to restore normal filtering."
             let captureOffNote = "Capture-debug mode is OFF (default): overlay windows request legacy sharingType=.none and render only annotations visible for the active app. This is not a security guarantee; modern capture tools control their own inclusion filters."
             #elseif os(Windows)
-            let coordinateSpaceNote = "Physical device pixels: widthPx/heightPx are the monitor's rectangle as reported by GetMonitorInfoW under PER_MONITOR_AWARE_V2 DPI awareness, which is already in physical pixels. backingScaleFactor is that monitor's effective DPI divided by 96 and is reported for scaling stroke widths and font sizes; it is NOT applied again to widthPx/heightPx. Drawing uses this same scale source."
+            let coordinateSpaceNote = "Physical device pixels: widthPx/heightPx are the monitor's rectangle as reported by GetMonitorInfoW under PER_MONITOR_AWARE_V2 DPI awareness, which is already in physical pixels. backingScaleFactor is that monitor's effective DPI divided by 96 and is reported for scaling stroke widths and font sizes; it is NOT applied again to widthPx/heightPx. Drawing uses this same scale source. All drawing coordinates are relative to the SELECTED display's OWN top-left corner: (0,0) is that display's top-left and widthPx/heightPx are its extent. appKitFrame and windowServerFrame (the same virtual-desktop rectangle under both names on this platform) only describe where the monitor sits on the virtual desktop, whose origin is the PRIMARY monitor's top-left and whose coordinates can be negative; they must NEVER be added to drawing coordinates."
             let backingScaleSource = "GetDpiForMonitor effective DPI / 96.0"
             let captureOnNote = "Capture-debug mode is ON: overlay windows clear SetWindowDisplayAffinity (WDA_NONE) and render every annotation. A capture tool may still omit these windows through its own filter. Call set_capture_visible(false) to restore normal filtering."
             let captureOffNote = "Capture-debug mode is OFF (default): overlay windows request SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) and render only annotations visible for the active app. This is not a security guarantee, it requires Windows 10 version 2004 or later, and it excludes only THIS process's own windows -- Windows has no way to exclude another process's windows from a capture."

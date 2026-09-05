@@ -29,10 +29,11 @@ import XCTest
 @testable import AIChalkboardCore
 
 final class AnnotationVerificationCompositorTests: XCTestCase {
-    private func screen(width: Int = 200, height: Int = 100, scale: Double = 1) -> ScreenInfo {
-        ScreenInfo(id: "screen-1", index: 0, name: "Test Screen", widthPx: width, heightPx: height,
+    private func screen(width: Int = 200, height: Int = 100, scale: Double = 1,
+                        id: String = "screen-1", index: Int = 0) -> ScreenInfo {
+        ScreenInfo(id: id, index: index, name: "Test Screen", widthPx: width, heightPx: height,
                    widthPt: Double(width) / scale, heightPt: Double(height) / scale,
-                   backingScaleFactor: scale, isMain: true)
+                   backingScaleFactor: scale, isMain: index == 0)
     }
 
     private func png(width: Int, height: Int, color: NSColor = .blue) throws -> URL {
@@ -271,6 +272,179 @@ final class AnnotationVerificationCompositorTests: XCTestCase {
         XCTAssertThrowsError(try AnnotationVerificationCompositor.composite(annotation: annotation(pathKind()), screen: screen(), screenshotPath: "relative.png")) { error in
             guard case AnnotationVerificationError.invalidPath = error else { return XCTFail("unexpected error: \(error)") }
         }
+    }
+
+    /// PINS THE macOS SCALE CHAIN AGAINST REFACTOR DRIFT. The scale factor
+    /// handed to `AnnotationRenderer` now comes from the shared
+    /// `OverlayDrawingMetrics.rendererScaleFactor` definition (the Windows
+    /// verifier was reading a different one than the Windows live overlay);
+    /// macOS behavior had to stay bit-for-bit unchanged through that
+    /// refactor, and nothing else in this suite exercises a backing scale
+    /// other than 1.
+    ///
+    /// THE ARITHMETIC, so a future edit can tell a drift from a fix: a
+    /// 400x200-backing-pixel display at 2x is a 200x100 POINT canvas, and the
+    /// screenshot here is that display's full backing resolution (image-to-
+    /// screen scale exactly 1.0). The path's MCP x=100 divides by the backing
+    /// scale to point 50, which the compositor's point-canvas-to-screenshot
+    /// scale (400/200 = 2) multiplies straight back to screenshot pixel 100.
+    /// MCP y=40 flips to point 100 - 20 = 80 and lands at screenshot row
+    /// 200 - 160 = 40. So the painted box must be the annotation's own MCP
+    /// backing-pixel box, exactly: a wrong divisor anywhere in that chain
+    /// moves and resizes it by the whole scale factor -- which is precisely
+    /// the failure the Windows branch used to ship.
+    func testCompositeAtBackingScaleTwoPinsPaintedBoundsToTheAnnotationsBackingPixels() throws {
+        let source = try png(width: 400, height: 200)
+        // Fill only, no stroke: a stroke's half-width would spread the
+        // painted box past the geometry and blur what this test is pinning.
+        let rect = AnnotationKind.vectorPath(
+            data: "M 100 40 L 300 40 L 300 160 L 100 160 Z", strokeColorHex: nil, strokeWidth: 0,
+            strokeOpacity: 0, fillColorHex: "#FF0000", fillOpacity: 1, dash: [],
+            usesEvenOddFillRule: false, coordinateScaleX: 1, coordinateScaleY: 1
+        )
+        let result = try AnnotationVerificationCompositor.composite(
+            annotation: annotation(rect), screen: screen(width: 400, height: 200, scale: 2),
+            screenshotPath: source.path, paddingPx: 0
+        )
+        XCTAssertEqual(result.metadata["backingScaleFactor"] as? Double, 2)
+        XCTAssertEqual(try paintedBounds(result), ["x": 100, "y": 40, "width": 200, "height": 120])
+    }
+
+    /// THE DUAL-IDENTICAL-MONITOR FAILURE. `ScreenshotGeometry
+    /// .fullDisplayScale` only ever compared the image against ONE screen's
+    /// dimensions and carries no display identity, so a screenshot of the
+    /// OTHER 200x100 display passed at scale 1.0 and the annotation was
+    /// composited over unrelated UI -- a convincing picture of a placement
+    /// error that does not exist.
+    func testAmbiguousScreenshotIsRejectedWhenSeveralConnectedDisplaysAcceptIt() throws {
+        let source = try png(width: 200, height: 100)
+        let connected = [screen(), screen(id: "screen-2", index: 1)]
+        XCTAssertThrowsError(try AnnotationVerificationCompositor.composite(
+            annotation: annotation(pathKind()), screen: screen(), screenshotPath: source.path,
+            paddingPx: 2, ambiguityCandidateScreens: connected
+        )) { error in
+            guard case AnnotationVerificationError.ambiguousScreenshotDisplay = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            let message = error.localizedDescription
+            // Both candidates must be NAMED: the correction is one argument
+            // away only if the caller can see what it is choosing between.
+            XCTAssertTrue(message.contains("screen-1"), message)
+            XCTAssertTrue(message.contains("screen-2"), message)
+            XCTAssertTrue(message.contains("screenshot_screen_id"), message)
+            XCTAssertTrue(message.contains("capture_source='chalkboard'"), message)
+        }
+    }
+
+    /// The ambiguity filter counts a candidate only when the image could
+    /// PLAUSIBLY be a capture of it -- uniform mapping AND no upscale
+    /// (`ScreenshotGeometry.isPlausibleFullDisplayCapture`) -- so a native
+    /// capture of the annotation's display is NOT ambiguous against a
+    /// same-aspect smaller sibling, which the image "fits" only via an
+    /// enlargement no screenshot pipeline produces. Aspect-only counting
+    /// rejected exactly this formerly-valid verification.
+    func testNativeCaptureIsNotAmbiguousAgainstASameAspectSmallerSibling() throws {
+        XCTAssertFalse(ScreenshotGeometry.isPlausibleFullDisplayCapture(
+            screenshotWidth: 400, screenshotHeight: 200, screenWidth: 200, screenHeight: 100
+        ), "an upscale is not a plausible capture")
+        XCTAssertTrue(ScreenshotGeometry.isPlausibleFullDisplayCapture(
+            screenshotWidth: 400, screenshotHeight: 200, screenWidth: 400, screenHeight: 200
+        ), "a native capture is")
+        XCTAssertTrue(ScreenshotGeometry.isPlausibleFullDisplayCapture(
+            screenshotWidth: 200, screenshotHeight: 100, screenWidth: 400, screenHeight: 200
+        ), "and so is a downsample")
+
+        let source = try png(width: 400, height: 200)
+        let big = screen(width: 400, height: 200)
+        let smallSibling = screen(width: 200, height: 100, id: "screen-2", index: 1)
+        let result = try AnnotationVerificationCompositor.composite(
+            annotation: annotation(pathKind()), screen: big, screenshotPath: source.path,
+            paddingPx: 2, ambiguityCandidateScreens: [big, smallSibling]
+        )
+        XCTAssertFalse(result.pngData.isEmpty)
+    }
+
+    /// The counterpart boundary: an image that is native for one display AND
+    /// a clean half-resolution downsample of another is plausible for both,
+    /// so it must still refuse to guess.
+    func testDownsamplePlausibleForSeveralDisplaysIsStillAmbiguous() throws {
+        let source = try png(width: 400, height: 200)
+        let native = screen(width: 400, height: 200)
+        let doubled = screen(width: 800, height: 400, id: "screen-2", index: 1)
+        XCTAssertThrowsError(try AnnotationVerificationCompositor.composite(
+            annotation: annotation(pathKind()), screen: native, screenshotPath: source.path,
+            paddingPx: 2, ambiguityCandidateScreens: [native, doubled]
+        )) { error in
+            guard case AnnotationVerificationError.ambiguousScreenshotDisplay = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+    }
+
+    /// The way out the rejection above advertises. A verified
+    /// `screenshot_screen_id` (or Chalkboard's own capture) answers the
+    /// which-display question BEFORE the compositor is called, which the
+    /// handler expresses by passing no candidates at all -- see
+    /// `handleVerifyAnnotation`.
+    func testAssertedScreenshotDisplayLeavesNothingToDisambiguate() throws {
+        let source = try png(width: 200, height: 100)
+        let result = try AnnotationVerificationCompositor.composite(
+            annotation: annotation(pathKind()), screen: screen(), screenshotPath: source.path,
+            paddingPx: 2, ambiguityCandidateScreens: []
+        )
+        XCTAssertFalse(result.pngData.isEmpty)
+        XCTAssertEqual(result.metadata["screenId"] as? String, "screen-1")
+        // Every verification must NAME the display it interpreted the
+        // screenshot as, not merely carry it as a field a caller may skip.
+        XCTAssertTrue((result.metadata["verificationNote"] as? String ?? "").contains("display screen-1"),
+                      "the note must say which display this image was interpreted as")
+    }
+
+    /// THE ORDINARY SINGLE-DISPLAY SETUP MUST BE UNTOUCHED: one accepting
+    /// display is not ambiguous, so the full connected-screen list changes
+    /// nothing about the result.
+    func testSingleConnectedDisplayCompositesExactlyAsBefore() throws {
+        let source = try png(width: 200, height: 100)
+        let guarded = try AnnotationVerificationCompositor.composite(
+            annotation: annotation(pathKind()), screen: screen(), screenshotPath: source.path,
+            paddingPx: 2, ambiguityCandidateScreens: [screen()]
+        )
+        let unguarded = try AnnotationVerificationCompositor.composite(
+            annotation: annotation(pathKind()), screen: screen(), screenshotPath: source.path, paddingPx: 2
+        )
+        XCTAssertEqual(try paintedBounds(guarded), try paintedBounds(unguarded))
+    }
+
+    /// A screenshot whose dimensions fit NO connected display keeps its
+    /// previous meaning (`aspectRatioMismatch`) even with several candidates
+    /// in hand -- the mismatch guard runs first, exactly as it does on the
+    /// draw path.
+    func testDimensionMismatchStillOutranksTheAmbiguityGuard() throws {
+        let square = try png(width: 100, height: 100)
+        XCTAssertThrowsError(try AnnotationVerificationCompositor.composite(
+            annotation: annotation(pathKind()), screen: screen(), screenshotPath: square.path,
+            ambiguityCandidateScreens: [screen(), screen(id: "screen-2", index: 1)]
+        )) { error in
+            guard case AnnotationVerificationError.aspectRatioMismatch = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+    }
+
+    /// The `screenshot_screen_id`-names-the-wrong-display refusal. Pure text,
+    /// reachable with no MCP transport, which is why it lives beside the
+    /// ambiguity guard rather than inline in `handleVerifyAnnotation`.
+    func testScreenshotOfAnotherDisplayIsRefusedAndNamesBothDisplays() throws {
+        let rejection = try XCTUnwrap(AnnotationVerificationCompositor.screenshotDisplayMismatchRejection(
+            annotationId: "annotation-9", annotationScreenId: "screen-1", screenshotScreenId: "screen-2"
+        ))
+        XCTAssertTrue(rejection.contains("lives on display screen-1"), rejection)
+        XCTAssertTrue(rejection.contains("screenshot of display screen-2"), rejection)
+        XCTAssertTrue(rejection.contains("cannot prove or refute"), rejection)
+        XCTAssertTrue(rejection.contains("capture_source='chalkboard'"), rejection)
+        XCTAssertNil(AnnotationVerificationCompositor.screenshotDisplayMismatchRejection(
+            annotationId: "annotation-9", annotationScreenId: "screen-1", screenshotScreenId: "screen-1"
+        ), "asserting the annotation's own display is the supported, non-rejected case")
     }
 
     func testInMemoryCGImageUsesTheSameCompositePathAsFileInput() throws {

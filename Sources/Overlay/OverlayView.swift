@@ -4,6 +4,13 @@ import AppKit
 
 public final class OverlayView: NSView {
     public var screenId: String = ""
+    /// This display's `NSScreen.backingScaleFactor`, set once by
+    /// `OverlayWindowController.makeOverlayWindow`. It is the DISPLAY's scale,
+    /// not the renderer's divisor: `draw(_:)` below converts it through
+    /// `OverlayDrawingMetrics.rendererScaleFactor` -- the single definition
+    /// the verification compositor reads too -- rather than handing it to the
+    /// renderer directly, so this live path and the verification path cannot
+    /// drift apart. See that function for the full rationale.
     public var scaleFactor: CGFloat = 2.0
 
     override public init(frame frameRect: NSRect) {
@@ -77,7 +84,10 @@ public final class OverlayView: NSView {
             annotations,
             into: drawingContext,
             canvasSize: bounds.size,
-            scaleFactor: scaleFactor
+            // `bounds.size` is a POINT canvas, so the divisor this resolves to
+            // on macOS is exactly the display's backing scale -- unchanged
+            // behavior, now stated once in a place the verifier reads too.
+            scaleFactor: OverlayDrawingMetrics.rendererScaleFactor(displayBackingScaleFactor: scaleFactor)
         ) { assetId in
             rasterLease.image(id: assetId).map(NSImageRasterHandle.init)
         }

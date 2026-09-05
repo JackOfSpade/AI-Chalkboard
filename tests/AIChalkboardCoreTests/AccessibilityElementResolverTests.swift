@@ -362,8 +362,10 @@ final class AccessibilityElementResolverTests: XCTestCase {
 
     // MARK: - AccessibilityElementResolverError.noMatches exposed-sample preview (item 9)
 
-    private func candidate(_ label: String, role: String?) -> AccessibilityElementCandidate {
-        AccessibilityElementCandidate(matchedAttribute: "AXTitle", matchedLabel: label, role: role)
+    private func candidate(_ label: String, role: String?,
+                           backingFrame: AccessibilityBackingRect? = nil) -> AccessibilityElementCandidate {
+        AccessibilityElementCandidate(matchedAttribute: "AXTitle", matchedLabel: label,
+                                      role: role, backingFrame: backingFrame)
     }
 
     // Windows-only note: every test below through
@@ -661,6 +663,30 @@ final class AccessibilityElementResolverTests: XCTestCase {
 
     // MARK: - Traversal error messages name `occurrence` as the escape hatch first
 
+    /// The traversal errors are the two places this codebase actively PUSHES a
+    /// caller toward `occurrence` ("Try supplying occurrence FIRST"). That
+    /// advice hands back a truncated walk, so it must ship with the check that
+    /// covers what the truncation gave up -- otherwise the tool's own advice
+    /// is what produces an unverified, possibly-wrong anchor. Shared (not
+    /// macOS-only): the Windows `traversalLimitReached` carries this caveat
+    /// in the identical words, deliberately, because the property being
+    /// described belongs to `occurrence` rather than to either platform.
+    func testTraversalLimitReachedPairsTheOccurrenceAdviceWithAUniquenessCaveat() throws {
+        let message = try XCTUnwrap(AccessibilityElementResolverError.traversalLimitReached(3_000).errorDescription)
+        XCTAssertTrue(message.contains("occurrence short-circuits uniqueness checking"),
+                       "the occurrence advice must disclose what it gives up: \(message)")
+        let occurrenceAdvice = try XCTUnwrap(message.range(of: "Try supplying occurrence FIRST"))
+        let caveat = try XCTUnwrap(message.range(of: "occurrence short-circuits uniqueness checking"))
+        XCTAssertLessThan(occurrenceAdvice.lowerBound, caveat.lowerBound,
+                           "the caveat must follow the advice it qualifies, not precede it: \(message)")
+        // `verify_annotation` already appears in the screenshot-fallback tail,
+        // so pin that it ALSO appears alongside the occurrence advice rather
+        // than only at the very end of the message.
+        let verifyBeforeFallback = try XCTUnwrap(message.range(of: "verify_annotation"))
+        XCTAssertLessThan(verifyBeforeFallback.lowerBound, message.range(of: "raise max_nodes")?.lowerBound ?? message.endIndex,
+                           "verify_annotation must be paired with the occurrence advice: \(message)")
+    }
+
     func testTraversalLimitReachedNamesOccurrenceBeforeRaisingMaxNodesAndKeepsTheScreenshotFallback() throws {
         let message = try XCTUnwrap(AccessibilityElementResolverError.traversalLimitReached(3_000).errorDescription)
         XCTAssertTrue(message.contains("occurrence: 1"), "expected the concrete occurrence example in: \(message)")
@@ -694,6 +720,18 @@ final class AccessibilityElementResolverTests: XCTestCase {
                            "occurrence must be named as the FIRST thing to try, ahead of raising timeout_seconds: \(message)")
         XCTAssertTrue(message.contains("verify_annotation"))
         XCTAssertTrue(message.localizedCaseInsensitiveContains("screenshot"))
+    }
+
+    func testTraversalTimedOutPairsTheOccurrenceAdviceWithTheSameUniquenessCaveat() throws {
+        // Same requirement as `traversalLimitReached`'s caveat test above,
+        // and deliberately the same sentence: the two errors are two symptoms
+        // of one limitation and must not drift into two different accounts of
+        // what `occurrence` costs.
+        let message = try XCTUnwrap(AccessibilityElementResolverError.traversalTimedOut(seconds: 2.0).errorDescription)
+        let caveat = "Then confirm the result with verify_annotation, because occurrence short-circuits uniqueness checking: you get the first highlightable match, never a guarantee that it is the only one."
+        XCTAssertTrue(message.contains(caveat), "missing verbatim uniqueness caveat in: \(message)")
+        let limitMessage = try XCTUnwrap(AccessibilityElementResolverError.traversalLimitReached(3_000).errorDescription)
+        XCTAssertTrue(limitMessage.contains(caveat), "missing verbatim uniqueness caveat in: \(limitMessage)")
     }
 
     func testTraversalLimitReachedAndTraversalTimedOutShareTheSameScreenshotFallbackSentenceVerbatim() throws {
@@ -756,6 +794,197 @@ final class AccessibilityElementResolverTests: XCTestCase {
         for frame in nonFiniteFrames {
             XCTAssertNil(AccessibilityElementResolver.backingRect(forAccessibilityFrame: frame, screens: [primary]),
                          "expected nil for non-finite frame \(frame)")
+        }
+    }
+
+    // MARK: - Ambiguity candidates carry geometry, so `occurrence` is not blind
+    //
+    // The BFS that POPULATES `AccessibilityElementCandidate.backingFrame` is a
+    // live cross-process AX walk and is not reachable headlessly (it needs a
+    // running target app plus a granted TCC Accessibility permission), so what
+    // is pinned here is everything downstream of it that a caller actually
+    // reads: the rendering of one candidate's geometry, and the whole
+    // `.ambiguous` message built from a list of them. That is the part a
+    // regression would silently break -- the resolver would keep computing
+    // correct rects while the message stopped showing them, putting the caller
+    // straight back to guessing an occurrence.
+    //
+    // Windows-only note: `.ambiguous` has a different SHAPE there
+    // (`ambiguous(matchCount:)` -- `chalk_uia_find_element` reports a count
+    // and no per-candidate list at all), and `geometryNote` exists only on the
+    // macOS error type, so this whole section is macOS-only.
+    #if os(macOS)
+    private func backing(_ screenId: String, _ x: Double, _ y: Double,
+                         _ width: Double, _ height: Double) -> AccessibilityBackingRect {
+        AccessibilityBackingRect(screenId: screenId, x: x, y: y, width: width, height: height)
+    }
+
+    func testCandidateGeometryNoteRendersWholeBackingPixelsWithoutFloatingPointNoise() {
+        XCTAssertEqual(
+            AccessibilityElementResolverError.geometryNote(
+                for: candidate("Tracking", role: "AXStaticText",
+                               backingFrame: backing("S1", 4_200, 600, 240, 36))
+            ),
+            " -- screen S1 at 4200,600 240x36"
+        )
+    }
+
+    func testCandidateGeometryNoteSaysSoWhenACandidateMapsOntoNoSingleDisplay() {
+        // Reachable in real use: a match can publish a perfectly usable AX
+        // frame that still straddles two displays, which `backingRect`
+        // rejects. Selecting that occurrence would fail with
+        // `frameCannotBeMapped`, so the list must say so rather than print a
+        // silent gap that reads like "geometry unknown, probably fine".
+        let note = AccessibilityElementResolverError.geometryNote(
+            for: candidate("Tracking", role: "AXStaticText", backingFrame: nil)
+        )
+        XCTAssertEqual(note, " -- does not map onto a single display")
+    }
+
+    func testAmbiguousPreviewNumbersEachCandidateWithTheOccurrenceThatSelectsIt() throws {
+        // THE BUG THIS FIXES: five identically-labelled candidates used to
+        // render as five IDENTICAL strings, with no index and no geometry, so
+        // the caller picked an `occurrence` blind -- a measured session ringed
+        // a menu-bar item roughly 4,000 backing pixels from the Inspector row
+        // it meant. The list position and the argument value must be visibly
+        // the same number.
+        let matches = [
+            candidate("Tracking", role: "AXMenuItem", backingFrame: backing("S1", 120, 4, 80, 22)),
+            candidate("Tracking", role: "AXStaticText", backingFrame: backing("S1", 4_200, 600, 240, 36))
+        ]
+        let message = try XCTUnwrap(AccessibilityElementResolverError.ambiguous(matches: matches).errorDescription)
+        XCTAssertTrue(message.contains("occurrence 1: 'Tracking' [AXMenuItem] via AXTitle -- screen S1 at 120,4 80x22"),
+                       "expected a numbered, geometry-carrying first entry in: \(message)")
+        XCTAssertTrue(message.contains("occurrence 2: 'Tracking' [AXStaticText] via AXTitle -- screen S1 at 4200,600 240x36"),
+                       "expected a numbered, geometry-carrying second entry in: \(message)")
+        XCTAssertTrue(message.contains("ambiguous across 2 elements"), "expected the total count in: \(message)")
+    }
+
+    func testAmbiguousMessageStatesThatOccurrenceFollowsDiscoveryOrderNotVisualOrder() throws {
+        // Without this, "occurrence 2" reads like "the second one down the
+        // screen", which is exactly the assumption that put a highlight on a
+        // menu-bar item instead of an Inspector row.
+        let message = try XCTUnwrap(
+            AccessibilityElementResolverError.ambiguous(matches: [
+                candidate("Tracking", role: "AXStaticText", backingFrame: backing("S1", 0, 0, 10, 10))
+            ]).errorDescription
+        )
+        XCTAssertTrue(message.contains("BREADTH-FIRST DISCOVERY ORDER"), "expected in: \(message)")
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("not visual top-to-bottom or left-to-right order"),
+                       "must explicitly deny visual ordering: \(message)")
+    }
+
+    func testAmbiguousPreviewStillTruncatesAtEightAndKeepsOccurrenceNumbersAlignedWithTheList() throws {
+        // Geometry made each entry longer, so the existing eight-entry bound
+        // matters more, not less. The numbers must stay the real occurrence
+        // values (1...8), never a renumbering of the truncated slice.
+        let matches = (1...10).map {
+            candidate("Item", role: "AXButton", backingFrame: backing("S1", Double($0) * 10, 0, 20, 20))
+        }
+        let message = try XCTUnwrap(AccessibilityElementResolverError.ambiguous(matches: matches).errorDescription)
+        for index in 1...8 {
+            XCTAssertTrue(message.contains("occurrence \(index): 'Item' [AXButton] via AXTitle -- screen S1 at \(index * 10),0 20x20"),
+                           "expected occurrence \(index) in: \(message)")
+        }
+        XCTAssertFalse(message.contains("occurrence 9:"), "the 9th entry must be truncated away: \(message)")
+        XCTAssertTrue(message.contains("(and 2 more)"), "expected a truncation tail counting the remaining 2: \(message)")
+    }
+
+    // MARK: - A wrong/mis-cased role must not be reported as "not exposed"
+
+    func testLabelSeenUnderOtherRolesNamesEveryRoleAndNeverClaimsTheControlIsUnexposed() throws {
+        // THE BUG: role comparison is verbatim String equality against the
+        // app's own AXRole, so `role: "button"` matches nothing against a live
+        // "AXButton" -- and the resulting error used to say the UI "may not
+        // expose that control to macOS Accessibility", which is FALSE and
+        // sends the caller off to eyeball a screenshot.
+        let message = try XCTUnwrap(
+            AccessibilityElementResolverError.labelSeenUnderOtherRoles(
+                label: "Render", requestedRole: "button", seenRoles: ["AXButton", "AXMenuItem"]
+            ).errorDescription
+        )
+        XCTAssertTrue(message.contains("'AXButton'"), "must name the roles the label WAS seen under: \(message)")
+        XCTAssertTrue(message.contains("'AXMenuItem'"), "must name every role seen, not just the first: \(message)")
+        XCTAssertTrue(message.contains("'Render'"), "must echo the label that was searched for: \(message)")
+        XCTAssertTrue(message.contains("'button'"), "must echo the role the caller actually supplied: \(message)")
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("may not expose that control"),
+                        "this wording is reserved for the genuinely-nothing-found case: \(message)")
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("retry without role"),
+                       "must offer the two corrections that actually work: \(message)")
+    }
+
+    func testLabelSeenUnderOtherRolesUsesSingularWordingForASingleRole() throws {
+        let message = try XCTUnwrap(
+            AccessibilityElementResolverError.labelSeenUnderOtherRoles(
+                label: "Render", requestedRole: "AXbutton", seenRoles: ["AXButton"]
+            ).errorDescription
+        )
+        XCTAssertTrue(message.contains("under role: 'AXButton'"), "expected singular wording in: \(message)")
+        XCTAssertFalse(message.contains("under roles:"), "expected singular wording in: \(message)")
+    }
+
+    func testLabelSeenUnderOtherRolesIsADistinctCaseFromNoMatchesWithAnEmptySample() throws {
+        // These are opposite situations with opposite advice -- "the control
+        // is exposed, fix your role string" versus "nothing like this label
+        // was published at all" -- so they must never collapse into one case
+        // or one message. The empty-sample `.noMatches` wording is pinned
+        // verbatim by
+        // `testNoMatchesWithEmptySampleKeepsTheOriginalSentenceVerbatim`; this
+        // asserts the new case does not reuse it.
+        let roleMismatch = AccessibilityElementResolverError.labelSeenUnderOtherRoles(
+            label: "Render", requestedRole: "button", seenRoles: ["AXButton"]
+        )
+        let nothingFound = AccessibilityElementResolverError.noMatches(
+            label: "Render", role: "button", exposedSample: []
+        )
+        XCTAssertNotEqual(roleMismatch, nothingFound)
+        let roleMismatchMessage = try XCTUnwrap(roleMismatch.errorDescription)
+        let nothingFoundMessage = try XCTUnwrap(nothingFound.errorDescription)
+        XCTAssertNotEqual(roleMismatchMessage, nothingFoundMessage)
+        XCTAssertTrue(nothingFoundMessage.localizedCaseInsensitiveContains("may not expose that control"),
+                       "the genuinely-nothing-found wording must survive unchanged: \(nothingFoundMessage)")
+    }
+    #endif
+
+    // MARK: - highlight_element discloses an occurrence-short-circuited search
+    //
+    // `highlightSearchDisclosureFields` lives in MCPToolHandlers+Highlight.swift
+    // but is tested here, alongside the resolver's occurrence semantics,
+    // because the thing it discloses IS a resolver behaviour: `resolve()`
+    // returns the instant `matches.count == occurrence`, which makes its
+    // post-walk uniqueness check unreachable on every occurrence-supplied
+    // success path. The payload fields are the only place that fact ever
+    // reaches a caller.
+
+    func testNoDisclosureFieldsAreAddedWhenOccurrenceWasNotSupplied() {
+        // A lookup with no occurrence walked the whole tree and PROVED
+        // uniqueness, so there is nothing to disclose -- and adding two
+        // permanent "nothing unusual happened" fields would train a reader to
+        // skip exactly the fields that matter when they do appear.
+        XCTAssertTrue(highlightSearchDisclosureFields(occurrence: nil).isEmpty)
+    }
+
+    func testOccurrenceDrivenSuccessFlagsTheShortCircuitAndDemandsVerifyAnnotation() throws {
+        let fields = highlightSearchDisclosureFields(occurrence: 3)
+        XCTAssertEqual(fields["searchWasShortCircuited"] as? Bool, true)
+        let note = try XCTUnwrap(fields["searchShortCircuitNote"] as? String)
+        XCTAssertTrue(note.contains("match 3"), "the note must name WHICH match the walk stopped at: \(note)")
+        XCTAssertTrue(note.localizedCaseInsensitiveContains("uniqueness was NOT checked"),
+                       "the note must say uniqueness checking was skipped: \(note)")
+        XCTAssertTrue(note.localizedCaseInsensitiveContains("other elements may share this label"),
+                       "the note must say the result may not be unique: \(note)")
+        XCTAssertTrue(note.contains("verify_annotation"),
+                       "the note must name the confirmation step: \(note)")
+    }
+
+    func testDisclosedMatchIndexTracksTheSuppliedOccurrence() {
+        // The note is only useful if the number in it is the caller's own
+        // occurrence; a hardcoded "1" would read as correct while describing
+        // a different match every time.
+        for occurrence in [1, 2, 17] {
+            let note = highlightSearchDisclosureFields(occurrence: occurrence)["searchShortCircuitNote"] as? String
+            XCTAssertEqual(note?.contains("match \(occurrence)"), true,
+                           "expected match \(occurrence) named in: \(note ?? "<nil>")")
         }
     }
 }

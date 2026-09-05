@@ -6,23 +6,27 @@ import XCTest
 @testable import AIChalkboardCore
 
 /// Covers `ellipsePathData` (the two-half-arc closed-ellipse formula shared by
-/// `draw_shape` and `highlight_element`) and `draw_shape`'s own geometry
-/// parsing (`MCPServer.makeShapeKind`), all of it headless and display-free.
+/// `draw_shape` and `highlight_element`), `draw_shape`'s own geometry parsing
+/// (`MCPServer.makeShapeKind`), and `highlight_element`'s padding/coverage
+/// arithmetic (`highlightOutlinePathData`), all of it headless and
+/// display-free.
 ///
-/// NOT covered here: `highlight_element`'s own `.rect`/`.ellipse`/`.circle`
-/// dispatch (`makeHighlightKind`/`makeHighlightStyle` in
-/// `MCPToolHandlers+Highlight.swift`). Both are `private` to that file, and
-/// the only reachable entry point, `handleHighlightElement`, requires
-/// resolving a live running application through the real Accessibility API
-/// (no seam to inject a fake AX tree) and writes its result straight to
-/// stdout -- the live JSON-RPC transport -- exactly the hazard
-/// `MCPPureHelperTests`'s header comment calls out for `send*` methods. That
-/// combination makes it untestable headlessly without widening those
-/// declarations' access level, which is out of scope for a tests-only change.
-/// `ellipsePathData` below is the one piece `makeHighlightKind` actually
-/// delegates its ellipse/circle math to, so its correctness is still
-/// exercised end to end; only the padding/circumscribe-vs-inscribe arithmetic
-/// specific to the highlight code path is left unverified.
+/// `highlight_element`'s geometry used to be listed here as untestable, and it
+/// really was: the arithmetic lived inside `private makeHighlightKind`, whose
+/// only entry point resolves a live running application through the real
+/// Accessibility API and answers on stdout. Nothing headless could reach it,
+/// and a `circle` that clipped the very element it was drawn to ring shipped
+/// unnoticed as a direct result. That arithmetic now lives in the free, pure
+/// `highlightOutlinePathData`, which the tests below pin with nothing but a
+/// few doubles -- including the containment property whose violation was the
+/// bug.
+///
+/// STILL NOT covered here: the AX-resolution and transport plumbing around it
+/// -- `handleHighlightElement`'s live element lookup (no seam to inject a fake
+/// AX tree) and its write straight to stdout, the live JSON-RPC transport,
+/// exactly the hazard `MCPPureHelperTests`'s header comment calls out for
+/// `send*` methods. `makeHighlightStyle`'s argument validation stays `private`
+/// with it for the same reason.
 final class MCPShapeGeometryTests: XCTestCase {
 
     // MARK: - Helpers
@@ -128,6 +132,103 @@ final class MCPShapeGeometryTests: XCTestCase {
         XCTAssertEqual(box.midY, 284, accuracy: 1e-6)
         XCTAssertEqual(box.width, 80, accuracy: 1e-6)
         XCTAssertEqual(box.height, 24, accuracy: 1e-6)
+    }
+
+    // MARK: - highlight_element: padded outline geometry
+
+    /// BYTE-IDENTICAL, not merely equivalent geometry: `highlight_element`
+    /// stores this exact string as the annotation's path, and an existing
+    /// caller reads it back verbatim through list_annotations /
+    /// verify_annotation / update_annotation. A 300x80 element at (100, 200)
+    /// with the default padding_px=8 has padded bounds (92, 192) 316x96.
+    func testHighlightOutlineRectTracesThePaddedBoundsInTheHistoricalFormat() {
+        let data = highlightOutlinePathData(
+            shape: .rect, frameX: 100, frameY: 200, frameWidth: 300, frameHeight: 80, padding: 8
+        )
+        XCTAssertEqual(data, "M 92.0 192.0 H 408.0 V 288.0 H 92.0 Z")
+    }
+
+    /// Inscribed: tangent to all four edges of the same padded bounds the rect
+    /// pin above traces -- centre (250, 240), radii 316/2 and 96/2. This is
+    /// the shape that deliberately does NOT contain a rectangular element's
+    /// corners; it traces a round or pill control's silhouette instead.
+    func testHighlightOutlineEllipseIsInscribedInThePaddedBounds() {
+        let data = highlightOutlinePathData(
+            shape: .ellipse, frameX: 100, frameY: 200, frameWidth: 300, frameHeight: 80, padding: 8
+        )
+        XCTAssertEqual(data, ellipsePathData(centerX: 250.0, centerY: 240.0, radiusX: 158.0, radiusY: 48.0))
+    }
+
+    /// The 44x44 icon button from the defect report, at the default
+    /// padding_px=8: radius = half the ELEMENT's diagonal plus the padding,
+    /// and the ring stays concentric with the element.
+    func testHighlightOutlineCircleRadiusIsHalfTheElementDiagonalPlusPadding() throws {
+        let radius = (44.0 * 44.0 + 44.0 * 44.0).squareRoot() / 2 + 8
+        XCTAssertEqual(radius, 39.11269837220809, accuracy: 1e-9, "the formula this test pins, spelled out")
+        let data = highlightOutlinePathData(
+            shape: .circle, frameX: 500, frameY: 300, frameWidth: 44, frameHeight: 44, padding: 8
+        )
+        let box = try boundingBox(of: data)
+        // The WIDTH is exact to the last bit: `ellipsePathData` splits the
+        // outline at the left and right poles, so those two extrema are
+        // literal path endpoints. The HEIGHT is not -- the vertical extrema
+        // fall in the middle of the cubic segments `SVGPathParser` reduces
+        // each arc to, and a cubic only approximates a circular arc (how
+        // closely depends on how many segments the arc's sweep is divided
+        // into, so it varies by case). Microns of slack there, not more; an
+        // outline that had actually become an ellipse would miss by pixels.
+        XCTAssertEqual(Double(box.width), 2 * radius, accuracy: 1e-9)
+        XCTAssertEqual(Double(box.height), 2 * radius, accuracy: 1e-4, "a circle, not an ellipse")
+        XCTAssertEqual(Double(box.midX), 522, accuracy: 1e-9, "concentric with the element: 500 + 44/2")
+        XCTAssertEqual(Double(box.midY), 322, accuracy: 1e-9, "concentric with the element: 300 + 44/2")
+    }
+
+    /// THE regression test for the shipped defect: the ring must clear the
+    /// element by at least `padding` EVERYWHERE, corners included -- the
+    /// corners being exactly where the old radius failed. The sizes below span
+    /// square, wide, tall, large, and extremely elongated elements, because the
+    /// old max(paddedWidth, paddedHeight)/2 radius was only ever adequate for
+    /// the last of those.
+    func testHighlightOutlineCircleKeepsEveryElementCornerAtLeastThePaddingInside() throws {
+        for (width, height) in [(44.0, 44.0), (120.0, 32.0), (32.0, 120.0), (200.0, 200.0), (5.0, 300.0)] {
+            for padding in [0.0, 8.0, 24.0] {
+                let data = highlightOutlinePathData(
+                    shape: .circle, frameX: 640, frameY: 480,
+                    frameWidth: width, frameHeight: height, padding: padding
+                )
+                let box = try boundingBox(of: data)
+                // Read back off the EMITTED path rather than recomputed, so
+                // this really does test what a caller would be drawn. The
+                // width is the exact diameter (see the radius pin above for
+                // why the width is bit-exact and the height is not).
+                let radius = Double(box.width) / 2
+                // All four corners of the element are the same distance from
+                // the shared centre -- half the element's diagonal -- so this
+                // one number is the worst case for the whole outline.
+                let cornerDistance = (width * width + height * height).squareRoot() / 2
+                XCTAssertLessThanOrEqual(
+                    cornerDistance, radius - padding + 1e-9,
+                    "\(width)x\(height) at padding \(padding): the ring comes closer to a corner than the requested padding"
+                )
+                XCTAssertEqual(Double(box.height), 2 * radius, accuracy: 1e-4, "\(width)x\(height): must stay round")
+                XCTAssertEqual(Double(box.midX), 640 + width / 2, accuracy: 1e-9)
+                XCTAssertEqual(Double(box.midY), 480 + height / 2, accuracy: 1e-9)
+            }
+        }
+
+        // Stated as the OLD formula's failure rather than the new one's
+        // success, so this pins WHY the radius changed: a 44x44 button padded
+        // by 8 has 60x60 padded bounds, giving max(60, 60)/2 = 30 -- while the
+        // button's own corners sit ~31.11px from the centre. The ring drawn to
+        // enclose the button passed straight through it, which is exactly what
+        // the user reported seeing.
+        let paddedWidth: Double = 44 + 2 * 8
+        let paddedHeight: Double = 44 + 2 * 8
+        let oldRadius = max(paddedWidth, paddedHeight) / 2
+        let cornerDistance = (44.0 * 44.0 + 44.0 * 44.0).squareRoot() / 2
+        XCTAssertEqual(oldRadius, 30)
+        XCTAssertEqual(cornerDistance, 31.11269837220809, accuracy: 1e-9)
+        XCTAssertGreaterThan(cornerDistance, oldRadius)
     }
 
     // MARK: - draw_shape: coordinate semantics (item 5)

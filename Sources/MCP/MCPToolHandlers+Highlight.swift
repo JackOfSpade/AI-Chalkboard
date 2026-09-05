@@ -27,8 +27,136 @@ private typealias HighlightProcessID = UInt32
 /// (radio buttons, circular icon buttons, dots), and ringing one with a
 /// rectangle draws attention to its bounding box rather than its actual
 /// silhouette.
-private enum HighlightShape: String {
+///
+/// Internal, not `private`, only so `MCPShapeGeometryTests` can name it when
+/// pinning `highlightOutlinePathData` below. The raw values are the wire
+/// strings `highlight_element`'s `shape` argument accepts and are part of the
+/// published schema (see MCPToolCatalog.swift); do not rename them.
+enum HighlightOutlineShape: String {
     case rect, ellipse, circle
+}
+
+/// The radius of the `.circle` outline, in one place because
+/// `makeHighlightKind`'s range guard and the path this radius is actually
+/// emitted into MUST be the same number -- a guard computing the radius its
+/// own way would be checking a value nothing draws.
+///
+/// WHY HALF THE ELEMENT DIAGONAL PLUS PADDING: the region of points at least
+/// `padding` away from every point of a w x h rectangle is that rectangle
+/// grown by `padding` with ROUNDED corners, and the tightest circle that
+/// contains it is centred on the element with radius `hypot(w, h)/2 +
+/// padding`. Anything smaller crosses the rounded corner arcs, i.e. comes
+/// closer to the element than the caller's padding -- or worse.
+///
+/// The previous formula, `max(paddedWidth, paddedHeight)/2`, only reached the
+/// padded rectangle's EDGE MIDPOINTS; its corners lay outside the ring. On a
+/// square element that failure is not cosmetic: a 44x44 icon button at the
+/// default padding_px=8 has padded bounds 60x60, so the old radius was 30 --
+/// while the button's OWN corners sit (44*44 + 44*44).squareRoot()/2 ~=
+/// 31.11px from centre. The ring passed through the button it was drawn to
+/// enclose. The formula below puts that same corner 8px inside the ring, as
+/// asked.
+///
+/// `.squareRoot()` rather than `hypot()`: this file builds on both the macOS
+/// and the Windows toolchain, and the stdlib method needs no libc import to
+/// be in scope on either (same reason ChalkGeometry.swift's quadratic solver
+/// uses `discriminant.squareRoot()`).
+private func highlightCircleRadius(frameWidth: Double, frameHeight: Double, padding: Double) -> Double {
+    (frameWidth * frameWidth + frameHeight * frameHeight).squareRoot() / 2 + padding
+}
+
+/// Builds the exact path string `highlight_element` draws for one resolved
+/// element frame and `padding_px`, for each of the three outline shapes.
+///
+/// A free, internal, pure function -- no `MCPServer`, no AppKit, no
+/// Accessibility, no display -- for exactly the reason `ellipsePathData` in
+/// MCPToolHandlers+Shape.swift is one: it lets a test pin this geometry with
+/// nothing but a few doubles. That seam is not decoration. The padding and
+/// coverage arithmetic used to live entirely inside `private
+/// makeHighlightKind`, whose only entry point resolves a live application
+/// through the real Accessibility API and answers on stdout, so nothing
+/// headless could reach it -- which is precisely how a circle that clipped
+/// the element it ringed shipped unnoticed (see `highlightCircleRadius`).
+///
+/// ARITHMETIC ONLY, no validation: every finite/magnitude/positivity check
+/// stays in `makeHighlightKind`, which must reject bad bounds with its own
+/// error text before any path exists. Callers must validate first.
+///
+/// The `.rect` string is byte-identical to the pre-`shape` behaviour, and
+/// must stay that way: an existing caller's stored annotation geometry is
+/// compared verbatim by `verify_annotation`/`update_annotation`.
+func highlightOutlinePathData(
+    shape: HighlightOutlineShape,
+    frameX: Double,
+    frameY: Double,
+    frameWidth: Double,
+    frameHeight: Double,
+    padding: Double
+) -> String {
+    let x = frameX - padding
+    let y = frameY - padding
+    let width = frameWidth + 2 * padding
+    let height = frameHeight + 2 * padding
+    // Padding is symmetric, so the element and its padded bounds share a
+    // centre -- all three shapes are concentric with both.
+    let centerX = x + width / 2
+    let centerY = y + height / 2
+
+    switch shape {
+    case .rect:
+        return "M \(x) \(y) H \(x + width) V \(y + height) H \(x) Z"
+
+    case .ellipse:
+        // Inscribed in the padded bounds -- the ellipse touches the padded
+        // rectangle at the midpoint of each of its four edges. That is the
+        // natural reading of "ellipse around this element" for the round and
+        // pill-shaped controls this shape exists for: it traces the
+        // silhouette. On a genuinely rectangular element it necessarily
+        // clips the corners, which is why the schema tells callers to pick
+        // rect or circle when containment is what they want.
+        return ellipsePathData(centerX: centerX, centerY: centerY, radiusX: width / 2, radiusY: height / 2)
+
+    case .circle:
+        let radius = highlightCircleRadius(frameWidth: frameWidth, frameHeight: frameHeight, padding: padding)
+        return ellipsePathData(centerX: centerX, centerY: centerY, radiusX: radius, radiusY: radius)
+    }
+}
+
+/// The extra `highlight_element` result fields that disclose a
+/// short-circuited search, or an empty dictionary when the search was NOT
+/// short-circuited.
+///
+/// WHY THIS EXISTS. `AccessibilityElementResolver.resolve` returns the moment
+/// `matches.count == occurrence`, and that return is a TRUNCATED walk: it
+/// never visits the rest of the tree, so it never learns whether another
+/// element carries the same label. The post-walk ambiguity check (`guard
+/// matches.count == 1`) is provably unreachable on every occurrence-supplied
+/// success path, because reaching it requires the loop to run to completion,
+/// which an occurrence-supplied match by construction prevents. Until now
+/// nothing said so: an occurrence-driven success and an
+/// uniqueness-PROVEN success produced byte-identical payloads, so a caller
+/// had no way to tell "this is the only 'Render' button" from "this is the
+/// first of possibly many". The fix is disclosure, NOT more walking -- the
+/// short circuit is what keeps `highlight_element` inside its max_nodes and
+/// timeout budgets on the large trees that need occurrence in the first
+/// place (measured: 0.01-1.3s with occurrence versus a 4.2s node-cap failure
+/// without it).
+///
+/// A free, internal, pure function -- no `MCPServer`, no Accessibility, no
+/// display -- for the same reason `highlightOutlinePathData` above is one:
+/// the wire KEY NAMES and the note's wording are the entire product here, and
+/// a test can pin them with nothing but an `Int?`.
+///
+/// The keys are absent (rather than present-and-false) when `occurrence` was
+/// not supplied: their presence IS the signal, and a payload that grows two
+/// permanent fields to say "nothing unusual happened" trains a reader to skip
+/// them.
+func highlightSearchDisclosureFields(occurrence: Int?) -> [String: Any] {
+    guard let occurrence else { return [:] }
+    return [
+        "searchWasShortCircuited": true,
+        "searchShortCircuitNote": "Because occurrence was supplied, the accessibility walk stopped at highlightable match \(occurrence) instead of finishing the tree, so uniqueness was NOT checked: other elements may share this label, and this may not be the one you meant. Confirm the placement with verify_annotation before relying on it."
+    ]
 }
 
 private struct HighlightStyle {
@@ -38,7 +166,7 @@ private struct HighlightStyle {
     let fillColor: String?
     let fillOpacity: Double
     let padding: Double
-    let shape: HighlightShape
+    let shape: HighlightOutlineShape
 }
 
 /// Renderer-visible alpha includes a color's own RGBA alpha.  Named colors
@@ -177,8 +305,47 @@ extension MCPServer {
             sendErrorResult(id: id, text: error.localizedDescription)
             return
         }
-        guard let screen = screens.first(where: { $0.id == match.backingFrame.screenId }) else {
-            sendErrorResult(id: id, text: "The resolved accessibility element belongs to a display that is no longer connected. Retry the lookup.")
+        // RE-READ THE DISPLAY LAYOUT AND RE-CONVERT, rather than trusting the
+        // pre-walk snapshot. `screens` above was captured BEFORE a traversal
+        // that callers may legitimately let run for up to
+        // `maxTraversalTimeoutSeconds` (10s), and the element's frame is read
+        // live, mid-walk, in whatever display arrangement is current AT THAT
+        // MOMENT. Convert that frame against a snapshot from ten seconds
+        // earlier and a display reconfiguration in between silently shifts
+        // the answer: `backingRect` anchors macOS's conversion to the
+        // zero-origin display's height, picks the containing screen by
+        // frame, and multiplies by that screen's backingScaleFactor -- all
+        // three change when a monitor is added, removed, rearranged, or
+        // rescaled. Nothing about that failure is visible: it returns a
+        // perfectly well-formed rectangle in the wrong place, and stores the
+        // annotation against a screen id that may no longer exist.
+        //
+        // The guard this replaces could not catch any of it. It looked the
+        // resolved `screenId` up in the SAME `screens` array that produced
+        // it, and `backingRect` only ever returns an id belonging to a
+        // member of that array -- so "belongs to a display that is no longer
+        // connected" was unreachable by construction, on both platforms.
+        //
+        // Re-deriving the rect from a FRESH snapshot and requiring it to be
+        // identical makes the check real. Equality is the right test, not
+        // "recompute and use the new value": if the two disagree, the AX
+        // frame itself was measured in an arrangement we can no longer
+        // identify, so NEITHER conversion is trustworthy and guessing
+        // between them would just move the misplacement around. Note this
+        // deliberately compares the conversion RESULT, not the snapshots:
+        // `ScreenInfo.isMain` follows keyboard focus and changes constantly
+        // without affecting placement at all, so comparing snapshots would
+        // reject ordinary window switching. Cost is one extra main-thread
+        // hop plus pure arithmetic, against a lookup that just spent
+        // milliseconds-to-seconds in cross-process IPC.
+        let screensAfterWalk = OverlayWindowController.shared.screenSnapshot().screens
+        guard let confirmedFrame = AccessibilityElementResolver.backingRect(
+                  forAccessibilityFrame: match.accessibilityFrame, screens: screensAfterWalk
+              ),
+              confirmedFrame == match.backingFrame,
+              let screen = screensAfterWalk.first(where: { $0.id == confirmedFrame.screenId })
+        else {
+            sendErrorResult(id: id, text: "The display layout changed while the target app's accessibility tree was being walked, so the matched element's screen coordinates cannot be converted safely (its frame was measured against the previous arrangement). Nothing was drawn. This is transient -- retry highlight_element; do not fall back to screenshot-measured coordinates, because the element itself resolved fine and anchoring will work once the layout settles.")
             return
         }
 
@@ -210,6 +377,13 @@ extension MCPServer {
                 "anchorBehavior": "resolved once at draw time; call highlight_element again after the UI moves"
             ]
             payload["matchedElement"] = jsonObject(match) ?? NSNull()
+            // Merged rather than assigned field-by-field so the disclosure's
+            // key names live in exactly one place -- the pure function a test
+            // can pin. See `highlightSearchDisclosureFields` for why an
+            // occurrence-driven success MUST say that uniqueness was skipped.
+            for (key, value) in highlightSearchDisclosureFields(occurrence: MCPArgument.integer(args["occurrence"])) {
+                payload[key] = value
+            }
             guard let text = jsonString(payload) else {
                 sendErrorResult(id: id, text: "Created the highlight but failed to encode its accessibility metadata.")
                 return
@@ -404,7 +578,7 @@ extension MCPServer {
         if args.keys.contains("shape"), !(args["shape"] is String) {
             return .failure("shape must be 'rect', 'ellipse', or 'circle' when supplied.")
         }
-        let shape: HighlightShape
+        let shape: HighlightOutlineShape
         switch (args["shape"] as? String)?.lowercased() ?? "rect" {
         case "rect": shape = .rect
         case "ellipse": shape = .ellipse
@@ -457,21 +631,19 @@ extension MCPServer {
             return .failure("Resolved accessibility bounds are not usable for a highlight.")
         }
 
-        let data: String
+        // Every derived value the emitted path depends on is range-checked
+        // HERE, before `highlightOutlinePathData` -- which deliberately does
+        // no validation of its own -- turns it into a string. The centre is
+        // shared by all three shapes (padding is symmetric).
+        let cx = x + width / 2
+        let cy = y + height / 2
         switch style.shape {
         case .rect:
-            // Byte-identical to the pre-`shape` behaviour: an omitted `shape`
-            // must change nothing about what an existing caller gets back.
-            data = "M \(x) \(y) H \(x + width) V \(y + height) H \(x) Z"
+            // The padded-bounds trace uses nothing but the four values the
+            // guard above already covers; there is no derived radius to check.
+            break
 
         case .ellipse:
-            // Inscribed in the padded bounds -- the ellipse touches the
-            // padded rectangle at the midpoint of each of its four edges.
-            // That is the natural reading of "ellipse around this element":
-            // the padded rectangle already traces the element's outline, so
-            // the tightest ellipse containing it is the one tangent to it.
-            let cx = x + width / 2
-            let cy = y + height / 2
             let rx = width / 2
             let ry = height / 2
             guard [cx, cy, rx, ry].allSatisfy(\.isFinite),
@@ -479,30 +651,32 @@ extension MCPServer {
                   rx > 0, ry > 0 else {
                 return .failure("Resolved accessibility bounds are not usable for a highlight.")
             }
-            data = ellipsePathData(centerX: cx, centerY: cy, radiusX: rx, radiusY: ry)
 
         case .circle:
-            // Concentric with the padded bounds, but sized to CIRCUMSCRIBE
-            // them (r = max(width, height)/2) rather than inscribe them (r =
-            // min(width, height)/2). A UI element -- a button, a toolbar
-            // icon -- is usually wider than it is tall; an inscribed circle
-            // would clip its left/right ends, which defeats the entire point
-            // of ringing it. Circumscribing costs a little extra ring
-            // above/below a wide element in exchange for never cutting off
-            // what it is meant to highlight.
-            let cx = x + width / 2
-            let cy = y + height / 2
-            let r = max(width, height) / 2
+            // Derived from the ELEMENT frame, not the padded bounds: see
+            // `highlightCircleRadius` for why half the element's diagonal
+            // plus the padding is the radius that actually encloses the
+            // element, and for the 44x44 button the old max(w, h)/2 ring cut
+            // straight through.
+            let r = highlightCircleRadius(
+                frameWidth: frame.width, frameHeight: frame.height, padding: style.padding
+            )
             guard [cx, cy, r].allSatisfy(\.isFinite),
                   [cx, cy, r].allSatisfy({ abs($0) <= DrawingDefaults.maxCoordinateMagnitudePx }),
                   r > 0 else {
                 return .failure("Resolved accessibility bounds are not usable for a highlight.")
             }
-            data = ellipsePathData(centerX: cx, centerY: cy, radiusX: r, radiusY: r)
         }
 
         return .success(.vectorPath(
-            data: data,
+            data: highlightOutlinePathData(
+                shape: style.shape,
+                frameX: frame.x,
+                frameY: frame.y,
+                frameWidth: frame.width,
+                frameHeight: frame.height,
+                padding: style.padding
+            ),
             strokeColorHex: style.strokeColor,
             strokeWidth: style.strokeWidth,
             strokeOpacity: style.strokeOpacity,
