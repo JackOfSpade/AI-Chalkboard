@@ -2,16 +2,35 @@
 """Opt-in, real-process coverage for the suspension lease protocol.
 
 This is deliberately *not* part of the ordinary unit-test run.  It creates
-two actual AppKit/MCP processes, which means it needs an Aqua WindowServer and
-would otherwise be far too easy to aim at a person's live Chalkboard setup.
-The explicit environment gate also prevents this test from ever using the
-production DistributedNotificationCenter name or Application Support state.
+two actual MCP processes with real overlay windows, which means it needs a live
+window system and would otherwise be far too easy to aim at a person's live
+Chalkboard setup.  The explicit environment gate also prevents this test from
+ever using the production broadcast name or Application Support state.
+
+The lease protocol is one contract on both platforms, but the evidence that
+suspension actually MOVED the windows can only come from the local window
+system.  So `_SuspensionTwoProcessContract` holds everything platform-neutral
+and two suites supply that one probe:
+
+  SuspensionTwoProcessMacOSTests    darwin  -- CGWindowListCopyWindowInfo
+  SuspensionTwoProcessWindowsTests  win32   -- IsWindowVisible
+
+Exactly one runs on a given machine; the other reports itself skipped, with the
+platform as the reason.  Neither reads the child's own `isOnScreen`, which is
+the claim under test -- both ask the OS independently, matching on owner PID
+AND window handle so an unrelated process cannot satisfy the check.
 
 Run only against an expendable build, for example:
 
   AI_CHALKBOARD_RUN_TWO_PROCESS_TEST=1 \\
   AI_CHALKBOARD_SUSPENSION_TWO_PROCESS_BINARY="$PWD/.build/debug/AIChalkboard" \\
   python3 -m unittest tests/test_suspension_two_process.py
+
+On Windows the built product is named and laid out differently -- SwiftPM writes
+the triple-qualified directory and cannot create the `.build/debug` convenience
+symlink, so that path does not exist there:
+
+  .build/x86_64-unknown-windows-msvc/debug/AIChalkboard.exe
 """
 
 import json
@@ -33,19 +52,46 @@ RUN_GATE = "AI_CHALKBOARD_RUN_TWO_PROCESS_TEST"
 BINARY_ENV = "AI_CHALKBOARD_SUSPENSION_TWO_PROCESS_BINARY"
 
 
-@unittest.skipUnless(
-    os.environ.get(RUN_GATE) == "1" and os.environ.get(BINARY_ENV),
-    "requires explicit two-process opt-in and disposable MCP binary",
-)
-class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
-    """Uses only randomized test state/transport and only kills its children."""
+GATE_OPEN = os.environ.get(RUN_GATE) == "1" and bool(os.environ.get(BINARY_ENV))
+GATE_REASON = "requires explicit two-process opt-in and disposable MCP binary"
+
+
+class _SuspensionTwoProcessContract:
+    """Everything about the lease protocol that does not depend on the platform.
+
+    Deliberately NOT a `unittest.TestCase`: it has no `window_on_screen`, so if
+    unittest could collect it directly it would run the whole protocol and then
+    die on the one assertion that proves the windows actually moved. The two
+    concrete suites below mix this into `TestCase` and supply that probe.
+
+    Uses only randomized test state/transport and only kills its children.
+    """
+
+    @staticmethod
+    def window_on_screen(pid, window_number):
+        """Is this exact (pid, window_number) pair on screen, per the OS?
+
+        Answered by an INDEPENDENT query to the window system from the test
+        process -- never by reading the child's own `isOnScreen`, which is the
+        very claim under test. Each suite supplies the local primitive.
+        """
+        raise NotImplementedError
 
     timeout = 10.0
 
     def setUp(self):
         binary = Path(os.environ[BINARY_ENV]).resolve()
-        if not binary.is_file() or not os.access(binary, os.X_OK):
-            self.fail(f"{BINARY_ENV} is not an executable file: {binary}")
+        if not binary.is_file():
+            self.fail(f"{BINARY_ENV} is not a file: {binary}")
+        # Split rather than folded into the condition above, because os.X_OK is
+        # meaningful only where POSIX permission bits are. On Windows os.access
+        # returns True for any readable file, so as a single condition half this
+        # guard was dead there while still blaming "not an executable file" for
+        # either cause. Skipped where it cannot mean anything; enforced where it
+        # can, since pointing this variable at a non-executable is an easy
+        # mistake and the failure it causes otherwise is a confusing one.
+        if os.name != "nt" and not os.access(binary, os.X_OK):
+            self.fail(f"{BINARY_ENV} is not executable: {binary}")
 
         self.tempdir = tempfile.mkdtemp(prefix="ai-chalkboard-suspension-it-")
         # Registered IMMEDIATELY, and likewise for each child below, because
@@ -122,7 +168,24 @@ class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
             }, request_id=10 + index, raw_method=True)
             self.assertIn("result", response, self.child_diagnostics())
 
-        self.assertEqual(os.stat(self.tempdir).st_mode & 0o777, 0o700)
+        # The lease registry and the instance lock both live in this directory,
+        # so on POSIX it must not be group- or world-readable: mkdtemp promises
+        # 0o700 and this pins that nothing widened it.
+        #
+        # Skipped on Windows, which does not implement POSIX mode bits at all --
+        # CPython synthesises st_mode from the read-only attribute and reports
+        # 0o777 for every directory, so this could only ever fail there (it did:
+        # "AssertionError: 511 != 448"). The protection itself is not lost, it is
+        # just expressed differently: mkdtemp creates under the per-user %TEMP%,
+        # whose ACL grants the owning user, SYSTEM and Administrators rather than
+        # Everyone. Asserting that would mean parsing ACLs, which is a different
+        # test from this one.
+        if os.name != "nt":
+            self.assertEqual(
+                os.stat(self.tempdir).st_mode & 0o777, 0o700,
+                f"{self.tempdir} is not owner-only, so the suspension registry "
+                f"and instance lock inside it are exposed to other users",
+            )
         for index in range(2):
             state = self.payload(index, "get_overlay_state", {}, 20 + index)
             self.assertTrue(state["suspensionRegistryBootstrapped"], state)
@@ -226,52 +289,19 @@ class SuspensionTwoProcessIntegrationTests(unittest.TestCase):
         # own cleanups when an assertion in setUp is what failed.
         return "; ".join(f"pid={proc.pid} status={proc.poll()}" for proc in self.children)
 
-    @staticmethod
-    def windowserver_on_screen(pid, window_number):
-        """Ask Quartz for this exact test child PID/window-number pair.
-
-        The test passes neither Chalkboard's name nor a broad owner match to
-        WindowServer, so an unrelated live process cannot satisfy this check.
-        A short Swift one-liner is used instead of PyObjC (not a project
-        dependency).  Its sole output is a JSON boolean.
-        """
-        source = r'''
-import ApplicationServices
-import Foundation
-let pid = Int(CommandLine.arguments[1])!
-let number = Int(CommandLine.arguments[2])!
-let entries = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-let found = entries.contains { entry in
-    (entry[kCGWindowOwnerPID as String] as? NSNumber)?.intValue == pid &&
-    (entry[kCGWindowNumber as String] as? NSNumber)?.intValue == number
-}
-print(found ? "true" : "false")
-'''
-        completed = subprocess.run(
-            ["/usr/bin/swift", "-e", source, str(pid), str(window_number)],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            check=False,
-        )
-        if completed.returncode:
-            raise AssertionError(f"Quartz probe failed: {completed.stderr.strip()}")
-        return completed.stdout.strip() == "true"
-
-    def assert_windows_match_windowserver(self, child, expected_on_screen):
+    def assert_windows_match_compositor(self, child, expected_on_screen):
         state = self.payload(child, "get_overlay_state", {}, 300 + child)
         for overlay in state["overlays"]:
             number = overlay.get("windowNumber")
             if number is None:
                 continue
-            observed = self.windowserver_on_screen(self.children[child].pid, number)
+            observed = self.window_on_screen(self.children[child].pid, number)
             self.assertEqual(
                 observed, expected_on_screen,
                 f"PID {self.children[child].pid}, window {number}: state={state}",
             )
 
-    def test_overlapping_leases_idempotency_and_real_windowserver_quiescence(self):
+    def test_overlapping_leases_idempotency_and_real_window_quiescence(self):
         # Give each raw executable process an annotation so it owns at least
         # one overlay, then capture actual PID/window-number WindowServer
         # evidence before and after the lease transitions.
@@ -290,8 +320,8 @@ print(found ? "true" : "false")
             if all(any(o.get("windowNumber") for o in state["overlays"]) for state in states):
                 break
             time.sleep(0.05)
-        self.assert_windows_match_windowserver(0, True)
-        self.assert_windows_match_windowserver(1, True)
+        self.assert_windows_match_compositor(0, True)
+        self.assert_windows_match_compositor(1, True)
 
         key_a = str(uuid.uuid4())
         first = self.payload(0, "suspend_annotations", {
@@ -344,8 +374,8 @@ print(found ? "true" : "false")
         self.live_tokens.add(token_b)
         self.assertNotEqual(token_b, token_a)
         self.assertEqual(second["activeLeaseCount"], 2)
-        self.assert_windows_match_windowserver(0, False)
-        self.assert_windows_match_windowserver(1, False)
+        self.assert_windows_match_compositor(0, False)
+        self.assert_windows_match_compositor(1, False)
 
         released_a = self.payload(0, "resume_annotations", {"lease_token": token_a}, 405)
         self.live_tokens.discard(token_a)
@@ -353,8 +383,8 @@ print(found ? "true" : "false")
         self.assertTrue(released_a["annotationsSuspended"], "B's lease must keep both processes hidden")
         self.assertTrue(released_a["peerPresentationSettled"])
         self.assertEqual(released_a["activeLeaseCount"], 1)
-        self.assert_windows_match_windowserver(0, False)
-        self.assert_windows_match_windowserver(1, False)
+        self.assert_windows_match_compositor(0, False)
+        self.assert_windows_match_compositor(1, False)
 
         released_b = self.payload(1, "resume_annotations", {"lease_token": token_b}, 406)
         self.live_tokens.discard(token_b)
@@ -362,8 +392,116 @@ print(found ? "true" : "false")
         self.assertFalse(released_b["peerPresentationSettled"])
         self.assertIn("does not prove global peer/window convergence", released_b["note"])
         self.assertEqual(released_b["activeLeaseCount"], 0)
-        self.assert_windows_match_windowserver(0, True)
-        self.assert_windows_match_windowserver(1, True)
+        self.assert_windows_match_compositor(0, True)
+        self.assert_windows_match_compositor(1, True)
+
+
+@unittest.skipUnless(sys.platform == "darwin",
+                     "macOS suite: proves quiescence through the WindowServer")
+@unittest.skipUnless(GATE_OPEN, GATE_REASON)
+class SuspensionTwoProcessMacOSTests(_SuspensionTwoProcessContract, unittest.TestCase):
+    """The contract above, with quiescence proved against the macOS WindowServer.
+
+    Skips on every other platform rather than failing there: the probe below
+    needs Quartz, and a suite that cannot run its own evidence should say so
+    plainly instead of erroring several frames deep inside subprocess.
+    """
+
+    @staticmethod
+    def window_on_screen(pid, window_number):
+        """Ask Quartz for this exact test child PID/window-number pair.
+
+        The test passes neither Chalkboard's name nor a broad owner match to
+        WindowServer, so an unrelated live process cannot satisfy this check.
+        A short Swift one-liner is used instead of PyObjC (not a project
+        dependency).  Its sole output is a JSON boolean.
+        """
+        source = r'''
+import ApplicationServices
+import Foundation
+let pid = Int(CommandLine.arguments[1])!
+let number = Int(CommandLine.arguments[2])!
+let entries = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+let found = entries.contains { entry in
+    (entry[kCGWindowOwnerPID as String] as? NSNumber)?.intValue == pid &&
+    (entry[kCGWindowNumber as String] as? NSNumber)?.intValue == number
+}
+print(found ? "true" : "false")
+'''
+        completed = subprocess.run(
+            ["/usr/bin/swift", "-e", source, str(pid), str(window_number)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        if completed.returncode:
+            raise AssertionError(f"Quartz probe failed: {completed.stderr.strip()}")
+        return completed.stdout.strip() == "true"
+
+
+@unittest.skipUnless(sys.platform == "win32",
+                     "Windows suite: proves quiescence through Win32 window visibility")
+@unittest.skipUnless(GATE_OPEN, GATE_REASON)
+class SuspensionTwoProcessWindowsTests(_SuspensionTwoProcessContract, unittest.TestCase):
+    """The contract above, with quiescence proved against Win32.
+
+    `IsWindowVisible` is the right predicate rather than an approximation of the
+    macOS one: the Windows backend hides overlays with
+    `SetWindowPos`+`SWP_HIDEWINDOW` specifically so that this becomes false, and
+    its own doc comment rejects moving the window off-screen because that
+    "leaves it `IsWindowVisible`, still composited"
+    (Sources/Overlay/OverlayWindowController+Presentation.swift:715-720).
+
+    Weaker than the macOS probe in one honest respect, and deliberately not
+    described as equivalent: `CGWindowListCopyWindowInfo(.optionOnScreenOnly)`
+    reflects what the compositor actually has on screen, whereas
+    `IsWindowVisible` reports the WS_VISIBLE style bit, which stays true for a
+    window that is fully occluded. Both answer "did the suspension actually move
+    this window", which is what the test asserts; neither is a proof of pixels.
+    """
+
+    @staticmethod
+    def window_on_screen(pid, window_number):
+        """Ask Win32 for this exact test child PID/window-number pair.
+
+        Matches on BOTH owner PID and handle, exactly as the Quartz probe does,
+        so a recycled handle belonging to some other process cannot satisfy it.
+        On Windows `overlays[].windowNumber` is the HWND itself
+        (`Int(bitPattern: window.hwnd)`,
+        Sources/Overlay/OverlayWindowController+Diagnostics.swift:552-554).
+
+        ctypes and wintypes are imported here rather than at module scope
+        because `ctypes.wintypes` raises on non-Windows, which would break
+        collection of the macOS suite.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        # argtypes are not optional here: without them ctypes marshals the
+        # handle as a C int, truncating any HWND above 2^31 on 64-bit Windows.
+        user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+        hwnd = wintypes.HWND(window_number)
+        if not user32.IsWindow(hwnd):
+            return False
+        owner = wintypes.DWORD()
+        if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner)):
+            raise AssertionError(
+                f"GetWindowThreadProcessId failed for HWND {window_number}: "
+                f"error {ctypes.get_last_error()}"
+            )
+        if owner.value != pid:
+            return False
+        return bool(user32.IsWindowVisible(hwnd))
 
 
 if __name__ == "__main__":

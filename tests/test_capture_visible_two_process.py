@@ -12,6 +12,15 @@ session, because broadcast channels are intentionally session-wide:
   AI_CHALKBOARD_RUN_CAPTURE_VISIBLE_TWO_PROCESS_TEST=1 \
   AI_CHALKBOARD_CAPTURE_VISIBLE_TWO_PROCESS_BINARY="$PWD/.build/debug/AIChalkboard" \
   python3 -m unittest tests/test_capture_visible_two_process.py
+
+On Windows both the product name and the layout differ: SwiftPM writes the
+triple-qualified directory and cannot create the `.build/debug` convenience
+symlink, so the path above simply does not exist there. Use:
+
+  .build/x86_64-unknown-windows-msvc/debug/AIChalkboard.exe
+
+A Windows run still covers the broadcast and the flag, but not the applied
+window state -- the sharingType read-back below is darwin-only.
 """
 
 import json
@@ -62,13 +71,25 @@ CAPTURE_DEBUG_REASON_CODE = "included-capture-debug"
 # Asserting membership rather than just inequality means a renamed or newly
 # added reason code fails loudly here instead of being silently read as
 # "capture-debug is off", which would let this test pass while measuring nothing.
-KNOWN_REASON_CODES = frozenset({
-    "excluded",
-    "excluded-forced-by-environment",
-    "included-capture-debug",
-    "included-suppressed-by-environment",
-    "included-suppressed-remote-session",
-})
+# Mirrors CaptureExclusionPolicy.Decision.excludesFromCapture (:322-328) on the
+# wire. This is the INDEPENDENT anchor that keeps the sharingType check below
+# honest. That check compares overlays[].sharingType against
+# captureExclusion.excludesFromCapture, and both would move together if the
+# switch itself were broken -- e.g. `.exclude` wrongly returning false would
+# leave overlays capturable on an ordinary desktop while baseline expected and
+# observed both read "readOnly", passing green. Pinning what each REASON CODE
+# implies catches that, because the reason code comes from a different arm of
+# the same enum than the boolean does.
+EXCLUDES_FOR_REASON = {
+    "excluded": True,
+    "excluded-forced-by-environment": True,
+    "included-capture-debug": False,
+    "included-suppressed-by-environment": False,
+    "included-suppressed-remote-session": False,
+}
+
+# Derived rather than repeated, so the two cannot drift apart.
+KNOWN_REASON_CODES = frozenset(EXCLUDES_FOR_REASON)
 
 # The one assertion in this file that a flag cannot fake: `overlays[].sharingType`
 # in `get_overlay_state` is a live read-back of what the OS reports for each
@@ -77,7 +98,26 @@ KNOWN_REASON_CODES = frozenset({
 # the macOS NSWindow.sharingType spellings, which is why the check is applied on
 # darwin only -- the Windows port reconciles the same state through a different
 # primitive and does not report these names.
-SHARING_TYPE_FOR_VISIBLE = {True: "readOnly", False: "none"}
+#
+# Keyed on `captureExclusion.excludesFromCapture`, NOT on capture-debug. Those
+# are different questions, and conflating them was a live false failure rather
+# than a hypothetical one:
+#
+#     sharingType      = includeInCapture ? .readOnly : .none   (Presentation:621)
+#     includeInCapture = !decision.excludesFromCapture          (Presentation:146)
+#     excludesFromCapture == false for .includeForCaptureDebug,
+#         .includeSuppressedByEnvironment, .includeSuppressedForRemoteSession
+#                                                 (CaptureExclusionPolicy:322-328)
+#
+# Capture-debug is therefore only ONE of three ways a window stays capturable.
+# With capture-debug OFF but exclusion SUPPRESSED -- a Mac running any host in
+# `knownStreamingHosts`, which the policy itself notes "CAN produce a false
+# positive" when merely idling as a background service, or a shell exporting
+# AI_CHALKBOARD_CAPTURE_EXCLUSION=never -- the window reports "readOnly" while a
+# capture-debug-keyed table demands "none". That fired on the FIRST baseline
+# assertion, so the broadcast under test was never reached at all and the message
+# blamed the wrong subsystem. The decision is read from the same response now.
+SHARING_TYPE_FOR_EXCLUDED = {True: "none", False: "readOnly"}
 
 
 @unittest.skipUnless(
@@ -95,8 +135,15 @@ class CaptureVisibleTwoProcessIntegrationTests(unittest.TestCase):
 
     def setUp(self):
         binary = Path(os.environ[BINARY_ENV]).resolve()
-        if not binary.is_file() or not os.access(binary, os.X_OK):
-            self.fail(f"{BINARY_ENV} is not an executable file: {binary}")
+        if not binary.is_file():
+            self.fail(f"{BINARY_ENV} is not a file: {binary}")
+        # os.X_OK is meaningful only where POSIX permission bits are. On Windows
+        # it returns True for any readable file, so folding both checks into one
+        # condition left half this guard dead there while still reporting "not an
+        # executable file" for either cause. Split, and skipped where it cannot
+        # mean anything.
+        if os.name != "nt" and not os.access(binary, os.X_OK):
+            self.fail(f"{BINARY_ENV} is not executable: {binary}")
 
         self.tempdir = tempfile.mkdtemp(prefix="ai-chalkboard-capture-visible-it-")
         # Registered IMMEDIATELY, and likewise for each child below, because
@@ -136,6 +183,17 @@ class CaptureVisibleTwoProcessIntegrationTests(unittest.TestCase):
             # cannot help here because it detects an XCTest bundle -- a binary
             # spawned as a plain subprocess looks exactly like the real app.
             "AI_CHALKBOARD_LOG_DIR": os.path.join(self.tempdir, "logs"),
+            # Pinned so the developer's shell cannot steer the very decision
+            # under test: spawn_mcp_child starts from os.environ.copy(), and
+            # `never` is the workaround the docs tell a remote-Mac user to
+            # export, which would silently exercise a different policy branch
+            # than an ordinary run. "auto" is the default spelling.
+            #
+            # This does NOT make the sharingType expectation constant, and is
+            # not an alternative to deriving it: under "auto" a detected
+            # streaming host still suppresses the exclusion, which is precisely
+            # why SHARING_TYPE_FOR_EXCLUDED is keyed on the decision.
+            "AI_CHALKBOARD_CAPTURE_EXCLUSION": "auto",
         }
 
         for _ in range(2):
@@ -285,6 +343,20 @@ class CaptureVisibleTwoProcessIntegrationTests(unittest.TestCase):
             f"reason code is {reason!r}: the two projections of one Decision "
             f"disagree, so the wire contract has changed: {state}",
         )
+
+        excluded = exclusion.get("excludesFromCapture")
+        self.assertIsInstance(
+            excluded, bool,
+            f"captureExclusion.excludesFromCapture is not a boolean: {state}",
+        )
+        self.assertEqual(
+            excluded, EXCLUDES_FOR_REASON[reason],
+            f"child {child} reports excludesFromCapture={excluded} under reason code "
+            f"{reason!r}, which implies {EXCLUDES_FOR_REASON[reason]}. "
+            f"CaptureExclusionPolicy.Decision.excludesFromCapture no longer agrees "
+            f"with reasonCode, and the overlay sharingType check derives its "
+            f"expectation from that boolean: {state}",
+        )
         return visible, state
 
     def _wait_capture_visible(self, child, expected, timeout):
@@ -302,22 +374,57 @@ class CaptureVisibleTwoProcessIntegrationTests(unittest.TestCase):
             f"{timeout}s ({self.child_diagnostics()}); last state={last}"
         )
 
-    def _wait_overlay_sharing(self, child, expected_visible, timeout):
-        """Waits until every overlay window's live sharingType matches capture-debug.
+    def _wait_overlay_sharing(self, child, timeout):
+        """Waits until every overlay window's live sharingType matches the exclusion decision.
 
         Polls rather than asserting once because this reads a SECOND tool call:
         a one-shot check could straddle the asynchronous self-echo of a broadcast
         and see the two calls' states disagree for reasons that are not defects.
         Requires at least one overlay so a process reporting no windows fails
         here instead of passing this check vacuously.
+
+        The expectation is read from `captureExclusion.excludesFromCapture` in the
+        SAME response as the windows it is compared against. That keeps this a
+        real check rather than a tautology, because the two sides come from
+        different places: the field is a projection of the in-memory Decision,
+        while `sharingType` is a live per-window read-back of what the OS reports.
+        Requiring them to agree IS the evidence that the decision reached the
+        windows. Reading them together also matters -- an expectation carried over
+        from an earlier call could straddle a broadcast echo, which is the same
+        reason this polls at all.
+
+        Takes no expected-visibility argument, because it asks a narrower
+        question than its caller does: not "is capture-debug in the state we
+        asked for" -- `_wait_capture_visible` has already established that, and
+        pins reasonCode against the flag on every poll -- but "did whatever
+        decision is now in force actually reach the windows". Passing the flag in
+        would only invite re-deriving the expectation from it, which is the bug
+        this function was fixed for.
         """
         if sys.platform != "darwin":
             return
-        expected = SHARING_TYPE_FOR_VISIBLE[expected_visible]
         deadline = time.monotonic() + timeout
         last = None
+        expected = None
+        observed = None
         while True:
             last = self.payload(child, "get_overlay_state", {}, self._next_request_id())
+            # Asserted, not tolerated: if this key ever disappears, the fallback
+            # would be to guess an expectation, and a guessed expectation that
+            # happens to match is exactly the silent no-op this file exists to
+            # avoid. Mirrors the captureExclusion handling in _capture_visible.
+            exclusion = last.get("captureExclusion")
+            self.assertIsInstance(
+                exclusion, dict,
+                f"get_overlay_state no longer reports a captureExclusion object, so the "
+                f"expected sharingType can no longer be derived: {last}",
+            )
+            excluded = exclusion.get("excludesFromCapture")
+            self.assertIsInstance(
+                excluded, bool,
+                f"captureExclusion.excludesFromCapture is not a boolean: {last}",
+            )
+            expected = SHARING_TYPE_FOR_EXCLUDED[excluded]
             observed = [overlay.get("sharingType") for overlay in last.get("overlays") or []]
             if observed and all(value == expected for value in observed):
                 return
@@ -325,15 +432,16 @@ class CaptureVisibleTwoProcessIntegrationTests(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.fail(
-            f"overlay sharingType did not become {expected!r} on child {child} within "
-            f"{timeout}s ({self.child_diagnostics()}); observed={observed}; last state={last}"
+            f"overlay sharingType did not become {expected!r} (the exclusion decision "
+            f"in the same response) on child {child} within {timeout}s "
+            f"({self.child_diagnostics()}); observed={observed}; last state={last}"
         )
 
     def _assert_capture_visible_everywhere(self, expected):
         """Asserts both peers agree, flag and applied window state alike."""
         for child in range(len(self.children)):
             self._wait_capture_visible(child, expected, self.settle_timeout)
-            self._wait_overlay_sharing(child, expected, self.settle_timeout)
+            self._wait_overlay_sharing(child, self.settle_timeout)
 
     def test_set_capture_visible_broadcast_reaches_sibling(self):
         # Baseline. This also proves the assertion below is not vacuous: if
