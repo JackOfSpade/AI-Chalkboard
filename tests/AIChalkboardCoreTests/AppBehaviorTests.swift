@@ -6,68 +6,52 @@ import XCTest
 @testable import AIChalkboardCore
 
 final class AppBehaviorTests: XCTestCase {
-    /// Absolute path of this suite's throwaway suspension registry.
-    /// `processIdentifier` rather than a UUID so a crashed run leaves one
-    /// predictable directory behind instead of an unbounded pile.
-    private static let isolatedSuspensionRoot = FileManager.default.temporaryDirectory
-        .appendingPathComponent("ai-chalkboard-appbehavior-\(ProcessInfo.processInfo.processIdentifier)",
-                                isDirectory: true)
-        .standardizedFileURL
-
+    /// Guards the isolation of `SuspensionLeaseCoordinator.shared`.
+    ///
     /// This is the only suite that drives the process-wide
-    /// `OverlayWindowController.shared`, and that controller's presentation
-    /// state is driven in turn by `SuspensionLeaseCoordinator.shared`:
-    /// `recordAndApply` calls `setAnnotationsSuspended(_:generation:)` whenever
-    /// `controlsPresentation` is true, which is true precisely for the shared
-    /// instance (it is `storageDirectory == nil`).
+    /// `OverlayWindowController.shared`, whose presentation state is driven in
+    /// turn by `SuspensionLeaseCoordinator.shared`: `recordAndApply` calls
+    /// `setAnnotationsSuspended(_:generation:)` whenever `controlsPresentation`
+    /// is true, which is true precisely for the shared instance (it is
+    /// `storageDirectory == nil`).
     ///
-    /// Left alone that singleton resolves to the REAL per-user registry --
+    /// Unisolated, that singleton resolves to the REAL per-user registry --
     /// `%LOCALAPPDATA%\AIChalkboard` on Windows, `~/Library/Application
-    /// Support/AIChalkboard` on macOS -- which is the very file a live AI
-    /// Chalkboard connector is using. The two processes then contend for its
-    /// lock, and when this one loses, `refreshViewsNow` fails closed and forces
-    /// `annotationsSuspended = true` in the middle of a test. That is the
-    /// intermittent failure this suite exhibited: `setAnnotationsSuspended(true)`
-    /// returning false because something else had already suspended it.
+    /// Support/AIChalkboard` on macOS -- the very file a live connector is
+    /// using. The two processes then contend for its lock, and when this one
+    /// loses, `refreshViewsNow` fails closed and forces
+    /// `annotationsSuspended = true` mid-test. That was a real intermittent
+    /// failure here: `setAnnotationsSuspended(true)` returning false because
+    /// something else had already suspended it.
     ///
-    /// So point the process at a throwaway root before the lazy singleton is
-    /// ever touched. The value must be absolute in the platform's own syntax
-    /// (see `AbsolutePath.isAbsolute`); until that guard was fixed this had no
-    /// effect on Windows at all.
-    override class func setUp() {
-        super.setUp()
-        // Start from an empty directory. `createDirectory` succeeds silently on
-        // an existing one without clearing it, and the name is keyed by PID --
-        // so a run that crashed before tearDown could otherwise hand its
-        // leftover registry state to a later run that Windows happened to give
-        // the same PID.
-        try? FileManager.default.removeItem(at: isolatedSuspensionRoot)
-        try? FileManager.default.createDirectory(at: isolatedSuspensionRoot,
-                                                 withIntermediateDirectories: true)
-        TestEnvironment.set("AI_CHALKBOARD_SUSPENSION_ROOT", isolatedSuspensionRoot.path)
-    }
-
-    override class func tearDown() {
-        try? FileManager.default.removeItem(at: isolatedSuspensionRoot)
-        // Clear the override too, rather than leaving the rest of the process
-        // pointed at a directory that no longer exists. Nothing later in the
-        // target reads it today, but a future test constructing a bare
-        // SuspensionLeaseCoordinator(storageDirectory: nil) would silently
-        // inherit a dangling root.
-        TestEnvironment.set("AI_CHALKBOARD_SUSPENSION_ROOT", nil)
-        super.tearDown()
-    }
-
-    /// Guards the isolation above. `SuspensionLeaseCoordinator.shared` is a
-    /// lazy `static let`, so it binds its directory at whatever moment it is
-    /// first touched. Nothing else in this target reaches it today, but if that
-    /// ever changes this fails loudly here instead of resurfacing as a rare,
-    /// confusing suspension flake somewhere else in the suite.
-    func testThisSuiteIsIsolatedFromTheRealSuspensionRegistry() {
+    /// This suite used to buy that isolation for itself, by pointing
+    /// `AI_CHALKBOARD_SUSPENSION_ROOT` at a throwaway directory from its own
+    /// `class setUp`. `TestHarness` now provides it for the whole bundle, so
+    /// the local mechanism is gone -- and the guarantee is strictly stronger
+    /// than what it replaced. The old approach could only work if THIS suite's
+    /// `setUp` happened to run before anything else touched the lazy
+    /// singleton; any suite that touched it first bound the real registry and
+    /// this assertion failed. The sandbox does not depend on ordering at all,
+    /// because it is the coordinator's own default rather than a window of
+    /// environment state.
+    ///
+    /// Kept as a test rather than deleted with the mechanism: the failure it
+    /// catches is a rare, confusing suspension flake surfacing somewhere else
+    /// entirely, and this is where it gets diagnosed in one line.
+    func testTheSharedCoordinatorIsIsolatedFromTheRealSuspensionRegistry() {
+        let bound = SuspensionLeaseCoordinator.shared.storageDirectory.standardizedFileURL
         XCTAssertEqual(
-            SuspensionLeaseCoordinator.shared.storageDirectory.standardizedFileURL.path,
-            Self.isolatedSuspensionRoot.path,
-            "the shared coordinator bound the real per-user registry before this suite's class setUp ran"
+            bound.path,
+            TestHarness.sandboxDirectory.standardizedFileURL.path,
+            "the shared coordinator did not bind the test sandbox"
+        )
+        // The property that actually matters, asserted independently of which
+        // sandbox mechanism supplies it: whatever it bound, it must not be the
+        // live per-user registry a running connector polls.
+        XCTAssertNotEqual(
+            bound.path,
+            PlatformPaths.applicationSupportDirectory.standardizedFileURL.path,
+            "the shared coordinator bound the REAL per-user registry"
         )
     }
 
