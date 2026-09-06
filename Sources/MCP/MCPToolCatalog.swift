@@ -498,7 +498,7 @@ enum MCPToolCatalog {
         ],
         [
             "name": "set_capture_visible",
-            "description": "Applies legacy capture eligibility/exclusion and per-app debug filtering locally before responding, then broadcasts the request to sibling instances. External capture programs retain independent filters; this flag auto-reverts after five minutes.",
+            "description": "Applies legacy capture eligibility/exclusion and per-app debug filtering locally before responding, then broadcasts the request to sibling instances. External capture programs retain independent filters; this flag auto-reverts after five minutes. Setting it false restores per-app filtering but does not by itself re-apply capture exclusion: on a session detected as remote or streamed the exclusion stays off. The response, get_screens, and get_overlay_state all report the resulting captureExclusion decision.",
             "inputSchema": ["type": "object", "properties": ["visible": ["type": "boolean"]], "required": ["visible"]]
         ]
         ]

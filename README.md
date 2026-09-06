@@ -19,7 +19,7 @@ Designed specifically for AI agents (**Claude Cowork**, **Claude Desktop**, **Cl
 - **Persists Until Explicitly Cleared**: A drawing has no lifetime and no timeout. It stays on screen until something explicitly clears it — the AI calling `clear` (by `annotation_id`, by `app`, or `scope="all"`), or the user clicking the menu-bar "Clear Annotations for Current App + Global" (⌘K) or "Clear Everything (All Apps)". `duration_seconds` is not a tool parameter any more: supplying it on any drawing tool is REJECTED outright rather than silently ignored, so a caller cannot come away believing a drawing will clean itself up. This guarantee holds only for the life of the MCP server process — annotations are held in server memory, not written to disk, so they do not survive that process restarting or quitting.
 - **Closed-Loop Verification**: `verify_annotation` proves free-draw placement against a clean UI screenshot using the exact live renderer and reports the painted bounds in the screenshot's own pixels. On a desktop where the screenshot could plausibly be a full-display capture (native or downsampled — never upscaled) of more than one connected display, a caller-supplied screenshot is refused unless `screenshot_screen_id` names the display it was captured from (which must be the annotation's own display) — dimensions alone cannot identify which monitor an image shows, and compositing over the wrong monitor's UI would report a placement error that does not exist — the same `AnnotationRenderer` Swift source on both platforms, though the rasterizer underneath differs (Core Graphics on macOS, GDI+ on Windows), so output is not bit-identical across platforms. `verify_presentation` separately checks the retained window state and bounded alignment with the annotation's target display so agents can detect most presentation failures without asking a human to eyeball the display. On macOS this is a dual-witness check — AppKit's own window state cross-checked against `CGWindowListCopyWindowInfo`, WindowServer's independently maintained ledger. Windows has no equivalent second source for an ordinary window: `verify_presentation` there reads only this process's own Win32 state (`IsWindowVisible`/`GetWindowRect`/extended style) plus DWM's independently maintained cloak flag, which is real but much narrower evidence — see "Platform differences" below.
 - **Bounded Diagnostics**: Coordinate/verification rejections and lifecycle/presentation events are timestamped in UTC and attempted as complete records on stderr plus a rotating log file — `~/Library/Logs/AIChalkboard/ai_chalkboard.log` on macOS, `%LOCALAPPDATA%\AIChalkboard\Logs\ai_chalkboard.log` on Windows. macOS makes stderr nonblocking and drops a whole record under backpressure; Windows hands bounded records to a bounded serial writer because an arbitrary inherited standard-error handle cannot safely be converted to overlapped I/O. A full pipe can therefore occupy only that Windows worker, never the MCP loop or unbounded memory. On both platforms the asynchronous file handoff is likewise bounded and may drop records when saturated. Message payloads are capped at 16 KiB; the retained file log rotates at 5 MiB and keeps one backup (each file can exceed the threshold only by a bounded final record). Cross-process rotation is coordinated with `flock` on macOS and `LockFileEx` on Windows, and each platform detects another process having rotated the file out from under it by comparing file identity — POSIX inode on macOS, `GetFileInformationByHandle`'s volume-serial/file-index pair on Windows, which Microsoft documents as not guaranteed stable across a close/reopen on every filesystem the way a POSIX inode is (the only consequence of that instability here is a harmless extra close-and-reopen, never a misdirected write). If size measurement or rotation cannot complete, file writes pause, so a persistent filesystem error cannot create an infinitely growing log. Rejection records use fixed reason codes and numeric geometry rather than persisting caller text, UI labels, or local asset paths.
-- **Capture Debug Request**: `set_capture_visible(true)` asks compatible capture paths to include the overlay and renders all annotations for placement checks. Capture programs retain their own app/window filters, so inclusion is not guaranteed; on macOS `NSWindow.SharingType.none` is also not a privacy boundary on modern releases. On Windows the same toggle instead governs `SetWindowDisplayAffinity`'s `WDA_EXCLUDEFROMCAPTURE`, which only ever affects captures taken by *other* applications of *this* window — it has no bearing on Chalkboard's own `chalk_capture_monitor` (BitBlt) capture route, which always includes every composited window (see "Platform differences" below). Two safety nets guard against forgetting to turn it back off: it auto-reverts to `false` after 5 minutes with no renewal, and the menu-bar icon tints orange for as long as it's on.
+- **Capture Debug Request**: `set_capture_visible(true)` asks compatible capture paths to include the overlay and renders all annotations for placement checks. Capture programs retain their own app/window filters, so inclusion is not guaranteed; on macOS `NSWindow.SharingType.none` is also not a privacy boundary on modern releases. On Windows the same toggle instead governs `SetWindowDisplayAffinity`'s `WDA_EXCLUDEFROMCAPTURE`, which only ever affects captures taken by *other* applications of *this* window — it has no bearing on Chalkboard's own `chalk_capture_monitor` (BitBlt) capture route, which always includes every composited window (see "Platform differences" below). Two safety nets guard against forgetting to turn it back off: it auto-reverts to `false` after 5 minutes with no renewal, and the menu-bar icon tints orange for as long as it's on. Capture exclusion is *also* suppressed automatically whenever this session looks remote or streamed — see "Remote and streamed sessions" below — so `set_capture_visible(false)` no longer implies the exclusion is in force. `get_screens` and `get_overlay_state` both report the actual decision, and the evidence behind it, in a `captureExclusion` object.
 - **Launch-Mode-Dependent Lifecycle UI** (macOS specifics; Windows has a parallel status-icon control surface described below but no bundle/`Info.plist`/Dock concept to branch on): The activation policy is chosen at runtime from `argv`, not from the bundle. A direct GUI launch (Finder/Dock) uses `.regular`, so the app appears in the Dock and Cmd-Tab and can be quit by right-clicking its Dock icon. An MCP launch (`--mcp`, how Claude Desktop/Cowork start it) uses `.accessory` instead — no Dock icon, no Cmd-Tab entry, since one config entry spawns several processes and each would otherwise add its own Dock icon. `LSUIElement` is deliberately left `false` in `Info.plist`: a static plist cannot branch on `argv`, so the runtime `setActivationPolicy` call is the only thing that can tell the two modes apart. In MCP mode the menu-bar status item — "Clear Annotations for Current App + Global" (⌘K), "Clear Everything (All Apps)", "Capture Debug Mode", "Quit AI Chalkboard" (⌘Q) — is the **only** user-facing control surface, and only the primary instance owns one. On Windows the equivalent is a system-tray icon owned by whichever process wins the same primary-election lock (see "Single-instance lock" below); Windows has no bundle/Dock/Cmd-Tab concept for a launch-mode-dependent policy to select between.
 
 ---
@@ -45,6 +45,52 @@ therefore always reports capture as granted, with an explicit note that there
 is no permission system to check. This is a real reduction in what the OS
 enforces on Windows, not a convenience: there is no equivalent of revoking
 Screen Recording access for this app.
+
+**Remote and streamed sessions.** Capture exclusion — `NSWindow.SharingType
+.none` on macOS, `SetWindowDisplayAffinity`'s `WDA_EXCLUDEFROMCAPTURE` on
+Windows — has always been a preference ("don't let annotations leak into the
+user's OBS recording"), never a boundary. On a machine whose own display *is* a
+capture, that preference turns destructive, so Chalkboard now detects such
+sessions and does not apply the exclusion there at all. Two independent
+failures motivate this. First, if the streaming host honours the exclusion the
+way the API documents, the overlay is composited out of the exact frame the
+human is watching: the annotations become invisible to the only person who
+could see them, while every diagnostic still reports success. Second, some
+capture stacks treat the mere presence of a display-affinity request as
+"protected content is on screen" and refuse to stream at all — NVIDIA's
+ShadowPlay walks visible windows with `GetWindowDisplayAffinity` and disables
+Instant Replay for *any* non-`WDA_NONE` window (password managers and Zoom's
+own screen-share banner trip it, with no DRM involved), and Shadow's cloud PC
+reports the same class of false positive to the user as error S-102, "Shadow
+has detected a protected video that we cannot display". A host doing that walk
+cannot distinguish `WDA_EXCLUDEFROMCAPTURE` from the older `WDA_MONITOR`, so
+there is no gentler affinity value to retreat to — the only safe answer is to
+apply none.
+
+Detection is by known streaming/remote-desktop host process (Shadow, Parsec,
+Sunshine/Moonlight, NICE DCV, Teradici, Citrix, VMware Blast, Chrome Remote
+Desktop, AnyDesk, TeamViewer, RustDesk, VNC), plus
+`GetSystemMetrics(SM_REMOTESESSION)` on Windows. That metric is necessary but
+nowhere near sufficient and is deliberately not relied on alone: a cloud PC
+such as Shadow runs in the *console* session against a virtual display adapter
+and reports 0. The bias is deliberate and asymmetric — failing to detect a
+streamed session costs the user their whole screen, while a false positive
+costs only that annotations become capturable, which is exactly what already
+happens on every capture path that ignores the hint. Set
+`AI_CHALKBOARD_CAPTURE_EXCLUSION=always` to force the exclusion on anyway, or
+`=never` to suppress it unconditionally; the default is `auto`. The decision,
+its stable `reasonCode`, and the concrete signals behind it are reported by
+`get_screens` and `get_overlay_state` so the behaviour is checkable rather than
+merely asserted.
+
+The two platforms detect unequally, and the gap is stated rather than papered
+over: Windows walks the full process table (`CreateToolhelp32Snapshot`), so it
+sees background services, while macOS enumerates
+`NSWorkspace.runningApplications`, which lists launched applications but *not*
+daemons. macOS's own Screen Sharing (`screensharingd`) and other launchd-only
+remote-access services are therefore invisible to detection there; closing that
+gap needs a `sysctl(KERN_PROC_ALL)` walk that does not exist yet, and
+`AI_CHALKBOARD_CAPTURE_EXCLUSION=never` covers the case by hand until it does.
 
 **Sibling-instance capture exclusion.** On macOS, Chalkboard's verification
 capture goes through ScreenCaptureKit, which can be configured to exclude a
@@ -233,7 +279,7 @@ trusting a stale handle.
 | `verify_annotation` | `annotation_id`, `screenshot_path?` or `capture_source="chalkboard"`, `request_permission?`, `padding_px?` | Returns a PNG crop composited with the exact live renderer. Exactly one screenshot source is required; `request_permission` is valid only for Chalkboard capture and defaults to false. |
 | `verify_presentation` | `annotation_id` | macOS: checks AppKit drawable state cross-checked against WindowServer's independently maintained all/on-screen registration, plus target-display bounds — a dual-witness check. Windows: checks this process's own Win32 window state (visibility/frame/extended style) plus DWM's independently maintained cloak flag — a single-source check with one narrow independent corroboration, materially weaker evidence than the macOS dual-witness form (see "Platform differences"). Neither platform claims raw-framebuffer proof. |
 | `get_active_app` | `none` | Returns raw/current frontmost app state, the fallback app targeted by untagged drawing calls, and local `annotationsSuspended` presentation state. |
-| `set_capture_visible` | `visible` | Applies capture-debug state locally before responding, then broadcasts it to sibling instances; external capture filters still decide inclusion. |
+| `set_capture_visible` | `visible` | Applies capture-debug state locally before responding, then broadcasts it to sibling instances; external capture filters still decide inclusion. `false` restores per-app filtering but does not re-apply capture exclusion on a session detected as remote/streamed. |
 
 ---
 

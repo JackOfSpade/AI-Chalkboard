@@ -93,6 +93,21 @@ public final class OverlayWindowController: NSObject {
     let captureLock = NSLock()
     var _captureVisible = false
 
+    /// PRESENTATION-THREAD-ONLY. The capture-affinity value most recently
+    /// pushed to the live windows, or `nil` when none has been pushed since the
+    /// last `rebuildOverlayWindows()`.
+    ///
+    /// WHY THIS EXISTS: `desiredIncludeInCapture` is no longer a pure function
+    /// of `_captureVisible` -- it also consults `RemoteSessionProbe`, whose
+    /// answer can change while this process runs (someone starts Parsec, or
+    /// connects to a remote-access daemon that was idling). Window creation and
+    /// `setCaptureVisible` are the only two moments that used to apply
+    /// affinity, and neither of them fires on that kind of change, so
+    /// `refreshViewsNow(under:)` reconciles as well. This field is what keeps
+    /// that reconciliation from turning into a redundant syscall per window on
+    /// every foreground switch: it only pushes when the answer actually moved.
+    var lastAppliedIncludeInCapture: Bool?
+
     /// How long capture-debug mode may stay on with no renewal before it
     /// reverts to OFF on its own.
     ///
@@ -179,6 +194,11 @@ public final class OverlayWindowController: NSObject {
         }
         overlayWindows.removeAll()
         overlayViews.removeAll()
+        // The windows those pushes went to no longer exist, so what was last
+        // pushed says nothing about the fresh ones. Clearing it makes the
+        // `refreshViews()` below reconcile unconditionally, which is also what
+        // repairs the state if any window failed to be created above.
+        lastAppliedIncludeInCapture = nil
 
         let screens = NSScreen.screens
         for (idx, screen) in screens.enumerated() {
@@ -394,6 +414,21 @@ public final class OverlayWindowController {
     let captureLock = NSLock()
     var _captureVisible = false
 
+    /// PRESENTATION-THREAD-ONLY. The capture-affinity value most recently
+    /// pushed to the live windows, or `nil` when none has been pushed since the
+    /// last `rebuildOverlayWindows()`.
+    ///
+    /// WHY THIS EXISTS: `desiredIncludeInCapture` is no longer a pure function
+    /// of `_captureVisible` -- it also consults `RemoteSessionProbe`, whose
+    /// answer can change while this process runs (someone starts Parsec, or
+    /// connects to a remote-access daemon that was idling). Window creation and
+    /// `setCaptureVisible` are the only two moments that used to apply
+    /// affinity, and neither of them fires on that kind of change, so
+    /// `refreshViewsNow(under:)` reconciles as well. This field is what keeps
+    /// that reconciliation from turning into a redundant syscall per window on
+    /// every foreground switch: it only pushes when the answer actually moved.
+    var lastAppliedIncludeInCapture: Bool?
+
     public var onCaptureVisibleChanged: ((Bool) -> Void)?
 
     /// Cancelable stand-in for the macOS branch's `Timer`-based auto-revert.
@@ -503,6 +538,11 @@ public final class OverlayWindowController {
             window.close()
         }
         overlayWindows.removeAll()
+        // Same reasoning as the macOS branch's identical line: the windows
+        // those pushes went to are gone, so the memo is meaningless, and
+        // clearing it makes the `refreshViewsNow()` below reconcile
+        // unconditionally.
+        lastAppliedIncludeInCapture = nil
 
         // Newly (re)created windows are born with whatever capture-debug
         // request is currently in effect, mirroring the macOS branch's

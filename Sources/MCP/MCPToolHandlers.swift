@@ -39,6 +39,10 @@ extension MCPServer {
                 return
             }
             let captureVisible = OverlayWindowController.shared.isCaptureVisible
+            // Read once, for the same reason get_overlay_state reads it once:
+            // the decision consults a TTL-cached probe, so two reads could
+            // disagree with each other inside one response.
+            let screensCaptureExclusion = OverlayWindowController.shared.captureExclusionDecision
             let annotationsSuspended = OverlayWindowController.shared.isAnnotationsSuspended
             // PLATFORM-ACCURATE PROSE, not a cosmetic detail. These strings are
             // read by the AI agent deciding how to compute coordinates, so
@@ -64,12 +68,23 @@ extension MCPServer {
             let coordinateSpaceNote = "AppKit backing pixels: widthPx/heightPx are NSScreen.frame point dimensions multiplied by that same screen's NSScreen.backingScaleFactor. Drawing uses this same scale source. All drawing coordinates are relative to the SELECTED display's OWN top-left corner: (0,0) is that display's top-left and widthPx/heightPx are its extent. appKitFrame (AppKit points, bottom-left desktop origin) and windowServerFrame (CGDisplayBounds, global top-left points -- the same space as kCGWindowBounds, NOT backing pixels) only describe where the display sits on the desktop, in OTHER units; they must NEVER be added to drawing coordinates."
             let backingScaleSource = "NSScreen.backingScaleFactor"
             let captureOnNote = "Capture-debug mode is ON: overlay windows request sharingType=.readOnly and render every annotation. A capture tool may still omit these windows through its own app/window filter. Call set_capture_visible(false) to restore normal filtering."
-            let captureOffNote = "Capture-debug mode is OFF (default): overlay windows request legacy sharingType=.none and render only annotations visible for the active app. This is not a security guarantee; modern capture tools control their own inclusion filters."
+            // Says only what capture-debug being OFF actually determines --
+            // the per-app RENDER filter. It deliberately no longer claims
+            // sharingType=.none is applied: that is now a separate decision
+            // (CaptureExclusionPolicy), and stating it here unconditionally
+            // was wrong on any session detected as remote/streamed. The real
+            // answer rides along in captureExclusion.
+            let captureOffNote = "Capture-debug mode is OFF (default): overlay windows render only annotations visible for the active app. Whether they ALSO ask to be excluded from other applications' captures is a separate decision reported in captureExclusion below. That exclusion is never a security guarantee; modern capture tools control their own inclusion filters."
             #elseif os(Windows)
             let coordinateSpaceNote = "Physical device pixels: widthPx/heightPx are the monitor's rectangle as reported by GetMonitorInfoW under PER_MONITOR_AWARE_V2 DPI awareness, which is already in physical pixels. backingScaleFactor is that monitor's effective DPI divided by 96 and is reported for scaling stroke widths and font sizes; it is NOT applied again to widthPx/heightPx. Drawing uses this same scale source. All drawing coordinates are relative to the SELECTED display's OWN top-left corner: (0,0) is that display's top-left and widthPx/heightPx are its extent. appKitFrame and windowServerFrame (the same virtual-desktop rectangle under both names on this platform) only describe where the monitor sits on the virtual desktop, whose origin is the PRIMARY monitor's top-left and whose coordinates can be negative; they must NEVER be added to drawing coordinates."
             let backingScaleSource = "GetDpiForMonitor effective DPI / 96.0"
             let captureOnNote = "Capture-debug mode is ON: overlay windows clear SetWindowDisplayAffinity (WDA_NONE) and render every annotation. A capture tool may still omit these windows through its own filter. Call set_capture_visible(false) to restore normal filtering."
-            let captureOffNote = "Capture-debug mode is OFF (default): overlay windows request SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) and render only annotations visible for the active app. This is not a security guarantee, it requires Windows 10 version 2004 or later, and it excludes only THIS process's own windows -- Windows has no way to exclude another process's windows from a capture."
+            // Same correction as the macOS branch above: capture-debug being
+            // OFF determines the per-app RENDER filter and nothing else. It no
+            // longer asserts WDA_EXCLUDEFROMCAPTURE, which is now decided by
+            // CaptureExclusionPolicy and is deliberately NOT applied on a
+            // session detected as remote/streamed.
+            let captureOffNote = "Capture-debug mode is OFF (default): overlay windows render only annotations visible for the active app. Whether they ALSO request SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) is a separate decision reported in captureExclusion below. That exclusion is not a security guarantee, it requires Windows 10 version 2004 or later, and it excludes only THIS process's own windows -- Windows has no way to exclude another process's windows from a capture."
             #endif
 
             let payload: [String: Any] = [
@@ -80,6 +95,17 @@ extension MCPServer {
                 "captureVisible": captureVisible,
                 "annotationsSuspended": annotationsSuspended,
                 "captureNote": captureVisible ? captureOnNote : captureOffNote,
+                // Mirrors get_overlay_state's field of the same name, so a
+                // caller that already has get_screens open does not have to
+                // make a second call to learn whether exclusion is actually in
+                // force on this machine.
+                "captureExclusion": [
+                    "excludesFromCapture": screensCaptureExclusion.excludesFromCapture,
+                    "reasonCode": screensCaptureExclusion.reasonCode,
+                    "signals": screensCaptureExclusion.signals,
+                    "environmentVariable": CaptureExclusionPolicy.environmentVariableName,
+                    "note": screensCaptureExclusion.explanation
+                ],
                 "suspensionNote": annotationsSuspended
                     ? "Annotations are suspended: all overlay windows are ordered out while store entries are retained. Release the exact suspension lease token with resume_annotations to restore normal presentation once no other lease remains."
                     : "Annotations are not suspended. suspend_annotations is available as a temporary click-workaround, not simultaneous visual click-through."
@@ -126,6 +152,21 @@ extension MCPServer {
                 sendErrorResult(id: id, text: "Failed to encode overlay input state.")
                 return
             }
+            // Read ONCE and reused for both the structured fields and the prose
+            // below: the decision consults a TTL-cached probe, and two reads
+            // straddling that TTL could report a reasonCode that disagrees with
+            // its own explanation.
+            let captureExclusion = OverlayWindowController.shared.captureExclusionDecision
+            // PLATFORM-ACCURATE PROSE, same rule as suspensionNote: name the
+            // primitive this platform actually uses. The policy's own
+            // explanation is deliberately platform-neutral so it can be
+            // composed with either mechanism name here.
+            #if os(macOS)
+            let captureMechanismName = "NSWindow.sharingType (.none excludes, .readOnly does not)"
+            #elseif os(Windows)
+            let captureMechanismName = "SetWindowDisplayAffinity (WDA_EXCLUDEFROMCAPTURE excludes, WDA_NONE does not; requires Windows 10 version 2004 or later)"
+            #endif
+            let captureExclusionNote = "\(captureExclusion.explanation) Mechanism on this platform: \(captureMechanismName). Each overlays[].sharingType is a live read-back of what the OS reports for that window, so it is the authoritative record of what was actually applied."
             let payload: [String: Any] = [
                 "overlays": overlayJSON,
                 "version": BuildMetadata.productVersion,
@@ -140,6 +181,20 @@ extension MCPServer {
                 "nextLeaseExpiryInSeconds": leaseSnapshot.nextExpiryInSeconds ?? NSNull(),
                 "suspensionRegistryError": leaseSnapshot.error ?? NSNull(),
                 "externalClickDispatcherMustHonorClickThrough": true,
+                // Capture exclusion is no longer implied by captureVisible
+                // alone (see CaptureExclusionPolicy), so the decision and the
+                // evidence behind it are reported rather than left to be
+                // inferred. `reasonCode` is the stable, machine-readable half;
+                // `note` below is the prose. `signals` names the concrete
+                // evidence so a reader can check the claim instead of trusting
+                // it, and is empty on an ordinary local desktop.
+                "captureExclusion": [
+                    "excludesFromCapture": captureExclusion.excludesFromCapture,
+                    "reasonCode": captureExclusion.reasonCode,
+                    "signals": captureExclusion.signals,
+                    "environmentVariable": CaptureExclusionPolicy.environmentVariableName,
+                    "note": captureExclusionNote
+                ],
                 "note": suspensionNote
             ]
             guard let text = jsonString(payload) else {
@@ -365,20 +420,27 @@ extension MCPServer {
             // self-delivered copy is an idempotent renewal.
             _ = OverlayWindowController.shared.setCaptureVisible(visible)
             InstanceBroadcast.shared.postSetCaptureVisible(visible)
+            // Read AFTER setCaptureVisible so it describes what was actually
+            // applied, not what was requested. The two can differ: turning
+            // capture-debug OFF no longer implies the exclusion came back on
+            // -- on a session detected as remote/streamed it stays off, and
+            // saying otherwise would send the caller looking for an exclusion
+            // that is not there.
+            let appliedDecision = OverlayWindowController.shared.captureExclusionDecision
             let explanation = visible
                 ? "AI Chalkboard now requests capture eligibility and renders every annotation for placement checks. The capture program can still omit overlay windows through its own filters. Restore false when finished."
-                : "AI Chalkboard now requests legacy capture exclusion and has restored normal per-app rendering. Modern capture programs may independently include or exclude these windows, so this is not a privacy guarantee."
+                : "AI Chalkboard has restored normal per-app rendering. Modern capture programs may independently include or exclude these windows, so capture exclusion is never a privacy guarantee."
             // Name the mechanism this platform actually used. Reporting
             // `NSWindowSharingType` to a Windows caller describes an API that
             // does not exist there; the Windows overlay toggles
             // SetWindowDisplayAffinity instead. Same reasoning as the
             // platform-split prose in MCPToolCatalog.
             #if os(macOS)
-            let appliedMechanism = visible ? "sharingType = NSWindowSharingType.readOnly" : "sharingType = NSWindowSharingType.none"
+            let appliedMechanism = appliedDecision.excludesFromCapture ? "sharingType = NSWindowSharingType.none" : "sharingType = NSWindowSharingType.readOnly"
             #elseif os(Windows)
-            let appliedMechanism = visible ? "display affinity = WDA_NONE" : "display affinity = WDA_EXCLUDEFROMCAPTURE"
+            let appliedMechanism = appliedDecision.excludesFromCapture ? "display affinity = WDA_EXCLUDEFROMCAPTURE" : "display affinity = WDA_NONE"
             #endif
-            sendTextResult(id: id, text: "capture_visible = \(visible) (\(appliedMechanism)), applied locally before this response; a broadcast has been sent to sibling AI Chalkboard instances. \(explanation)")
+            sendTextResult(id: id, text: "capture_visible = \(visible) (\(appliedMechanism); capture-exclusion decision: \(appliedDecision.reasonCode)), applied locally before this response; a broadcast has been sent to sibling AI Chalkboard instances. \(explanation) \(appliedDecision.explanation)")
 
         default:
             sendErrorResult(id: id, text: "Unknown tool: \(name)")

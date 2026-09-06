@@ -82,6 +82,68 @@ extension OverlayWindowController {
         return _captureVisible
     }
 
+    /// The live capture-exclusion decision: capture-debug state, the
+    /// `AI_CHALKBOARD_CAPTURE_EXCLUSION` override, and whether this session
+    /// looks remote/streamed, resolved by `CaptureExclusionPolicy`.
+    ///
+    /// This is the ONE place the three inputs are combined. Both platforms'
+    /// `desired...` properties and every diagnostic string read it, so a
+    /// machine reported as "exclusion suppressed" in `get_overlay_state` is by
+    /// construction the same machine whose windows were configured that way --
+    /// there is no second, drifting derivation of the same answer.
+    ///
+    /// Recomputed per call rather than memoised: `RemoteSessionProbe` already
+    /// caches the expensive half behind a short TTL, and a stale memo here is
+    /// exactly the failure this whole change exists to avoid.
+    public var captureExclusionDecision: CaptureExclusionPolicy.Decision {
+        let parsed = CaptureExclusionPolicy.parseOverride(
+            fromEnvironmentValue: ProcessInfo.processInfo.environment[CaptureExclusionPolicy.environmentVariableName])
+        if case .unrecognized(let raw) = parsed {
+            // Warn rather than fail: a typo in an environment variable must not
+            // stop the app from presenting annotations. Logged every time it is
+            // read, which is the point -- a silently ignored override is how a
+            // user ends up convinced they already tried the workaround.
+            Logger.shared.log("OverlayWindowController: \(CaptureExclusionPolicy.environmentVariableName)=\"\(raw)\" is not a recognised value (expected auto, never, or always); treating it as auto.", level: "WARN")
+        }
+        return CaptureExclusionPolicy.decide(
+            captureDebugVisible: isCaptureVisible,
+            override: parsed.resolved,
+            remoteSessionSignals: RemoteSessionProbe.currentSignals()
+        )
+    }
+
+    /// Whether overlay windows should currently be capturable by other
+    /// applications -- the single bit both platforms' capture-affinity
+    /// primitives are derived from.
+    public var desiredIncludeInCapture: Bool {
+        !captureExclusionDecision.excludesFromCapture
+    }
+
+    /// Pushes `desiredIncludeInCapture` to every live window, but only when it
+    /// differs from what was last pushed.
+    ///
+    /// PRESENTATION-THREAD-ONLY. Called from `refreshViewsNow(under:)` -- see
+    /// `lastAppliedIncludeInCapture` for why reconciling there is necessary at
+    /// all, given window creation and `setCaptureVisible` already apply
+    /// affinity at their own moments.
+    ///
+    /// Uses `setCaptureAffinity(includeInCapture:)`, an operation
+    /// `OverlayPresentationBackend` already declares and both platforms already
+    /// implement, so this adds no protocol requirement and no new parity
+    /// surface for `check_platform_conformance.py` to police.
+    func reconcileCaptureAffinity() {
+        let include = desiredIncludeInCapture
+        guard lastAppliedIncludeInCapture != include else { return }
+        let previous = lastAppliedIncludeInCapture
+        lastAppliedIncludeInCapture = include
+        for (_, window) in presentationWindows {
+            window.setCaptureAffinity(includeInCapture: include)
+        }
+        // Only ever logged on a real transition, so this cannot become the
+        // per-frame noise that would make the log useless.
+        Logger.shared.log("OverlayWindowController: capture affinity reconciled to includeInCapture=\(include) (was \(previous.map { String($0) } ?? "unset")) across \(presentationWindows.count) overlay window(s): \(captureExclusionDecision.reasonCode).", level: "INFO")
+    }
+
     /// Turns the capture-debug request on/off across every overlay window.
     ///
     /// APPROACH: assigns capture affinity on the LIVE windows -- no teardown,
@@ -117,13 +179,19 @@ extension OverlayWindowController {
 
             guard changed else { return changed }
 
-            // `presentationWindows` is a flat, index-aligned projection (one
-            // entry per real display) -- see each platform's own
-            // `presentationWindows` doc comment -- so each window is visited
-            // exactly once here.
-            for (_, window) in presentationWindows {
-                window.setCaptureAffinity(includeInCapture: visible)
-            }
+            // Routed through the policy rather than pushing `visible` straight
+            // at the windows. `set_capture_visible(false)` means "stop the
+            // capture-debug override", NOT "apply capture exclusion
+            // unconditionally" -- on a remote/streamed session the exclusion
+            // must stay off, and pushing the raw flag here would re-apply it
+            // and undo the fix every time the debug toggle was turned back off
+            // (including when the five-minute auto-revert does it).
+            //
+            // `reconcileCaptureAffinity()` visits each window exactly once via
+            // `presentationWindows`, a flat, index-aligned projection with one
+            // entry per real display -- see each platform's own
+            // `presentationWindows` doc comment.
+            reconcileCaptureAffinity()
 
             // This intentionally runs synchronously with the capture-affinity
             // mutation. A caller may safely inspect capture/debug state after
@@ -417,6 +485,18 @@ extension OverlayWindowController {
         annotationsSuspensionGeneration = permit.generation
         annotationsSuspended = false
 
+        // Reconciled BEFORE any window is ordered on screen, so a window never
+        // spends a composited frame with the wrong capture affinity. That
+        // ordering is the whole point on a streamed session: a host that treats
+        // a capture-excluded window as protected content reacts to the frame,
+        // not to our intent, and a single bad frame is enough to blank it.
+        //
+        // Cheap by construction -- `reconcileCaptureAffinity()` returns
+        // immediately unless the decision actually moved, and the probe behind
+        // it is TTL-cached -- which matters because this runs on every
+        // foreground change, not just on rebuilds.
+        reconcileCaptureAffinity()
+
         for (screenId, window) in presentationWindows {
             // Painting is a rendering concern, not a presentation one (see
             // `AnnotationRenderer`/`DrawingContext`), so it is deliberately
@@ -522,7 +602,11 @@ extension OverlayWindowController {
     // internal (not private): OverlayWindowController.swift's
     // createOverlayWindow(for:screenId:) reads this when birthing a window.
     var desiredSharingType: NSWindow.SharingType {
-        return isCaptureVisible ? .readOnly : .none
+        // Derived from the shared policy, not from `isCaptureVisible` alone --
+        // see `captureExclusionDecision`. `.readOnly` is the "capturable"
+        // answer and `.none` the "excluded" one; the mapping is unchanged, only
+        // the input that chooses between them is now broader.
+        return desiredIncludeInCapture ? .readOnly : .none
     }
 
     /// A flat, index-aligned projection over `overlayWindows`/`overlayViews`
@@ -636,7 +720,12 @@ extension OverlayWindowController {
     /// triggered by a display change does not silently revert the user's
     /// capture-debug toggle.
     var desiredExcludedFromCapture: Bool {
-        !isCaptureVisible
+        // Derived from the shared policy, not from `isCaptureVisible` alone --
+        // see `captureExclusionDecision`. On a session detected as
+        // remote/streamed this is `false`, so a freshly (re)built window is
+        // born with `WDA_NONE` and never spends even one composited frame
+        // asking to be excluded.
+        !desiredIncludeInCapture
     }
 
     /// The Windows analogue of the macOS branch's identical projection --
