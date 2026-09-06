@@ -65,6 +65,28 @@ public protocol OverlayPresentationBackend: AnyObject {
     func setCaptureAffinity(includeInCapture: Bool)
 }
 
+/// De-duplicates the "unrecognised `AI_CHALKBOARD_CAPTURE_EXCLUSION` value"
+/// warning down to one line per distinct value.
+///
+/// Keyed by the raw value rather than a plain "already warned" flag so that a
+/// user who fixes one typo into a second typo still gets told. Process-global
+/// static state guarded by its own lock, because the property that calls this
+/// is read from the presentation thread and from the MCP server's background
+/// read queue.
+private enum CaptureExclusionOverrideWarning {
+    private static let lock = NSLock()
+    private static var lastWarnedValue: String?
+
+    static func warnOnce(_ raw: String) {
+        lock.lock()
+        let alreadyWarned = (lastWarnedValue == raw)
+        lastWarnedValue = raw
+        lock.unlock()
+        guard !alreadyWarned else { return }
+        Logger.shared.log("OverlayWindowController: \(CaptureExclusionPolicy.environmentVariableName)=\"\(raw)\" is not a recognised value (expected auto, never, or always); treating it as auto. This is logged once per distinct value.", level: "WARN")
+    }
+}
+
 extension OverlayWindowController {
     /// Whether this process has temporarily ordered all overlay windows out.
     /// Kept as a synchronous query because MCP diagnostics must describe the
@@ -100,10 +122,15 @@ extension OverlayWindowController {
             fromEnvironmentValue: ProcessInfo.processInfo.environment[CaptureExclusionPolicy.environmentVariableName])
         if case .unrecognized(let raw) = parsed {
             // Warn rather than fail: a typo in an environment variable must not
-            // stop the app from presenting annotations. Logged every time it is
-            // read, which is the point -- a silently ignored override is how a
-            // user ends up convinced they already tried the workaround.
-            Logger.shared.log("OverlayWindowController: \(CaptureExclusionPolicy.environmentVariableName)=\"\(raw)\" is not a recognised value (expected auto, never, or always); treating it as auto.", level: "WARN")
+            // stop the app from presenting annotations. A silently ignored
+            // override is how a user ends up convinced they already tried the
+            // workaround.
+            //
+            // Throttled because this property is read on EVERY foreground
+            // change (via `refreshViewsNow`), so an unthrottled warning would
+            // emit one line per alt-tab for the whole life of the process --
+            // the same log-flood shape as the suspension-lock fail-closed bug.
+            CaptureExclusionOverrideWarning.warnOnce(raw)
         }
         return CaptureExclusionPolicy.decide(
             captureDebugVisible: isCaptureVisible,
