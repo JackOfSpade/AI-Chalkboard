@@ -436,14 +436,23 @@ def isolated_suspension_env(suspension_root, namespace_prefix):
     only labels the randomized DNC namespace for readability in logs -- the
     fresh UUID is what actually guarantees no sibling process can hear it.
 
-    ONE DELIBERATE EXCEPTION, which is not drift and must not be "migrated":
-    tests/test_suspension_two_process.py hand-rolls these same three keys
-    because its TWO children have to SHARE one
+    THE DELIBERATE EXCEPTIONS, which are not drift and must not be "migrated":
+    tests/test_suspension_two_process.py and
+    tests/test_capture_visible_two_process.py hand-roll these same three keys
+    because their TWO children have to SHARE one
     `AI_CHALKBOARD_SUSPENSION_NAMESPACE` -- the behaviour under test is two
     peers in the SAME isolated domain. This helper mints a fresh uuid4 on
     every call, so calling it once per child would put those peers in separate
-    domains and silently defeat the only cross-process suspension test in the
-    repo. Treat this helper as being for SINGLE-child harnesses only.
+    domains and silently defeat the only cross-process tests in the repo.
+    Treat this helper as being for SINGLE-child harnesses only.
+
+    NOT COVERED HERE: `AI_CHALKBOARD_LOG_DIR`. These keys isolate the
+    suspension domain and the instance lock, but Logger still resolves to the
+    user's real ~/Library/Logs/AIChalkboard unless that absolute override is
+    also set, and TestHarness.isActive cannot substitute for it -- it detects
+    an XCTest bundle, and a binary spawned as a plain subprocess looks exactly
+    like the real app. Callers that care (see
+    tests/test_capture_visible_two_process.py) set it themselves.
     """
     return {
         "AI_CHALKBOARD_SUSPENSION_ROOT": suspension_root,

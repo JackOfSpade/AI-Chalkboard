@@ -194,11 +194,13 @@ jobs:
         # its protocol framing and deadline behavior are pure Python and must be
         # exercised here rather than merely syntax-checked. The macOS build job below
         # separately launches the packaged app for its headless ping/backpressure
-        # slice. tests/test_suspension_two_process.py launches the full app twice
-        # (opt-in only via its own env-var gate -- see its module docstring), so it gets
-        # syntax-check-only treatment here; without this it was py_compile'd nowhere.
+        # slice. tests/test_suspension_two_process.py and
+        # tests/test_capture_visible_two_process.py each launch the full app twice
+        # (opt-in only via their own env-var gates -- see their module docstrings), so
+        # they get syntax-check-only treatment here; without this they were
+        # py_compile'd nowhere.
         run: |
-          python3 -m py_compile test_mcp_stdio.py tests/test_mcp_stdio_harness.py tests/test_suspension_two_process.py
+          python3 -m py_compile test_mcp_stdio.py tests/test_mcp_stdio_harness.py tests/test_suspension_two_process.py tests/test_capture_visible_two_process.py
           python3 -m unittest tests/test_mcp_stdio_harness.py
 
       - name: MCP wire-snapshot tool syntax + canonicalisation tests
