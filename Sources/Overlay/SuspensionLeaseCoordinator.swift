@@ -696,6 +696,59 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         return LockedResult(value: value, state: state, didPersist: bodyChanged || read.needsRewrite)
     }
 
+    /// How many times a presentation fence re-attempts the NONBLOCKING lock
+    /// before it gives up and lets `withPresentationPermit` fail closed, and
+    /// how long it pauses between attempts.
+    ///
+    /// WHY THIS EXISTS (bug fix -- overlay flicker on ordinary focus changes):
+    /// every desktop-wide `EVENT_SYSTEM_FOREGROUND`/`didActivate` makes EVERY
+    /// Chalkboard process refresh presentation, and Claude Desktop runs two
+    /// `--mcp` children per config entry. Both therefore reach for the same
+    /// registry lock in the same millisecond, and one of them loses. A loss
+    /// here is not evidence that the registry is unavailable -- the peer holds
+    /// it for the few milliseconds of its own presentation fence, which
+    /// performs no durable write -- but the failure path treats the two
+    /// identically: it hides EVERY overlay window (`orderAllWindowsOffScreen`)
+    /// and logs at ERROR, and the background reconciliation only puts them
+    /// back 30-90 ms later. With an annotation on screen that is a visible
+    /// blink, and it fires on every alt-tab; a production log showed 82 such
+    /// cycles in 14 minutes between two sibling PIDs.
+    ///
+    /// Retrying briefly collapses that whole class of false alarm without
+    /// weakening anything: this stays a NONBLOCKING acquire (it never waits on
+    /// the peer the way the background path's `waitForAvailability: true`
+    /// does), the fail-closed behaviour is unchanged for a registry that is
+    /// genuinely unavailable -- every attempt simply fails and the real error
+    /// still propagates -- and the total worst case is an order of magnitude
+    /// shorter than the flicker it replaces. It also cannot deadlock against
+    /// the peer, because a presentation fence never waits on anything else
+    /// while holding this lock.
+    private static let presentationLockAttempts = 4
+    private static let presentationLockRetryDelay: TimeInterval = 0.003
+
+    /// Bounded-retry wrapper around the nonblocking acquire. Only the ACQUIRE
+    /// is retried -- never the read/validate/write body below it, where a
+    /// retry could turn one durable write into two.
+    private func acquirePresentationLock() throws -> HeldLock<PlatformBackend> {
+        var attempt = 1
+        while true {
+            do {
+                return try acquireLock(waitForAvailability: false)
+            } catch {
+                // The last attempt rethrows verbatim, so `installFailure`
+                // still reports the genuine underlying reason rather than a
+                // synthesized "gave up retrying" message.
+                guard attempt < Self.presentationLockAttempts else { throw error }
+                attempt += 1
+                // Blocks the UI thread for a few milliseconds by design. The
+                // alternative -- returning to the caller -- costs a full
+                // hide/show cycle of every overlay window, which is both
+                // slower and visible.
+                Thread.sleep(forTimeInterval: Self.presentationLockRetryDelay)
+            }
+        }
+    }
+
     /// The presentation counterpart to `withLockedState`.  It intentionally
     /// keeps `held` alive while `body` performs its synchronous AppKit action;
     /// see `withPresentationPermit` for the lock-ordering contract.
@@ -706,7 +759,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         // Presentation can only use a nonblocking lock attempt.  The caller
         // is on the platform UI thread and will order every overlay out if a
         // peer currently owns the durable operation lock.
-        let held = try acquireLock(waitForAvailability: false)
+        let held = try acquirePresentationLock()
         defer { held.release() }
 
         try validateHeldLock(held)
