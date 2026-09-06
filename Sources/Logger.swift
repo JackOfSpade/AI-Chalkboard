@@ -219,10 +219,25 @@ public final class Logger: @unchecked Sendable {
             || environment["XCTestConfigurationFilePath"] != nil
             || environment["XCTestBundlePath"] != nil
         #elseif os(Windows)
-        // Objective-C runtime class lookup is not available on Windows.
-        // Preserve the environment-based detection supported by XCTest there.
+        // Objective-C runtime class lookup is not available on Windows, so the
+        // macOS branch's reliable signal is unavailable -- and the doc comment
+        // above already records that `swift test` exports NEITHER of these
+        // environment variables on this toolchain. Together that left this
+        // branch with no working detection whatsoever: every `swift test` run
+        // wrote its synthetic WARN records straight into the user's real log,
+        // competing for the same 5 MB rotation budget that retains genuine
+        // diagnostics -- exactly the eviction the macOS branch was written to
+        // prevent. Verified from a production log, whose polluting records
+        // carried a `Build:` line pointing at
+        // `.build\...\AIChalkboardPackageTests.xctest`.
+        //
+        // That path is itself the fix: SwiftPM's Windows test runner is an
+        // executable named `<Package>PackageTests.xctest`, so the running
+        // image's own name identifies the harness. Unlike an environment
+        // variable it cannot simply be absent.
         let isTestHarness = environment["XCTestConfigurationFilePath"] != nil
             || environment["XCTestBundlePath"] != nil
+            || isTestBundleExecutablePath(CommandLine.arguments.first ?? "")
         #endif
         if isTestHarness {
             return fileManager.temporaryDirectory
@@ -236,6 +251,26 @@ public final class Logger: @unchecked Sendable {
         #elseif os(Windows)
         return PlatformPaths.logDirectory
         #endif
+    }
+
+    /// Whether `path` names a Swift test-bundle executable.
+    ///
+    /// Split out as a pure function over a string, rather than reading
+    /// `CommandLine` itself, so the matching rule is unit-testable on both
+    /// platforms without having to be inside a test bundle to exercise it --
+    /// the same shape `SuspensionLeaseCoordinator.overrideStorageDirectory
+    /// (fromEnvironmentValue:)` uses for its own environment input.
+    ///
+    /// Splits on BOTH separators for the reason `AbsolutePath` exists in this
+    /// repo: a Windows path handed to a POSIX-flavoured path API is silently
+    /// mis-parsed, and this must give identical answers on both platforms
+    /// because its tests run on both.
+    static func isTestBundleExecutablePath(_ path: String) -> Bool {
+        let lastComponent = path.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init) ?? path
+        // `contains`, not `hasSuffix`: SwiftPM names the Windows runner
+        // `<Package>PackageTests.xctest` with no further extension, while other
+        // toolchains append one (`...xctest.exe`). Both must match.
+        return lastComponent.lowercased().contains(".xctest")
     }
 
     /// Resolves the normal user-facing log location without assuming
