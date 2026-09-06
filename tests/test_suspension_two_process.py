@@ -289,17 +289,54 @@ class _SuspensionTwoProcessContract:
         # own cleanups when an assertion in setUp is what failed.
         return "; ".join(f"pid={proc.pid} status={proc.poll()}" for proc in self.children)
 
-    def assert_windows_match_compositor(self, child, expected_on_screen):
-        state = self.payload(child, "get_overlay_state", {}, 300 + child)
-        for overlay in state["overlays"]:
-            number = overlay.get("windowNumber")
-            if number is None:
-                continue
-            observed = self.window_on_screen(self.children[child].pid, number)
-            self.assertEqual(
-                observed, expected_on_screen,
-                f"PID {self.children[child].pid}, window {number}: state={state}",
+    def assert_windows_match_compositor(self, child, expected_on_screen, timeout=3.0):
+        """Waits until every window this child owns matches `expected_on_screen`.
+
+        Polls rather than asserting once because a lease released on ONE child
+        reaches the other by broadcast, so a single-shot read can straddle that
+        delivery and see the sibling still suspended. Observed on Windows at
+        roughly one run in twelve, on the final check after both leases are
+        released: `resume_annotations` had already returned activeLeaseCount 0,
+        while this child still reported activeLeaseCount 1, annotationsSuspended
+        true and its window correctly still hidden. Nothing was wrong except that
+        the question was asked too early. macOS was never seen to fail here, which
+        is consistent with delivery being faster there rather than with the race
+        not existing.
+
+        Requires at least one probed window, so a child reporting no window
+        numbers fails here instead of satisfying this check vacuously.
+        """
+        deadline = time.monotonic() + timeout
+        attempt = 0
+        while True:
+            state = self.payload(child, "get_overlay_state", {}, 3000 + attempt * 10 + child)
+            probed, mismatched = 0, []
+            for overlay in state["overlays"]:
+                number = overlay.get("windowNumber")
+                if number is None:
+                    continue
+                probed += 1
+                observed = self.window_on_screen(self.children[child].pid, number)
+                if observed != expected_on_screen:
+                    mismatched.append((number, observed))
+            if probed and not mismatched:
+                return
+            if time.monotonic() >= deadline:
+                break
+            attempt += 1
+            time.sleep(0.05)
+
+        if not probed:
+            self.fail(
+                f"child {child} (PID {self.children[child].pid}) reported no window "
+                f"numbers within {timeout}s, so this check would have proved "
+                f"nothing: state={state}"
             )
+        self.fail(
+            f"windows of PID {self.children[child].pid} did not all reach "
+            f"on_screen={expected_on_screen} within {timeout}s; still mismatched "
+            f"(window, observed)={mismatched}: state={state}"
+        )
 
     def test_overlapping_leases_idempotency_and_real_window_quiescence(self):
         # Give each raw executable process an annotation so it owns at least
