@@ -1172,6 +1172,62 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
             URL(fileURLWithPath: shared, isDirectory: true).standardizedFileURL)
     }
 
+    /// REGRESSION GUARD. `TestHarness.sandboxDirectory` is a lazy static whose
+    /// initializer CREATES a directory that nothing ever deletes, so merely
+    /// evaluating it is a side effect. It was originally passed to
+    /// `resolveStorageDirectory` as a plain argument, and Swift evaluates
+    /// every argument before entering the callee -- so the real app forced it
+    /// on each launch and left behind a `<temp>/AIChalkboardTestSandbox/
+    /// xctest-<pid>/` directory despite never having run a test.
+    ///
+    /// The parameter is `@autoclosure` now. This asserts the deferral rather
+    /// than the parameter's spelling: a spy records whether the expression was
+    /// ever evaluated, so reverting to a plain argument fails here even though
+    /// the resolved path would still be correct. The old tests could not catch
+    /// it -- they passed throwaway literals, whose evaluation is harmless.
+    func testProductionResolutionNeverEvaluatesTheSandboxDirectory() {
+        #if os(Windows)
+        let support = URL(fileURLWithPath: #"C:\Users\example\AppData\Local"#, isDirectory: true)
+        let shared = #"C:\shared\registry"#
+        #else
+        let support = URL(fileURLWithPath: "/Users/example/Library/Application Support", isDirectory: true)
+        let shared = "/tmp/shared-registry"
+        #endif
+
+        // Production: no injection, no override, not a test harness.
+        var evaluated = false
+        _ = SuspensionLeaseCoordinator.resolveStorageDirectory(
+            injected: nil, environmentValue: nil, isTestHarness: false,
+            sandboxDirectory: { evaluated = true; return support }(),
+            applicationSupportDirectory: support)
+        XCTAssertFalse(evaluated, "production resolution must not force the sandbox directory")
+
+        // Both explicit rungs short-circuit above the sandbox too, so neither
+        // may evaluate it either -- including when isTestHarness is true.
+        evaluated = false
+        _ = SuspensionLeaseCoordinator.resolveStorageDirectory(
+            injected: support, environmentValue: nil, isTestHarness: true,
+            sandboxDirectory: { evaluated = true; return support }(),
+            applicationSupportDirectory: nil)
+        XCTAssertFalse(evaluated, "an injected directory must not force the sandbox directory")
+
+        evaluated = false
+        _ = SuspensionLeaseCoordinator.resolveStorageDirectory(
+            injected: nil, environmentValue: shared, isTestHarness: true,
+            sandboxDirectory: { evaluated = true; return support }(),
+            applicationSupportDirectory: nil)
+        XCTAssertFalse(evaluated, "an environment override must not force the sandbox directory")
+
+        // ...and it IS evaluated on the one rung that actually returns it,
+        // so the deferral cannot be "never call it at all".
+        evaluated = false
+        _ = SuspensionLeaseCoordinator.resolveStorageDirectory(
+            injected: nil, environmentValue: nil, isTestHarness: true,
+            sandboxDirectory: { evaluated = true; return support }(),
+            applicationSupportDirectory: nil)
+        XCTAssertTrue(evaluated, "the sandbox rung must still evaluate the directory it returns")
+    }
+
     /// A platform that cannot even name an application-support directory must
     /// still produce a ROOTED sentinel, never a bare relative name that would
     /// resolve against whatever directory the process happened to launch from.

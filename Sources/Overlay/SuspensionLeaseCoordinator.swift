@@ -269,10 +269,22 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     ///      application-support directory. Absolute on purpose: anything
     ///      relative would resolve against whatever directory the process
     ///      happened to launch from.
+    /// `sandboxDirectory` is `@autoclosure` and that is a correctness
+    /// requirement, not a micro-optimisation. Swift evaluates every argument
+    /// before entering the callee, so passing `TestHarness.sandboxDirectory`
+    /// as a plain argument forced that lazy static on EVERY call -- including
+    /// production, where `isTestHarness` is false and the value is discarded.
+    /// Forcing it is not free: its initializer creates
+    /// `<temp>/AIChalkboardTestSandbox/xctest-<pid>/` on disk and, by design,
+    /// nothing ever deletes it. The real app would have left one behind on
+    /// every launch, named as if a test had run. Deferring the evaluation is
+    /// what makes the "none of this fires in the real app" claim actually
+    /// true; the other three call sites already got it for free by sitting
+    /// inside an `if TestHarness.isActive`.
     static func resolveStorageDirectory(injected: URL?,
                                         environmentValue: String?,
                                         isTestHarness: Bool,
-                                        sandboxDirectory: URL,
+                                        sandboxDirectory: @autoclosure () -> URL,
                                         applicationSupportDirectory: URL?) -> URL {
         if let injected {
             return injected.standardizedFileURL
@@ -281,7 +293,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
             return override
         }
         if isTestHarness {
-            return sandboxDirectory
+            return sandboxDirectory()
         }
         if let applicationSupportDirectory {
             return applicationSupportDirectory.appendingPathComponent("AIChalkboard", isDirectory: true)

@@ -196,8 +196,18 @@ final class TestHarnessTests: XCTestCase {
         }
         if let explicit = ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_NAMESPACE"] {
             // This process was launched with an explicit override present.
+            //
+            // An override that sanitizes to nothing does NOT yield an empty
+            // suffix: production deliberately falls through to the
+            // test-harness namespace rather than short-circuiting, precisely
+            // so a typo cannot put a test bundle back on the live channel.
+            // Modelling that as "" here would have asserted the very bug the
+            // fallthrough exists to prevent -- and passed anyway, because this
+            // suite normally runs with no override set at all.
             let cleaned = sanitize(explicit)
-            let expected = cleaned.isEmpty ? "" : "." + cleaned
+            let expected = cleaned.isEmpty
+                ? "." + sanitize(TestHarness.processScopedNamespace)
+                : "." + cleaned
             XCTAssertEqual(BroadcastNamespace.suffix, expected)
         } else {
             // The ordinary case for this suite: no override, and
@@ -208,6 +218,22 @@ final class TestHarnessTests: XCTestCase {
             // user's live connector listens on.
             XCTAssertEqual(BroadcastNamespace.suffix, "." + TestHarness.processScopedNamespace)
         }
+    }
+
+    /// The safety property itself, stated without re-implementing any of the
+    /// production algorithm -- so it stays true no matter what the ambient
+    /// environment holds, and cannot be broken by the mirror above drifting
+    /// out of sync with the code it mirrors.
+    ///
+    /// An empty suffix inside a test bundle means this process posts to the
+    /// exact unscoped, session-wide channel names the user's live connector
+    /// listens on, `quitAll` included.
+    func testATestBundleNeverCarriesTheProductionSuffix() {
+        XCTAssertTrue(TestHarness.isActive, "precondition: this assertion is only meaningful inside a test bundle")
+        XCTAssertFalse(BroadcastNamespace.suffix.isEmpty,
+                       "an empty suffix puts this test bundle on the live connector's channels")
+        XCTAssertTrue(BroadcastNamespace.suffix.hasPrefix("."),
+                      "the suffix must be dot-separated so it cannot merge into the base name")
     }
 
     func testScopedAppendsTheSuffixToTheBaseName() {
