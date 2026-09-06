@@ -127,7 +127,20 @@ public class InstanceLockPolicy<Primitive: FileLockPrimitive>: @unchecked Sendab
         // temporary directory and must name an ordinary file beneath it. See
         // each primitive's `testLockURLFromEnvironment` for the platform-
         // specific path syntax this validates.
+        //
+        // Falling back to this process's own sandbox under a test bundle is
+        // not cosmetic isolation. The production path is the SAME
+        // `instance.lock` the user's running connector holds to stay primary,
+        // so a test reaching `InstanceLock.shared` contended for it directly
+        // and could demote the live primary -- taking its tray icon with it --
+        // on a developer machine that happened to have the app running. The
+        // explicit environment override still wins, so the subprocess
+        // integration tests that deliberately share a namespace are
+        // unaffected. See `TestHarness`.
         lockURLOverride = Primitive.testLockURLFromEnvironment()
+            ?? (TestHarness.isActive
+                ? TestHarness.sandboxDirectory.appendingPathComponent("instance.lock")
+                : nil)
         logHandler = { message, level in
             Logger.shared.log(message, level: level)
         }

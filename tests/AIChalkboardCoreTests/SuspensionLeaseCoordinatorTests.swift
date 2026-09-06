@@ -1101,20 +1101,95 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
     /// behaviour production depends on, and the reason the guard has to
     /// reject junk rather than pass it through.
     func testAbsentSuspensionRootOverrideLeavesTheRealPerUserDirectoryInPlace() {
-        // AppBehaviorTests sets this variable process-wide to isolate itself,
-        // so clear it just for this call rather than skipping -- skipping here
-        // would silently drop the only coverage of the production fallback.
-        // Only this freshly constructed instance is affected; the shared
-        // coordinator resolved its own directory long before now.
-        let coordinator = TestEnvironment.withValue("AI_CHALKBOARD_SUSPENSION_ROOT", nil) {
-            SuspensionLeaseCoordinator(
-                storageDirectory: nil,
-                bootSessionIdentifier: "test-boot",
-                instanceNonce: "test-nonce"
-            )
-        }
-        XCTAssertEqual(coordinator.storageDirectory.lastPathComponent, "AIChalkboard")
-        XCTAssertTrue((coordinator.storageDirectory.path as NSString).isAbsolutePath,
+        // Exercised through the pure resolver rather than by constructing a
+        // coordinator. A test bundle no longer FALLS THROUGH to the real
+        // per-user directory -- `isTestHarness` diverts it to a sandbox so the
+        // suite cannot read or write the registry a live connector polls -- so
+        // this branch is unreachable from inside the suite by construction.
+        // Passing `isTestHarness: false` is what keeps the production fallback
+        // covered instead of quietly deleted.
+        // Platform-appropriate literal: `AbsolutePath.isAbsolute` deliberately
+        // rejects a leading-slash POSIX path on Windows, where absolute means
+        // `C:\...`, `C:/...`, or a UNC share. Production feeds this argument
+        // from FileManager, which already yields the right shape per platform.
+        #if os(Windows)
+        let support = URL(fileURLWithPath: #"C:\Users\example\AppData\Local"#, isDirectory: true)
+        #else
+        let support = URL(fileURLWithPath: "/Users/example/Library/Application Support", isDirectory: true)
+        #endif
+        let resolved = SuspensionLeaseCoordinator.resolveStorageDirectory(
+            injected: nil,
+            environmentValue: nil,
+            isTestHarness: false,
+            sandboxDirectory: URL(fileURLWithPath: "/unused-sandbox", isDirectory: true),
+            applicationSupportDirectory: support
+        )
+        XCTAssertEqual(resolved.lastPathComponent, "AIChalkboard")
+        XCTAssertTrue(AbsolutePath.isAbsolute(resolved.path),
                       "the fallback must be absolute, never resolved against the current directory")
+    }
+
+    /// The sandbox rung, and the precedence around it. This is the guarantee
+    /// that stops `swift test` from reading and writing the same
+    /// `annotations-suspension-v3.json` a running connector polls.
+    func testTestHarnessGetsTheSandboxInsteadOfTheRealPerUserDirectory() {
+        let sandbox = URL(fileURLWithPath: "/tmp/sandbox-xctest", isDirectory: true)
+        let support = URL(fileURLWithPath: "/Users/example/Library/Application Support", isDirectory: true)
+        let resolved = SuspensionLeaseCoordinator.resolveStorageDirectory(
+            injected: nil,
+            environmentValue: nil,
+            isTestHarness: true,
+            sandboxDirectory: sandbox,
+            applicationSupportDirectory: support
+        )
+        XCTAssertEqual(resolved, sandbox)
+        XCTAssertNotEqual(resolved.lastPathComponent, "AIChalkboard")
+    }
+
+    /// Both explicit forms must outrank the sandbox. The two-process Python
+    /// integration tests drive real `AIChalkboard.exe` children that have to
+    /// SHARE one registry; a per-process sandbox winning here would put each
+    /// child on its own registry and silently break their whole premise.
+    func testExplicitFormsOutrankTheTestSandbox() {
+        let sandbox = URL(fileURLWithPath: "/tmp/sandbox-xctest", isDirectory: true)
+        let injected = URL(fileURLWithPath: "/tmp/injected-root", isDirectory: true)
+
+        XCTAssertEqual(
+            SuspensionLeaseCoordinator.resolveStorageDirectory(
+                injected: injected, environmentValue: nil, isTestHarness: true,
+                sandboxDirectory: sandbox, applicationSupportDirectory: nil),
+            injected.standardizedFileURL)
+
+        #if os(Windows)
+        let shared = #"C:\shared\registry"#
+        #else
+        let shared = "/tmp/shared-registry"
+        #endif
+        XCTAssertEqual(
+            SuspensionLeaseCoordinator.resolveStorageDirectory(
+                injected: nil, environmentValue: shared, isTestHarness: true,
+                sandboxDirectory: sandbox, applicationSupportDirectory: nil),
+            URL(fileURLWithPath: shared, isDirectory: true).standardizedFileURL)
+    }
+
+    /// A platform that cannot even name an application-support directory must
+    /// still produce a ROOTED sentinel, never a bare relative name that would
+    /// resolve against whatever directory the process happened to launch from.
+    ///
+    /// Asserts rooted-ness rather than `AbsolutePath.isAbsolute`: the sentinel
+    /// is the POSIX literal `/var/empty/AIChalkboard`, which that helper
+    /// correctly reports as NOT absolute by Windows rules (there is no drive
+    /// letter). That is pre-existing behaviour on an unreachable branch --
+    /// `FileManager` has always resolved an application-support directory on
+    /// both supported platforms -- so this pins what the code actually
+    /// guarantees instead of asserting something untrue about it.
+    func testUnresolvableApplicationSupportStillYieldsARootedSentinel() {
+        let resolved = SuspensionLeaseCoordinator.resolveStorageDirectory(
+            injected: nil, environmentValue: nil, isTestHarness: false,
+            sandboxDirectory: URL(fileURLWithPath: "/unused-sandbox", isDirectory: true),
+            applicationSupportDirectory: nil)
+        XCTAssertEqual(resolved.lastPathComponent, "AIChalkboard")
+        XCTAssertTrue(resolved.path.hasPrefix("/") || AbsolutePath.isAbsolute(resolved.path),
+                      "the sentinel must be rooted, never a cwd-relative name")
     }
 }

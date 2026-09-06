@@ -242,22 +242,67 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         return URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
     }
 
+    /// The full storage-directory precedence, as a pure function of its
+    /// inputs.
+    ///
+    /// Pulled out of `init` so the PRODUCTION fallback stays testable. Once a
+    /// test bundle stopped falling through to the real per-user directory (see
+    /// the `isTestHarness` branch), nothing constructed inside the suite could
+    /// observe that branch any more -- the coverage would have had to be
+    /// deleted rather than fixed. Taking the environment as parameters keeps
+    /// every rung of the ladder assertable from either side.
+    ///
+    /// Order, highest priority first:
+    ///
+    ///   1. `injected` -- an explicit `storageDirectory:` argument. Always
+    ///      wins; this is how most tests isolate themselves today.
+    ///   2. `AI_CHALKBOARD_SUSPENSION_ROOT`, when absolute. The two-process
+    ///      Python tests drive real `AIChalkboard.exe` children that must
+    ///      SHARE one registry, so their explicit namespace has to outrank the
+    ///      per-process sandbox below.
+    ///   3. The test sandbox. This replaces what used to be the fallback for a
+    ///      test bundle: the live per-user registry a running connector polls,
+    ///      which a test reaching `.shared` without opting in would read and
+    ///      write. See `TestHarness`.
+    ///   4. The real per-user directory -- production.
+    ///   5. A non-writable sentinel, when the platform cannot even name an
+    ///      application-support directory. Absolute on purpose: anything
+    ///      relative would resolve against whatever directory the process
+    ///      happened to launch from.
+    static func resolveStorageDirectory(injected: URL?,
+                                        environmentValue: String?,
+                                        isTestHarness: Bool,
+                                        sandboxDirectory: URL,
+                                        applicationSupportDirectory: URL?) -> URL {
+        if let injected {
+            return injected.standardizedFileURL
+        }
+        if let override = overrideStorageDirectory(fromEnvironmentValue: environmentValue) {
+            return override
+        }
+        if isTestHarness {
+            return sandboxDirectory
+        }
+        if let applicationSupportDirectory {
+            return applicationSupportDirectory.appendingPathComponent("AIChalkboard", isDirectory: true)
+        }
+        return URL(fileURLWithPath: "/var/empty/AIChalkboard", isDirectory: true)
+    }
+
     /// Production reads its optional root override exactly once at launch.
     /// Tests can inject both an isolated directory and a stable boot id.
     public init(storageDirectory: URL? = nil, bootSessionIdentifier: String? = nil,
                 instanceNonce: String? = nil, mutationSettleHook: (() -> Void)? = nil,
                 storagePrecommitHook: (() -> Void)? = nil) {
         controlsPresentation = storageDirectory == nil
-        if let storageDirectory {
-            self.storageDirectory = storageDirectory.standardizedFileURL
-        } else if let override = Self.overrideStorageDirectory(
-            fromEnvironmentValue: ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_ROOT"]) {
-            self.storageDirectory = override
-        } else if let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            self.storageDirectory = support.appendingPathComponent("AIChalkboard", isDirectory: true)
-        } else {
-            self.storageDirectory = URL(fileURLWithPath: "/var/empty/AIChalkboard", isDirectory: true)
-        }
+        self.storageDirectory = Self.resolveStorageDirectory(
+            injected: storageDirectory,
+            environmentValue: ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_ROOT"],
+            isTestHarness: TestHarness.isActive,
+            sandboxDirectory: TestHarness.sandboxDirectory,
+            applicationSupportDirectory: FileManager.default
+                .urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        )
         lockURL = self.storageDirectory.appendingPathComponent(Self.lockName)
         stateURL = self.storageDirectory.appendingPathComponent(Self.stateName)
         if let bootSessionIdentifier {

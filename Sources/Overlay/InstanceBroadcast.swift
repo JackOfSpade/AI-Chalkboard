@@ -43,6 +43,59 @@ import WinSDK
 // bug fix -- flag it to whoever owns that tradeoff rather than silently
 // tightening behavior here. Do not read the "no larger than clear/quit"
 // sentence above as covering setCaptureVisible; it does not.
+
+/// The suffix that scopes every broadcast channel name, on both platforms.
+///
+/// WHY EVERY CHANNEL AND NOT JUST ONE: this suffix used to be applied to
+/// exactly one name -- `chalkboardSuspensionInvalidated`, the only broadcast
+/// that carries no command and is treated by receivers as a mere wake-up hint.
+/// The three channels that DO carry commands (`clearAll`, `setCaptureVisible`,
+/// and `quitAll`, which terminates the receiving process) were left on
+/// unscoped, session-wide names. The isolation was applied to the harmless
+/// channel and withheld from the dangerous ones.
+///
+/// On Windows it was worse still: the suffix was never consulted at all there,
+/// because the transport is a message-only window found by class name and that
+/// name was a hardcoded literal. A `FindWindowExW` walk reaches EVERY window
+/// under that class in the session, whoever created it.
+///
+/// The concrete hazard is a test process posting `quitAll` and killing the
+/// user's running connector. No test does today; nothing structural stopped
+/// one, and the failure would look like the app randomly quitting.
+///
+/// Precedence: an explicit `AI_CHALKBOARD_SUSPENSION_NAMESPACE` wins, so the
+/// subprocess integration tests that deliberately put a pair of real servers
+/// on one shared channel keep working. Otherwise a test bundle gets a
+/// per-process namespace. Otherwise -- the real app -- the suffix is empty and
+/// every name is byte-identical to what it has always been, so this is not a
+/// wire-format change and an existing build still talks to a new one.
+enum BroadcastNamespace {
+    static let suffix: String = {
+        let sanitize: (String) -> String = { raw in
+            String(String.UnicodeScalarView(raw.unicodeScalars.filter {
+                CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_"
+            }))
+        }
+        // An explicit override only counts once it survives sanitizing. A
+        // value made entirely of stripped characters reduces to "", and
+        // returning that here would put a TEST BUNDLE back on the production
+        // channel -- the exact outcome this type exists to prevent, reached by
+        // way of a typo. So an unusable override falls through to the
+        // test-harness namespace below rather than short-circuiting to empty.
+        if let explicit = ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_NAMESPACE"] {
+            let cleaned = sanitize(explicit)
+            if !cleaned.isEmpty { return "." + cleaned }
+        }
+        if TestHarness.isActive {
+            return "." + sanitize(TestHarness.processScopedNamespace)
+        }
+        return ""
+    }()
+
+    /// Appends the suffix to a base channel name.
+    static func scoped(_ base: String) -> String { base + suffix }
+}
+
 extension Notification.Name {
     /// "Every AI Chalkboard process: wipe your AnnotationStore and repaint."
     ///
@@ -50,10 +103,10 @@ extension Notification.Name {
     /// `postClear(scope:appId:appName:)`. The NAME is unchanged on purpose: it
     /// is the verified-working channel, and a payload-less post from an older
     /// build still means exactly what it always meant (clear everything).
-    static let chalkboardClearAll = Notification.Name("com.aichalkboard.overlay.clearAllAnnotations")
+    static let chalkboardClearAll = Notification.Name(BroadcastNamespace.scoped("com.aichalkboard.overlay.clearAllAnnotations"))
 
     /// "Every AI Chalkboard process: terminate yourself."
-    static let chalkboardQuitAll = Notification.Name("com.aichalkboard.overlay.quitAllInstances")
+    static let chalkboardQuitAll = Notification.Name(BroadcastNamespace.scoped("com.aichalkboard.overlay.quitAllInstances"))
 
     /// "Every AI Chalkboard process: set your overlay windows' sharingType."
     ///
@@ -62,20 +115,12 @@ extension Notification.Name {
     /// applied in one process would leave the other process using a different
     /// sharing preference and render filter. Half-applied would make placement
     /// checks show an arbitrary subset on capture paths that include overlays.
-    static let chalkboardSetCaptureVisible = Notification.Name("com.aichalkboard.overlay.setCaptureVisible")
+    static let chalkboardSetCaptureVisible = Notification.Name(BroadcastNamespace.scoped("com.aichalkboard.overlay.setCaptureVisible"))
 
     /// A wake-up hint that durable suspension state changed. It carries no
     /// command: a receiver always re-reads the protected lease registry.
-    static var chalkboardSuspensionInvalidated: Notification.Name {
-        struct Name {
-            static let value: Notification.Name = {
-                let suffix = ProcessInfo.processInfo.environment["AI_CHALKBOARD_SUSPENSION_NAMESPACE"]
-                    .map { "." + $0.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) || $0 == "-" || $0 == "_" }.map(String.init).joined() } ?? ""
-                return Notification.Name("com.aichalkboard.overlay.suspensionLeaseInvalidated.v2\(suffix)")
-            }()
-        }
-        return Name.value
-    }
+    static let chalkboardSuspensionInvalidated =
+        Notification.Name(BroadcastNamespace.scoped("com.aichalkboard.overlay.suspensionLeaseInvalidated.v2"))
 }
 /// The QUIT broadcast's `object`, used only to scope Dock/Cmd-Q quits to
 /// instances launched the same way as the poster.
@@ -917,7 +962,7 @@ public final class InstanceBroadcast: BroadcastTransport {
     /// schema later without an old and a new build silently misinterpreting
     /// each other's payloads -- an old build simply will not find (or be
     /// found by) a differently-versioned class name.
-    private static let windowClassName = "com.aichalkboard.overlay.broadcast.v1"
+    private static let windowClassName = BroadcastNamespace.scoped("com.aichalkboard.overlay.broadcast.v1")
     private static let windowClassNameWide: [UInt16] = Array(windowClassName.utf16) + [0]
 
     /// The `HWND_MESSAGE` sentinel (`(HWND)-3`), used as every broadcast
