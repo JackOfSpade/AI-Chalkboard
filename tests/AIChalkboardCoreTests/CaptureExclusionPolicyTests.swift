@@ -317,4 +317,59 @@ final class CaptureExclusionPolicyTests: XCTestCase {
         XCTAssertTrue(CaptureExclusionPolicy.Decision.includeSuppressedByEnvironment.explanation
             .contains(CaptureExclusionPolicy.environmentVariableName))
     }
+
+    // MARK: - Whitespace around the executable name
+
+    // REGRESSION GUARD. normalizedProcessName used to trim whitespace AFTER
+    // stripping the extension, which cannot work: "anydesk.exe " ends in
+    // "exe ", so hasSuffix(".exe") is false and nothing is stripped. The
+    // result kept its extension, matched no table entry, and a running
+    // remote-access host went undetected -- so capture exclusion would be
+    // applied on a streamed session, the exact failure this type prevents.
+
+    func testTrailingWhitespaceStillYieldsAnExtensionlessName() {
+        XCTAssertEqual(CaptureExclusionPolicy.normalizedProcessName("AnyDesk.exe "), "anydesk")
+        XCTAssertEqual(CaptureExclusionPolicy.normalizedProcessName("  ShadowStreamer.exe\t"), "shadowstreamer")
+        XCTAssertEqual(CaptureExclusionPolicy.normalizedProcessName("Parsec.app  "), "parsec")
+    }
+
+    func testAWhitespacePaddedHostNameIsStillDetected() {
+        // The end-to-end consequence, not just the string helper: a padded
+        // name must still produce a signal, or decide() silently falls through
+        // to .exclude on a machine that is being streamed.
+        let signals = CaptureExclusionPolicy.remoteSessionSignals(
+            runningProcessNames: ["AnyDesk.exe "], isTerminalServicesSession: false)
+        XCTAssertEqual(signals.count, 1)
+        XCTAssertTrue(signals[0].contains("AnyDesk"))
+
+        let decision = CaptureExclusionPolicy.decide(
+            captureDebugVisible: false, override: .auto, remoteSessionSignals: signals)
+        XCTAssertFalse(decision.excludesFromCapture)
+    }
+
+    func testWhitespaceLeftBehindByStrippingTheExtensionIsAlsoRemoved() {
+        XCTAssertEqual(CaptureExclusionPolicy.normalizedProcessName("anydesk .exe"), "anydesk")
+    }
+
+    // MARK: - isCaptureDebugVisible
+
+    // This exists so a diagnostic can recover the capture-debug input from the
+    // SAME snapshot the decision was built from, instead of re-reading the
+    // live flag and risking a payload that says capture-debug is both on and
+    // off. It is only correct while it agrees exactly with decide()'s input.
+
+    func testIsCaptureDebugVisibleMatchesTheInputThatProducedTheDecision() {
+        for override in [CaptureExclusionPolicy.Override.auto, .never, .always] {
+            for signals in [[], ["Shadow cloud PC (shadowstreamer)"]] {
+                for debugVisible in [true, false] {
+                    let decision = CaptureExclusionPolicy.decide(
+                        captureDebugVisible: debugVisible,
+                        override: override,
+                        remoteSessionSignals: signals)
+                    XCTAssertEqual(decision.isCaptureDebugVisible, debugVisible,
+                                   "debugVisible=\(debugVisible) override=\(override) signals=\(signals)")
+                }
+            }
+        }
+    }
 }

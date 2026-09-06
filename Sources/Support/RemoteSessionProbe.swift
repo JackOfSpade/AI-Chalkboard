@@ -150,6 +150,20 @@ enum RemoteSessionProbe {
 
     /// Running applications, by executable name.
     ///
+    /// THREADING: `NSWorkspace.runningApplications` is AppKit, and this is
+    /// reached from the MCP server's background read queue (`get_screens`,
+    /// `get_overlay_state`, `set_capture_visible` all read
+    /// `captureExclusionDecision`), so it takes the same main-thread hop every
+    /// other `NSWorkspace` query in this package takes -- see
+    /// `MCPToolHandlers+Highlight.swift`, whose identical hop names this exact
+    /// API. `MainThread.sync` runs inline when already on the UI thread, so the
+    /// presentation path (`refreshViewsNow` -> `reconcileCaptureAffinity`)
+    /// re-enters it safely rather than deadlocking.
+    ///
+    /// Strings are extracted INSIDE the hop for the same reason that file
+    /// gives: no `NSRunningApplication` -- a live, main-thread-owned object --
+    /// escapes back to the read queue. A `String` is just bytes.
+    ///
     /// KNOWN GAP, stated rather than papered over: `NSWorkspace` enumerates
     /// launched applications, not daemons, so macOS's own Screen Sharing
     /// (`screensharingd`) and other launchd-only remote-access services are
@@ -160,8 +174,10 @@ enum RemoteSessionProbe {
     /// shortfall, and `AI_CHALKBOARD_CAPTURE_EXCLUSION=never` covers the case
     /// by hand.
     private static func runningProcessNames() -> [String] {
-        NSWorkspace.shared.runningApplications.compactMap { app in
-            app.executableURL?.lastPathComponent ?? app.bundleURL?.lastPathComponent
+        MainThread.sync {
+            NSWorkspace.shared.runningApplications.compactMap { app -> String? in
+                app.executableURL?.lastPathComponent ?? app.bundleURL?.lastPathComponent
+            }
         }
     }
 

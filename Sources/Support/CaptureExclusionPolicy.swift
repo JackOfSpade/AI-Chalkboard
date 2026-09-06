@@ -221,7 +221,14 @@ public enum CaptureExclusionPolicy {
     /// tests run on both.
     public static func normalizedProcessName(_ raw: String) -> String {
         let lastComponent = raw.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init) ?? raw
-        var name = lastComponent.lowercased()
+        // Trimmed BEFORE the extension check, not after. Trimming afterwards
+        // looks equivalent and is not: `"AnyDesk.exe "` ends in `"exe "`, so
+        // `hasSuffix(".exe")` is false, nothing is stripped, and the trailing
+        // trim then yields `"anydesk.exe"` -- which matches no table entry, so
+        // a running remote-access host goes undetected and the exclusion is
+        // applied on a streamed session. That is precisely the false negative
+        // this whole type exists to prevent, so the order is load-bearing.
+        var name = lastComponent.trimmingCharacters(in: .whitespaces).lowercased()
         // Only strip a trailing extension, and only a known one. Truncating at
         // the last "." unconditionally would mangle names that legitimately
         // contain dots.
@@ -229,6 +236,8 @@ public enum CaptureExclusionPolicy {
             name.removeLast(suffix.count)
             break
         }
+        // Trailing trim again: a name like `"anydesk .exe"` leaves whitespace
+        // behind once the extension is gone.
         return name.trimmingCharacters(in: .whitespaces)
     }
 
@@ -311,6 +320,21 @@ public enum CaptureExclusionPolicy {
             case .includeSuppressedByEnvironment: return "included-suppressed-by-environment"
             case .includeSuppressedForRemoteSession: return "included-suppressed-remote-session"
             }
+        }
+
+        /// Whether capture-debug mode (`set_capture_visible(true)`) was in
+        /// effect when this decision was made.
+        ///
+        /// WHY CALLERS SHOULD PREFER THIS over reading `isCaptureVisible`
+        /// again: `decide` returns `.includeForCaptureDebug` if and only if
+        /// `captureDebugVisible` was true, so this is exactly that input --
+        /// but recovered from the SAME snapshot the rest of the decision was
+        /// built from. A diagnostic that reads the live flag separately can
+        /// straddle a concurrent change (the five-minute auto-revert timer, a
+        /// sibling instance's broadcast, or the menu toggle) and emit one
+        /// payload saying capture-debug is both on and off.
+        public var isCaptureDebugVisible: Bool {
+            self == .includeForCaptureDebug
         }
 
         /// The evidence behind `.includeSuppressedForRemoteSession`; empty for

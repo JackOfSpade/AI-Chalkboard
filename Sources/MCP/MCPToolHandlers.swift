@@ -38,11 +38,17 @@ extension MCPServer {
                 sendErrorResult(id: id, text: "Failed to encode screen list.")
                 return
             }
-            let captureVisible = OverlayWindowController.shared.isCaptureVisible
-            // Read once, for the same reason get_overlay_state reads it once:
-            // the decision consults a TTL-cached probe, so two reads could
-            // disagree with each other inside one response.
+            // ONE read, and `captureVisible` is derived from it rather than
+            // read separately. `_captureVisible` is mutable from the
+            // presentation thread (menu toggle, the five-minute auto-revert
+            // timer, a sibling instance's broadcast) while this handler runs on
+            // the MCP server's background read queue, so two independent reads
+            // can straddle a change and put flatly contradictory statements in
+            // one payload -- `captureNote` saying capture-debug is OFF beside a
+            // `captureExclusion.note` saying it is ON. Deriving both from one
+            // snapshot makes that unrepresentable rather than unlikely.
             let screensCaptureExclusion = OverlayWindowController.shared.captureExclusionDecision
+            let captureVisible = screensCaptureExclusion.isCaptureDebugVisible
             let annotationsSuspended = OverlayWindowController.shared.isAnnotationsSuspended
             // PLATFORM-ACCURATE PROSE, not a cosmetic detail. These strings are
             // read by the AI agent deciding how to compute coordinates, so
