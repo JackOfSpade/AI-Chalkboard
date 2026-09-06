@@ -83,14 +83,29 @@ its stable `reasonCode`, and the concrete signals behind it are reported by
 `get_screens` and `get_overlay_state` so the behaviour is checkable rather than
 merely asserted.
 
-The two platforms detect unequally, and the gap is stated rather than papered
-over: Windows walks the full process table (`CreateToolhelp32Snapshot`), so it
-sees background services, while macOS enumerates
-`NSWorkspace.runningApplications`, which lists launched applications but *not*
-daemons. macOS's own Screen Sharing (`screensharingd`) and other launchd-only
-remote-access services are therefore invisible to detection there; closing that
-gap needs a `sysctl(KERN_PROC_ALL)` walk that does not exist yet, and
-`AI_CHALKBOARD_CAPTURE_EXCLUSION=never` covers the case by hand until it does.
+The two platforms detect unequally, and **Windows detection is much the
+stronger of the two**. Windows walks the full process table
+(`CreateToolhelp32Snapshot`), so it sees background services. macOS is thinner
+for two separate reasons, both worth stating plainly:
+
+1. `NSWorkspace.runningApplications` lists launched applications but *not*
+   daemons, so macOS's own Screen Sharing (`screensharingd`) and other
+   launchd-only remote-access services are invisible. Closing this needs a
+   `sysctl(KERN_PROC_ALL)` walk that does not exist yet.
+2. Even among applications it does see, a match depends on the name lining up
+   with the host table — and most of that table is Windows service binaries,
+   several of them naming software with no macOS build at all (Shadow's cloud
+   PC, PCoIP and Blast host agents, Citrix VDA, the Windows VNC servers). On
+   macOS an app appears under its *product* name, so `TeamViewer.app` reads as
+   `teamviewer`, not `teamviewer_desktop`. Product-name aliases are listed for
+   the vendors that ship a macOS host, but the practical macOS coverage is
+   essentially Parsec, AnyDesk, TeamViewer, RustDesk and Sunshine — not the
+   full list above.
+
+An earlier version of this section named only the first reason and asserted
+that the four cross-platform apps "are covered", which was not true of
+TeamViewer. On macOS, treat `AI_CHALKBOARD_CAPTURE_EXCLUSION=never` as the
+reliable control rather than relying on detection.
 
 **Sibling-instance capture exclusion.** On macOS, Chalkboard's verification
 capture goes through ScreenCaptureKit, which can be configured to exclude a

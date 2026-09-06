@@ -169,6 +169,21 @@ public enum CaptureExclusionPolicy {
     ///     this machine is watching another one -- the opposite of what we care
     ///     about -- and matching it would be a false positive with backwards
     ///     reasoning.)
+    ///
+    /// MACOS NAMING. Most entries here are Windows service/binary names, and
+    /// several name software with no macOS build at all (Shadow's cloud PC,
+    /// PCoIP and Blast host agents, Citrix VDA, the WinVNC/TightVNC/UltraVNC
+    /// servers). On macOS an app is seen through `NSWorkspace` as its
+    /// CFBundleExecutable or its bundle name, which is normally the PRODUCT
+    /// name -- `TeamViewer.app` yields `teamviewer`, not `teamviewer_desktop`.
+    /// Entries written only in the Windows shape therefore never matched
+    /// there, silently, on exactly the vendors this table claimed to cover.
+    /// `anydesk` and `rustdesk` were unaffected only by luck: those products
+    /// use the same lowercase name on both platforms. Bare product-name
+    /// aliases are listed alongside the Windows names for the vendors that
+    /// actually ship a macOS host, and the real limits of macOS detection are
+    /// stated in README's "Remote and streamed sessions" section rather than
+    /// implied to be narrower than they are.
     public static let knownStreamingHosts: [StreamingHost] = [
         // Shadow (shadow.tech) cloud PC. All three names are unmistakably
         // theirs; the generic-sounding `ShadowLogger`/`ShadowManager` siblings
@@ -176,8 +191,10 @@ public enum CaptureExclusionPolicy {
         StreamingHost(executable: "shadowstreamer", vendor: "Shadow cloud PC"),
         StreamingHost(executable: "shadowsvsmanager", vendor: "Shadow cloud PC"),
         StreamingHost(executable: "shadowprocessator", vendor: "Shadow cloud PC"),
-        // Parsec.
+        // Parsec. Both the Windows service binary and the bare product name:
+        // see the macOS-naming note at the end of this table.
         StreamingHost(executable: "parsecd", vendor: "Parsec"),
+        StreamingHost(executable: "parsec", vendor: "Parsec"),
         // Sunshine, the self-hosted Moonlight server. (`moonlight` itself is
         // the client and is intentionally not matched.)
         StreamingHost(executable: "sunshine", vendor: "Sunshine/Moonlight"),
@@ -204,6 +221,7 @@ public enum CaptureExclusionPolicy {
         StreamingHost(executable: "teamviewer_desktop", vendor: "TeamViewer"),
         StreamingHost(executable: "tv_w32", vendor: "TeamViewer"),
         StreamingHost(executable: "tv_x64", vendor: "TeamViewer"),
+        StreamingHost(executable: "teamviewer", vendor: "TeamViewer"),
         StreamingHost(executable: "rustdesk", vendor: "RustDesk"),
         StreamingHost(executable: "winvnc", vendor: "VNC server"),
         StreamingHost(executable: "tvnserver", vendor: "VNC server"),

@@ -351,6 +351,59 @@ final class CaptureExclusionPolicyTests: XCTestCase {
         XCTAssertEqual(CaptureExclusionPolicy.normalizedProcessName("anydesk .exe"), "anydesk")
     }
 
+    // MARK: - macOS-shaped names
+
+    // REGRESSION GUARD, and the reason it exists is worth stating: every
+    // vendor test in this file used to pass Windows-shaped names only
+    // ("teamviewer_desktop.exe", "parsecd.exe"), so the suite was green while
+    // macOS detection silently failed for those same vendors. macOS surfaces
+    // an app through NSWorkspace as its CFBundleExecutable or bundle name --
+    // the PRODUCT name -- so "TeamViewer.app" arrives as "teamviewer", which
+    // matched no entry. These assert the shape macOS actually produces.
+    //
+    // Runs on both platforms on purpose: the policy is pure and platform
+    // neutral, so a Windows-only CI must still catch a macOS-only regression.
+
+    func testMacOSBundleNamesAreDetected() {
+        let cases: [(String, String)] = [
+            ("/Applications/TeamViewer.app", "TeamViewer"),
+            ("/Applications/Parsec.app", "Parsec"),
+            ("/Applications/AnyDesk.app", "AnyDesk"),
+            ("/Applications/RustDesk.app", "RustDesk")
+        ]
+        for (bundlePath, vendorFragment) in cases {
+            let signals = CaptureExclusionPolicy.remoteSessionSignals(
+                runningProcessNames: [bundlePath], isTerminalServicesSession: false)
+            XCTAssertEqual(signals.count, 1, "no signal for macOS bundle \(bundlePath)")
+            XCTAssertTrue(signals.first?.localizedCaseInsensitiveContains(vendorFragment) == true,
+                          "signal for \(bundlePath) did not name \(vendorFragment): \(signals)")
+        }
+    }
+
+    func testMacOSExecutablePathsInsideABundleAreDetected() {
+        // The other shape `NSWorkspace` can yield: executableURL, which points
+        // at Contents/MacOS/<CFBundleExecutable> and carries no ".app".
+        let executables = [
+            "/Applications/TeamViewer.app/Contents/MacOS/TeamViewer",
+            "/Applications/Parsec.app/Contents/MacOS/parsecd",
+            "/Applications/AnyDesk.app/Contents/MacOS/AnyDesk"
+        ]
+        for path in executables {
+            let signals = CaptureExclusionPolicy.remoteSessionSignals(
+                runningProcessNames: [path], isTerminalServicesSession: false)
+            XCTAssertEqual(signals.count, 1, "no signal for macOS executable \(path)")
+        }
+    }
+
+    func testTheAddedProductNameAliasesDoNotDuplicateAVendorSignal() {
+        // Both spellings of a vendor may legitimately be running at once. The
+        // dedupe is by VENDOR, so that must still yield exactly one signal.
+        let signals = CaptureExclusionPolicy.remoteSessionSignals(
+            runningProcessNames: ["TeamViewer.app", "tv_x64.exe", "teamviewer_desktop.exe"],
+            isTerminalServicesSession: false)
+        XCTAssertEqual(signals.count, 1, "vendor dedupe broke once aliases were added: \(signals)")
+    }
+
     // MARK: - isCaptureDebugVisible
 
     // This exists so a diagnostic can recover the capture-debug input from the

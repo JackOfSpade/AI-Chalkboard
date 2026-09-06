@@ -164,15 +164,27 @@ enum RemoteSessionProbe {
     /// gives: no `NSRunningApplication` -- a live, main-thread-owned object --
     /// escapes back to the read queue. A `String` is just bytes.
     ///
-    /// KNOWN GAP, stated rather than papered over: `NSWorkspace` enumerates
-    /// launched applications, not daemons, so macOS's own Screen Sharing
-    /// (`screensharingd`) and other launchd-only remote-access services are
-    /// invisible here. The cross-platform streaming hosts that ship as regular
-    /// applications -- Parsec, AnyDesk, TeamViewer, RustDesk -- are covered.
-    /// Closing the gap properly needs a `sysctl(KERN_PROC_ALL)` walk; until
-    /// that exists, README's "Platform differences" section documents the
-    /// shortfall, and `AI_CHALKBOARD_CAPTURE_EXCLUSION=never` covers the case
-    /// by hand.
+    /// KNOWN GAPS, stated rather than papered over. There are TWO, and an
+    /// earlier version of this comment claimed only the first while asserting
+    /// that "Parsec, AnyDesk, TeamViewer, RustDesk are covered" -- which was
+    /// not true of TeamViewer, and is the kind of confident wrong sentence
+    /// that stops anyone from checking.
+    ///
+    ///   1. `NSWorkspace` enumerates launched applications, not daemons, so
+    ///      macOS's own Screen Sharing (`screensharingd`) and other
+    ///      launchd-only remote-access services are invisible here. Closing
+    ///      this properly needs a `sysctl(KERN_PROC_ALL)` walk.
+    ///   2. Even for applications it DOES see, matching depends on the name
+    ///      lining up with `CaptureExclusionPolicy.knownStreamingHosts`, whose
+    ///      entries are mostly Windows service binaries -- see that table's
+    ///      own "MACOS NAMING" note. Product-name aliases are listed for the
+    ///      vendors that ship a macOS host, but macOS detection is
+    ///      structurally thinner than Windows', where the full process table
+    ///      is walked.
+    ///
+    /// Until both are closed, README's "Remote and streamed sessions" section
+    /// states the shortfall plainly and
+    /// `AI_CHALKBOARD_CAPTURE_EXCLUSION=never` covers the case by hand.
     private static func runningProcessNames() -> [String] {
         MainThread.sync {
             NSWorkspace.shared.runningApplications.compactMap { app -> String? in
