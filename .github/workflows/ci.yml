@@ -67,8 +67,23 @@ jobs:
       # shellcheck on each embedded `run:` block). A *blocking* linter must be pinned
       # so that a future actionlint release adding a new check cannot suddenly
       # red-light every merge out of nowhere — bump this pin deliberately instead.
+      # Skipped under act for the same reason the shellcheck step below is gated
+      # on env.ACT, in the opposite direction. act runs this job against the
+      # developer's real checkout path, which can contain a space (e.g.
+      # ".../Desktop/My Apps/AI-Chalkboard"); the post-run save shells out to
+      # `tar ... -C <workspace>` and that path reaches tar word-split, so it dies
+      # with "tar: /Users/jack/Desktop/My: Cannot open". A cache save cannot fail
+      # a job, so this only ever surfaced as a ::warning:: on every single push
+      # to main via the pre-push `act push` hook -- but because the save never
+      # succeeded, the restore never hit either, making the whole step pure
+      # overhead locally rather than a cache. GitHub-hosted runners check out
+      # under /home/runner/work/... where no path component has a space, so real
+      # CI keeps caching exactly as before. `!= 'true'` mirrors the `== 'true'`
+      # convention documented below: env.ACT is set only by act, and GitHub
+      # treats any non-empty string as truthy, so compare explicitly.
       - name: Cache actionlint binary (pinned v1.7.12)
         id: cache-actionlint
+        if: ${{ env.ACT != 'true' }}
         uses: actions/cache@v6
         with:
           path: actionlint
