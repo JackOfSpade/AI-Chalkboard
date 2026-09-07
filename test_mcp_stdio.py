@@ -577,7 +577,11 @@ def main():
         }, args.timeout)
         print("Initialize response:", json.dumps(init_res, indent=2), flush=True)
         server_info = init_res["result"]["serverInfo"]
-        assert server_info["version"] == "2.1.0"
+        # Pinned deliberately, like BuildMetadataTests' own assertion: a
+        # version bump should be a conscious edit here too, not something that
+        # silently drifts. Keep this in step with
+        # BuildMetadata.productVersion.
+        assert server_info["version"] == "2.2.0"
         assert isinstance(server_info["buildIdentifier"], str) and server_info["buildIdentifier"]
 
         print("\n2. Testing 'tools/list'...", flush=True)
