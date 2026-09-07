@@ -235,4 +235,50 @@ final class AnnotationBoundsSupportTests: XCTestCase {
             screenshotToBackingScale: (x: 1, y: 1), adjustment: nanScale
         ), "a non-finite adjustment scale must omit the correction rather than propagate NaN")
     }
+
+    // MARK: - notPaintedDisclosure: the "hidden/lost is not currently painted" fix
+
+    /// THE fix's core case: an anchored annotation whose window is currently
+    /// `.hidden` must disclose that `paintedBoundsBackingPx` is a
+    /// hypothetical, not a report of something actually on screen.
+    func testNotPaintedDisclosureAppearsForAHiddenAnchor() {
+        let disclosure = AnnotationBoundsSupport.notPaintedDisclosure(isAnchored: true, state: .hidden)
+        let text = try! XCTUnwrap(disclosure)
+        XCTAssertTrue(text.contains("hidden"), "must name the actual state, not a generic warning")
+        XCTAssertTrue(text.contains("NOT being painted"))
+    }
+
+    /// Same disclosure for `.lost` -- painting is suppressed permanently for
+    /// a lost anchor too (see `Annotation.anchorPermitsPainting`'s doc
+    /// comment), and this tool's caller needs the same warning either way.
+    func testNotPaintedDisclosureAppearsForALostAnchor() {
+        let disclosure = AnnotationBoundsSupport.notPaintedDisclosure(isAnchored: true, state: .lost)
+        let text = try! XCTUnwrap(disclosure)
+        XCTAssertTrue(text.contains("lost"))
+    }
+
+    /// A `.tracking` anchor IS currently painted where reported -- no
+    /// disclosure needed, and none must be added, or every anchored
+    /// annotation's response would carry a spurious warning.
+    func testNotPaintedDisclosureAbsentForATrackingAnchor() {
+        XCTAssertNil(AnnotationBoundsSupport.notPaintedDisclosure(isAnchored: true, state: .tracking))
+    }
+
+    /// An unanchored annotation has no `anchor.state` for a caller to
+    /// cross-reference in the first place, so `state` is irrelevant to it --
+    /// this must stay nil even if a stray `state` value were somehow passed
+    /// in alongside `isAnchored: false`, since an unanchored annotation's
+    /// bounds are never conditional on any window.
+    func testNotPaintedDisclosureAbsentWhenUnanchoredRegardlessOfState() {
+        XCTAssertNil(AnnotationBoundsSupport.notPaintedDisclosure(isAnchored: false, state: .hidden))
+        XCTAssertNil(AnnotationBoundsSupport.notPaintedDisclosure(isAnchored: false, state: .lost))
+        XCTAssertNil(AnnotationBoundsSupport.notPaintedDisclosure(isAnchored: false, state: nil))
+    }
+
+    /// A `nil` state on an anchored annotation -- never sampled yet -- must
+    /// not be treated as "not painted": only an OBSERVED `.hidden`/`.lost`
+    /// verdict warrants the warning.
+    func testNotPaintedDisclosureAbsentForAnAnchoredAnnotationWithNoStateYet() {
+        XCTAssertNil(AnnotationBoundsSupport.notPaintedDisclosure(isAnchored: true, state: nil))
+    }
 }

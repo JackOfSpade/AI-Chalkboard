@@ -3,11 +3,11 @@ import XCTest
 
 final class BuildMetadataTests: XCTestCase {
     func testProductVersionMatchesMCPReleaseVersion() {
-        XCTAssertEqual(BuildMetadata.productVersion, "2.1.0")
+        XCTAssertEqual(BuildMetadata.productVersion, "2.2.0")
     }
 
     func testBundleVersionStartsAtTheFirstDistributedBuild() {
-        XCTAssertEqual(BuildMetadata.bundleVersion, "1")
+        XCTAssertEqual(BuildMetadata.bundleVersion, "2")
     }
 
     func testBuildIdentifierUsesBundledValueWhenPresent() {

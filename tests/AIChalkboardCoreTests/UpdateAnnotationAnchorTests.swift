@@ -562,24 +562,35 @@ final class UpdateAnnotationAnchorTests: XCTestCase {
         )
     }
 
-    /// BUG 1's reproduction for `anchor: "window"` re-anchoring. `.reanchor`
-    /// needs a resolved target window, which -- per this file's header
-    /// comment -- is never driven through a real foreign process; instead
-    /// this builds the SAME `AnnotationPatchResult` shape `patchedAnnotation`
-    /// would have produced, using `DrawRequest.buildWindowAnchor` with a
-    /// hand-built `TargetWindowSample` (exactly `DrawRequestAnchorTests
+    /// BUG 1 (freeze) AND BUG 2 (selection) for `anchor: "window"`
+    /// re-anchoring, together: with TWO non-overlapping candidate windows, a
+    /// tracker sample landing between the pre-lock pick and this commit must
+    /// not just leave the drawing's PIXEL POSITION correct (BUG 1) -- it
+    /// must also make the committed `anchor` point at whichever window the
+    /// drawing is ACTUALLY over once the race lands (BUG 2), not whichever
+    /// window the pre-lock (by commit time, stale) sample happened to
+    /// prefer. `AnchorTracker.applyAnchorProjections` deliberately never
+    /// bumps `revision` (see its own doc comment), so this race's CAS still
+    /// succeeds.
+    ///
+    /// `.reanchor` needs a resolved target window, which -- per this file's
+    /// header comment -- is never driven through a real foreign process;
+    /// instead this builds the SAME `AnnotationPatchResult` shape
+    /// `patchedAnnotation` would have produced -- `reanchorContext` included
+    /// -- using `DrawRequest.buildWindowAnchor` with two hand-built
+    /// `TargetWindowSample`s (exactly `DrawRequestAnchorTests
     /// .testBuildWindowAnchorChoosesLargestIntersectionAndCapturesItsFrame`'s
     /// own pattern) in place of live process/window resolution. The window
-    /// PICK itself is not what BUG 1 is about -- freezing the drawing's
-    /// position across the switch is -- so this is a faithful regression
-    /// test of the actual fix without needing OS-level window access.
-    func testReanchorThroughTheRealStoreFreezesTheLiveAdjustmentEvenWithARacingTrackerWriteInterleaved() throws {
+    /// PICK is deterministic geometry over those two samples, so this is a
+    /// faithful regression test of the actual fix without needing any
+    /// OS-level window access.
+    func testReanchorThroughTheRealStoreReselectsTheWindowMatchingTheLiveBoundsWhenARacingTrackerWriteInterleaves() throws {
         let store = AnnotationStore.shared
         let id = "update-annotation-anchor-tests-reanchor-race-\(UUID().uuidString)"
         let original = annotation(
             id: id,
             anchor: windowAnchor(windowId: 1, referenceScreenId: "1"),
-            staticAdjustment: AnchorAdjustment(scaleX: 1, scaleY: 1, translateX: 5, translateY: -3),
+            staticAdjustment: .identity,
             anchorProjection: liveProjection(adjustment: .identity, effectiveScreenId: "screen-9")
         )
         XCTAssertEqual(store.addWithOutcome(original), .added)
@@ -587,49 +598,109 @@ final class UpdateAnnotationAnchorTests: XCTestCase {
 
         let stored = try XCTUnwrap(store.get(id: id))
 
-        let sample = TargetWindowSample(
-            windowId: 99, processId: 100,
-            frame: CGRect(x: 0, y: 0, width: 400, height: 300),
-            screenId: "new-screen", isOnScreen: true
+        // Two candidates, deliberately far apart and non-overlapping: which
+        // one wins must be decided by where the drawing ACTUALLY is, never
+        // a coin flip between two overlapping rects.
+        let nearWindow = TargetWindowSample(
+            windowId: 101, processId: 100,
+            frame: CGRect(x: 0, y: 0, width: 50, height: 50),
+            screenId: "screen-near", isOnScreen: true
         )
-        let resolvedWindow = try XCTUnwrap(DrawRequest.buildWindowAnchor(
-            processId: 100, appId: Self.fixtureAppId, samples: [sample],
-            paintedBounds: CGRect(x: 0, y: 0, width: 10, height: 10), resize: .pin, now: Date()
+        let farWindow = TargetWindowSample(
+            windowId: 202, processId: 100,
+            frame: CGRect(x: 500, y: 500, width: 50, height: 50),
+            screenId: "screen-far", isOnScreen: true
+        )
+        let samples = [nearWindow, farWindow]
+
+        // The PRE-lock (and, before this fix, final) pick: `stored`'s
+        // painted bounds -- the fixture's "M0 0 L10 10" path, at offset
+        // (0, 0), under `stored`'s identity `effectiveAdjustment` -- sit at
+        // roughly (0, 0, 10, 10): squarely inside `nearWindow`, nowhere near
+        // `farWindow`.
+        let preRaceBounds = stored.effectiveAdjustment.apply(
+            to: (PaintedBounds.paintedBounds(of: stored.kind) ?? .zero).offsetBy(dx: stored.offsetX, dy: stored.offsetY)
+        )
+        let provisionalPick = try XCTUnwrap(DrawRequest.buildWindowAnchor(
+            processId: 100, appId: Self.fixtureAppId, samples: samples,
+            paintedBounds: preRaceBounds, resize: .pin, now: Date()
         ))
+        XCTAssertEqual(provisionalPick.anchor.target.windowId, 101, "sanity: the pre-race pick must actually favor the near window, or this test would not be exercising the race at all")
+
         // The "provisional" patch `patchedAnnotation` would hand
-        // `handleUpdateAnnotation`: everything else copied from `stored`,
-        // with `anchor` set to the just-resolved window -- see
-        // `finalizeAnchorPatch`'s doc comment for why `.reanchor`'s resolved
-        // window is reused as-is while its FREEZE fields still get
-        // recomputed from the live annotation at commit time.
+        // `handleUpdateAnnotation`, `reanchorContext` included -- see
+        // `finalizeAnchorPatch`'s doc comment for why `.reanchor`'s window
+        // SELECTION is re-run at commit time against `reanchorContext
+        // .samples`, rather than reused verbatim from this provisional pick.
         let patch = AnnotationPatchResult(
             annotation: Annotation(
                 id: stored.id, screenId: stored.screenId, kind: stored.kind, colorHex: stored.colorHex,
                 label: stored.label, appId: stored.appId, appName: stored.appName, opacity: stored.opacity,
                 offsetX: stored.offsetX, offsetY: stored.offsetY, zIndex: stored.zIndex,
-                anchor: resolvedWindow.anchor, staticAdjustment: stored.staticAdjustment,
+                anchor: provisionalPick.anchor, staticAdjustment: stored.staticAdjustment,
                 createdAt: stored.createdAt
             ),
-            projectionOverride: resolvedWindow.projection,
-            anchorIntent: .reanchor(resize: .pin)
+            projectionOverride: provisionalPick.projection,
+            anchorIntent: .reanchor(resize: .pin),
+            reanchorContext: ReanchorWindowContext(processId: 100, appId: Self.fixtureAppId, resize: .pin, samples: samples)
         )
 
+        // The race: a tracker sample lands AFTER `stored`/`provisionalPick`
+        // were computed but BEFORE this commits, moving the drawing's LIVE
+        // painted position from squarely over `nearWindow` to squarely over
+        // `farWindow`.
         let racingProjection = liveProjection(
-            adjustment: AnchorAdjustment(scaleX: 2, scaleY: 2, translateX: 150, translateY: 0),
+            adjustment: AnchorAdjustment(scaleX: 1, scaleY: 1, translateX: 500, translateY: 500),
             effectiveScreenId: "screen-9"
         )
         XCTAssertTrue(store.applyAnchorProjections([id: racingProjection]))
-        let expectedFrozenAdjustment = try XCTUnwrap(store.get(id: id)).effectiveAdjustment
+        let racedStored = try XCTUnwrap(store.get(id: id))
+        let expectedFrozenAdjustment = racedStored.effectiveAdjustment
         XCTAssertNotEqual(expectedFrozenAdjustment, stored.effectiveAdjustment)
+
+        // Sanity: the racing sample really did move the live painted bounds
+        // onto `farWindow` and off `nearWindow` -- this race exercises a
+        // DIFFERENT winner, not merely a moved position under the same one.
+        let livePaintedBounds = racedStored.effectiveAdjustment.apply(
+            to: (PaintedBounds.paintedBounds(of: racedStored.kind) ?? .zero).offsetBy(dx: racedStored.offsetX, dy: racedStored.offsetY)
+        )
+        XCTAssertGreaterThan(TargetWindowSelection.intersectionArea(livePaintedBounds, farWindow.frame), 0)
+        XCTAssertEqual(TargetWindowSelection.intersectionArea(livePaintedBounds, nearWindow.frame), 0)
 
         XCTAssertEqual(commit(patch, id: id, expectedRevision: stored.revision), .updated)
 
         let after = try XCTUnwrap(store.get(id: id))
-        XCTAssertEqual(after.anchor?.target.windowId, 99, "the newly resolved window must take effect")
-        XCTAssertEqual(after.anchorProjection?.adjustment, .identity, "a freshly (re-)anchored id starts tracking at identity, not the pre-commit racing sample")
+        XCTAssertEqual(after.anchor?.target.windowId, 202, "re-anchoring must select the window matching the LIVE painted bounds at commit time, not the stale pre-race pick -- this is BUG 2, the false doc-comment claim that selection could never depend on `current.anchorProjection`")
+        XCTAssertEqual(after.anchor?.referenceScreenId, "screen-far")
+        XCTAssertEqual(after.anchorProjection?.adjustment, .identity, "a freshly (re-)selected window starts tracking at identity, not the pre-commit racing sample")
         XCTAssertEqual(
             after.effectiveAdjustment, expectedFrozenAdjustment,
-            "re-anchoring must freeze the LIVE adjustment at commit time -- including a tracker sample that landed after `stored` was read -- not the stale pre-race snapshot BUG 1 froze"
+            "re-anchoring must still freeze the LIVE pixel position at commit time (BUG 1) even though the WINDOW it tracks also changed (BUG 2)"
         )
+    }
+
+    // MARK: - anchorPatchShouldKickTracker (FIX 3): which intents nudge AnchorTracker
+
+    /// `.reanchor` and `.changeResizePolicy` both install a fresh reference
+    /// frame that `AnnotationStore`'s nil<->non-nil membership hook will NOT
+    /// restart the tracker's timer for (membership does not change), so both
+    /// must ask for an explicit `kick()` instead -- see
+    /// `anchorPatchShouldKickTracker`'s own doc comment for the full
+    /// rationale. Deliberately asserted directly against the pure predicate,
+    /// not by driving the real `AnchorTracker.shared` singleton's sampling
+    /// queue/global target state from a test (which `AnchorTrackerTests`'
+    /// own header comment on injected fakes exists specifically to avoid).
+    func testAnchorPatchShouldKickTrackerForReanchorAndChangeResizePolicy() {
+        XCTAssertTrue(MCPServer.shared.anchorPatchShouldKickTracker(.reanchor(resize: .pin)))
+        XCTAssertTrue(MCPServer.shared.anchorPatchShouldKickTracker(.reanchor(resize: .scale)))
+        XCTAssertTrue(MCPServer.shared.anchorPatchShouldKickTracker(.changeResizePolicy(resize: .pin)))
+        XCTAssertTrue(MCPServer.shared.anchorPatchShouldKickTracker(.changeResizePolicy(resize: .scale)))
+    }
+
+    /// `.detach` leaves no window to sample, and `.unchanged` never touches
+    /// tracking at all -- neither should wake the tracker early.
+    func testAnchorPatchShouldNotKickTrackerForDetachOrUnchanged() {
+        XCTAssertFalse(MCPServer.shared.anchorPatchShouldKickTracker(.detach))
+        XCTAssertFalse(MCPServer.shared.anchorPatchShouldKickTracker(.unchanged))
     }
 }

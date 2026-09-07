@@ -170,11 +170,12 @@ final class AnchorTrackerTests: XCTestCase {
     /// before `store.add` can enqueue any work that reads it).
     private func makeTracker(
         store: AnnotationStore, probe: TargetWindowSampling, clock: FakeClock,
-        elementResolver: AnchorElementResolving? = nil
+        elementResolver: AnchorElementResolving? = nil,
+        appIdentity: ((Int64) -> String?)? = nil
     ) -> AnchorTracker {
         let tracker = AnchorTracker(
             store: store, probe: probe, screens: { [weak self] in self?.fixtureScreens() ?? [] },
-            elementResolver: elementResolver, now: clock.now
+            elementResolver: elementResolver, now: clock.now, appIdentity: appIdentity
         )
         tracker.testDisableRealTimer = true
         return tracker
@@ -375,6 +376,168 @@ final class AnchorTrackerTests: XCTestCase {
         tracker.testOnlyTick() // one more absence: must be treated as absence #1, not #3
         XCTAssertEqual(store.get(id: ann.id)!.anchorProjection!.state, .hidden,
                        "a successful sample must reset the absence counter, so the very next absence must not immediately lose the window")
+    }
+
+    // MARK: - A `.lost` verdict must not poison a later, unrelated anchor
+    //
+    // Demonstrated repro this covers: anchor A to target T; drive 3 absences
+    // so T is `.lost` (A stays in the store, per the no-auto-clear rule);
+    // then add a NEW annotation B anchored to the SAME T with a healthy
+    // probe result now available. Before the fix, T was never sampled
+    // again, B kept its stale creation-time `.tracking` projection forever,
+    // and the sampling timer stopped outright (`allLost` was satisfied by
+    // both annotations, even though B was never actually sampled). The fix
+    // resets `lostTargets`/`targetAbsenceCounts` in `handleAnchoredSetChanged`
+    // whenever the anchored set changes, so the very next tick re-derives
+    // both A's and B's state from live evidence.
+
+    func testNewAnnotationOnAPreviouslyLostTargetIsSampledAndRecoversBothAnnotations() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let tracker = makeTracker(store: store, probe: probe, clock: clock)
+
+        let tgt = makeTarget(windowId: 7, processId: 200)
+        let anchorA = windowAnchor(target: tgt, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let annA = makeAnnotation(anchor: anchorA)
+        store.add(annA)
+
+        // Drive T to `.lost`: 3 consecutive absences (no probe result
+        // installed for windowId 7 yet), matching
+        // `testThirdConsecutiveAbsenceBecomesLostAndStopsPollingAndTimer`.
+        tracker.testOnlyTick()
+        tracker.testOnlyTick()
+        tracker.testOnlyTick()
+        XCTAssertEqual(store.get(id: annA.id)!.anchorProjection!.state, .lost)
+        XCTAssertFalse(tracker.statusSummary().isRunning, "an all-lost anchored set must stop polling")
+        XCTAssertEqual(probe.callCount(for: tgt.windowId), 3)
+
+        // The window was never actually gone -- e.g. it sat off every
+        // connected display for 3 ticks (a monitor unplug/reconfiguration)
+        // -- so a healthy sample is available again by the time a second
+        // annotation gets anchored to the SAME target.
+        probe.setResult(windowSample(frame: CGRect(x: 5, y: 5, width: 100, height: 100)), for: tgt.windowId)
+
+        let anchorB = windowAnchor(target: tgt, referenceFrame: CGRect(x: 5, y: 5, width: 100, height: 100))
+        let annB = makeAnnotation(anchor: anchorB)
+        store.add(annB) // fires onAnchoredSetChanged -> handleAnchoredSetChanged
+        tracker.testOnlyFlush() // wait for that async reset + ensureTimer to land
+
+        XCTAssertTrue(tracker.statusSummary().isRunning,
+                      "adding a new anchor to a previously all-lost set must restart the timer")
+
+        tracker.testOnlyTick()
+
+        XCTAssertGreaterThan(probe.callCount(for: tgt.windowId), 3,
+                             "the target must be sampled again once the anchored set changes, not permanently skipped")
+        XCTAssertEqual(store.get(id: annB.id)!.anchorProjection!.state, .tracking,
+                       "the new annotation must get a live projection, not its stale creation-time one")
+        XCTAssertEqual(store.get(id: annA.id)!.anchorProjection!.state, .tracking,
+                       "the original annotation must also recover -- it was never actually stranded")
+        XCTAssertTrue(tracker.statusSummary().isRunning, "two annotations, both now tracking, must keep the timer running")
+    }
+
+    func testRemovingAnAnnotationAlsoResetsLostBookkeepingForARemainingUnrelatedTarget() {
+        // The reset in `handleAnchoredSetChanged` fires on ANY anchored-set
+        // change, not just an add -- removing one anchored annotation while
+        // a DIFFERENT one shares no target with it must still give a
+        // separately-lost target a fresh chance next tick.
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let tracker = makeTracker(store: store, probe: probe, clock: clock)
+
+        let lostTarget = makeTarget(windowId: 1, processId: 100)
+        let otherTarget = makeTarget(windowId: 2, processId: 100)
+        let lostAnchor = windowAnchor(target: lostTarget, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let otherAnchor = windowAnchor(target: otherTarget, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let lostAnnotation = makeAnnotation(anchor: lostAnchor)
+        let otherAnnotation = makeAnnotation(anchor: otherAnchor)
+        store.add(lostAnnotation)
+        store.add(otherAnnotation)
+
+        probe.setResult(windowSample(frame: CGRect(x: 0, y: 0, width: 100, height: 100)), for: otherTarget.windowId)
+        tracker.testOnlyTick() // absence 1 for lostTarget; otherTarget tracking
+        tracker.testOnlyTick() // absence 2
+        tracker.testOnlyTick() // absence 3 -> lostTarget becomes .lost
+        XCTAssertEqual(store.get(id: lostAnnotation.id)!.anchorProjection!.state, .lost)
+        XCTAssertEqual(probe.callCount(for: lostTarget.windowId), 3)
+
+        // Remove the OTHER annotation (unrelated to the lost one) -- the set
+        // still changed, so the reset must still fire.
+        _ = store.remove(id: otherAnnotation.id)
+        tracker.testOnlyFlush()
+
+        probe.setResult(windowSample(frame: CGRect(x: 1, y: 1, width: 100, height: 100)), for: lostTarget.windowId)
+        tracker.testOnlyTick()
+
+        XCTAssertGreaterThan(probe.callCount(for: lostTarget.windowId), 3,
+                             "removing an unrelated annotation must still reset lost bookkeeping, giving the remaining lost target a fresh chance")
+        XCTAssertEqual(store.get(id: lostAnnotation.id)!.anchorProjection!.state, .tracking)
+    }
+
+    // MARK: - Recycled-pid guard (AnchorWindowTarget.appId)
+
+    func testAppIdMismatchRejectsALiveLookingSampleAsARecycledPid() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        // The pid now resolves to a DIFFERENT app than the one recorded at
+        // anchor time -- exactly the recycled-pid scenario `appId` exists to
+        // catch, even though the probe's own geometry sample looks perfectly
+        // live.
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, appIdentity: { _ in "com.different.app" })
+
+        let tgt = makeTarget() // appId: "com.example.app"
+        let anchor = windowAnchor(target: tgt, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        probe.setResult(windowSample(frame: CGRect(x: 0, y: 0, width: 100, height: 100)), for: tgt.windowId)
+
+        tracker.testOnlyTick() // rejected sample #1 -> hidden
+        tracker.testOnlyTick() // #2
+        tracker.testOnlyTick() // #3 -> lost
+
+        XCTAssertEqual(store.get(id: ann.id)!.anchorProjection!.state, .lost,
+                       "a resolved appId that no longer matches the recorded one must be treated as a recycled pid, never a live match")
+    }
+
+    func testMatchingAppIdAllowsTrackingToProceedNormally() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, appIdentity: { _ in "com.example.app" })
+
+        let tgt = makeTarget() // appId: "com.example.app"
+        let anchor = windowAnchor(target: tgt, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        probe.setResult(windowSample(frame: CGRect(x: 0, y: 0, width: 100, height: 100)), for: tgt.windowId)
+        tracker.testOnlyTick()
+
+        XCTAssertEqual(store.get(id: ann.id)!.anchorProjection!.state, .tracking,
+                       "a resolved appId that matches the recorded one must not block tracking")
+    }
+
+    func testNilRecordedAppIdSkipsTheIdentityCheckEntirely() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        // Would reject every target if the check ran unconditionally.
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, appIdentity: { _ in "com.whatever.app" })
+
+        let tgt = AnchorWindowTarget(processId: 100, windowId: 1, appId: nil)
+        let anchor = windowAnchor(target: tgt, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        probe.setResult(windowSample(frame: CGRect(x: 0, y: 0, width: 100, height: 100)), for: tgt.windowId)
+        tracker.testOnlyTick()
+
+        XCTAssertEqual(store.get(id: ann.id)!.anchorProjection!.state, .tracking,
+                       "a target with no recorded appId must never be rejected by the identity check")
     }
 
     // MARK: - Batching

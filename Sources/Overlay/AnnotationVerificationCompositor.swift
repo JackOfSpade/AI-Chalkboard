@@ -347,7 +347,16 @@ enum AnnotationVerificationCompositor {
         let metadata: [String: Any] = [
             "annotationId": annotation.id,
             "annotationType": annotation.kind.typeName,
-            "screenId": annotation.screenId,
+            // `screen.id`, NOT `annotation.screenId`: the caller resolved
+            // `screen` from `annotation.effectiveScreenId` precisely so an
+            // anchored annotation whose window has been dragged onto a second
+            // display is verified against the display it lives on NOW. This
+            // metadata names the display this image was actually composited
+            // and cropped against, so reporting the immutable creation-time
+            // field here would hand back a screenId contradicting the very
+            // picture it accompanies -- and, once the original display is
+            // disconnected, one that no longer exists at all.
+            "screenId": screen.id,
             "screenBackingPixels": ["width": screen.widthPx, "height": screen.heightPx],
             "screenPoints": ["width": screen.widthPt, "height": screen.heightPt],
             "backingScaleFactor": screen.backingScaleFactor,
@@ -376,7 +385,7 @@ enum AnnotationVerificationCompositor {
             // full-display capture of this display, and a screenshot of any
             // other display would compose a convincing picture that proves
             // nothing. See `ambiguousDisplayRejection`.
-            "verificationNote": "This image uses the live OverlayView renderer composited into the selected clean screenshot source, interpreted as a full-display image of display \(annotation.screenId) (see screenId) -- the display this annotation lives on, and the only display whose screenshot can prove or refute its placement. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that WindowServer presented the separate overlay window."
+            "verificationNote": "This image uses the live OverlayView renderer composited into the selected clean screenshot source, interpreted as a full-display image of display \(screen.id) (see screenId) -- the display this annotation lives on, and the only display whose screenshot can prove or refute its placement. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that WindowServer presented the separate overlay window."
         ]
 
         return AnnotationVerificationComposite(pngData: pngData, metadata: metadata)
@@ -887,7 +896,16 @@ enum AnnotationVerificationCompositor {
         let metadata: [String: Any] = [
             "annotationId": annotation.id,
             "annotationType": annotation.kind.typeName,
-            "screenId": annotation.screenId,
+            // `screen.id`, NOT `annotation.screenId`: the caller resolved
+            // `screen` from `annotation.effectiveScreenId` precisely so an
+            // anchored annotation whose window has been dragged onto a second
+            // display is verified against the display it lives on NOW. This
+            // metadata names the display this image was actually composited
+            // and cropped against, so reporting the immutable creation-time
+            // field here would hand back a screenId contradicting the very
+            // picture it accompanies -- and, once the original display is
+            // disconnected, one that no longer exists at all.
+            "screenId": screen.id,
             "screenBackingPixels": ["width": screen.widthPx, "height": screen.heightPx],
             "screenPoints": ["width": screen.widthPt, "height": screen.heightPt],
             "backingScaleFactor": screen.backingScaleFactor,
@@ -907,7 +925,7 @@ enum AnnotationVerificationCompositor {
             "verificationKind": "synthetic-composite",
             // Names the display for the same reason the macOS branch does --
             // see that branch's comment on this field.
-            "verificationNote": "This image uses the live AnnotationRenderer -- the same renderer code the live overlay uses -- composited into the selected clean screenshot source, interpreted as a full-display image of display \(annotation.screenId) (see screenId) -- the display this annotation lives on, and the only display whose screenshot can prove or refute its placement. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that the desktop compositor presented the separate overlay window. Rendered through GDI+ on this platform (not Core Graphics), so pixels are not bit-identical to a macOS verification image of the same annotation."
+            "verificationNote": "This image uses the live AnnotationRenderer -- the same renderer code the live overlay uses -- composited into the selected clean screenshot source, interpreted as a full-display image of display \(screen.id) (see screenId) -- the display this annotation lives on, and the only display whose screenshot can prove or refute its placement. It verifies annotation-to-UI coordinate placement; it does not prove raw-framebuffer pixels, occlusion, or that the desktop compositor presented the separate overlay window. Rendered through GDI+ on this platform (not Core Graphics), so pixels are not bit-identical to a macOS verification image of the same annotation."
         ]
 
         return AnnotationVerificationComposite(pngData: pngData, metadata: metadata)

@@ -57,6 +57,39 @@ final class AnchorAdjustmentTests: XCTestCase {
         XCTAssertEqual(mapped, CGRect(x: 18, y: -1, width: 12, height: 10))
     }
 
+    /// No LIVE adjustment can carry a negative scale today (see
+    /// `apply(to rect:)`'s doc comment), but a hand-built/frozen
+    /// `staticAdjustment` is not covered by that guarantee. This proves the
+    /// function is structurally safe anyway: the returned rect must always
+    /// have a non-negative size, standardized to the same two corners the
+    /// raw (unstandardized) arithmetic would have produced.
+    func testApplyToRectUnderNegativeScaleReturnsAStandardizedRect() {
+        let adjustment = AnchorAdjustment(scaleX: -2, scaleY: -3, translateX: 100, translateY: 200)
+        let rect = CGRect(x: 10, y: 10, width: 5, height: 4)
+        let mapped = adjustment.apply(to: rect)
+
+        // Raw (pre-standardization) arithmetic: origin = (10*-2+100, 10*-3+200)
+        // = (80, 170); raw width/height = 5*-2=-10, 4*-3=-12. Standardizing
+        // that shifts the origin to the actual minimum corner, (70, 158),
+        // with a positive (10, 12) size -- the SAME rectangle, just
+        // canonically expressed.
+        XCTAssertEqual(mapped, CGRect(x: 70, y: 158, width: 10, height: 12))
+        XCTAssertGreaterThanOrEqual(mapped.size.width, 0)
+        XCTAssertGreaterThanOrEqual(mapped.size.height, 0)
+    }
+
+    /// A negative scale on only ONE axis must standardize independently per
+    /// axis, not treat the rect as either fully standardized or not.
+    func testApplyToRectUnderSingleAxisNegativeScaleStandardizesOnlyThatAxis() {
+        let adjustment = AnchorAdjustment(scaleX: -1, scaleY: 2, translateX: 50, translateY: 0)
+        let rect = CGRect(x: 0, y: 0, width: 10, height: 5)
+        let mapped = adjustment.apply(to: rect)
+
+        // origin = (0*-1+50, 0*2+0) = (50, 0); raw size = (10*-1, 5*2) = (-10, 10).
+        // Standardized: x shifts left by 10 to 40; y/height untouched.
+        XCTAssertEqual(mapped, CGRect(x: 40, y: 0, width: 10, height: 10))
+    }
+
     // MARK: - concatenating: order and associativity
 
     func testConcatenatingAppliesSelfFirstThenOtherAgainstManualArithmetic() {

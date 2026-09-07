@@ -134,11 +134,38 @@ public struct AnchorTrackerStatus: Equatable, Sendable {
 /// immediately during interaction; at `.idle` (1 s) it is ~3 s, which is fine
 /// because nothing is being interacted with. There is deliberately no
 /// additional wall-clock timeout layered on top of the tick count -- a second,
-/// independent deadline would only be a way for the two to disagree. Once a
-/// target is `.lost` it is never sampled again (a macOS window number is not
-/// reused for the same window, and the probe's own pid re-check rejects a
-/// recycled id as a different window rather than as a live match), and once
-/// EVERY anchored annotation's target is `.lost`, the sampling timer stops
+/// independent deadline would only be a way for the two to disagree.
+///
+/// "PERMANENT" MEANS "for as long as the anchored SET does not change," NOT
+/// "for the rest of the process's lifetime". Once a target is `.lost`, it is
+/// excluded from sampling (a macOS window number is not reused for the same
+/// window, and the probe's own pid re-check -- plus a per-tick re-check of
+/// the sampled pid's LIVE OS app identity against `AnchorWindowTarget.appId`
+/// via `ForeignProcessIdentity.matches`, when that field is non-nil -- rejects
+/// a recycled id as a different window rather than as a live match) UNTIL
+/// `handleAnchoredSetChanged()` clears `lostTargets` and the absence counters
+/// on the very next add/remove of ANY anchored annotation, however unrelated
+/// to the lost key. This reset is load-bearing, not incidental: a freshly
+/// anchored annotation is, by construction, built from a window sampled
+/// moments earlier (see `DrawRequest.buildWindowAnchor`), so it must never
+/// inherit an OLDER, unrelated annotation's `.lost` verdict merely because
+/// both happen to share one `(processId, windowId)` pair -- reachable
+/// without exotic window-id reuse: a window sitting off every connected
+/// display for 3 ticks (a monitor unplug/reconfiguration) is already enough
+/// to mark it `.lost` even though the window itself is perfectly alive.
+/// Without the reset, the new annotation's projection would freeze at its
+/// creation-time value forever, AND the sampling timer could stop outright
+/// while it sat there un-sampled (`allLost`, below, is satisfied by every
+/// annotation whose key is in `lostTargets` -- it cannot tell "genuinely
+/// dead" apart from "never actually got a chance to be sampled"). The cost
+/// is that a genuinely dead target gets re-probed for up to 3 more
+/// consecutive absences after any UNRELATED anchor add/remove before
+/// `.lost` is reached again -- at this file's own measured 0.12 ms/sample
+/// that is not a real cost, and a narrower "reset only the one affected
+/// key" scheme is not available anyway: nothing at `handleAnchoredSetChanged`
+/// time knows in advance which new target, if any, will collide with an old
+/// lost one. Once EVERY anchored annotation's target is `.lost` (and stays
+/// that way after the reset above re-samples it), the sampling timer stops
 /// exactly as it does when there are no anchored annotations at all.
 ///
 /// THREAD SAFETY: all sampling/cadence/element-scheduling bookkeeping
@@ -189,7 +216,9 @@ public final class AnchorTracker: @unchecked Sendable {
     /// `OverlayWindowController`'s single main-thread hop (see its
     /// `screenSnapshot()`), plus the `AccessibilityElementResolver`-backed
     /// `AccessibilityAnchorElementResolver` that makes `.element`-mode
-    /// re-resolve live.
+    /// re-resolve live, and `ForeignProcessIdentity.appId(forProcessId:)`
+    /// (in TargetWindowProbe.swift) for the recycled-pid guard described on
+    /// `AnchorWindowTarget.appId`.
     ///
     /// The `elementResolver` parameter stays OPTIONAL rather than being
     /// hard-wired to that type, because every test in `AnchorTrackerTests`
@@ -202,7 +231,8 @@ public final class AnchorTracker: @unchecked Sendable {
         probe: TargetWindowProbe.shared,
         screens: { OverlayWindowController.shared.screenSnapshot().screens },
         elementResolver: AccessibilityAnchorElementResolver(),
-        now: Date.init
+        now: Date.init,
+        appIdentity: ForeignProcessIdentity.appId(forProcessId:)
     )
 
     private let store: AnnotationStore
@@ -210,6 +240,15 @@ public final class AnchorTracker: @unchecked Sendable {
     private let screensProvider: () -> [ScreenInfo]
     private let elementResolver: AnchorElementResolving?
     private let now: () -> Date
+    /// Resolves a pid's LIVE OS app identity for the recycled-pid guard (see
+    /// the class doc comment's "`.lost` IS A ONE-WAY, PERMANENT VERDICT"
+    /// section and `ForeignProcessIdentity` in TargetWindowProbe.swift).
+    /// `nil` disables the check entirely: every existing test constructs a
+    /// tracker without supplying this, so a fake pid (e.g. `100`) is never
+    /// run through a REAL `NSRunningApplication`/`OpenProcess` lookup and
+    /// spuriously rejected -- only `AnchorTracker.shared` and tests that
+    /// specifically exercise this path supply a non-nil closure.
+    private let appIdentity: ((Int64) -> String?)?
 
     /// Confines every sampling/cadence/element-scheduling decision to one
     /// thread. See the class doc comment's "THREAD SAFETY" section.
@@ -301,13 +340,15 @@ public final class AnchorTracker: @unchecked Sendable {
         probe: TargetWindowSampling,
         screens: @escaping () -> [ScreenInfo],
         elementResolver: AnchorElementResolving?,
-        now: @escaping () -> Date
+        now: @escaping () -> Date,
+        appIdentity: ((Int64) -> String?)? = nil
     ) {
         self.store = store
         self.probe = probe
         self.screensProvider = screens
         self.elementResolver = elementResolver
         self.now = now
+        self.appIdentity = appIdentity
 
         store.onAnchoredSetChanged = { [weak self] in
             self?.handleAnchoredSetChanged()
@@ -438,6 +479,21 @@ public final class AnchorTracker: @unchecked Sendable {
     private func handleAnchoredSetChanged() {
         samplingQueue.async { [weak self] in
             guard let self else { return }
+            // See the class doc comment's "`.lost` IS A ONE-WAY, PERMANENT
+            // VERDICT" section: a `.lost` verdict (and the absence counters
+            // that lead to one) must never survive past the anchored set
+            // actually changing, or a brand-new annotation that happens to
+            // share a `(processId, windowId)` pair with an old, unrelated
+            // `.lost` target would inherit a verdict it never earned --
+            // freezing its projection at its creation-time value forever
+            // and potentially stranding the sampling timer via `allLost`.
+            // Unconditional, regardless of which branch below runs: cheap
+            // (two dictionary clears), and correct either way -- if the set
+            // just went empty there is nothing left to poison anyway, and if
+            // it is still non-empty the next tick re-derives every target's
+            // liveness from fresh evidence.
+            self.lostTargets.removeAll()
+            self.targetAbsenceCounts.removeAll()
             if self.store.anchoredAnnotations().isEmpty {
                 self.stopTimer()
             } else {
@@ -507,9 +563,10 @@ public final class AnchorTracker: @unchecked Sendable {
         let tickNow = now()
 
         // 1. Which distinct targets are still worth sampling? A target
-        //    already `.lost` from an earlier tick is permanently excluded --
-        //    see the class doc comment's "`.lost` IS A ONE-WAY, PERMANENT
-        //    VERDICT" section.
+        //    already `.lost` from an earlier tick is excluded until the
+        //    anchored set changes (see `handleAnchoredSetChanged` and the
+        //    class doc comment's "`.lost` IS A ONE-WAY, PERMANENT VERDICT"
+        //    section).
         var distinctTargets: [TargetKey: AnchorWindowTarget] = [:]
         for snap in snapshots {
             let key = TargetKey(snap.anchor.target)
@@ -520,12 +577,23 @@ public final class AnchorTracker: @unchecked Sendable {
         }
 
         // 2. Sample each distinct target EXACTLY ONCE, however many
-        //    annotations share it.
+        //    annotations share it. A sample that names the right
+        //    (pid, windowId) pair but whose pid's LIVE app identity no
+        //    longer matches what was recorded at anchor time is a
+        //    recycled-pid collision, not a live match -- reject it exactly
+        //    like a nil sample (see `AnchorWindowTarget.appId`'s doc comment
+        //    and `ForeignProcessIdentity`, both in TargetWindowProbe.swift,
+        //    for the full rationale). `appIdentity` is nil in every test
+        //    that has no reason to exercise this path -- see that
+        //    property's own doc comment.
         var freshSamples: [TargetKey: TargetWindowSample] = [:]
         for (key, target) in distinctTargets {
-            if let sample = probe.window(id: target.windowId, processId: target.processId, screens: screens) {
-                freshSamples[key] = sample
+            guard let sample = probe.window(id: target.windowId, processId: target.processId, screens: screens) else { continue }
+            if let expectedAppId = target.appId, let appIdentity,
+               !ForeignProcessIdentity.matches(resolved: appIdentity(target.processId), recorded: expectedAppId) {
+                continue
             }
+            freshSamples[key] = sample
         }
 
         // 3. Update per-target liveness via the consecutive-absence counter.
@@ -921,9 +989,32 @@ public final class AnchorTracker: @unchecked Sendable {
 
     /// Records a failed re-resolve's reason code onto the annotation's
     /// CURRENT projection (read fresh, not from tick-start state) without
-    /// disturbing `state`/`adjustment`/`currentWindowFrame`. See the class
-    /// doc comment's "KNOWN, ACCEPTED RACE" section for the one way this can
-    /// still be overwritten by a concurrently-running sampling tick.
+    /// disturbing `state`/`adjustment`/`currentWindowFrame`.
+    ///
+    /// NOT A `samplingQueue` RACE: this whole method runs synchronously ON
+    /// `samplingQueue` (see the class doc comment's "EVERY WRITE TO A
+    /// STORED `AnchorProjection` HAPPENS ON `samplingQueue`" section), which
+    /// is serial, so no other tick or element-resolve completion can
+    /// interleave its own store calls between this method's `store.get`
+    /// and `store.applyAnchorProjections` below.
+    ///
+    /// THE REAL EXPOSURE IS EXTERNAL: those two calls are independently
+    /// locked, not one atomic transaction, and an MCP request thread is
+    /// free to run between them. `update_annotation`'s handler commits a
+    /// detach/re-anchor/resize-policy change through `AnnotationStore
+    /// .updateWithOutcome(id:expectedRevision:transform:)` with an explicit
+    /// `projectionOverride`, entirely under the store's own lock, from that
+    /// thread -- not from `samplingQueue`. If that commit lands in the gap
+    /// between this method's `get` and its `applyAnchorProjections`, this
+    /// method's write (built from the snapshot taken BEFORE that commit)
+    /// overwrites the freshly committed projection with the old
+    /// `state`/`adjustment`/`currentWindowFrame`, silently discarding it.
+    /// This window is narrow (an MCP call must land inside one
+    /// `samplingQueue`-confined synchronous method) and the cost of losing
+    /// it is bounded -- the next sampling tick re-derives `state`/
+    /// `adjustment` from live evidence within one cadence interval
+    /// regardless -- so it is accepted rather than closed with a second
+    /// lock or a compare-and-swap.
     private func recordElementIssue(id: String, code: String) {
         guard let projection = store.get(id: id)?.anchorProjection else { return }
         guard projection.elementResolutionIssue != code else { return }

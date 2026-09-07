@@ -91,19 +91,33 @@ public struct AnchorAdjustment: Codable, Equatable, Sendable {
     }
 
     /// Maps `rect` corner-wise: its origin through `apply(to:)`, and its
-    /// size scaled per axis. This only stays a well-formed (non-negative
-    /// size, already axis-ordered) rect because `scaleX`/`scaleY` are
-    /// positive by construction in every adjustment this type actually
-    /// produces: `.identity` is `(1, 1, ...)`, and
-    /// `mapping(reference:current:behavior:)`'s `.pin` branch hard-codes
-    /// scale to 1 while its `.scale` branch divides two positive, finite
-    /// sizes (see that function's own guards). A hand-built
-    /// `AnchorAdjustment` with a zero or negative scale is a caller
-    /// contract this function does not defend against, exactly as
-    /// `CGRect`'s own arithmetic does not defend against a negative size.
+    /// size scaled per axis, then STANDARDIZED (`CGRect.standardized`)
+    /// before returning.
+    ///
+    /// `scaleX`/`scaleY` are positive by construction in every adjustment
+    /// this type's own factory actually produces today: `.identity` is
+    /// `(1, 1, ...)`, and `mapping(reference:current:behavior:)`'s `.pin`
+    /// branch hard-codes scale to 1 while its `.scale` branch divides two
+    /// positive, finite sizes (see that function's own guards) -- so no LIVE
+    /// adjustment can carry a negative scale today. But `Annotation
+    /// .staticAdjustment` is a frozen, hand-editable value with no live
+    /// producer standing permanent guard over it (a future `staticAdjustment`
+    /// mutator, or a hand-built value in a test), and under a negative scale
+    /// the RAW `CGRect(x:y:width:height:)` initializer below would build a
+    /// rect whose STORED `size.width`/`size.height` are negative --
+    /// `CGRect.width`/`.height` silently report the ABSOLUTE value (masking
+    /// the sign), while `.minX`/`.maxX`/hit-testing/intersection math
+    /// elsewhere in this codebase still compute from the signed stored
+    /// value and land on the WRONG edge. Standardizing here costs nothing on
+    /// the (today, universal) positive-scale path -- a rect with
+    /// non-negative size is already standardized, so `.standardized` is a
+    /// no-op there -- and turns the negative-scale path into a well-formed
+    /// rect instead of a landmine, so this guard survives someone later
+    /// calling this function from production code with a `staticAdjustment`
+    /// this type does not currently produce.
     public func apply(to rect: CGRect) -> CGRect {
         let origin = apply(to: rect.origin)
-        return CGRect(x: origin.x, y: origin.y, width: rect.width * scaleX, height: rect.height * scaleY)
+        return CGRect(x: origin.x, y: origin.y, width: rect.width * scaleX, height: rect.height * scaleY).standardized
     }
 
     /// Exact equality against `.identity`, deliberately with no epsilon: the
@@ -254,7 +268,16 @@ public struct AnchorWindowTarget: Codable, Equatable, Sendable {
     /// `processId` do that -- only to DETECT a recycled id: an OS reuses
     /// small integer process and window ids constantly, so re-sampling
     /// `windowId` and finding it now owned by a different app than `appId`
-    /// names means the original window is gone, not merely moved.
+    /// names means the original window is gone, not merely moved. The check
+    /// itself runs once per distinct target per `AnchorTracker` sampling
+    /// tick, via `ForeignProcessIdentity.appId(forProcessId:)`/`.matches` in
+    /// `Sources/Overlay/TargetWindowProbe.swift` -- see that type's doc
+    /// comment for the measured/reasoned cost of resolving a pid's identity
+    /// on that cadence, and for why it is a separate, cheaper lookup than
+    /// `MCPServer.runningProcessIds(forAppId:)`'s enumeration. `nil` is a
+    /// valid, honest "no app identity was available to record" and simply
+    /// skips the check -- it is not a claim of a specific identity to
+    /// enforce.
     public let appId: String?
 
     public init(processId: Int64, windowId: UInt64, appId: String? = nil) {

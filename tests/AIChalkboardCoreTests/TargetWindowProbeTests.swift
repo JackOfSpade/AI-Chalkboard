@@ -271,4 +271,23 @@ final class TargetWindowProbeTests: XCTestCase {
             )
         }
     }
+
+    // MARK: - ForeignProcessIdentity.matches (recycled-pid guard comparison rule)
+    //
+    // Only the macOS (plain `==`) branch is exercised here -- this file
+    // compiles and runs on this (macOS) development machine only, exactly
+    // like every other test in this suite; see `ForeignProcessIdentity
+    // .matches`'s own doc comment for the case-INSENSITIVE Windows branch
+    // this cannot exercise here.
+
+    func testForeignProcessIdentityMatchesRequiresAnExactMatchOnAResolvedIdentity() {
+        XCTAssertTrue(ForeignProcessIdentity.matches(resolved: "com.example.app", recorded: "com.example.app"))
+        XCTAssertFalse(ForeignProcessIdentity.matches(resolved: "com.example.app", recorded: "com.other.app"),
+                       "a different resolved identity must never match -- this is exactly the recycled-pid case the guard exists to catch")
+    }
+
+    func testForeignProcessIdentityMatchesFailsClosedWhenResolutionFailed() {
+        XCTAssertFalse(ForeignProcessIdentity.matches(resolved: nil, recorded: "com.example.app"),
+                       "an unresolved identity must never be treated as a match -- a lookup failure is not evidence the pid is still the one recorded")
+    }
 }

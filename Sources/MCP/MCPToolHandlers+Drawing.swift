@@ -40,6 +40,32 @@ struct AnnotationPatchResult {
     /// `AnchorTracker` most recently wrote instead of a stale read -- which
     /// is the actual fix for BUG 1 in the adversarial review this addresses.
     let anchorIntent: AnchorPatchIntent
+    /// `.reanchor` only: the already-sampled candidate windows (plus the
+    /// pid/appId/resize policy needed to re-run the pick) from
+    /// `resolveAnchorPatch`'s pre-lock work. `finalizeAnchorPatch` uses this
+    /// to RE-RUN window SELECTION -- pure, and therefore legal inside
+    /// `AnnotationStore`'s lock -- against the live annotation's CURRENT
+    /// painted bounds, instead of trusting `annotation.anchor` above, which
+    /// was picked against a pre-lock (and therefore potentially stale)
+    /// snapshot. See `finalizeAnchorPatch`'s doc comment for the race this
+    /// closes. `nil` for every other intent, which has no window to
+    /// reselect.
+    let reanchorContext: ReanchorWindowContext?
+}
+
+/// `.reanchor`'s sampled window candidates, carried forward from
+/// `resolveAnchorPatch`'s pre-lock, impure sampling
+/// (`TargetWindowProbe.shared.windows(forProcessId:screens:)`) to
+/// `finalizeAnchorPatch`, where the PURE selection step
+/// (`DrawRequest.buildWindowAnchor` / `TargetWindowSelection
+/// .selectWindow(forRect:among:)`) is re-run against the live annotation --
+/// see `finalizeAnchorPatch`'s doc comment for why selection must be re-run
+/// there while the sampling that produced `samples` must not.
+struct ReanchorWindowContext {
+    let processId: Int64
+    let appId: String
+    let resize: AnchorResizeBehavior
+    let samples: [TargetWindowSample]
 }
 
 /// The four `update_annotation` anchor behaviors, decided purely from
@@ -71,6 +97,12 @@ struct AnchorPatchResolution {
     let anchor: AnnotationAnchor?
     let staticAdjustment: AnchorAdjustment
     let projectionOverride: AnchorProjection?
+    /// Populated only by `.reanchor`'s branch of `resolveAnchorPatch`; `nil`
+    /// for every other intent. See `AnnotationPatchResult.reanchorContext`'s
+    /// doc comment -- this is the same value, just threaded one layer
+    /// earlier, before `patchedAnnotation` copies it onto the
+    /// `AnnotationPatchResult` it returns.
+    let reanchorContext: ReanchorWindowContext?
 }
 
 extension MCPServer {
@@ -490,6 +522,15 @@ extension MCPServer {
         }
         switch outcome {
         case .updated:
+            // Nudges `AnchorTracker` off whatever cadence it had already
+            // decayed to, rather than leaving a freshly (re-)anchored or
+            // rebaselined target to wait for the timer's own next scheduled
+            // tick -- up to its 1 s `.idle` cadence (see that class's doc
+            // comment). Only reached on `.updated`, never on a
+            // stale/rejected outcome that left the store untouched.
+            if anchorPatchShouldKickTracker(patch.anchorIntent) {
+                AnchorTracker.shared.kick()
+            }
             sendTextResult(id: id, text: updateAnnotationResponseText(
                 annotationID: annotationID, anchor: committedAnchor, projection: committedProjection
             ))
@@ -512,6 +553,45 @@ extension MCPServer {
             // to handle exhaustively. Worded the same as the others in case a
             // future change ever makes it reachable.
             sendErrorResult(id: id, text: "The update was not applied because it would push the store to \(attempted) annotations, exceeding the \(limit)-annotation session limit. The existing annotation was left unchanged.")
+        }
+    }
+
+    /// Whether a successfully committed `update_annotation` anchor patch
+    /// should nudge `AnchorTracker` with a `kick()` -- split out as a pure
+    /// decision, separate from `AnchorTracker.shared` itself, so it is
+    /// testable without touching that real singleton's global sampling
+    /// state (matching this package's standing "decision separate from the
+    /// runtime plumbing" precedent -- see `TargetWindowSelection`/
+    /// `PaintedBounds`/`AnnotationVisibilityDiagnostic` for the same split).
+    ///
+    /// `true` for `.reanchor` and `.changeResizePolicy`: both install a
+    /// FRESH reference frame (a newly picked window, or a rebaseline to the
+    /// current one), and `AnnotationStore.updateWithOutcome` only fires
+    /// `onAnchoredSetChanged` -- which would otherwise restart the tracker's
+    /// timer -- on a nil<->non-nil anchor TRANSITION (see that method's own
+    /// comment on its `notifyAnchoredSetChanged()` call). Membership
+    /// genuinely does NOT change here, so without this kick a tracker that
+    /// had already decayed to its 1 s `.idle` cadence could leave the freshly
+    /// (re-)anchored target waiting up to a second for its first real sample
+    /// against the new reference. This is deliberately a `kick()` (one extra
+    /// sample, off the caller's thread) rather than a membership-hook fire:
+    /// firing the membership hook instead would also reset cadence
+    /// bookkeeping for every OTHER tracked target for no reason, since it
+    /// forces `.active` cadence process-wide, not just for this one id.
+    ///
+    /// `false` for `.detach` (there is no window left to sample) and
+    /// `.unchanged` (nothing about tracking changed).
+    ///
+    /// A brand-new anchored annotation (`draw_*`'s own anchor resolution)
+    /// needs no equivalent kick: `AnnotationStore.addWithOutcome` fires
+    /// `onAnchoredSetChanged` unconditionally whenever the freshly stored
+    /// annotation is anchored (nil -> non-nil is guaranteed for a brand-new
+    /// id), which already forces `.active` cadence immediately -- see that
+    /// method's own comment.
+    func anchorPatchShouldKickTracker(_ intent: AnchorPatchIntent) -> Bool {
+        switch intent {
+        case .reanchor, .changeResizePolicy: return true
+        case .unchanged, .detach: return false
         }
     }
 
@@ -598,7 +678,8 @@ extension MCPServer {
             createdAt: current.createdAt
         )
         return .success(AnnotationPatchResult(
-            annotation: patched, projectionOverride: anchorResolution.projectionOverride, anchorIntent: anchorIntent
+            annotation: patched, projectionOverride: anchorResolution.projectionOverride, anchorIntent: anchorIntent,
+            reanchorContext: anchorResolution.reanchorContext
         ))
     }
 
@@ -678,7 +759,8 @@ extension MCPServer {
         case .unchanged:
             return .success(AnchorPatchResolution(
                 screenId: current.screenId, anchor: current.anchor,
-                staticAdjustment: current.staticAdjustment, projectionOverride: nil
+                staticAdjustment: current.staticAdjustment, projectionOverride: nil,
+                reanchorContext: nil
             ))
 
         case .detach:
@@ -711,7 +793,8 @@ extension MCPServer {
             )
             return .success(AnchorPatchResolution(
                 screenId: frozenScreenId, anchor: nil,
-                staticAdjustment: frozenAdjustment, projectionOverride: override
+                staticAdjustment: frozenAdjustment, projectionOverride: override,
+                reanchorContext: nil
             ))
 
         case .reanchor(let resize):
@@ -739,6 +822,22 @@ extension MCPServer {
             // what the renderer paints today (see
             // `AnnotationRenderer.drawAnnotations`'s "stored geometry ->
             // + offset -> adjustment" ordering).
+            //
+            // THIS PICK IS PROVISIONAL. `current` is a snapshot read before
+            // this call even started, and `frozenAdjustment` -- therefore
+            // `currentPaintedBounds`, therefore WHICH WINDOW WINS -- depends
+            // on `current.anchorProjection`, which `AnchorTracker` can
+            // overwrite at any moment via `applyAnchorProjections` (a write
+            // that deliberately never bumps `revision`, so it cannot fail a
+            // caller's CAS). `finalizeAnchorPatch` re-runs the SELECTION
+            // half of this same computation against the LIVE annotation,
+            // inside `AnnotationStore`'s lock, using `samples` carried
+            // forward via `reanchorContext` below -- see that function's doc
+            // comment for the full race this closes. Only the ERROR paths
+            // computed from this provisional pick (no eligible window, and
+            // the app/process checks above) are trusted as final: none of
+            // them depend on `current.anchorProjection`, so a racing
+            // projection write cannot change their answer.
             let storedBounds = PaintedBounds.paintedBounds(of: current.kind) ?? .zero
             let currentPaintedBounds = frozenAdjustment.apply(
                 to: storedBounds.offsetBy(dx: current.offsetX, dy: current.offsetY)
@@ -756,7 +855,8 @@ extension MCPServer {
             // its raw, un-adjusted stored position the instant it re-anchors.
             return .success(AnchorPatchResolution(
                 screenId: frozenScreenId, anchor: resolution.anchor,
-                staticAdjustment: frozenAdjustment, projectionOverride: resolution.projection
+                staticAdjustment: frozenAdjustment, projectionOverride: resolution.projection,
+                reanchorContext: ReanchorWindowContext(processId: pid, appId: appId, resize: resize, samples: samples)
             ))
 
         case .changeResizePolicy(let resize):
@@ -804,7 +904,8 @@ extension MCPServer {
             )
             return .success(AnchorPatchResolution(
                 screenId: current.effectiveScreenId, anchor: rebaselined,
-                staticAdjustment: frozenAdjustment, projectionOverride: override
+                staticAdjustment: frozenAdjustment, projectionOverride: override,
+                reanchorContext: nil
             ))
         }
     }
@@ -826,16 +927,55 @@ extension MCPServer {
     /// `notifyChange()`, nothing that could call back into the store while
     /// its lock is held.
     ///
-    /// `.reanchor`'s resolved WINDOW (`patch.annotation.anchor`/
-    /// `patch.projectionOverride`) is reused exactly as `patchedAnnotation`
-    /// built it, not re-derived here: it came from `buildWindowAnchor`,
-    /// which depends on sampled OS windows -- impure work this function
-    /// must never perform. That resolved window does not depend on
-    /// `current.anchorProjection` at all (only on `appId`, the sampled
-    /// windows, and the resize policy), so there is nothing about it to
-    /// re-derive against `live`. Only its FREEZE fields
-    /// (`staticAdjustment`/the frozen `screenId`) still need `live`, exactly
-    /// like the other two intents.
+    /// `.reanchor`'s WINDOW SELECTION IS RE-RUN HERE, against `live` -- an
+    /// earlier version of this comment claimed the opposite ("that resolved
+    /// window does not depend on `current.anchorProjection` at all"), and
+    /// that claim was wrong, which was BUG 2 in the review that produced
+    /// this fix. `resolveAnchorPatch`'s `.reanchor` case picks a window via
+    /// `DrawRequest.buildWindowAnchor(paintedBounds:...)`, and
+    /// `paintedBounds` there is `current`'s STORED bounds, offset, then run
+    /// through `current.effectiveAdjustment` -- which depends on
+    /// `current.anchorProjection`. `AnchorTracker` writes projections via
+    /// `applyAnchorProjections`, which deliberately never bumps `revision`
+    /// (see that method's own doc comment), so such a write CANNOT fail this
+    /// call's CAS. The gap it can land in is not microseconds:
+    /// `resolveAnchorPatch(.reanchor)` does real I/O before the lock --
+    /// `runningProcessIds`, `OverlayWindowController.shared.screenSnapshot()`
+    /// (which hops to the main thread), then window sampling -- so
+    /// milliseconds. With two overlapping candidate windows, a tracker
+    /// sample landing in that gap can move the drawing's true painted
+    /// position onto the OTHER window while the pre-lock pick still names
+    /// the first one. The pixel position would not jump either way (the
+    /// freeze below always uses `live.effectiveAdjustment`), but the
+    /// annotation would silently start TRACKING THE WRONG WINDOW from that
+    /// point on -- wrong not in position, but in which window's future
+    /// moves it follows.
+    ///
+    /// The fix: `patch.reanchorContext` carries `resolveAnchorPatch`'s
+    /// already-sampled `[TargetWindowSample]` (plus the pid/appId/resize
+    /// policy) forward from before the lock, and SELECTION alone --
+    /// `DrawRequest.buildWindowAnchor` / `TargetWindowSelection
+    /// .selectWindow(forRect:among:)`, pure arithmetic over an array already
+    /// in hand -- is re-run here against `live`'s CURRENT painted bounds.
+    /// That is legal inside this transform precisely because selection is
+    /// pure; the SAMPLING that produced the candidate array is not, and it
+    /// stays where it already ran, before the lock, in `resolveAnchorPatch`.
+    /// `patch`'s pre-lock resolution keeps sole authority over every ERROR
+    /// path (no app, app not running, ambiguous pids, no eligible window at
+    /// all) -- none of those depend on `current.anchorProjection`, so a
+    /// racing projection write cannot change their answer, and they must
+    /// still fail before commit with their existing wording.
+    ///
+    /// One staleness survives this fix, and is not worth chasing: the
+    /// sampled window FRAMES inside `reanchorContext.samples` are still
+    /// exactly as old as the pre-lock sample that produced them -- a few
+    /// milliseconds stale if the winning window itself moved or resized
+    /// meanwhile. This is benign and self-correcting: the freshly built
+    /// anchor's `referenceWindowFrame` is set from that same sample, so if
+    /// the window has since moved, `AnchorTracker`'s very next tick maps
+    /// reference -> current and the drawing picks up that movement
+    /// correctly on its next paint -- exactly like any other anchored
+    /// drawing whose window moves after it was created.
     ///
     /// `.unchanged`/`.detach`/`.changeResizePolicy` never perform I/O at
     /// all, so their entire resolution is simply re-run against `live`
@@ -855,12 +995,7 @@ extension MCPServer {
     ) -> (annotation: Annotation, projection: AnchorProjection?) {
         let resolution: AnchorPatchResolution
         if case .reanchor = patch.anchorIntent {
-            resolution = AnchorPatchResolution(
-                screenId: live.effectiveScreenId,
-                anchor: patch.annotation.anchor,
-                staticAdjustment: live.effectiveAdjustment,
-                projectionOverride: patch.projectionOverride
-            )
+            resolution = reanchorResolution(patch: patch, live: live)
         } else {
             switch resolveAnchorPatch(patch.anchorIntent, current: live) {
             case .success(let value):
@@ -876,7 +1011,8 @@ extension MCPServer {
                 // precedent).
                 resolution = AnchorPatchResolution(
                     screenId: live.effectiveScreenId, anchor: live.anchor,
-                    staticAdjustment: live.staticAdjustment, projectionOverride: nil
+                    staticAdjustment: live.staticAdjustment, projectionOverride: nil,
+                    reanchorContext: nil
                 )
             }
         }
@@ -889,6 +1025,57 @@ extension MCPServer {
             createdAt: patch.annotation.createdAt
         )
         return (finalAnnotation, resolution.projectionOverride)
+    }
+
+    /// `finalizeAnchorPatch`'s `.reanchor` branch: re-runs window SELECTION
+    /// against `live`, inside `AnnotationStore`'s lock -- see that
+    /// function's doc comment for the full race this closes. Split out as
+    /// its own function only for readability; it has no life of its own
+    /// outside that one call site.
+    private func reanchorResolution(patch: AnnotationPatchResult, live: Annotation) -> AnchorPatchResolution {
+        guard let context = patch.reanchorContext else {
+            // Unreachable in practice: `patchedAnnotation` always populates
+            // `reanchorContext` whenever `anchorIntent` is `.reanchor` (see
+            // `AnnotationPatchResult`'s doc comment). Falls back to
+            // `patch`'s own pre-lock pick -- NOT a call to
+            // `resolveAnchorPatch`, which would run process lookup and
+            // window sampling INSIDE this lock, exactly the impurity this
+            // function's own doc comment forbids -- and to a safe fallback
+            // rather than a trap, matching this file's standing "fail safe
+            // over fail loud" precedent (see `resolveAnchorPatch`'s own
+            // `.changeResizePolicy` fallback for the identical shape).
+            return AnchorPatchResolution(
+                screenId: live.effectiveScreenId, anchor: patch.annotation.anchor,
+                staticAdjustment: live.effectiveAdjustment, projectionOverride: patch.projectionOverride,
+                reanchorContext: nil
+            )
+        }
+        // Same formula `resolveAnchorPatch`'s `.reanchor` case used
+        // pre-lock, against `current` -- reproduced here against `live`
+        // instead: the renderer's own "stored geometry -> + offset ->
+        // adjustment" ordering (see that case's own comment for why).
+        let storedBounds = PaintedBounds.paintedBounds(of: live.kind) ?? .zero
+        let livePaintedBounds = live.effectiveAdjustment.apply(
+            to: storedBounds.offsetBy(dx: live.offsetX, dy: live.offsetY)
+        )
+        // `context.samples` is exactly the array that already won a
+        // successful `TargetWindowSelection.selectWindow` call pre-lock --
+        // `resolveAnchorPatch` only reaches the success path that builds
+        // `reanchorContext` once `buildWindowAnchor` has already succeeded
+        // against these same samples -- so it can never be empty and this
+        // call can never return `nil` in practice. The `??` fallback below
+        // is defensive, not expected to fire.
+        let reselected = DrawRequest.buildWindowAnchor(
+            processId: context.processId, appId: context.appId, samples: context.samples,
+            paintedBounds: livePaintedBounds, resize: context.resize, now: Date()
+        )
+        return AnchorPatchResolution(
+            screenId: live.effectiveScreenId,
+            anchor: reselected?.anchor ?? patch.annotation.anchor,
+            staticAdjustment: live.effectiveAdjustment,
+            projectionOverride: reselected?.projection ?? patch.projectionOverride,
+            reanchorContext: nil
+        )
     }
 
     /// Builds `update_annotation`'s success text: today's exact plain string

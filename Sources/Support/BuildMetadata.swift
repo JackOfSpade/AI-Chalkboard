@@ -22,13 +22,13 @@ import WinSDK
 /// sidecar file on Windows -- intentionally falls back to the stable
 /// `source` identifier rather than pretending to know a Git revision.
 enum BuildMetadata {
-    static let productVersion = "2.1.0"
+    static let productVersion = "2.2.0"
 
     /// `CFBundleVersion` for distributed bundles. Increment this before every
     /// distribution, independently of the user-facing product version. Apple
     /// accepts one to three period-separated non-negative integer components;
     /// `1` is the initial distributed build number.
-    static let bundleVersion = "1"
+    static let bundleVersion = "2"
 
     static let buildIdentifierInfoKey = "AIChalkboardBuildIdentifier"
     static let sourceBuildIdentifier = "source"

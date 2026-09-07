@@ -143,6 +143,29 @@ enum AnnotationBoundsSupport {
         guard offsetX.isFinite, offsetY.isFinite else { return nil }
         return (offsetX, offsetY)
     }
+
+    /// The sentence `get_annotation_bounds`'s `evidence` field appends when
+    /// -- and only when -- the annotation is anchored AND its last known
+    /// tracking state is `.hidden` or `.lost`. `nil` for `.tracking`, for
+    /// `nil` (unanchored, or a state that was never sampled), and whenever
+    /// `isAnchored` is false regardless of `state` (an unanchored
+    /// annotation's `state` is meaningless).
+    ///
+    /// WHY THIS EXISTS: `evidence` already explains that this tool reports
+    /// RENDERER geometry, not captured pixels -- but that framing quietly
+    /// assumes the renderer is painting the annotation somewhere AT ALL.
+    /// `hidden`/`lost` are exactly the two states where it is not: painting
+    /// is suppressed (see `Annotation.anchorPermitsPainting`'s doc comment),
+    /// and `paintedBoundsBackingPx` reports where the annotation WOULD paint
+    /// if its window came back, not a location it currently occupies on
+    /// screen. Unlike `verify_annotation`/`list_annotations`, this tool has
+    /// no `isVisibleNow` field, so a caller that never cross-references
+    /// `anchor.state` could otherwise read "here are its bounds" as "it is
+    /// on screen there" when it is nothing of the sort.
+    static func notPaintedDisclosure(isAnchored: Bool, state: AnchorTrackingState?) -> String? {
+        guard isAnchored, let state, state == .hidden || state == .lost else { return nil }
+        return " This annotation's anchor is currently \"\(state.rawValue)\", so it is NOT being painted anywhere right now; the bounds above are where it WOULD paint if its window came back."
+    }
 }
 
 extension MCPServer {
@@ -278,7 +301,13 @@ extension MCPServer {
             )
         }
 
-        payload["evidence"] = "This is renderer geometry, not captured pixels: the exact live AnnotationRenderer painted this annotation ALONE into an offscreen transparent bitmap sized to display \(screen.id)'s backing pixels (\(screen.widthPx)x\(screen.heightPx)), and paintedBoundsBackingPx is that render's non-transparent pixel bounds. No screen-capture API and no Screen Recording permission was used or required to produce this answer -- it does NOT prove any pixel reached a framebuffer, was actually displayed, or would appear in any capture pipeline's output. For that kind of evidence use verify_presentation (window-registration proof) or verify_annotation (a composited proof against an actual screenshot)."
+        var evidence = "This is renderer geometry, not captured pixels: the exact live AnnotationRenderer painted this annotation ALONE into an offscreen transparent bitmap sized to display \(screen.id)'s backing pixels (\(screen.widthPx)x\(screen.heightPx)), and paintedBoundsBackingPx is that render's non-transparent pixel bounds. No screen-capture API and no Screen Recording permission was used or required to produce this answer -- it does NOT prove any pixel reached a framebuffer, was actually displayed, or would appear in any capture pipeline's output. For that kind of evidence use verify_presentation (window-registration proof) or verify_annotation (a composited proof against an actual screenshot)."
+        if let disclosure = AnnotationBoundsSupport.notPaintedDisclosure(
+            isAnchored: annotation.anchor != nil, state: annotation.anchorProjection?.state
+        ) {
+            evidence += disclosure
+        }
+        payload["evidence"] = evidence
 
         guard let text = jsonString(payload) else {
             sendErrorResult(id: id, text: "Failed to encode annotation bounds.")

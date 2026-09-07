@@ -1,16 +1,21 @@
 import Foundation
 #if os(macOS)
+import AppKit
 import CoreGraphics
 #elseif os(Windows)
 import WinSDK
 #endif
 
 /// The only place in AI Chalkboard that reads another application's window
-/// geometry. `AnchorTracker` (owned separately) polls it to keep a
-/// `window`/`element`-anchored annotation glued to its target window as that
-/// window moves, resizes, hides, or closes; the MCP draw-request anchor
-/// resolution (owned separately) uses it to pick which of a target app's
-/// windows a NEW annotation should follow.
+/// geometry -- plus, via `ForeignProcessIdentity` below, a running process's
+/// own OS-level app identity, needed for the recycled-pid guard described on
+/// `AnchorWindowTarget.appId`. `AnchorTracker` (owned separately) polls the
+/// geometry half to keep a `window`/`element`-anchored annotation glued to
+/// its target window as that window moves, resizes, hides, or closes, and
+/// the identity half to reject a sample whose pid has been silently
+/// reassigned to a different app; the MCP draw-request anchor resolution
+/// (owned separately) uses the geometry half to pick which of a target
+/// app's windows a NEW annotation should follow.
 ///
 /// PERMISSION STORY (macOS) -- this is the reason the file is shaped the way
 /// it is. `CGWindowListCopyWindowInfo` needs NO Screen Recording grant to
@@ -454,6 +459,125 @@ struct Win32TargetWindowSampling: TargetWindowSampling {
 }
 
 #endif
+
+// MARK: - Foreign process app-identity lookup (recycled-pid guard)
+
+/// Resolves ONE process's current OS-level app identity -- bundle id on
+/// macOS, executable file name on Windows -- the exact shape
+/// `AnchorWindowTarget.appId` records at anchor time (see that property's
+/// doc comment for what it is FOR: detecting a recycled `(processId,
+/// windowId)` pair, where the OS has reassigned both small integers to an
+/// unrelated window of an unrelated app).
+///
+/// WHY A SEPARATE, CHEAPER LOOKUP THAN `MCPServer.runningProcessIds
+/// (forAppId:)`: that method answers "which pids are running THIS appId
+/// right now" by enumerating every running process (an `NSWorkspace
+/// .runningApplications` walk on macOS, a `CreateToolhelp32Snapshot` walk on
+/// Windows) -- correct and affordable for the occasional draw-time call it
+/// serves today, but `AnchorTracker.performTick` needs the OPPOSITE, much
+/// higher-frequency question -- "what is THIS ONE already-known pid's
+/// identity, right now" -- up to once per distinct target per tick (a real
+/// session anchors to 1-3 windows; see that class's own MEASURED COSTS
+/// section), at cadences up to 30/sec. `appId(forProcessId:)` below is a
+/// single, non-enumerating per-process lookup instead, mirroring this
+/// file's own per-window `TargetWindowSampling.window(id:processId:
+/// screens:)` versus its per-process `windows(forProcessId:screens:)` sweep.
+///
+/// MEASURED COST (macOS, this development machine): `NSRunningApplication
+/// (processIdentifier:)?.bundleIdentifier`, timed over 1000 calls against
+/// both a live pid and an arbitrary other one, averaged **0.0015 ms/call**
+/// -- about 80x cheaper than this file's own already-accepted 0.12 ms
+/// single-window sample (see `TargetWindowSample`'s header comment above).
+/// Folding this into `AnchorTracker`'s per-tick, per-distinct-target
+/// sampling loop is therefore noise next to work that loop already does
+/// every tick.
+///
+/// WINDOWS COST: not measured on this (macOS) machine -- see
+/// `Win32TargetWindowSampling`'s own doc comment for this port's "written by
+/// close analogy, reviewed by reading" contract, which this follows.
+/// `exeFileName(forProcess:)` below is the same `OpenProcess
+/// (PROCESS_QUERY_LIMITED_INFORMATION)` + `QueryFullProcessImageNameW` +
+/// `CloseHandle` triple already relied on elsewhere in this codebase for
+/// per-pid identity (`ActiveAppTracker.exeFileName(forProcess:)`,
+/// `SuspensionQuiescence.processImagePath(pid:)`, and `InstanceBroadcast`'s
+/// equivalent) -- one non-enumerating handle open/query/close, the same cost
+/// SHAPE as the macOS lookup above, unlike this file's OWN Windows
+/// `topLevelOnScreenCandidates(matchingProcessId:)`, which enumerates every
+/// top-level window. Reasoned as cheap by that existing precedent rather
+/// than measured directly.
+///
+/// DUPLICATED, NOT SHARED, WITH `ActiveAppTracker.exeFileName(forProcess:)`:
+/// that copy is `private`, and this file already documents itself as
+/// depending on nothing outside `AccessibilityElementResolver`'s shared
+/// coordinate conversion -- threading a new cross-file dependency through a
+/// class with its own unrelated foreground-tracking state and threading
+/// rules, for four lines of Win32, buys nothing a fourth small,
+/// independently-reviewable copy does not already buy more simply. This is
+/// the same trade the THREE existing copies already made against each
+/// other.
+enum ForeignProcessIdentity {
+    /// `nil` means "could not be resolved" (the process has likely exited,
+    /// or -- Windows only -- `OpenProcess` was refused). `AnchorTracker`
+    /// treats an unresolved identity exactly like a resolved-but-mismatched
+    /// one: FAIL CLOSED. The whole point of this lookup is to catch a
+    /// resurrected pid wearing a dead window's clothes; a lookup failure is
+    /// not evidence that did NOT happen, so a live-looking geometry sample
+    /// must not be trusted on the strength of "the identity check merely
+    /// didn't run" alone.
+    static func appId(forProcessId processId: Int64) -> String? {
+        #if os(macOS)
+        guard let pid = pid_t(exactly: processId) else { return nil }
+        return NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
+        #elseif os(Windows)
+        guard let pid = DWORD(exactly: processId) else { return nil }
+        return exeFileName(forProcess: pid)
+        #endif
+    }
+
+    /// Whether `resolved` (this type's own return value) names the SAME app
+    /// as `recorded` (`AnchorWindowTarget.appId`, captured at anchor time).
+    /// Plain `==` on macOS (bundle ids are consistently cased by the OS
+    /// across every read this codebase does of them); case-INSENSITIVE on
+    /// Windows, matching `ActiveAppTracker`'s documented contract for the
+    /// `app` parameter's Windows identity string ("compared and stored
+    /// CASE-INSENSITIVELY") -- getting this wrong in the strict direction on
+    /// Windows would turn an ordinary same-app case difference into a false
+    /// "recycled pid" verdict, permanently losing a perfectly live anchor.
+    static func matches(resolved: String?, recorded: String) -> Bool {
+        guard let resolved else { return false }
+        #if os(macOS)
+        return resolved == recorded
+        #elseif os(Windows)
+        return resolved.caseInsensitiveCompare(recorded) == .orderedSame
+        #endif
+    }
+
+    #if os(Windows)
+    /// Verbatim technique from `ActiveAppTracker.exeFileName(forProcess:)` --
+    /// see that function's doc comment for the full identity-string
+    /// rationale (file name, extension included, no stem-trimming) this
+    /// mirrors exactly, so a value recorded via that function's sibling
+    /// lookups compares correctly against a value resolved through this one.
+    private static func exeFileName(forProcess pid: DWORD) -> String? {
+        guard pid != 0 else { return nil }
+        guard let handle = OpenProcess(DWORD(PROCESS_QUERY_LIMITED_INFORMATION), false, pid) else {
+            return nil
+        }
+        defer { CloseHandle(handle) }
+
+        var buffer = [WCHAR](repeating: 0, count: 1024)
+        var size = DWORD(buffer.count)
+        let ok = buffer.withUnsafeMutableBufferPointer { ptr -> Bool in
+            QueryFullProcessImageNameW(handle, 0, ptr.baseAddress, &size)
+        }
+        guard ok, size > 0, size <= DWORD(buffer.count) else { return nil }
+
+        let path = String(decoding: buffer[0..<Int(size)], as: UTF16.self)
+        guard let idx = path.lastIndex(where: { $0 == "\\" || $0 == "/" }) else { return path }
+        return String(path[path.index(after: idx)...])
+    }
+    #endif
+}
 
 // MARK: - Platform-forked entry point
 
