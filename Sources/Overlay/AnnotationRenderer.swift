@@ -155,12 +155,35 @@ public struct AnnotationRenderer {
         for annotation in annotations {
             context.save()
             context.setGlobalAlpha(Double(OverlayDrawingMetrics.clampedAlpha(annotation.opacity)))
+            // `effectiveAdjustment` is `.identity` (scaleX/Y 1, translateX/Y
+            // 0) for every unanchored annotation, and multiplying by that
+            // exact 1.0 / adding that exact 0.0 is bit-for-bit exact in IEEE
+            // 754 -- see `AnnotationVerificationCompositorTests`'
+            // `testUnanchoredAndIdentityAdjustedAnchoredAnnotationsRenderBitForBitIdentically`
+            // -- so one unconditional formula serves both the anchored
+            // and unanchored cases with no branch to keep in sync. Folding
+            // the adjustment into the OFFSET here (rather than leaving the
+            // offset alone and only scaling primitive geometry below) is
+            // what makes a caller's offset_x/offset_y translate WITH the
+            // tracked window exactly like the geometry it displaces --
+            // see RENDERER_MATH.md's derivation for why the adjustment has
+            // to be applied outermost, in the same backing-pixel space the
+            // offset itself is stored in, before either is converted to
+            // points.
+            let adjustment = annotation.effectiveAdjustment
             context.translate(
-                x: Double(OverlayDrawingMetrics.points(forPhysicalPixels: annotation.offsetX, backingScaleFactor: scale)),
-                y: -Double(OverlayDrawingMetrics.points(forPhysicalPixels: annotation.offsetY, backingScaleFactor: scale))
+                x: Double(OverlayDrawingMetrics.points(
+                    forPhysicalPixels: annotation.offsetX * adjustment.scaleX + adjustment.translateX,
+                    backingScaleFactor: scale
+                )),
+                y: -Double(OverlayDrawingMetrics.points(
+                    forPhysicalPixels: annotation.offsetY * adjustment.scaleY + adjustment.translateY,
+                    backingScaleFactor: scale
+                ))
             )
             drawKind(annotation.kind, colorHex: annotation.colorHex,
                      scale: scale, viewHeight: viewHeight, context: context,
+                     adjustment: adjustment,
                      imageForAssetId: imageForAssetId)
             context.restore()
         }
@@ -169,8 +192,29 @@ public struct AnnotationRenderer {
     /// Recursive renderer used for both a top-level annotation and every item
     /// inside an atomic batch. Keeping dispatch here means live drawing and
     /// synthetic verification support exactly the same primitive set.
+    ///
+    /// `adjustment` carries only the SCALE half of `annotation.effectiveAdjustment`
+    /// into each primitive's own coordinates -- the translate half is already
+    /// baked into the graphics context by `drawAnnotations`' `context.translate`
+    /// call before this is ever reached, for both a top-level annotation and
+    /// every recursive `.batch` item (a `context.translate` composes onto the
+    /// current transform, so nested items inherit it for free). Applying the
+    /// scale again here, per primitive, is what keeps a caller's `offset_x`/
+    /// `offset_y` and the drawing's own geometry both moving and resizing
+    /// together as one placement, rather than the geometry silently staying
+    /// unscaled while only the offset tracked the window.
+    ///
+    /// Deliberately does NOT touch `strokeWidth`, `dash`, `fontSize`, or
+    /// `paddingPx` anywhere below: those are STYLE dimensions, always backing
+    /// pixels regardless of `coordinateScaleX`/`coordinateScaleY` (see
+    /// `AnnotationKind`'s existing `normalized`-coordinates precedent), and
+    /// the design contract requires the same rule survive anchoring -- a 2px
+    /// hairline must still be 2px after its window doubles in size. Scaling
+    /// them here would have been the wrong fix at the wrong layer (see
+    /// `RENDERER_MATH.md`'s "why not a `DrawingContext` scale instead").
     private static func drawKind(_ kind: AnnotationKind, colorHex: String,
                                   scale: CGFloat, viewHeight: CGFloat, context: DrawingContext,
+                                  adjustment: AnchorAdjustment,
                                   imageForAssetId: (String) -> RasterImageHandle?) {
         switch kind {
             case .vectorPath(let data, let strokeColorHex, let strokeWidth, let strokeOpacity,
@@ -179,18 +223,26 @@ public struct AnnotationRenderer {
                 drawVectorPath(data: data, strokeColorHex: strokeColorHex, strokeWidth: strokeWidth,
                                strokeOpacity: strokeOpacity, fillColorHex: fillColorHex, fillOpacity: fillOpacity, dash: dash,
                                usesEvenOddFillRule: usesEvenOddFillRule,
-                               coordinateScaleX: coordinateScaleX, coordinateScaleY: coordinateScaleY,
+                               coordinateScaleX: coordinateScaleX * adjustment.scaleX,
+                               coordinateScaleY: coordinateScaleY * adjustment.scaleY,
                                fallbackColorHex: colorHex, scale: scale, viewHeight: viewHeight, context: context)
 
             case .image(let assetId, let x, let y, let width, let height, let rotationDegrees, let opacity):
-                drawImage(assetId: assetId, x: x, y: y, width: width, height: height,
+                // Rotation applies about the ALREADY-scaled rect's own centre
+                // (see `drawImage` below), so a non-uniform `adjustment` on a
+                // rotated image is only an approximation of what genuinely
+                // shearing the rotated result would look like -- the intended,
+                // documented tradeoff (see RENDERER_MATH.md), not a bug.
+                drawImage(assetId: assetId, x: x * adjustment.scaleX, y: y * adjustment.scaleY,
+                          width: width * adjustment.scaleX, height: height * adjustment.scaleY,
                           rotationDegrees: rotationDegrees, opacity: opacity,
                           scale: scale, viewHeight: viewHeight, context: context,
                           imageForAssetId: imageForAssetId)
 
             case .text(let text, let x, let y, let fontSize, let textColorHex, let backgroundColorHex,
                        let backgroundOpacity, let paddingPx, let opacity):
-                drawText(text: text, x: x, y: y, fontSize: fontSize, textColorHex: textColorHex,
+                drawText(text: text, x: x * adjustment.scaleX, y: y * adjustment.scaleY, fontSize: fontSize,
+                         textColorHex: textColorHex,
                          backgroundColorHex: backgroundColorHex, backgroundOpacity: backgroundOpacity,
                          paddingPx: paddingPx, opacity: opacity, scale: scale, viewHeight: viewHeight,
                          context: context)
@@ -200,6 +252,7 @@ public struct AnnotationRenderer {
                     context.save()
                     drawKind(item.kind, colorHex: item.colorHex,
                              scale: scale, viewHeight: viewHeight, context: context,
+                             adjustment: adjustment,
                              imageForAssetId: imageForAssetId)
                     context.restore()
                 }

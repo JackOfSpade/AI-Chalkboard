@@ -77,6 +77,28 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // annotation of a session land on the wrong app (or on none).
         ActiveAppTracker.shared.start()
 
+        // Warms `AnchorTracker.shared`'s lazy construction here rather than
+        // leaving it to whatever code happens to touch it first. Touching the
+        // singleton -- NOT calling its `start()` method -- is the correct
+        // action at launch: `start()` unconditionally spins its sampling
+        // timer up, which would fight the tracker's own "ZERO COST WHEN
+        // UNUSED" contract (no timer runs while no anchored annotation
+        // exists) for no benefit, since nothing has drawn anything yet.
+        // Merely constructing it is what wires `AnnotationStore
+        // .onAnchoredSetChanged` to this tracker's start/stop-the-timer
+        // callback, and THAT wiring must already be in place before the first
+        // `draw_*` call that requests `anchor:"window"` adds an anchored
+        // annotation to the store -- otherwise that add would have nothing
+        // listening to begin tracking it. It does not need to run after
+        // `OverlayWindowController.shared.setup()` below: `AnchorTracker`
+        // only ever writes an `AnchorProjection` back onto `AnnotationStore`
+        // and relies on the store's EXISTING change-notification ->
+        // `refreshViews()` path to trigger a repaint, exactly like any other
+        // store mutation -- it never touches `OverlayWindowController` or the
+        // overlay windows directly, so it has no dependency on either
+        // existing yet.
+        _ = AnchorTracker.shared
+
         // The overlay is the entire reason the MCP server exists (it's what
         // draw_path/draw_image/draw_batch actually render into), so it must be set up in
         // BOTH modes, never skipped. Construct this main-thread singleton
@@ -641,6 +663,17 @@ public final class AppDelegate: AppHostUI {
         }
 
         ActiveAppTracker.shared.start()
+
+        // See the macOS branch's identical call for the full rationale
+        // (construct, don't `start()`; wires `AnnotationStore
+        // .onAnchoredSetChanged` before any anchored annotation can exist;
+        // has no dependency on `OverlayWindowController.shared.setup()` below
+        // since it only ever writes to `AnnotationStore` and rides that
+        // store's own change-notification repaint path). Unchanged by the
+        // synchronous suspension bootstrap that follows on this platform --
+        // that ordering concern is specific to `SuspensionLeaseCoordinator`
+        // and does not apply to this singleton.
+        _ = AnchorTracker.shared
 
         let suspensionBootstrap = SuspensionLeaseCoordinator.shared.bootstrapAndReconcile()
         if let error = suspensionBootstrap.error {

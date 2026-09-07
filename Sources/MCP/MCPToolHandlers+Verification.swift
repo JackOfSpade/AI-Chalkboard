@@ -23,6 +23,25 @@ final class CaptureFlightGate: @unchecked Sendable {
     }
 }
 
+/// Whether an anchored annotation's tracked window moved between two
+/// `AnchorProjection` samples -- pure equality, but pulled out to its own
+/// tiny, directly-testable unit rather than an inline `!=` at the one call
+/// site, matching this file's existing "decision separate from the
+/// MCP/AppKit plumbing" precedent (`AnnotationVerificationCompositor
+/// .screenshotDisplayMismatchRejection`, `ambiguousDisplayRejection`).
+enum AnchorMovementDetector {
+    /// `true` means the tracker's live projection changed somewhere between
+    /// `before` and `after` -- a different `currentWindowFrame`, a different
+    /// `adjustment`, or a state transition such as `.tracking` -> `.hidden` --
+    /// so geometry rendered against `before` may already describe a stale
+    /// placement. This is EVIDENCE, not a failure: see
+    /// `handleVerifyAnnotation`'s use of this for why an agent must not treat
+    /// `true` as an error to retry against.
+    static func moved(before: AnchorProjection?, after: AnchorProjection?) -> Bool {
+        before != after
+    }
+}
+
 extension MCPServer {
     // internal: called from handleToolsCall in MCPToolHandlers.swift.
     func handleVerifyAnnotation(id: Any, args: [String: Any]) {
@@ -105,9 +124,21 @@ extension MCPServer {
             return
         }
         let annotation = renderSnapshot.annotation
+        // The projection as it stood when this render started -- compared
+        // against a fresh read taken after compositing finishes, below, to
+        // detect whether the window moved mid-verification. See
+        // `anchorMovedDuringVerification`'s assignment for why this has to
+        // be read now, before any rendering or (for `capture_source=
+        // 'chalkboard'`) a capture that can itself take up to 30 seconds.
+        let anchorProjectionBeforeCompositing = annotation.anchorProjection
         let snapshot = OverlayWindowController.shared.screenSnapshot()
-        guard let screen = snapshot.screens.first(where: { $0.id == annotation.screenId }) else {
-            sendErrorResult(id: id, text: "Annotation \(annotationId) belongs to screen \(annotation.screenId), which is no longer connected. Nothing was rendered.")
+        // EFFECTIVE screen, not the creation screen: an anchored annotation
+        // whose tracked window has crossed onto another display now paints
+        // THERE (see `Annotation.effectiveScreenId`'s doc comment), and that
+        // is the display whose screenshot can actually verify it.
+        let effectiveScreenId = annotation.effectiveScreenId
+        guard let screen = snapshot.screens.first(where: { $0.id == effectiveScreenId }) else {
+            sendErrorResult(id: id, text: "Annotation \(annotationId)'s current display (\(effectiveScreenId)) is no longer connected. Nothing was rendered.")
             return
         }
 
@@ -189,11 +220,43 @@ extension MCPServer {
             for (key, value) in sourceMetadata { metadata[key] = value }
             metadata["appId"] = jsonValue(annotation.appId)
             metadata["appName"] = jsonValue(annotation.appName)
+            // Reuses DrawRequest.anchorResponsePayload so this tool's `anchor`
+            // object is byte-for-byte the same shape draw_*/highlight_element/
+            // update_annotation/list_annotations/get_annotation_bounds already
+            // emit. Built from the SNAPSHOT taken before compositing, matching
+            // what the composited image itself actually depicts -- see
+            // `anchorMovedDuringVerification` just below for whether that has
+            // since gone stale.
+            if let anchor = annotation.anchor, let projection = anchorProjectionBeforeCompositing {
+                metadata["anchor"] = DrawRequest.anchorResponsePayload(
+                    DrawRequest.DrawAnchorResolution(anchor: anchor, projection: projection)
+                )
+                // The tracker samples on its own cadence independent of this
+                // call, so the anchored window can move between the moment
+                // this render started and the moment compositing (screenshot
+                // decode/main-thread render, or up to a 30-second Chalkboard
+                // capture) actually finishes. `true` here is EVIDENCE for the
+                // caller to interpret, NOT a failure: it means the reported
+                // `paintedBoundsScreenshotPx` already describes a placement
+                // that has changed, because the user is dragging or resizing
+                // the anchor window right now. An agent that treats this as
+                // an error and retries in a loop will simply keep re-catching
+                // a window still in motion; the correct response is to wait
+                // for the drag/resize to settle (or re-verify once
+                // `anchor.state` in a fresh `list_annotations`/draw response
+                // shows a stable `currentWindowFrame`) rather than treating
+                // the number itself as wrong.
+                metadata["anchorMovedDuringVerification"] = AnchorMovementDetector.moved(
+                    before: anchorProjectionBeforeCompositing,
+                    after: AnnotationStore.shared.get(id: annotationId)?.anchorProjection
+                )
+            }
             let visibility = AnnotationVisibilityDiagnostic(
                 annotationsSuspended: OverlayWindowController.shared.isAnnotationsSuspended,
                 captureVisible: OverlayWindowController.shared.isCaptureVisible,
                 annotationAppId: annotation.appId,
-                activeAppId: ActiveAppTracker.shared.currentAppId
+                activeAppId: ActiveAppTracker.shared.currentAppId,
+                anchorPermitsPainting: annotation.anchorPermitsPainting
             )
             metadata["annotationsSuspended"] = visibility.annotationsSuspended
             metadata["wouldBeVisibleWithoutSuspension"] = visibility.wouldBeVisibleWithoutSuspension

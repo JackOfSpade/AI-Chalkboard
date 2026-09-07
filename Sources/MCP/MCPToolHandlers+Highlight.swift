@@ -15,8 +15,9 @@ private typealias HighlightProcessID = pid_t
 /// direct compile attempt: `error: cannot find type 'pid_t' in scope`).
 /// `UInt32` is both what chalkboard_win.h declares `chalk_uia_find_element`'s
 /// `process_id` parameter as and what `PROCESSENTRY32W.th32ProcessID`
-/// naturally hands back (see `processIDs(forExecutableIdentity:)` below), so
-/// it is the natural Windows analogue used throughout this file's Windows
+/// naturally hands back (see `MCPServer.runningProcessIds(forAppId:)`'s
+/// Windows branch in DrawRequest.swift), so it is the natural Windows
+/// analogue used throughout this file's Windows
 /// branch and by `AccessibilityElementResolver.resolve(processID:...)`.
 private typealias HighlightProcessID = UInt32
 #endif
@@ -28,63 +29,30 @@ private typealias HighlightProcessID = UInt32
 /// rectangle draws attention to its bounding box rather than its actual
 /// silhouette.
 ///
-/// Internal, not `private`, only so `MCPShapeGeometryTests` can name it when
-/// pinning `highlightOutlinePathData` below. The raw values are the wire
-/// strings `highlight_element`'s `shape` argument accepts and are part of the
-/// published schema (see MCPToolCatalog.swift); do not rename them.
-enum HighlightOutlineShape: String {
-    case rect, ellipse, circle
-}
+/// The real declaration -- and the outline arithmetic itself -- now lives in
+/// `HighlightOutlineGeometry` (Sources/Support/HighlightOutlineGeometry.swift),
+/// platform-neutral and MCP-free so the element anchor tracker can regenerate
+/// a highlight's outline after its window settles without reaching into this
+/// file. This is a typealias, not a second enum, so this file's own shape
+/// vocabulary can never drift from the one `HighlightOutlineGeometry` defines
+/// -- exactly the kind of drift that put a ring through the middle of a 44x44
+/// button before. The raw values are the wire strings `highlight_element`'s
+/// `shape` argument accepts and are part of the published schema (see
+/// MCPToolCatalog.swift); do not rename them.
+typealias HighlightOutlineShape = HighlightOutlineGeometry.Shape
 
-/// The radius of the `.circle` outline, in one place because
-/// `makeHighlightKind`'s range guard and the path this radius is actually
-/// emitted into MUST be the same number -- a guard computing the radius its
-/// own way would be checking a value nothing draws.
+/// Thin forwarding wrapper over `HighlightOutlineGeometry.rawPathData` (see
+/// that type in Sources/Support/HighlightOutlineGeometry.swift for the actual
+/// arithmetic, moved there verbatim so the element anchor tracker can share
+/// it without reaching into this MCP-only file). Kept here, under its
+/// original name and signature, purely so this function's existing callers --
+/// notably `MCPShapeGeometryTests`, which pins this exact geometry with
+/// nothing but a few doubles -- need not change.
 ///
-/// WHY HALF THE ELEMENT DIAGONAL PLUS PADDING: the region of points at least
-/// `padding` away from every point of a w x h rectangle is that rectangle
-/// grown by `padding` with ROUNDED corners, and the tightest circle that
-/// contains it is centred on the element with radius `hypot(w, h)/2 +
-/// padding`. Anything smaller crosses the rounded corner arcs, i.e. comes
-/// closer to the element than the caller's padding -- or worse.
-///
-/// The previous formula, `max(paddedWidth, paddedHeight)/2`, only reached the
-/// padded rectangle's EDGE MIDPOINTS; its corners lay outside the ring. On a
-/// square element that failure is not cosmetic: a 44x44 icon button at the
-/// default padding_px=8 has padded bounds 60x60, so the old radius was 30 --
-/// while the button's OWN corners sit (44*44 + 44*44).squareRoot()/2 ~=
-/// 31.11px from centre. The ring passed through the button it was drawn to
-/// enclose. The formula below puts that same corner 8px inside the ring, as
-/// asked.
-///
-/// `.squareRoot()` rather than `hypot()`: this file builds on both the macOS
-/// and the Windows toolchain, and the stdlib method needs no libc import to
-/// be in scope on either (same reason ChalkGeometry.swift's quadratic solver
-/// uses `discriminant.squareRoot()`).
-private func highlightCircleRadius(frameWidth: Double, frameHeight: Double, padding: Double) -> Double {
-    (frameWidth * frameWidth + frameHeight * frameHeight).squareRoot() / 2 + padding
-}
-
-/// Builds the exact path string `highlight_element` draws for one resolved
-/// element frame and `padding_px`, for each of the three outline shapes.
-///
-/// A free, internal, pure function -- no `MCPServer`, no AppKit, no
-/// Accessibility, no display -- for exactly the reason `ellipsePathData` in
-/// MCPToolHandlers+Shape.swift is one: it lets a test pin this geometry with
-/// nothing but a few doubles. That seam is not decoration. The padding and
-/// coverage arithmetic used to live entirely inside `private
-/// makeHighlightKind`, whose only entry point resolves a live application
-/// through the real Accessibility API and answers on stdout, so nothing
-/// headless could reach it -- which is precisely how a circle that clipped
-/// the element it ringed shipped unnoticed (see `highlightCircleRadius`).
-///
-/// ARITHMETIC ONLY, no validation: every finite/magnitude/positivity check
-/// stays in `makeHighlightKind`, which must reject bad bounds with its own
-/// error text before any path exists. Callers must validate first.
-///
-/// The `.rect` string is byte-identical to the pre-`shape` behaviour, and
-/// must stay that way: an existing caller's stored annotation geometry is
-/// compared verbatim by `verify_annotation`/`update_annotation`.
+/// ARITHMETIC ONLY, no validation, exactly as before: every finite/magnitude/
+/// positivity check stays in `makeHighlightKind` below, which must reject bad
+/// bounds with its own error text before any path exists (now via
+/// `HighlightOutlineGeometry.pathData`). Callers must validate first.
 func highlightOutlinePathData(
     shape: HighlightOutlineShape,
     frameX: Double,
@@ -93,33 +61,10 @@ func highlightOutlinePathData(
     frameHeight: Double,
     padding: Double
 ) -> String {
-    let x = frameX - padding
-    let y = frameY - padding
-    let width = frameWidth + 2 * padding
-    let height = frameHeight + 2 * padding
-    // Padding is symmetric, so the element and its padded bounds share a
-    // centre -- all three shapes are concentric with both.
-    let centerX = x + width / 2
-    let centerY = y + height / 2
-
-    switch shape {
-    case .rect:
-        return "M \(x) \(y) H \(x + width) V \(y + height) H \(x) Z"
-
-    case .ellipse:
-        // Inscribed in the padded bounds -- the ellipse touches the padded
-        // rectangle at the midpoint of each of its four edges. That is the
-        // natural reading of "ellipse around this element" for the round and
-        // pill-shaped controls this shape exists for: it traces the
-        // silhouette. On a genuinely rectangular element it necessarily
-        // clips the corners, which is why the schema tells callers to pick
-        // rect or circle when containment is what they want.
-        return ellipsePathData(centerX: centerX, centerY: centerY, radiusX: width / 2, radiusY: height / 2)
-
-    case .circle:
-        let radius = highlightCircleRadius(frameWidth: frameWidth, frameHeight: frameHeight, padding: padding)
-        return ellipsePathData(centerX: centerX, centerY: centerY, radiusX: radius, radiusY: radius)
-    }
+    HighlightOutlineGeometry.rawPathData(
+        shape: shape, frameX: frameX, frameY: frameY,
+        frameWidth: frameWidth, frameHeight: frameHeight, padding: padding
+    )
 }
 
 /// The extra `highlight_element` result fields that disclose a
@@ -167,6 +112,311 @@ private struct HighlightStyle {
     let fillOpacity: Double
     let padding: Double
     let shape: HighlightOutlineShape
+}
+
+// MARK: - `anchor`/`anchor_resize` argument parsing (highlight_element)
+
+/// The purely-string-validated outcome of `highlight_element`'s
+/// `anchor`/`anchor_resize` arguments. `nil` means anchor="none": no
+/// `AnnotationAnchor` is attached and this highlight resolves once at draw
+/// time, exactly as it always has. Unlike `DrawRequest.AnchorArgumentRequest`
+/// (every `draw_*` tool's `.window`-only, `"none"`-default vocabulary), this
+/// also carries the requested `AnchorMode`, because `highlight_element` alone
+/// can additionally request `.element`, and defaults to it -- see
+/// `parseHighlightAnchorArguments` below.
+struct HighlightAnchorRequest: Equatable {
+    let mode: AnchorMode
+    let resize: AnchorResizeBehavior
+}
+
+/// Validates ONLY `anchor`/`anchor_resize`'s STRINGS -- no process
+/// resolution, no window enumeration, no Accessibility/TCC work -- mirroring
+/// `DrawRequest.parseAnchorArguments`'s "reject before AX/TCC work" contract
+/// (see that function's own doc comment, and `rejectDurationSecondsIfSupplied`'s,
+/// for the identical reasoning): `handleHighlightElement` calls this BEFORE
+/// `resolveRunningHighlightTarget`/`AccessibilityElementResolver.resolve`, so
+/// a typo'd `anchor` value fails before it can trigger a process lookup or a
+/// cross-process Accessibility walk.
+///
+/// `highlight_element`'s vocabulary differs from every `draw_*` tool's (see
+/// MCP_SURFACE.md's argument table: `"element"` here is the NEW DEFAULT,
+/// alongside `"window"`/`"none"`, versus draw_*'s `"none"`-default
+/// `"none"`/`"window"` pair), so this cannot simply call
+/// `DrawRequest.parseAnchorArguments` -- it is instead this file's own small
+/// three-value counterpart, following that function's exact structure.
+///
+/// `anchor_resize` is valid ONLY together with `anchor="window"` -- REJECTED
+/// under `"none"` (no anchor window at all) AND under `"element"` (which
+/// re-resolves the element's true bounds directly on settle, so no resize
+/// POLICY applies -- see the shipped `highlight_element` catalog entry's own
+/// `anchor_resize` description). This is narrower than
+/// `DrawRequest.parseAnchorArguments`'s "REJECTED whenever the effective mode
+/// is none" rule, because unlike every `draw_*` tool, `highlight_element` has
+/// a THIRD mode for it to also be inapplicable to; the literal rejection
+/// text ("only valid with anchor=\"window\"") already says exactly this.
+/// `.element`-mode anchors therefore always carry `resize: .pin` -- an inert
+/// default, since the caller has no way to choose otherwise and the interim
+/// window-projection phase this briefly governs is corrected away by the
+/// next on-settle regeneration regardless (see ELEMENT_MODE.md).
+///
+/// internal (not private): called from `handleHighlightElement` below and
+/// pinned directly by tests.
+func parseHighlightAnchorArguments(_ args: [String: Any]) -> DrawOutcome<HighlightAnchorRequest?> {
+    if args.keys.contains("anchor"), !(args["anchor"] is String) {
+        return .failure("anchor must be one of \"element\", \"window\", \"none\" when supplied.")
+    }
+    let anchorRaw = (args["anchor"] as? String) ?? "element"
+    guard anchorRaw == "element" || anchorRaw == "window" || anchorRaw == "none" else {
+        return .failure("anchor must be one of \"element\", \"window\", \"none\" when supplied.")
+    }
+    if args.keys.contains("anchor_resize"), !(args["anchor_resize"] is String) {
+        return .failure("anchor_resize must be one of \"pin\", \"scale\" when supplied.")
+    }
+    let resizeRaw = args["anchor_resize"] as? String
+    if let resizeRaw, resizeRaw != "pin", resizeRaw != "scale" {
+        return .failure("anchor_resize must be one of \"pin\", \"scale\" when supplied.")
+    }
+    guard anchorRaw == "none" else {
+        guard anchorRaw == "window" else {
+            // anchorRaw == "element": same reject-over-ignore rule as
+            // "none" below, and the SAME literal message -- `anchor_resize`
+            // is unconditionally inapplicable to any mode but "window".
+            guard resizeRaw == nil else {
+                return .failure("anchor_resize is only valid with anchor=\"window\": it selects how a drawing reacts to its anchor window being resized, and there is no anchor window without one. Nothing was drawn; remove anchor_resize, or add anchor=\"window\".")
+            }
+            return .success(HighlightAnchorRequest(mode: .element, resize: .pin))
+        }
+        let resize: AnchorResizeBehavior = (resizeRaw == "scale") ? .scale : .pin
+        return .success(HighlightAnchorRequest(mode: .window, resize: resize))
+    }
+    // Mirrors `DrawRequest.parseAnchorArguments`'s reject-over-ignore rule for
+    // `anchor_resize` supplied under the "none" effective mode: it is
+    // unambiguous evidence of an intent this call cannot honour (there is no
+    // anchor window without an anchor), so it is rejected rather than
+    // silently ignored.
+    guard resizeRaw == nil else {
+        return .failure("anchor_resize is only valid with anchor=\"window\": it selects how a drawing reacts to its anchor window being resized, and there is no anchor window without one. Nothing was drawn; remove anchor_resize, or add anchor=\"window\".")
+    }
+    return .success(nil)
+}
+
+/// Everything `AnchorTracker`'s `.element`-mode re-resolve needs to re-run
+/// THIS exact lookup later, captured from the request that produced a
+/// successful match. `occurrence` stores `0` when the caller did not supply
+/// one -- this file's own sentinel, reusing the SAME 0-means-"require
+/// exactly one" convention `AccessibilityElementRequest.occurrence == nil`
+/// already has on macOS and `chalk_uia_find_element`'s `occurrence`
+/// parameter already has on Windows (see `AccessibilityElementResolver
+/// .resolve`'s Windows overload doc comment) -- so
+/// `AccessibilityAnchorElementResolver` (Sources/Overlay/
+/// AccessibilityAnchorElementResolver.swift) need only translate `0` back to
+/// `nil` to reproduce this exact call's uniqueness requirement.
+///
+/// internal (not private): called from `handleHighlightElement` below and
+/// pinned directly by tests. Takes primitive fields rather than the private
+/// `HighlightStyle` struct so its signature stays visible outside this file.
+func makeAnchorElementSpec(
+    label: String,
+    role: String?,
+    matchMode: AccessibilityLabelMatchMode,
+    occurrence: Int?,
+    maxNodes: Int,
+    timeoutSeconds: Double,
+    shape: HighlightOutlineShape,
+    paddingPx: Double
+) -> AnchorElementSpec {
+    AnchorElementSpec(
+        label: label,
+        role: role,
+        matchMode: matchMode.rawValue,
+        occurrence: occurrence ?? 0,
+        maxNodes: maxNodes,
+        timeoutSeconds: timeoutSeconds,
+        shape: shape.rawValue,
+        paddingPx: paddingPx
+    )
+}
+
+/// Builds the anchor a resolved `highlight_element` match should carry, by
+/// picking the containing window via largest intersection with the RESOLVED
+/// ELEMENT FRAME -- deliberately never the rendered highlight's own padded/
+/// shaped bounds, which is what would be passed for an ordinary `draw_*`
+/// call -- among `processId`'s windows.
+///
+/// Reuses `DrawRequest.buildWindowAnchor` (which itself reuses
+/// `TargetWindowSelection.selectWindow`) for the actual window pick and the
+/// identity `.tracking` projection every new anchor is stored with, rather
+/// than duplicating that selection logic: `.window` mode's result is used
+/// exactly as `buildWindowAnchor` returns it (no element spec), and
+/// `.element` mode re-shapes ONLY the `mode`/`element` fields of that SAME
+/// resolved anchor afterward, so both modes are guaranteed to agree on which
+/// window won and what its reference frame/projection are.
+///
+/// `nil` means `samples` offered no eligible window at all -- unlike
+/// `anchor="window"` on a `draw_*` tool (which fails the call), the caller
+/// here falls back to `highlight_element`'s no-fail
+/// `"target_window_unresolved"` reporting instead, per MCP_SURFACE.md ("the
+/// element resolved fine, and failing the call would be a regression over
+/// today's behaviour").
+///
+/// internal (not private): called from `handleHighlightElement` below and
+/// pinned directly by tests with hand-built `TargetWindowSample`s -- no live
+/// foreign window needed, matching `DrawRequestAnchorTests`'s treatment of
+/// `buildWindowAnchor` itself.
+func buildHighlightAnchor(
+    mode: AnchorMode,
+    processId: Int64,
+    appId: String,
+    samples: [TargetWindowSample],
+    elementFrame: CGRect,
+    resize: AnchorResizeBehavior,
+    elementSpec: AnchorElementSpec?,
+    now: Date
+) -> DrawRequest.DrawAnchorResolution? {
+    guard let windowResolution = DrawRequest.buildWindowAnchor(
+        processId: processId, appId: appId, samples: samples,
+        paintedBounds: elementFrame, resize: resize, now: now
+    ) else {
+        return nil
+    }
+    guard mode == .element else { return windowResolution }
+    let anchor = windowResolution.anchor
+    let elementAnchor = AnnotationAnchor(
+        mode: .element,
+        resize: anchor.resize,
+        target: anchor.target,
+        referenceWindowFrame: anchor.referenceWindowFrame,
+        referenceScreenId: anchor.referenceScreenId,
+        element: elementSpec,
+        createdAt: anchor.createdAt
+    )
+    return DrawRequest.DrawAnchorResolution(anchor: elementAnchor, projection: windowResolution.projection)
+}
+
+/// The `anchorBehavior` text for a highlight whose `anchor` was explicitly
+/// "none", OR that could not be resolved to any window at all. Byte-identical
+/// to the string this file has always returned (see MCP_SURFACE.md: "the
+/// \"none\" string must stay byte-identical to today's so opting out is
+/// provably today's behaviour") -- unchanged even by name, so a caller
+/// diffing against yesterday's response sees no difference at all.
+let highlightAnchorBehaviorNone = "resolved once at draw time; call highlight_element again after the UI moves"
+
+/// literal text from MCP_SURFACE.md's "`anchorBehavior` (highlight_element
+/// only)" section -- ship verbatim.
+let highlightAnchorBehaviorElement = "tracked: follows the target window as it moves and resizes, and re-resolves this element when the window settles so it stays on the control through a reflow. Check anchor.state and anchor.elementResolutionIssue in list_annotations; call highlight_element again only if it reports lost."
+
+/// literal text from MCP_SURFACE.md's "`anchorBehavior` (highlight_element
+/// only)" section -- ship verbatim.
+let highlightAnchorBehaviorWindow = "tracked: follows the target window as it moves and resizes, applying anchor_resize to the highlight geometry. The element itself is NOT re-resolved, so a UI that reflows rather than scales will drift; use anchor=\"element\" for that."
+
+/// The special no-fail fallback payload for an `"element"`/`"window"`
+/// request whose target window could not be resolved at all. Deliberately
+/// NOT the standard `DrawRequest.anchorResponsePayload` shape (mode/resize/
+/// state/windowId/...): this is a distinct, minimal object so a caller can
+/// tell "you asked for anchor=\"none\"" (key omitted entirely) apart from
+/// "you asked for tracking but no window could be found" (this object),
+/// per MCP_SURFACE.md.
+let highlightAnchorUnresolvedPayload: [String: Any] = ["mode": "none", "reason": "target_window_unresolved"]
+
+/// The no-fail fallback payload for a highlight whose target window WAS
+/// resolved (`buildHighlightAnchor` succeeded, below), but whose SECOND
+/// store write -- installing that resolved anchor onto the just-created
+/// annotation -- could not commit. Deliberately distinct from
+/// `highlightAnchorUnresolvedPayload` above (BUG 5 in the adversarial review
+/// this fixes): that payload means "no window could be found to track",
+/// reported BEFORE any second write is even attempted, so reusing it here
+/// would be false -- a window genuinely was resolved, and the highlight
+/// itself is already on screen (`request.finish` stored it before this
+/// file's `attachHighlightAnchor` ever runs); only attaching TRACKING to it
+/// failed, because `AnnotationStore`'s own compare-and-swap or resource caps
+/// rejected the second write. The wording says both things and names the
+/// recovery, since the drawing does not need to be redone, only re-anchored.
+let highlightAnchorAttachRejectedPayload: [String: Any] = [
+    "mode": "none",
+    "reason": "annotation_changed_before_anchor_attached",
+    "note": "The highlight was drawn, but attaching the resolved anchor to it failed because the annotation changed (or was cleared) between its creation and this attach step. Call list_annotations to see its current state; if it still exists, update_annotation with anchor=\"window\" can attach tracking."
+]
+
+/// Maps the outcome of `attachHighlightAnchor`'s SECOND
+/// `AnnotationStore.updateWithOutcome` call -- installing a resolved anchor
+/// onto a just-created annotation -- to the fallback payload reported on
+/// anything but `.updated`. A free, pure function (like
+/// `highlightSearchDisclosureFields` above) so the reason-code MAPPING --
+/// the actual BUG 5 fix -- is pinned by a test with nothing but an
+/// `AnnotationStoreUpdateResult`: no live store, no window, no Accessibility
+/// walk.
+func highlightAnchorAttachFailurePayload(for outcome: AnnotationStoreUpdateResult) -> [String: Any]? {
+    if case .updated = outcome { return nil }
+    return highlightAnchorAttachRejectedPayload
+}
+
+/// The impure glue between a resolved `highlight_element` match and its
+/// caller-requested anchor: samples `processId`'s windows, builds the anchor
+/// via `buildHighlightAnchor` above, and -- on success -- patches it onto the
+/// already-created (and, until this call returns, unanchored) annotation.
+///
+/// TWO STORE WRITES, deliberately: `AnnotationStore.updateWithOutcome`
+/// unconditionally carries the OLD annotation's `anchorProjection` forward
+/// rather than the replacement's (see that method's own doc comment on why
+/// -- an ordinary `update_annotation` restyle must not reset tracking
+/// state), so installing the brand-new `.tracking` identity projection needs
+/// a second, explicit `applyAnchorProjections` call. This is exactly the
+/// pattern `AnchorTracker.applyResolvedElement` already uses for the same
+/// reason.
+///
+/// This function is IMPURE (live window sampling, live store mutation) and
+/// therefore not unit tested directly, matching `DrawRequest
+/// .resolveWindowAnchor`'s own precedent: `buildHighlightAnchor`/
+/// `parseHighlightAnchorArguments`/`makeAnchorElementSpec` above carry the
+/// actually-testable decisions.
+///
+/// Returns the `anchorBehavior` text for the FINAL resolved mode (never
+/// merely the requested one -- a request that could not find a window
+/// resolves to "none" behaviour, since that is genuinely what happens) and
+/// the `anchor` payload to merge into the response, or `nil` to omit the key
+/// entirely (MCP_SURFACE.md: "Key omitted entirely when the annotation is
+/// unanchored").
+private func attachHighlightAnchor(
+    request: HighlightAnchorRequest?,
+    created: Annotation?,
+    processId: Int64,
+    appId: String,
+    elementFrame: CGRect,
+    elementSpec: AnchorElementSpec?,
+    screens: [ScreenInfo]
+) -> (payload: [String: Any]?, behavior: String) {
+    guard let request, let created else {
+        return (nil, highlightAnchorBehaviorNone)
+    }
+    let samples = TargetWindowProbe.shared.windows(forProcessId: processId, screens: screens)
+    guard let resolution = buildHighlightAnchor(
+        mode: request.mode, processId: processId, appId: appId, samples: samples,
+        elementFrame: elementFrame, resize: request.resize, elementSpec: elementSpec, now: Date()
+    ) else {
+        return (highlightAnchorUnresolvedPayload, highlightAnchorBehaviorNone)
+    }
+    let replacement = Annotation(
+        id: created.id, screenId: created.screenId, kind: created.kind, colorHex: created.colorHex,
+        label: created.label, appId: created.appId, appName: created.appName, opacity: created.opacity,
+        offsetX: created.offsetX, offsetY: created.offsetY, zIndex: created.zIndex,
+        anchor: resolution.anchor, staticAdjustment: created.staticAdjustment,
+        anchorProjection: created.anchorProjection, revision: created.revision, createdAt: created.createdAt
+    )
+    let commitOutcome = AnnotationStore.shared.updateWithOutcome(
+        id: created.id, with: replacement, expectedRevision: created.revision
+    )
+    guard case .updated = commitOutcome else {
+        // BUG 5's fix: this is NOT "target_window_unresolved" -- a window
+        // WAS found (`buildHighlightAnchor` already succeeded above) and the
+        // highlight is already drawn. See `highlightAnchorAttachFailurePayload`'s
+        // doc comment for why conflating the two would mislead the caller
+        // into thinking nothing was resolved, or nothing was drawn, when
+        // both happened.
+        return (highlightAnchorAttachFailurePayload(for: commitOutcome), highlightAnchorBehaviorNone)
+    }
+    _ = AnnotationStore.shared.applyAnchorProjections([created.id: resolution.projection])
+    let behavior = (resolution.anchor.mode == .element) ? highlightAnchorBehaviorElement : highlightAnchorBehaviorWindow
+    return (DrawRequest.anchorResponsePayload(resolution), behavior)
 }
 
 /// Renderer-visible alpha includes a color's own RGBA alpha.  Named colors
@@ -274,6 +524,27 @@ extension MCPServer {
             sendErrorResult(id: id, text: error)
             return
         }
+        // Pure string validation of `anchor`/`anchor_resize`, BEFORE any
+        // process resolution or AX/TCC work -- see `parseHighlightAnchorArguments`'s
+        // own doc comment, and `rejectDurationSecondsIfSupplied`'s just above,
+        // for why this ordering matters: a malformed anchor argument must not
+        // trigger a running-process lookup or a cross-process Accessibility
+        // walk merely to fail later.
+        let anchorRequest: HighlightAnchorRequest?
+        switch parseHighlightAnchorArguments(args) {
+        case .failure(let error): sendErrorResult(id: id, text: error); return
+        case .success(let value): anchorRequest = value
+        }
+        // `finish` below (DrawRequest.swift) validates `args["anchor"]`/
+        // `args["anchor_resize"]` itself, against the DIFFERENT two-value
+        // `draw_*` vocabulary -- it would reject "element" outright. Anchor
+        // resolution for THIS tool is handled entirely by this file (see
+        // `attachHighlightAnchor` below, called once the element itself has
+        // actually been resolved), so these two keys must not reach `finish`
+        // at all; stripping them here is what keeps `finish` creating a
+        // plain, unanchored annotation exactly as it always has.
+        finishArgs.removeValue(forKey: "anchor")
+        finishArgs.removeValue(forKey: "anchor_resize")
         let style: HighlightStyle
         switch makeHighlightStyle(args: args) {
         case .failure(let error): sendErrorResult(id: id, text: error); return
@@ -349,6 +620,24 @@ extension MCPServer {
             return
         }
 
+        // The RESOLVED ELEMENT FRAME -- confirmedFrame, re-derived above --
+        // not the eventual highlight's own padded/shaped bounds: anchor
+        // window selection must intersect against what the caller actually
+        // asked to highlight, not against this tool's rendering of it.
+        let elementFrame = CGRect(
+            x: confirmedFrame.x, y: confirmedFrame.y,
+            width: confirmedFrame.width, height: confirmedFrame.height
+        )
+        // Only `.element` mode re-runs this lookup later, so this is built
+        // only then; `.window`/`.none` never read it.
+        let elementSpec: AnchorElementSpec? = (anchorRequest?.mode == .element)
+            ? makeAnchorElementSpec(
+                label: label, role: args["role"] as? String, matchMode: matchMode,
+                occurrence: MCPArgument.integer(args["occurrence"]), maxNodes: maxNodes,
+                timeoutSeconds: timeoutSeconds, shape: style.shape, paddingPx: style.padding
+              )
+            : nil
+
         let kind: AnnotationKind
         switch makeHighlightKind(style: style, frame: match.backingFrame) {
         case .failure(let error): sendErrorResult(id: id, text: error); return
@@ -373,9 +662,17 @@ extension MCPServer {
             var payload: [String: Any] = [
                 "message": message,
                 "annotationId": created?.id ?? NSNull(),
-                "targetApp": ["bundleId": target.app.bundleId, "name": target.app.name],
-                "anchorBehavior": "resolved once at draw time; call highlight_element again after the UI moves"
+                "targetApp": ["bundleId": target.app.bundleId, "name": target.app.name]
             ]
+            let anchorOutcome = attachHighlightAnchor(
+                request: anchorRequest, created: created, processId: Int64(target.pid),
+                appId: target.app.bundleId, elementFrame: elementFrame, elementSpec: elementSpec,
+                screens: screensAfterWalk
+            )
+            payload["anchorBehavior"] = anchorOutcome.behavior
+            if let anchorPayload = anchorOutcome.payload {
+                payload["anchor"] = anchorPayload
+            }
             payload["matchedElement"] = jsonObject(match) ?? NSNull()
             // Merged rather than assigned field-by-field so the disclosure's
             // key names live in exactly one place -- the pure function a test
@@ -422,24 +719,23 @@ extension MCPServer {
             app = AppRef(bundleId: bundleId, name: fallback.name ?? bundleId)
         }
 
-        // `NSWorkspace.runningApplications` is AppKit, and this runs on the MCP
-        // server's background read queue, so the enumeration takes the same
-        // main-thread hop every other NSWorkspace query in this package takes
-        // (see MainThread.sync, whose contract names this exact API). The PIDs
-        // are extracted INSIDE the hop so no NSRunningApplication -- a live,
-        // main-thread-owned object -- escapes back to the read queue; a plain
-        // pid_t is just a number.
+        // The pid enumeration itself -- an `NSWorkspace.runningApplications`
+        // filter behind the same main-thread hop every other NSWorkspace
+        // query in this package takes -- lives in
+        // `MCPServer.runningProcessIds(forAppId:)` (DrawRequest.swift), the
+        // ONE place both this lookup and `anchor="window"`'s window-owning-
+        // process lookup ask "is this app running, and with how many
+        // processes". See that function's own doc comment for the
+        // main-thread-hop rationale; `HighlightProcessID(exactly:)` narrows
+        // its cross-platform `Int64` back to this platform's real `pid_t`.
         //
         // This does NOT close the gap between resolving the app above and
         // enumerating here, nor the one between this snapshot and the
         // Accessibility query that follows: the process can exit, or a second
         // instance can launch, in either window. The hop is a threading
         // correction, not a TOCTOU fix.
-        let runningPIDs: [HighlightProcessID] = MainThread.sync {
-            NSWorkspace.shared.runningApplications
-                .filter { $0.bundleIdentifier == app.bundleId && !$0.isTerminated }
-                .map { $0.processIdentifier }
-        }
+        let runningPIDs: [HighlightProcessID] = MCPServer.shared.runningProcessIds(forAppId: app.bundleId)
+            .compactMap { HighlightProcessID(exactly: $0) }
         guard runningPIDs.count == 1, let target = runningPIDs.first else {
             return runningPIDs.isEmpty
                 ? .failure("App '\(app.name)' [\(app.bundleId)] is no longer running, so its Accessibility hierarchy cannot be queried.")
@@ -463,17 +759,21 @@ extension MCPServer {
     ///     define that identity string; it only assumes the shape above. If
     ///     the actual `ActiveAppTracker` Windows implementation picks a
     ///     different identity shape (e.g. a full path, or a different
-    ///     matching rule), `processIDs(forExecutableIdentity:)` below must
-    ///     be updated to match -- see contractChanges/followUps.
+    ///     matching rule), `MCPServer.runningProcessIds(forAppId:)`'s
+    ///     Windows branch (DrawRequest.swift) must be updated to match --
+    ///     see contractChanges/followUps.
     ///
     /// (b) PID RESOLUTION. In place of `NSWorkspace.runningApplications`'s
-    ///     bundle-id filter, this enumerates every running process via
-    ///     `CreateToolhelp32Snapshot` and matches executable names --
-    ///     see `processIDs(forExecutableIdentity:)`. Like the macOS branch,
-    ///     this does NOT close the gap between resolving the app and
-    ///     enumerating processes, nor between this snapshot and the UI
-    ///     Automation query that follows: the process can exit, or a second
-    ///     instance can launch, in either window.
+    ///     bundle-id filter, this calls `MCPServer.runningProcessIds
+    ///     (forAppId:)` (DrawRequest.swift), whose Windows branch enumerates
+    ///     every running process via `CreateToolhelp32Snapshot` and matches
+    ///     executable names -- the ONE place that enumeration exists for
+    ///     both this lookup and `anchor="window"`'s window-owning-process
+    ///     lookup. Like the macOS branch, this does NOT close the gap
+    ///     between resolving the app and enumerating processes, nor between
+    ///     this snapshot and the UI Automation query that follows: the
+    ///     process can exit, or a second instance can launch, in either
+    ///     window.
     private func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, pid: HighlightProcessID)> {
         if args.keys.contains("app"), !(args["app"] is String) {
             return .failure("app must be a running app's executable name or display name when supplied.")
@@ -502,63 +802,14 @@ extension MCPServer {
             app = AppRef(bundleId: identity, name: fallback.name ?? identity)
         }
 
-        let matchingPIDs = Self.processIDs(forExecutableIdentity: app.bundleId)
+        let matchingPIDs = MCPServer.shared.runningProcessIds(forAppId: app.bundleId)
+            .compactMap { HighlightProcessID(exactly: $0) }
         guard matchingPIDs.count == 1, let target = matchingPIDs.first else {
             return matchingPIDs.isEmpty
                 ? .failure("App '\(app.name)' [\(app.bundleId)] is no longer running, so its UI Automation tree cannot be queried.")
                 : .failure("App '\(app.name)' [\(app.bundleId)] has \(matchingPIDs.count) running processes. highlight_element refuses to guess which process id to inspect.")
         }
         return .success((app, target))
-    }
-
-    /// Enumerates every running process via `CreateToolhelp32Snapshot`
-    /// (`TH32CS_SNAPPROCESS`) and returns the process ids whose executable
-    /// file name -- or that name's extension-less stem -- case-
-    /// insensitively matches `identity`. This is the Windows substitute for
-    /// `NSWorkspace.runningApplications`'s bundle-id filter on the macOS
-    /// branch: Win32 has no bundle-identifier concept, only a per-process
-    /// executable file name (`PROCESSENTRY32W.szExeFile`), so process
-    /// identity here is that name. Matching both the full file name AND its
-    /// stem tolerates a caller (or `ActiveAppTracker`) supplying either
-    /// `"Resolve.exe"` or `"Resolve"`.
-    private static func processIDs(forExecutableIdentity identity: String) -> [HighlightProcessID] {
-        let loweredFull = identity.lowercased()
-        let loweredStem = stem(of: identity).lowercased()
-
-        guard let snapshot = CreateToolhelp32Snapshot(DWORD(TH32CS_SNAPPROCESS), 0),
-              snapshot != INVALID_HANDLE_VALUE else {
-            return []
-        }
-        defer { CloseHandle(snapshot) }
-
-        var entry = PROCESSENTRY32W()
-        entry.dwSize = DWORD(MemoryLayout<PROCESSENTRY32W>.size)
-        var matches: [HighlightProcessID] = []
-        guard Process32FirstW(snapshot, &entry) else { return [] }
-        repeat {
-            // `szExeFile` is a fixed-size WCHAR[MAX_PATH] C array, imported
-            // as a Swift tuple; reinterpret it as a UTF-16 buffer to decode
-            // it as a String, the standard idiom for a fixed C char array.
-            let exeName = withUnsafePointer(to: &entry.szExeFile) { tuplePointer -> String in
-                tuplePointer.withMemoryRebound(to: UInt16.self, capacity: 260) { wide in
-                    String(decodingCString: wide, as: UTF16.self)
-                }
-            }
-            let loweredExe = exeName.lowercased()
-            if loweredExe == loweredFull || stem(of: exeName).lowercased() == loweredStem {
-                matches.append(entry.th32ProcessID)
-            }
-        } while Process32NextW(snapshot, &entry)
-        return matches
-    }
-
-    /// The extension-less stem of a file name (`"Resolve.exe"` -> `"Resolve"`).
-    /// A tiny local helper rather than `NSString.deletingPathExtension`, to
-    /// avoid depending on Foundation's NSString bridging on this platform
-    /// for a one-line string operation.
-    private static func stem(of fileName: String) -> String {
-        guard let dotIndex = fileName.lastIndex(of: ".") else { return fileName }
-        return String(fileName[..<dotIndex])
     }
     #endif
 
@@ -620,63 +871,29 @@ extension MCPServer {
         ))
     }
 
+    /// The finite/magnitude/positive-extent validation that used to live
+    /// directly in this function now lives in
+    /// `HighlightOutlineGeometry.pathData`
+    /// (Sources/Support/HighlightOutlineGeometry.swift), moved verbatim so
+    /// the element anchor tracker's on-settle re-resolve can reject the same
+    /// unusable bounds the same way, through the same code, instead of a
+    /// second copy of this guard drifting from this one. The error text
+    /// below is unchanged: `pathData` returns nil under exactly the
+    /// conditions this function used to fail on directly.
     private func makeHighlightKind(style: HighlightStyle, frame: AccessibilityBackingRect) -> DrawOutcome<AnnotationKind> {
-        let x = frame.x - style.padding
-        let y = frame.y - style.padding
-        let width = frame.width + 2 * style.padding
-        let height = frame.height + 2 * style.padding
-        guard [x, y, width, height].allSatisfy(\.isFinite),
-              [x, y, width, height].allSatisfy({ abs($0) <= DrawingDefaults.maxCoordinateMagnitudePx }),
-              width > 0, height > 0 else {
+        guard let data = HighlightOutlineGeometry.pathData(
+            shape: style.shape,
+            frameX: frame.x,
+            frameY: frame.y,
+            frameWidth: frame.width,
+            frameHeight: frame.height,
+            padding: style.padding
+        ) else {
             return .failure("Resolved accessibility bounds are not usable for a highlight.")
         }
 
-        // Every derived value the emitted path depends on is range-checked
-        // HERE, before `highlightOutlinePathData` -- which deliberately does
-        // no validation of its own -- turns it into a string. The centre is
-        // shared by all three shapes (padding is symmetric).
-        let cx = x + width / 2
-        let cy = y + height / 2
-        switch style.shape {
-        case .rect:
-            // The padded-bounds trace uses nothing but the four values the
-            // guard above already covers; there is no derived radius to check.
-            break
-
-        case .ellipse:
-            let rx = width / 2
-            let ry = height / 2
-            guard [cx, cy, rx, ry].allSatisfy(\.isFinite),
-                  [cx, cy, rx, ry].allSatisfy({ abs($0) <= DrawingDefaults.maxCoordinateMagnitudePx }),
-                  rx > 0, ry > 0 else {
-                return .failure("Resolved accessibility bounds are not usable for a highlight.")
-            }
-
-        case .circle:
-            // Derived from the ELEMENT frame, not the padded bounds: see
-            // `highlightCircleRadius` for why half the element's diagonal
-            // plus the padding is the radius that actually encloses the
-            // element, and for the 44x44 button the old max(w, h)/2 ring cut
-            // straight through.
-            let r = highlightCircleRadius(
-                frameWidth: frame.width, frameHeight: frame.height, padding: style.padding
-            )
-            guard [cx, cy, r].allSatisfy(\.isFinite),
-                  [cx, cy, r].allSatisfy({ abs($0) <= DrawingDefaults.maxCoordinateMagnitudePx }),
-                  r > 0 else {
-                return .failure("Resolved accessibility bounds are not usable for a highlight.")
-            }
-        }
-
         return .success(.vectorPath(
-            data: highlightOutlinePathData(
-                shape: style.shape,
-                frameX: frame.x,
-                frameY: frame.y,
-                frameWidth: frame.width,
-                frameHeight: frame.height,
-                padding: style.padding
-            ),
+            data: data,
             strokeColorHex: style.strokeColor,
             strokeWidth: style.strokeWidth,
             strokeOpacity: style.strokeOpacity,

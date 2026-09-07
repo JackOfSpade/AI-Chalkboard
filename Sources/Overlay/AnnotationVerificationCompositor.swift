@@ -255,73 +255,27 @@ enum AnnotationVerificationCompositor {
         // `MainThread.sync` work, including the overlay's own repaints) for
         // the scan's whole duration.
         //
-        // This is race-free: `overlayRep` is a freshly allocated,
-        // self-owned `NSBitmapImageRep` (never a CGImage-backed or
-        // otherwise lazily-produced one -- see `makeBitmap`), it is fully
-        // written by `flushGraphics()` before this block returns it, and
-        // nothing mutates it afterwards. Handing it from the main thread to
-        // the calling thread here is a one-way, one-time transfer, not
-        // concurrent access.
-        let overlayRep: NSBitmapImageRep = try MainThread.sync {
-            guard let overlayRep = makeBitmap(width: imageWidth, height: imageHeight),
-                  let overlayContext = NSGraphicsContext(bitmapImageRep: overlayRep) else {
-                throw AnnotationVerificationError.renderFailed
-            }
-
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = overlayContext
-            let cgContext = overlayContext.cgContext
-            let outputRect = CGRect(x: 0, y: 0, width: imageWidth, height: imageHeight)
-            cgContext.clear(outputRect)
-            cgContext.saveGState()
-            cgContext.clip(to: outputRect)
-
-            // OverlayView itself is sized in NSScreen.frame points. Scaling
-            // that point canvas into screenshot pixels preserves fixed-point
-            // strokes/fonts and physical-pixel paths exactly as the live
-            // renderer would look after the screenshot's resampling step.
-            let sourceSize = CGSize(width: screen.widthPt, height: screen.heightPt)
-            cgContext.scaleBy(
-                x: CGFloat(imageWidth) / sourceSize.width,
-                y: CGFloat(imageHeight) / sourceSize.height
-            )
-            // Snapshot the raster this annotation needs before drawing,
-            // exactly as the live overlay does in `OverlayView.draw(_:)` --
-            // a concurrent clear could otherwise release the store's
-            // ownership mid-render. The `rasterLease` parameter lets an
-            // in-process caller (e.g. Chalkboard-owned capture) reuse a lease
-            // it is already holding instead of taking out a fresh one here.
-            let lease = rasterLease ?? RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
-            let drawingContext = CoreGraphicsDrawingContext(context: cgContext)
-            AnnotationRenderer.drawAnnotations(
-                [annotation],
-                into: drawingContext,
-                canvasSize: sourceSize,
-                // The SAME definition `OverlayView.draw(_:)` (the live macOS
-                // overlay) reads -- see
-                // `OverlayDrawingMetrics.rendererScaleFactor`. A verification
-                // rendered at any other scale than the live overlay's would
-                // report a placement nothing ever painted. On macOS this
-                // resolves to the backing scale, exactly as this line always
-                // did against this same point canvas.
-                scaleFactor: OverlayDrawingMetrics.rendererScaleFactor(
-                    displayBackingScaleFactor: CGFloat(screen.backingScaleFactor)
-                )
-            ) { assetId in
-                lease.image(id: assetId).map(NSImageRasterHandle.init)
-            }
-            cgContext.restoreGState()
-            overlayContext.flushGraphics()
-            NSGraphicsContext.restoreGraphicsState()
-            return overlayRep
-        }
+        // `renderAnnotationAlone` is the SAME "render this one annotation
+        // alone into a transparent bitmap the size of `screen`'s backing
+        // pixels, then scan for its non-transparent bounds" implementation
+        // `renderedPaintedBounds(of:on:rasterLease:)` below uses for
+        // `get_annotation_bounds` -- factored into one place so the two can
+        // never independently disagree about where an annotation paints.
+        let lease = rasterLease ?? RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
+        let (overlayRep, paintedTopLeftOptional) = try renderAnnotationAlone(
+            annotation,
+            widthPx: imageWidth, heightPx: imageHeight,
+            pointsSize: CGSize(width: screen.widthPt, height: screen.heightPt),
+            backingScaleFactor: screen.backingScaleFactor,
+            lease: lease
+        )
 
         // Reaching here means the bitmap and its context were both created and
         // the renderer ran; an empty painted box is therefore a statement about
         // the annotation, not about the rendering machinery. Fully off-screen
         // coordinates, zero opacity, a transparent color, and an empty path are
         // all storable and all land exactly here.
-        guard let paintedTopLeft = paintedPixelBounds(in: overlayRep) else {
+        guard let paintedTopLeft = paintedTopLeftOptional else {
             throw AnnotationVerificationError.annotationPaintedNothing(
                 screenWidthPx: screen.widthPx,
                 screenHeightPx: screen.heightPx
@@ -525,6 +479,130 @@ enum AnnotationVerificationCompositor {
         )
     }
 
+    /// Renders `annotation` ALONE onto a fresh transparent `widthPx`x`heightPx`
+    /// bitmap and returns both the bitmap and its non-transparent pixel bounds
+    /// (raw bitmap row coordinates, top-left origin -- see `paintedPixelBounds
+    /// (in:)`'s doc comment -- or `nil` if nothing painted). `pointsSize` is the
+    /// point-space canvas `AnnotationRenderer` draws into (see its own
+    /// coordinate-space doc comment); `widthPx`/`heightPx` is the PHYSICAL
+    /// output resolution that canvas is scaled up to before drawing.
+    ///
+    /// THE ONE RENDER-AND-SCAN IMPLEMENTATION, shared by two callers that must
+    /// never independently disagree about where an annotation paints:
+    ///   * `composite(...)` above, which goes on to use the returned bitmap as
+    ///     the top layer it composites over a caller-supplied screenshot.
+    ///   * `renderedPaintedBounds(of:on:rasterLease:)` below, which
+    ///     `get_annotation_bounds` (Sources/MCP/MCPToolHandlers+AnnotationBounds.swift)
+    ///     calls for a placement answer with NO screenshot involved at all.
+    /// Duplicating this render+scan into a second, independent implementation
+    /// is exactly the drift this factoring exists to make impossible -- see
+    /// `renderedPaintedBounds`'s own doc comment for why that matters for
+    /// text, a rotated image, an `offset_x`/`offset_y`, and a live anchor
+    /// adjustment.
+    private static func renderAnnotationAlone(
+        _ annotation: Annotation,
+        widthPx: Int,
+        heightPx: Int,
+        pointsSize: CGSize,
+        backingScaleFactor: Double,
+        lease: RasterAssetStore.Lease
+    ) throws -> (bitmap: NSBitmapImageRep, paintedBounds: CGRect?) {
+        // Rendering genuinely needs the main thread -- it goes through
+        // AppKit/Core Graphics state (NSGraphicsContext.current, the shared
+        // graphics-state stack). This is race-free: the returned bitmap is a
+        // freshly allocated, self-owned `NSBitmapImageRep` (never a
+        // CGImage-backed or otherwise lazily-produced one -- see
+        // `makeBitmap`), fully written by `flushGraphics()` before this block
+        // returns it, and nothing mutates it afterwards. Handing it from the
+        // main thread to the calling thread here is a one-way, one-time
+        // transfer, not concurrent access.
+        try MainThread.sync {
+            guard let overlayRep = makeBitmap(width: widthPx, height: heightPx),
+                  let overlayContext = NSGraphicsContext(bitmapImageRep: overlayRep) else {
+                throw AnnotationVerificationError.renderFailed
+            }
+
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = overlayContext
+            let cgContext = overlayContext.cgContext
+            let outputRect = CGRect(x: 0, y: 0, width: widthPx, height: heightPx)
+            cgContext.clear(outputRect)
+            cgContext.saveGState()
+            cgContext.clip(to: outputRect)
+
+            // OverlayView itself is sized in NSScreen.frame points. Scaling
+            // that point canvas into the requested output resolution
+            // preserves fixed-point strokes/fonts and physical-pixel paths
+            // exactly as the live renderer would look after a screenshot's
+            // resampling step.
+            cgContext.scaleBy(
+                x: CGFloat(widthPx) / pointsSize.width,
+                y: CGFloat(heightPx) / pointsSize.height
+            )
+            let drawingContext = CoreGraphicsDrawingContext(context: cgContext)
+            AnnotationRenderer.drawAnnotations(
+                [annotation],
+                into: drawingContext,
+                canvasSize: pointsSize,
+                // The SAME definition `OverlayView.draw(_:)` (the live macOS
+                // overlay) reads -- see
+                // `OverlayDrawingMetrics.rendererScaleFactor`. A verification
+                // rendered at any other scale than the live overlay's would
+                // report a placement nothing ever painted.
+                scaleFactor: OverlayDrawingMetrics.rendererScaleFactor(
+                    displayBackingScaleFactor: CGFloat(backingScaleFactor)
+                )
+            ) { assetId in
+                lease.image(id: assetId).map(NSImageRasterHandle.init)
+            }
+            cgContext.restoreGState()
+            overlayContext.flushGraphics()
+            NSGraphicsContext.restoreGraphicsState()
+            return (overlayRep, paintedPixelBounds(in: overlayRep))
+        }
+    }
+
+    /// Renders `annotation` ALONE into a transparent bitmap the size of
+    /// `screen`'s backing pixels using the exact live `AnnotationRenderer` --
+    /// the SAME rendering `composite(...)` performs internally before ever
+    /// touching a caller's screenshot -- and returns its non-transparent
+    /// pixel bounds in TOP-LEFT-origin backing-pixel space of `screen` (the
+    /// same coordinate convention every MCP drawing coordinate already uses),
+    /// or `nil` if the annotation painted nothing.
+    ///
+    /// This is the single source of truth `get_annotation_bounds` reports
+    /// (see Sources/MCP/MCPToolHandlers+AnnotationBounds.swift): it shares
+    /// `renderAnnotationAlone` with `composite(...)` above rather than
+    /// running a second, independently-computed geometry estimate (compare
+    /// `PaintedBounds.swift`, which IS such an estimate but is explicitly
+    /// documented as "good enough to pick a window", never pixel-exact) --
+    /// which is what makes the answer correct for text (real glyph metrics,
+    /// unavailable without a live drawing context), a rotated image, an
+    /// `offset_x`/`offset_y`, and a live anchor adjustment.
+    ///
+    /// TOUCHES NO SCREEN-CAPTURE API AND NEEDS NO SCREEN RECORDING
+    /// PERMISSION: every step is Core Graphics/AppKit OFFSCREEN bitmap
+    /// rendering (`NSBitmapImageRep`, `NSGraphicsContext`, `CGContext`) --
+    /// the same machinery `composite(...)` already uses for its own
+    /// "annotation alone" pass. Nothing here calls `CGDisplayCreateImage`,
+    /// `CGWindowListCreateImage`, ScreenCaptureKit, `screencapture`, or any
+    /// other capture entry point.
+    static func renderedPaintedBounds(
+        of annotation: Annotation,
+        on screen: ScreenInfo,
+        rasterLease: RasterAssetStore.Lease? = nil
+    ) throws -> CGRect? {
+        let lease = rasterLease ?? RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
+        let (_, bounds) = try renderAnnotationAlone(
+            annotation,
+            widthPx: screen.widthPx, heightPx: screen.heightPx,
+            pointsSize: CGSize(width: screen.widthPt, height: screen.heightPt),
+            backingScaleFactor: screen.backingScaleFactor,
+            lease: lease
+        )
+        return bounds
+    }
+
     /// Returns painted bounds in raw bitmap row coordinates (top-left origin).
     /// The bitmap starts transparent, so any non-zero byte identifies an
     /// antialiased annotation pixel regardless of channel byte ordering.
@@ -696,20 +774,28 @@ enum AnnotationVerificationCompositor {
         guard sourceSize.width > 0, sourceSize.height > 0 else {
             throw AnnotationVerificationError.renderFailed
         }
-        let pixelScaleX = Double(imageWidth) / Double(sourceSize.width)
-        let pixelScaleY = Double(imageHeight) / Double(sourceSize.height)
-
-        guard let renderContext = GDIPlusDrawingContext(
-            width: imageWidth, height: imageHeight, scaleX: pixelScaleX, scaleY: pixelScaleY
-        ) else {
-            throw AnnotationVerificationError.renderFailed
-        }
 
         // Snapshot the raster this annotation needs before drawing, exactly
         // as the live overlay does and exactly as the macOS branch above
         // does -- a concurrent clear could otherwise release the store's
         // ownership mid-render.
         let lease = rasterLease ?? RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
+
+        // PASS 1 -- see this method's doc comment. `renderAnnotationAlone` is
+        // the SAME "render this one annotation alone, then scan for its
+        // non-transparent bounds" implementation `renderedPaintedBounds
+        // (of:on:rasterLease:)` below uses for `get_annotation_bounds`,
+        // factored into one place so the two can never independently
+        // disagree about where an annotation paints.
+        let (renderContext, paintedBoundsOptional) = try renderAnnotationAlone(
+            annotation, widthPx: imageWidth, heightPx: imageHeight,
+            pointsSize: sourceSize, backingScaleFactor: screen.backingScaleFactor, lease: lease
+        )
+        guard let paintedTopLeft = paintedBoundsOptional else {
+            throw AnnotationVerificationError.annotationPaintedNothing(
+                screenWidthPx: screen.widthPx, screenHeightPx: screen.heightPx
+            )
+        }
         func drawAnnotationOnly() {
             AnnotationRenderer.drawAnnotations(
                 [annotation], into: renderContext, canvasSize: sourceSize,
@@ -731,17 +817,6 @@ enum AnnotationVerificationCompositor {
                     displayBackingScaleFactor: CGFloat(screen.backingScaleFactor)
                 )
             ) { assetId in lease.image(id: assetId) }
-        }
-
-        // PASS 1 -- see this method's doc comment.
-        drawAnnotationOnly()
-        guard let overlayPixels = renderContext.pixelBuffer else { throw AnnotationVerificationError.renderFailed }
-        guard let paintedTopLeft = Self.paintedPixelBounds(
-            bytes: overlayPixels, width: imageWidth, height: imageHeight, stride: renderContext.bytesPerRow
-        ) else {
-            throw AnnotationVerificationError.annotationPaintedNothing(
-                screenWidthPx: screen.widthPx, screenHeightPx: screen.heightPx
-            )
         }
 
         let safePadding = CGFloat(min(max(paddingPx, 0), maxPaddingPx))
@@ -899,6 +974,74 @@ enum AnnotationVerificationCompositor {
         }
         guard maxX >= minX, maxY >= minY else { return nil }
         return CGRect(x: CGFloat(minX), y: CGFloat(minY), width: CGFloat(maxX - minX + 1), height: CGFloat(maxY - minY + 1))
+    }
+
+    /// Renders `annotation` ALONE onto a fresh `widthPx`x`heightPx`
+    /// `GDIPlusDrawingContext` and returns both the context (so `compositeCore`
+    /// above can clear and reuse it for its second, composited pass) and the
+    /// non-transparent pixel bounds of that lone render (raw buffer row
+    /// coordinates, top-left origin -- see `paintedPixelBounds(bytes:...)`'s
+    /// doc comment -- or `nil` if nothing painted).
+    ///
+    /// THE ONE RENDER-AND-SCAN IMPLEMENTATION for this platform, shared by
+    /// `compositeCore`'s PASS 1 above and `renderedPaintedBounds(of:on:
+    /// rasterLease:)` below -- see the macOS branch's identically-named
+    /// helper for why duplicating this into a second implementation is
+    /// exactly the drift this factoring exists to make impossible.
+    private static func renderAnnotationAlone(
+        _ annotation: Annotation,
+        widthPx: Int,
+        heightPx: Int,
+        pointsSize: CGSize,
+        backingScaleFactor: Double,
+        lease: RasterAssetStore.Lease
+    ) throws -> (context: GDIPlusDrawingContext, paintedBounds: CGRect?) {
+        guard pointsSize.width > 0, pointsSize.height > 0 else {
+            throw AnnotationVerificationError.renderFailed
+        }
+        let pixelScaleX = Double(widthPx) / Double(pointsSize.width)
+        let pixelScaleY = Double(heightPx) / Double(pointsSize.height)
+        guard let renderContext = GDIPlusDrawingContext(
+            width: widthPx, height: heightPx, scaleX: pixelScaleX, scaleY: pixelScaleY
+        ) else {
+            throw AnnotationVerificationError.renderFailed
+        }
+        AnnotationRenderer.drawAnnotations(
+            [annotation], into: renderContext, canvasSize: pointsSize,
+            // See `compositeCore`'s identical call for why this shared
+            // definition, not a literal `backingScaleFactor`, is load-bearing
+            // on this platform.
+            scaleFactor: OverlayDrawingMetrics.rendererScaleFactor(
+                displayBackingScaleFactor: CGFloat(backingScaleFactor)
+            )
+        ) { assetId in lease.image(id: assetId) }
+        guard let pixels = renderContext.pixelBuffer else { throw AnnotationVerificationError.renderFailed }
+        let bounds = Self.paintedPixelBounds(
+            bytes: pixels, width: widthPx, height: heightPx, stride: renderContext.bytesPerRow
+        )
+        return (renderContext, bounds)
+    }
+
+    /// Windows twin of the macOS `renderedPaintedBounds(of:on:rasterLease:)`
+    /// above -- SAME signature, same contract (renders `annotation` alone
+    /// through the exact live `AnnotationRenderer` and returns its
+    /// non-transparent pixel bounds in top-left-origin backing-pixel space of
+    /// `screen`, with no screenshot involved and no capture API touched), so
+    /// `get_annotation_bounds`'s one call site compiles and behaves
+    /// identically on both platforms. See that overload's doc comment for
+    /// the full contract.
+    static func renderedPaintedBounds(
+        of annotation: Annotation,
+        on screen: ScreenInfo,
+        rasterLease: RasterAssetStore.Lease? = nil
+    ) throws -> CGRect? {
+        let lease = rasterLease ?? RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
+        let (_, bounds) = try renderAnnotationAlone(
+            annotation, widthPx: screen.widthPx, heightPx: screen.heightPx,
+            pointsSize: CGSize(width: screen.widthPt, height: screen.heightPt),
+            backingScaleFactor: screen.backingScaleFactor, lease: lease
+        )
+        return bounds
     }
     #endif
 

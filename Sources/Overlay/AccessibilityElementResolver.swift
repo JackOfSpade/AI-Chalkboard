@@ -689,13 +689,44 @@ public enum AccessibilityElementResolver {
                                  timeout: normalized.timeoutSeconds)
     }
 
+    /// How a frame that does not sit wholly inside a single display is
+    /// mapped onto exactly one. See `backingRect(forAccessibilityFrame:
+    /// screens:selection:)`'s `selection` parameter for which callers should
+    /// choose which case.
+    public enum AccessibilityFrameDisplaySelection {
+        /// The frame must be fully contained by exactly one display. This is
+        /// `backingRect`'s DEFAULT and must stay behaviourally unchanged:
+        /// `highlight_element` draws around a single UI control, and a
+        /// control genuinely straddling two displays cannot be represented
+        /// by one Chalkboard annotation -- see this file's standing "reject
+        /// rather than silently clip or choose a monitor" policy.
+        case requireContainment
+        /// The display with the largest intersection area wins; a frame
+        /// that intersects NO display is still rejected (`nil`). Correct
+        /// for a WINDOW rather than an element: a window is routinely
+        /// dragged across a display boundary or pushed partly off the
+        /// desktop edge, and `requireContainment` would report it
+        /// unmappable on every such tick -- which a window-anchor tracker
+        /// reads as the window being GONE, permanently killing tracking for
+        /// the single most ordinary user action window anchoring exists to
+        /// survive. Under this case the returned rect's x/y MAY be
+        /// negative, or its far edge may extend past the chosen display's
+        /// own extent -- that is correct and expected for a window hanging
+        /// off an edge; a caller using this for anchor geometry only needs
+        /// the frame as a reference for a scale/translate computation, never
+        /// a rect that paints on screen by itself, so it is deliberately
+        /// left unclipped.
+        case largestOverlap
+    }
+
     /// Pure AX top-left global logical-point -> local backing-pixel conversion.
     /// AppKit's desktop has a bottom-left origin, hence the explicit desktop
     /// top calculation.  This lives outside the resolver so mixed-scale and
     /// secondary-display math can be unit-tested without an AX/TCC session.
     public static func backingRect(
         forAccessibilityFrame frame: AccessibilityScreenRect,
-        screens: [ScreenInfo]
+        screens: [ScreenInfo],
+        selection: AccessibilityFrameDisplaySelection = .requireContainment
     ) -> AccessibilityBackingRect? {
         // AX's global top-left origin is anchored to the ZERO-ORIGIN display
         // -- the one carrying the menu bar, whose AppKit frame origin is
@@ -734,12 +765,18 @@ public enum AccessibilityElementResolver {
             width: frame.width,
             height: frame.height
         )
-        // Elements which straddle displays cannot be represented by one
-        // Chalkboard annotation, whose coordinates deliberately name exactly
-        // one screen.  Reject rather than silently clip or choose a monitor.
-        guard let screen = screens.first(where: { fullyContains($0.appKitFrame, appKitRect) }) else {
-            return nil
+        let screen: ScreenInfo?
+        switch selection {
+        case .requireContainment:
+            // Elements which straddle displays cannot be represented by one
+            // Chalkboard annotation, whose coordinates deliberately name
+            // exactly one screen.  Reject rather than silently clip or
+            // choose a monitor.
+            screen = screens.first(where: { fullyContains($0.appKitFrame, appKitRect) })
+        case .largestOverlap:
+            screen = bestOverlappingScreen(appKitRect, in: screens, frame: \.appKitFrame)
         }
+        guard let screen else { return nil }
         let scale = screen.backingScaleFactor
         guard scale.isFinite, scale > 0 else { return nil }
         return AccessibilityBackingRect(
@@ -1182,6 +1219,36 @@ public enum AccessibilityElementResolver {
         [frame.x, frame.y, frame.width, frame.height].allSatisfy(\.isFinite)
             && frame.width > 0 && frame.height > 0
     }
+
+    /// Used only by `AccessibilityFrameDisplaySelection.largestOverlap` (see
+    /// `backingRect(forAccessibilityFrame:screens:selection:)`): the screen
+    /// whose `frame(_:)` has the largest intersection area with `rect`, or
+    /// `nil` when none overlaps at all. Ties resolve to whichever screen is
+    /// encountered first in `screens` -- stable, matching this file's other
+    /// selection helpers (`TargetWindowSelection.selectWindow` in
+    /// `TargetWindowProbe.swift` uses the identical "strictly greater, first
+    /// wins ties" rule).
+    private static func bestOverlappingScreen(
+        _ rect: ScreenCoordinateRect, in screens: [ScreenInfo], frame: (ScreenInfo) -> ScreenCoordinateRect
+    ) -> ScreenInfo? {
+        var best: ScreenInfo?
+        var bestArea = 0.0
+        for screen in screens {
+            let area = overlapArea(rect, frame(screen))
+            if area > bestArea {
+                bestArea = area
+                best = screen
+            }
+        }
+        return best
+    }
+
+    private static func overlapArea(_ a: ScreenCoordinateRect, _ b: ScreenCoordinateRect) -> Double {
+        let width = min(a.maxX, b.maxX) - max(a.x, b.x)
+        let height = min(a.maxY, b.maxY) - max(a.y, b.y)
+        guard width > 0, height > 0 else { return 0 }
+        return width * height
+    }
 }
 
 #elseif os(Windows)
@@ -1341,9 +1408,12 @@ public struct AccessibilityTrustStatus: Codable, Equatable {
 /// Windows counterpart of the macOS error taxonomy, matched one-for-one
 /// against `chalk_uia_find_element`'s documented `ChalkErrorCode`s (see
 /// chalkboard_win.h Section 3) wherever an equivalent macOS condition
-/// exists, PLUS two cases with no macOS analogue at all:
-/// `.roleFilterNotSupported` (the shim has no role/control-type parameter)
-/// and `.elevationBoundary` (UIPI has no macOS AX counterpart). See each
+/// exists, PLUS three cases with no macOS analogue at all:
+/// `.roleFilterNotSupported` (the shim has no role/control-type parameter),
+/// `.elevationBoundary` (UIPI has no macOS AX counterpart), and
+/// `.workerPoolExhausted` (the shim's outstanding-UIA-worker-thread cap has
+/// no macOS analogue: AXUIElement calls run synchronously on the caller's
+/// own thread, so there is no comparable worker pool to exhaust). See each
 /// case below for its exact shim mapping.
 public enum AccessibilityElementResolverError: LocalizedError, Equatable {
     case invalidRequest(String)
@@ -1436,6 +1506,18 @@ public enum AccessibilityElementResolverError: LocalizedError, Equatable {
     /// boundary. The only fixes are running AI Chalkboard elevated too, or
     /// falling back to screenshot-measured coordinates.
     case elevationBoundary
+    /// NO MACOS ANALOGUE. Maps `CHALK_ERR_UIA_TOO_MANY_PENDING`: the shim
+    /// already has its cap's worth of UIA worker threads outstanding (see
+    /// `kMaxOutstandingUiaWorkers` in chalk_uia.cpp) -- most of them likely
+    /// permanently stuck inside a hung UI Automation provider call that
+    /// classic UI Automation gives the shim no way to cancel. NOT
+    /// RETRYABLE, unlike `.applicationBusy`/`CHALK_ERR_UIA_RETRYABLE_
+    /// TIMEOUT`: per the header's own doc comment on this code, retrying --
+    /// with the same or a different process -- only adds another stuck
+    /// thread on top of an already-saturated pool. AXUIElement calls run
+    /// synchronously on the caller's own thread on macOS, with no
+    /// comparable worker-pool resource to exhaust, hence no analogue there.
+    case workerPoolExhausted
 
     public var errorDescription: String? {
         switch self {
@@ -1486,6 +1568,8 @@ public enum AccessibilityElementResolverError: LocalizedError, Equatable {
             return "role filtering is not supported on Windows: the UI Automation lookup this build uses matches only an element's Name property and has no control-type/role parameter. Omit role, or narrow the search with occurrence instead."
         case .elevationBoundary:
             return "The target app is running elevated (as administrator) and AI Chalkboard is not, so Windows UI Privilege Isolation (UIPI) blocks UI Automation from reading its interface. Run AI Chalkboard elevated too, or fall back to screenshot-measured coordinates confirmed with verify_annotation."
+        case .workerPoolExhausted:
+            return "AI Chalkboard's Windows UI Automation worker pool is fully occupied, most likely by earlier lookups stuck inside an unresponsive UI Automation provider that cannot be cancelled. This is NOT a busy target worth retrying immediately: retrying now -- against this process or another one -- only queues another thread behind the ones already stuck. Fall back to screenshot-measured coordinates confirmed with verify_annotation, or wait for the wedged target app to become responsive (or restart it) before attempting another element lookup."
         }
     }
 
@@ -1540,6 +1624,7 @@ public enum AccessibilityElementResolver {
     private static let chalkErrUiaNodeBudgetExhausted: Int32 = -306
     private static let chalkErrUiaAccessDenied: Int32 = -307
     private static let chalkErrUiaInvalidProcess: Int32 = -308
+    private static let chalkErrUiaTooManyPending: Int32 = -309
     private static let chalkUiaMatchExact: Int32 = 0
     private static let chalkUiaMatchContains: Int32 = 1
 
@@ -1643,6 +1728,8 @@ public enum AccessibilityElementResolver {
             // doc comment for why THIS is the right Swift case rather than
             // invalidProcessID (already handled by the guard above).
             throw AccessibilityElementResolverError.applicationUnavailable
+        case chalkErrUiaTooManyPending:
+            throw AccessibilityElementResolverError.workerPoolExhausted
         case chalkErrUiaUnavailable:
             throw AccessibilityElementResolverError.accessibilityNotTrusted
         case chalkErrInvalidArgument:
@@ -1689,19 +1776,48 @@ public enum AccessibilityElementResolver {
     /// duplicated here: it would re-ask a question already answered once,
     /// authoritatively, at the only point in the process's life where the
     /// answer can still be changed.
+    /// How a frame that does not sit wholly inside a single display is
+    /// mapped onto exactly one. Identical shape and identical case-by-case
+    /// meaning to the macOS `AccessibilityFrameDisplaySelection` above --
+    /// see that type's doc comment for the full rationale, repeated here
+    /// only in brief because this file duplicates each per-platform type
+    /// rather than sharing declarations across the `#if` boundary.
+    public enum AccessibilityFrameDisplaySelection {
+        /// The frame must be fully contained by exactly one display. This is
+        /// `backingRect`'s DEFAULT and must stay behaviourally unchanged --
+        /// correct for a UI ELEMENT, which cannot straddle two displays and
+        /// still be represented by one Chalkboard annotation.
+        case requireContainment
+        /// The display with the largest intersection area wins; a frame
+        /// that intersects NO display is still rejected (`nil`). Correct
+        /// for a WINDOW, which is routinely dragged across a display
+        /// boundary or pushed partly off the desktop edge -- see the macOS
+        /// enum's doc comment for why `requireContainment` would be actively
+        /// harmful there. The returned rect's x/y MAY be negative, or its
+        /// far edge may extend past the chosen display's own extent under
+        /// this case; that is expected and is deliberately left unclipped.
+        case largestOverlap
+    }
+
     public static func backingRect(
         forAccessibilityFrame frame: AccessibilityScreenRect,
-        screens: [ScreenInfo]
+        screens: [ScreenInfo],
+        selection: AccessibilityFrameDisplaySelection = .requireContainment
     ) -> AccessibilityBackingRect? {
         guard isUsable(frame) else { return nil }
         let frameRect = ScreenCoordinateRect(x: frame.x, y: frame.y, width: frame.width, height: frame.height)
-        // Elements which straddle displays cannot be represented by one
-        // Chalkboard annotation, whose coordinates deliberately name exactly
-        // one screen -- same "reject rather than silently clip or choose a
-        // monitor" policy as the macOS branch.
-        guard let screen = screens.first(where: { fullyContains($0.windowServerFrame, frameRect) }) else {
-            return nil
+        let screen: ScreenInfo?
+        switch selection {
+        case .requireContainment:
+            // Elements which straddle displays cannot be represented by one
+            // Chalkboard annotation, whose coordinates deliberately name
+            // exactly one screen -- same "reject rather than silently clip
+            // or choose a monitor" policy as the macOS branch.
+            screen = screens.first(where: { fullyContains($0.windowServerFrame, frameRect) })
+        case .largestOverlap:
+            screen = bestOverlappingScreen(frameRect, in: screens, frame: \.windowServerFrame)
         }
+        guard let screen else { return nil }
         return AccessibilityBackingRect(
             screenId: screen.id,
             x: frame.x - screen.windowServerFrame.x,
@@ -1812,6 +1928,32 @@ public enum AccessibilityElementResolver {
     private static func isUsable(_ frame: AccessibilityScreenRect) -> Bool {
         [frame.x, frame.y, frame.width, frame.height].allSatisfy(\.isFinite)
             && frame.width > 0 && frame.height > 0
+    }
+
+    /// Used only by `AccessibilityFrameDisplaySelection.largestOverlap` --
+    /// identical logic to the macOS branch's helper of the same name (see
+    /// its doc comment); duplicated rather than shared per this file's
+    /// standing per-platform-block convention.
+    private static func bestOverlappingScreen(
+        _ rect: ScreenCoordinateRect, in screens: [ScreenInfo], frame: (ScreenInfo) -> ScreenCoordinateRect
+    ) -> ScreenInfo? {
+        var best: ScreenInfo?
+        var bestArea = 0.0
+        for screen in screens {
+            let area = overlapArea(rect, frame(screen))
+            if area > bestArea {
+                bestArea = area
+                best = screen
+            }
+        }
+        return best
+    }
+
+    private static func overlapArea(_ a: ScreenCoordinateRect, _ b: ScreenCoordinateRect) -> Double {
+        let width = min(a.maxX, b.maxX) - max(a.x, b.x)
+        let height = min(a.maxY, b.maxY) - max(a.y, b.y)
+        guard width > 0, height > 0 else { return 0 }
+        return width * height
     }
 }
 #endif

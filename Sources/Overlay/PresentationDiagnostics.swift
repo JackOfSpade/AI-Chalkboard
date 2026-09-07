@@ -39,6 +39,57 @@ struct PresentationReadinessInput: Equatable {
     let windowServerLayer: Int?
     let expectedAlpha: Double
     let expectedLevel: Int
+    /// The anchor tracker's last known state for this annotation, or `nil`
+    /// for an unanchored one. Read here -- rather than re-derived from
+    /// `annotationIsInCurrentVisibleSet` -- because `.hidden`/`.lost` is the
+    /// ACTIONABLE reason an anchored annotation dropped out of the visible
+    /// set (see `failureReasons(for:)`'s "do not emit a second, misleading
+    /// geometry failure" layering, just like `windowserver_bounds_mismatch`
+    /// already does for a missing WindowServer entry): a caller told
+    /// `anchor_window_hidden` knows to wait for the target window to
+    /// reappear, while a bare `annotation_not_in_current_visible_set` gives
+    /// no hint that an anchor -- not app linkage, not suspension -- is why.
+    let anchorState: AnchorTrackingState?
+
+    init(
+        annotationExists: Bool,
+        annotationIsInCurrentVisibleSet: Bool,
+        annotationsSuspended: Bool,
+        overlayWindowExists: Bool,
+        contentViewIsExpectedOverlayView: Bool,
+        viewIsAttachedToWindow: Bool,
+        appKitWindowIsVisible: Bool,
+        appKitFrameMatchesExpectedScreen: Bool,
+        windowServerEntryFoundInAllWindows: Bool,
+        windowServerEntryFoundInOnScreenList: Bool,
+        windowServerBoundsMatchExpectedDisplay: Bool,
+        appKitAlpha: Double?,
+        windowServerAlpha: Double?,
+        appKitLevel: Int?,
+        windowServerLayer: Int?,
+        expectedAlpha: Double,
+        expectedLevel: Int,
+        anchorState: AnchorTrackingState? = nil
+    ) {
+        self.annotationExists = annotationExists
+        self.annotationIsInCurrentVisibleSet = annotationIsInCurrentVisibleSet
+        self.annotationsSuspended = annotationsSuspended
+        self.overlayWindowExists = overlayWindowExists
+        self.contentViewIsExpectedOverlayView = contentViewIsExpectedOverlayView
+        self.viewIsAttachedToWindow = viewIsAttachedToWindow
+        self.appKitWindowIsVisible = appKitWindowIsVisible
+        self.appKitFrameMatchesExpectedScreen = appKitFrameMatchesExpectedScreen
+        self.windowServerEntryFoundInAllWindows = windowServerEntryFoundInAllWindows
+        self.windowServerEntryFoundInOnScreenList = windowServerEntryFoundInOnScreenList
+        self.windowServerBoundsMatchExpectedDisplay = windowServerBoundsMatchExpectedDisplay
+        self.appKitAlpha = appKitAlpha
+        self.windowServerAlpha = windowServerAlpha
+        self.appKitLevel = appKitLevel
+        self.windowServerLayer = windowServerLayer
+        self.expectedAlpha = expectedAlpha
+        self.expectedLevel = expectedLevel
+        self.anchorState = anchorState
+    }
 }
 
 enum PresentationReadiness {
@@ -61,7 +112,9 @@ enum PresentationReadiness {
 
         var failures: [String] = []
         if !input.annotationExists { failures.append("annotation_not_found") }
-        if !input.annotationIsInCurrentVisibleSet { failures.append("annotation_not_in_current_visible_set") }
+        if !input.annotationIsInCurrentVisibleSet {
+            failures.append(visibilityAbsenceReason(anchorState: input.anchorState))
+        }
         if !input.overlayWindowExists { failures.append("overlay_window_missing") }
         if !input.contentViewIsExpectedOverlayView { failures.append("overlay_content_view_mismatch") }
         if !input.viewIsAttachedToWindow { failures.append("overlay_view_detached") }
@@ -81,6 +134,88 @@ enum PresentationReadiness {
         if input.appKitLevel != input.expectedLevel { failures.append("appkit_window_level_mismatch") }
         if input.windowServerLayer != input.expectedLevel { failures.append("windowserver_layer_mismatch") }
         return failures
+    }
+
+    /// Chooses the failure code for an annotation missing from the current
+    /// visible set. `anchor_window_hidden`/`anchor_window_lost` are emitted
+    /// INSTEAD OF the bare `annotation_not_in_current_visible_set` whenever an
+    /// anchor's tracked window explains the absence -- the SAME "do not emit
+    /// a second, misleading failure" layering `failureReasons(for:)` already
+    /// applies to `windowserver_bounds_mismatch` above: the anchor reason is
+    /// the ACTIONABLE one (the target window is minimised/hidden/gone), and
+    /// the visible-set absence is merely its consequence. A `nil`/`.tracking`
+    /// anchor state falls back to the original, unanchored-annotation code.
+    ///
+    /// Pulled out as its own pure function -- rather than inlined at
+    /// `failureReasons(for:)`'s one call site -- so the Windows branch of
+    /// `OverlayWindowController+Diagnostics.swift` (which builds its failure
+    /// list by hand instead of going through `PresentationReadinessInput`)
+    /// can share the exact same decision instead of restating it.
+    static func visibilityAbsenceReason(anchorState: AnchorTrackingState?) -> String {
+        switch anchorState {
+        case .some(.hidden): return "anchor_window_hidden"
+        case .some(.lost): return "anchor_window_lost"
+        case .some(.tracking), .none: return "annotation_not_in_current_visible_set"
+        }
+    }
+
+    /// Fixed, factual prose distinguishing what `presentationReady` DOES
+    /// prove (this window's own registration/drawable state) from what it
+    /// says NOTHING about (whether an independent capture pipeline -- another
+    /// application's screenshot tool -- composites these annotations into its
+    /// own output). This is the user-facing half of the fix for the reported
+    /// bug in CAPTURE_GAP.md: `verify_presentation` used to report
+    /// `presentationReady: true` while saying nothing about capture
+    /// exclusion, which is exactly how an agent burned an afternoon
+    /// confidently annotating a window whose pixels a DIFFERENT capture tool
+    /// was never going to see.
+    ///
+    /// Conditioned only on whether exclusion is CURRENTLY in force
+    /// (`excludesFromCapture`, from the same `CaptureExclusionPolicy.Decision`
+    /// `captureExclusion` is built from -- see `PresentationCaptureExclusionSummary`)
+    /// so the two fields cannot describe two different states.
+    static func captureHonestyNote(excludesFromCapture: Bool) -> String {
+        excludesFromCapture
+            ? "presentationReady describes this window's own registration/drawable state and says NOTHING about what an independent capture pipeline composites. Exclusion is currently in force (see captureExclusion): another application's screenshot will NOT contain these annotations even while presentationReady is true. Call set_capture_visible(true) to lift it, or use get_annotation_bounds to answer a placement question without needing the overlay in anyone's pixels."
+            : "presentationReady describes this window's own registration/drawable state and says NOTHING about what an independent capture pipeline composites. Exclusion is not currently in force (see captureExclusion), but any capture path may still filter this window on its own criteria -- presentationReady is not proof of inclusion in one. get_annotation_bounds answers a placement question without needing the overlay in anyone's pixels."
+    }
+}
+
+/// `verify_presentation`'s capture-honesty block: the SAME capture-exclusion
+/// decision the app already computes for `get_screens`/`get_overlay_state`/
+/// `set_capture_visible` (`OverlayWindowController.captureExclusionDecision`,
+/// backed by `CaptureExclusionPolicy`), restated here in the identical shape
+/// those tools already emit under their own `captureExclusion` key so a
+/// caller reading several tools' output sees one consistent field, not a
+/// second independently-shaped summary of the same fact.
+public struct PresentationCaptureExclusionSummary: Codable, Equatable {
+    public let excludesFromCapture: Bool
+    public let reasonCode: String
+    public let signals: [String]
+    public let environmentVariable: String
+    public let note: String
+
+    public init(excludesFromCapture: Bool, reasonCode: String, signals: [String], environmentVariable: String, note: String) {
+        self.excludesFromCapture = excludesFromCapture
+        self.reasonCode = reasonCode
+        self.signals = signals
+        self.environmentVariable = environmentVariable
+        self.note = note
+    }
+
+    /// Restates a live `CaptureExclusionPolicy.Decision` -- the app's ONE
+    /// computation of this decision, already used by `get_screens`/
+    /// `get_overlay_state`/`set_capture_visible` -- in this wire shape.
+    /// `OverlayWindowController+Diagnostics.swift`'s `presentationStatus(for:)`
+    /// is the one caller, and it passes `OverlayWindowController.shared
+    /// .captureExclusionDecision` straight through rather than recomputing
+    /// anything.
+    public init(decision: CaptureExclusionPolicy.Decision) {
+        self.excludesFromCapture = decision.excludesFromCapture
+        self.reasonCode = decision.reasonCode
+        self.signals = decision.signals
+        self.environmentVariable = CaptureExclusionPolicy.environmentVariableName
+        self.note = decision.explanation
     }
 }
 
@@ -201,4 +336,21 @@ struct PresentationStatus: Codable, Equatable {
     let presentationReady: Bool
     let failureReasons: [String]
     let note: String
+    /// The SAME capture-exclusion decision `get_screens`/`get_overlay_state`/
+    /// `set_capture_visible` already report -- restated here, not
+    /// recomputed, via `PresentationCaptureExclusionSummary.init(decision:)` --
+    /// so a caller reading only `verify_presentation` still learns whether an
+    /// independent capture pipeline (another application's screenshot tool)
+    /// would composite these annotations at all. Always present: this
+    /// decision is a live, global process state, not something that depends
+    /// on whether `annotationId` resolved.
+    let captureExclusion: PresentationCaptureExclusionSummary
+    /// See `PresentationReadiness.captureHonestyNote(excludesFromCapture:)`.
+    /// Spelled out as its own field, separate from `note` above (which is
+    /// about THIS window's registration evidence), because the two say
+    /// different things: `note` explains what evidence backs
+    /// `presentationReady`; `captureHonestyNote` explains what
+    /// `presentationReady` does NOT tell you about a capture pipeline it
+    /// never consults.
+    let captureHonestyNote: String
 }

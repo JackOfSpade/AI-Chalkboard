@@ -797,6 +797,106 @@ final class AccessibilityElementResolverTests: XCTestCase {
         }
     }
 
+    // MARK: - AccessibilityFrameDisplaySelection: `.largestOverlap` vs. the
+    // `.requireContainment` default
+    //
+    // `.largestOverlap` exists for `TargetWindowProbe.swift`'s window
+    // geometry (a window is routinely dragged across a display boundary or
+    // pushed partly off the desktop edge, unlike a UI element), and it must
+    // NOT change `backingRect`'s behaviour for any EXISTING caller: every
+    // test above this section calls `backingRect` with no `selection`
+    // argument at all and must keep passing unmodified, which is itself the
+    // proof that the default stayed `.requireContainment` byte-for-byte.
+    // Windows-only note: `AccessibilityFrameDisplaySelection` is duplicated,
+    // per-platform, with the Windows `backingRect` comparing against
+    // `windowServerFrame` with no bottom-left flip and no zero-origin-anchor
+    // requirement (see this file's header comment on why five earlier
+    // coordinate tests are macOS-only for the same reason) -- exercising the
+    // TWO-DISPLAY straddling/off-edge scenarios below through that different
+    // arithmetic would need its own, separately-derived expected numbers, so
+    // this section stays macOS-only rather than forcing artificial parity.
+    #if os(macOS)
+    func testLargestOverlapPicksTheDisplayWithMoreOverlapWhenStraddlingTwoDisplays() throws {
+        let left = screen(id: "left", appKitFrame: ScreenCoordinateRect(x: 0, y: 0, width: 1_000, height: 800), scale: 1)
+        let right = screen(id: "right", appKitFrame: ScreenCoordinateRect(x: 1_000, y: 0, width: 1_000, height: 800), scale: 1)
+        // Global top-left frame x:900-1150 straddles the x=1000 boundary:
+        // 100pt overlap with `left`, 150pt overlap with `right` -- `right`
+        // must win.
+        let frame = AccessibilityScreenRect(x: 900, y: 100, width: 250, height: 100)
+
+        XCTAssertNil(
+            AccessibilityElementResolver.backingRect(forAccessibilityFrame: frame, screens: [left, right]),
+            "The default policy must still reject a frame fully contained by neither display."
+        )
+
+        let result = try XCTUnwrap(AccessibilityElementResolver.backingRect(
+            forAccessibilityFrame: frame, screens: [left, right], selection: .largestOverlap
+        ))
+        XCTAssertEqual(result.screenId, "right")
+        // Negative x is EXPECTED here, not a bug: `right`'s own origin sits
+        // at global x=1000, and this window's left edge (global x=900) is
+        // 100pt to the left of that -- see `.largestOverlap`'s doc comment
+        // on why the result is deliberately left unclipped.
+        XCTAssertEqual(result.x, -100)
+        XCTAssertEqual(result.y, 100)
+        XCTAssertEqual(result.width, 250)
+        XCTAssertEqual(result.height, 100)
+    }
+
+    func testLargestOverlapStillRejectsAFrameThatOverlapsNoDisplayAtAll() {
+        let left = screen(id: "left", appKitFrame: ScreenCoordinateRect(x: 0, y: 0, width: 1_000, height: 800), scale: 1)
+        let right = screen(id: "right", appKitFrame: ScreenCoordinateRect(x: 1_000, y: 0, width: 1_000, height: 800), scale: 1)
+        let farAway = AccessibilityScreenRect(x: 5_000, y: 5_000, width: 100, height: 100)
+
+        XCTAssertNil(AccessibilityElementResolver.backingRect(forAccessibilityFrame: farAway, screens: [left, right]))
+        XCTAssertNil(AccessibilityElementResolver.backingRect(
+            forAccessibilityFrame: farAway, screens: [left, right], selection: .largestOverlap
+        ))
+    }
+
+    func testLargestOverlapAgreesWithRequireContainmentWhenFullyInsideOneDisplay() throws {
+        let left = screen(id: "left", appKitFrame: ScreenCoordinateRect(x: 0, y: 0, width: 1_000, height: 800), scale: 1)
+        let right = screen(id: "right", appKitFrame: ScreenCoordinateRect(x: 1_000, y: 0, width: 1_000, height: 800), scale: 1)
+        let frame = AccessibilityScreenRect(x: 100, y: 100, width: 200, height: 150)
+
+        let contained = try XCTUnwrap(AccessibilityElementResolver.backingRect(forAccessibilityFrame: frame, screens: [left, right]))
+        let overlap = try XCTUnwrap(AccessibilityElementResolver.backingRect(
+            forAccessibilityFrame: frame, screens: [left, right], selection: .largestOverlap
+        ))
+        XCTAssertEqual(contained, overlap, "A frame that already sits wholly inside one display must convert identically under either policy.")
+        XCTAssertEqual(contained.screenId, "left")
+    }
+
+    func testLargestOverlapMapsAFrameHangingOffTheDesktopsRightEdgeWhichRequireContainmentRejects() throws {
+        let left = screen(id: "left", appKitFrame: ScreenCoordinateRect(x: 0, y: 0, width: 1_000, height: 800), scale: 1)
+        let right = screen(id: "right", appKitFrame: ScreenCoordinateRect(x: 1_000, y: 0, width: 1_000, height: 800), scale: 1)
+        // Global top-left frame x:1900-2100 -- mostly on `right` (whose
+        // desktop-space extent ends at x=2000) but pushed 100pt past its
+        // right edge, off the desktop entirely. An everyday window position
+        // (a window dragged to the far edge of the rightmost monitor), not a
+        // pathological one.
+        let frame = AccessibilityScreenRect(x: 1_900, y: 100, width: 200, height: 100)
+
+        XCTAssertNil(
+            AccessibilityElementResolver.backingRect(forAccessibilityFrame: frame, screens: [left, right]),
+            "requireContainment must still reject a frame that is not FULLY inside any one display."
+        )
+
+        let result = try XCTUnwrap(AccessibilityElementResolver.backingRect(
+            forAccessibilityFrame: frame, screens: [left, right], selection: .largestOverlap
+        ))
+        XCTAssertEqual(result.screenId, "right")
+        XCTAssertEqual(result.x, 900)
+        XCTAssertEqual(result.y, 100)
+        // Width is reported in full (200), even though `right` is only
+        // 1000pt/px wide and this rect's far edge (x=900+200=1100) extends
+        // 100 past it -- deliberately unclipped, per `.largestOverlap`'s doc
+        // comment.
+        XCTAssertEqual(result.width, 200)
+        XCTAssertEqual(result.height, 100)
+    }
+    #endif
+
     // MARK: - Ambiguity candidates carry geometry, so `occurrence` is not blind
     //
     // The BFS that POPULATES `AccessibilityElementCandidate.backingFrame` is a
@@ -987,4 +1087,31 @@ final class AccessibilityElementResolverTests: XCTestCase {
                            "expected match \(occurrence) named in: \(note ?? "<nil>")")
         }
     }
+
+    // MARK: - AccessibilityElementResolverError.workerPoolExhausted (Windows CHALK_ERR_UIA_TOO_MANY_PENDING)
+    //
+    // Regression coverage for a documented shim status
+    // (CHALK_ERR_UIA_TOO_MANY_PENDING = -309, chalkboard_win.h) that used to
+    // have no Swift case at all: a -309 fell into `resolve()`'s `default:`
+    // and was reported as `.invalidRequest`, whose wording tells the caller
+    // their REQUEST was malformed when the request was fine and the shim
+    // was simply out of UIA worker threads. `resolve()` itself cannot be
+    // exercised here (it calls into the live, Windows-only shim), so this
+    // pins the one piece that IS pure Swift: the case's own message, which
+    // must actually describe worker-pool exhaustion and must NOT tell the
+    // caller to just retry immediately, since the header documents this
+    // status as explicitly non-retryable.
+    #if os(Windows)
+    func testWorkerPoolExhaustedDescribesNonRetryableExhaustionNotAMalformedRequest() throws {
+        let message = try XCTUnwrap(AccessibilityElementResolverError.workerPoolExhausted.errorDescription)
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("worker"),
+                       "must name the actual cause (worker pool exhaustion), not a generic status: \(message)")
+        XCTAssertFalse(message.localizedCaseInsensitiveContains("invalid"),
+                       "must not read as a malformed-request diagnosis: \(message)")
+        XCTAssertTrue(message.localizedCaseInsensitiveContains("not") && message.localizedCaseInsensitiveContains("retry"),
+                       "must disclose that this is NOT worth retrying immediately: \(message)")
+        XCTAssertTrue(message.contains("verify_annotation"),
+                       "must point to a concrete fallback confirmed the usual way: \(message)")
+    }
+    #endif
 }

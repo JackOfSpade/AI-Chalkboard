@@ -462,4 +462,118 @@ final class MCPShapeGeometryTests: XCTestCase {
         }
     }
 
+    // MARK: - HighlightOutlineGeometry.rebuiltKind: the element anchor tracker's new surface
+
+    /// A distinctively-styled `.vectorPath` highlight kind, as if
+    /// `update_annotation` had restyled it after creation -- every style
+    /// field here is deliberately unlike any `makeHighlightStyle` default,
+    /// so a test that finds these exact values in the rebuilt kind knows
+    /// they came from `existing`, not from some fallback.
+    private func makeRestyledVectorPathKind(data: String = "M 0.0 0.0 H 1.0 V 1.0 H 0.0 Z") -> AnnotationKind {
+        .vectorPath(
+            data: data,
+            strokeColorHex: "#123456",
+            strokeWidth: 12.5,
+            strokeOpacity: 0.42,
+            fillColorHex: "#ABCDEF",
+            fillOpacity: 0.77,
+            dash: [3, 1, 4],
+            usesEvenOddFillRule: true,
+            coordinateScaleX: 1,
+            coordinateScaleY: 1
+        )
+    }
+
+    private func makeElementSpec(shape: String = "rect", paddingPx: Double = 8) -> AnchorElementSpec {
+        AnchorElementSpec(
+            label: "Render",
+            role: nil,
+            matchMode: "exact",
+            occurrence: 1,
+            maxNodes: 10_000,
+            timeoutSeconds: 2.0,
+            shape: shape,
+            paddingPx: paddingPx
+        )
+    }
+
+    /// Every style field on the restyled kind above must survive the rebuild
+    /// untouched, and `data` must be regenerated from `newFrame`/`spec`,
+    /// exactly matching what `HighlightOutlineGeometry.pathData` computes
+    /// directly for the same inputs -- not the original (now stale) `data`.
+    func testRebuiltKindPreservesEveryStyleFieldFromTheExistingKindWhileRegeneratingData() throws {
+        let existing = makeRestyledVectorPathKind()
+        let spec = makeElementSpec(shape: "ellipse", paddingPx: 8)
+        let newFrame = CGRect(x: 100, y: 200, width: 300, height: 80)
+
+        let rebuilt = try XCTUnwrap(HighlightOutlineGeometry.rebuiltKind(from: existing, spec: spec, newFrame: newFrame))
+        guard case .vectorPath(
+            let data, let strokeColorHex, let strokeWidth, let strokeOpacity,
+            let fillColorHex, let fillOpacity, let dash, let usesEvenOddFillRule,
+            let scaleX, let scaleY
+        ) = rebuilt else {
+            return XCTFail("expected a vector path")
+        }
+
+        let expectedData = try XCTUnwrap(HighlightOutlineGeometry.pathData(
+            shape: .ellipse, frameX: 100, frameY: 200, frameWidth: 300, frameHeight: 80, padding: 8
+        ))
+        XCTAssertEqual(data, expectedData)
+        XCTAssertNotEqual(data, "M 0.0 0.0 H 1.0 V 1.0 H 0.0 Z", "must not keep the stale path")
+
+        XCTAssertEqual(strokeColorHex, "#123456")
+        XCTAssertEqual(strokeWidth, 12.5)
+        XCTAssertEqual(strokeOpacity, 0.42)
+        XCTAssertEqual(fillColorHex, "#ABCDEF")
+        XCTAssertEqual(fillOpacity, 0.77)
+        XCTAssertEqual(dash, [3, 1, 4])
+        XCTAssertEqual(usesEvenOddFillRule, true)
+        XCTAssertEqual(scaleX, 1)
+        XCTAssertEqual(scaleY, 1)
+    }
+
+    /// `.text`/`.image`/`.batch` kinds have no vector path to regenerate --
+    /// `element` mode is `highlight_element`-only, so a caller anchoring
+    /// something else must never reach this far, but the function itself
+    /// must still refuse rather than fabricate a path.
+    func testRebuiltKindReturnsNilForANonVectorPathKind() {
+        let textKind = AnnotationKind.text(
+            text: "hello", x: 0, y: 0, fontSize: 12, textColorHex: "#FFFFFF",
+            backgroundColorHex: nil, backgroundOpacity: 0, paddingPx: 0, opacity: 1
+        )
+        let result = HighlightOutlineGeometry.rebuiltKind(
+            from: textKind, spec: makeElementSpec(), newFrame: CGRect(x: 0, y: 0, width: 100, height: 100)
+        )
+        XCTAssertNil(result)
+    }
+
+    /// A degenerate re-resolved frame (here: zero-width/height at zero
+    /// padding, so the padded bounds stay zero too -- the same
+    /// "non-positive extent" condition `pathData` rejects) must fail the
+    /// rebuild instead of installing a collapsed outline. (Padding alone
+    /// cannot be used to manufacture this case: a positive `padding_px`
+    /// would inflate a zero-size frame into positive padded bounds, which is
+    /// exactly why `paddingPx: 0` is required here.)
+    func testRebuiltKindReturnsNilForAnUnusableFrame() {
+        let existing = makeRestyledVectorPathKind()
+        let result = HighlightOutlineGeometry.rebuiltKind(
+            from: existing, spec: makeElementSpec(paddingPx: 0),
+            newFrame: CGRect(x: 100, y: 200, width: 0, height: 0)
+        )
+        XCTAssertNil(result)
+    }
+
+    /// `AnchorElementSpec.shape` is a raw, unvalidated wire string (see that
+    /// type's own doc comment); a value that does not map onto
+    /// `HighlightOutlineGeometry.Shape` must be refused, not silently treated
+    /// as `.rect`.
+    func testRebuiltKindReturnsNilForAnUnrecognisedShapeString() {
+        let existing = makeRestyledVectorPathKind()
+        let result = HighlightOutlineGeometry.rebuiltKind(
+            from: existing, spec: makeElementSpec(shape: "triangle"),
+            newFrame: CGRect(x: 100, y: 200, width: 300, height: 80)
+        )
+        XCTAssertNil(result)
+    }
+
 }

@@ -201,6 +201,15 @@ extension MCPServer {
                     "environmentVariable": CaptureExclusionPolicy.environmentVariableName,
                     "note": captureExclusionNote
                 ],
+                // Lets an agent tell "tracking is live" from "tracking is
+                // idle" without guessing -- see `anchorTrackingJSON`'s doc
+                // comment and MCP_SURFACE.md's `get_overlay_state` section.
+                // Always present, even when nothing is anchored at all
+                // (every count reads 0 and both millisecond fields read
+                // JSON `null`), per the design contract's "honest
+                // reporting" invariant: this object never claims continuous
+                // tracking that is not happening.
+                "anchorTracking": anchorTrackingJSON(AnchorTracker.shared.statusSummary()),
                 "note": suspensionNote
             ]
             guard let text = jsonString(payload) else {
@@ -393,6 +402,16 @@ extension MCPServer {
 
         case "verify_annotation":
             handleVerifyAnnotation(id: id, args: args)
+
+        // Deliberately adjacent to the two verify_* cases rather than filed
+        // with the read-only get_* tools: it answers the same "did this land
+        // where I meant it to" question they do, but without capturing
+        // anything. That matters because it is the ONLY one of the three that
+        // still works when the caller's own screenshot tool cannot see the
+        // overlay at all -- see this tool's own doc comment, and the README's
+        // "Verifying placement when the overlay is not in your screenshot".
+        case "get_annotation_bounds":
+            handleGetAnnotationBounds(id: id, args: args)
 
         case "verify_presentation":
             guard let annotationId = (args["annotation_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),

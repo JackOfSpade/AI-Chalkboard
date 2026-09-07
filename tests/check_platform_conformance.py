@@ -43,6 +43,8 @@ PROTOCOLS = {
     "DrawingContext": ("Sources/Overlay/DrawingContext.swift",
                        ["Sources/Overlay/CoreGraphicsDrawingContext.swift",
                         "Sources/Overlay/GDIPlusDrawingContext.swift"]),
+    "TargetWindowSampling": ("Sources/Overlay/TargetWindowProbe.swift",
+                             ["Sources/Overlay/TargetWindowProbe.swift"]),
 }
 
 FUNC_RE = re.compile(r"^\s*(?:@\w+\s+)*(?:public\s+|internal\s+|private\s+|fileprivate\s+|open\s+)?(?:static\s+|class\s+|mutating\s+)*func\s+(\w+)\s*\((.*)\)", re.S)

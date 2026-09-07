@@ -17,7 +17,8 @@ final class PresentationDiagnosticsTests: XCTestCase {
         appKitAlpha: Double? = 1,
         serverAlpha: Double? = 1,
         appKitLevel: Int? = 25,
-        serverLayer: Int? = 25
+        serverLayer: Int? = 25,
+        anchorState: AnchorTrackingState? = nil
     ) -> PresentationReadinessInput {
         PresentationReadinessInput(
             annotationExists: annotationExists,
@@ -36,7 +37,8 @@ final class PresentationDiagnosticsTests: XCTestCase {
             appKitLevel: appKitLevel,
             windowServerLayer: serverLayer,
             expectedAlpha: 1,
-            expectedLevel: 25
+            expectedLevel: 25,
+            anchorState: anchorState
         )
     }
 
@@ -152,5 +154,117 @@ final class PresentationDiagnosticsTests: XCTestCase {
         XCTAssertEqual(entry.alpha, 1)
         XCTAssertEqual(entry.isOnScreen, true)
         XCTAssertEqual(entry.bounds, PresentationRect(x: 10, y: 20, width: 30, height: 40))
+    }
+
+    // MARK: - anchor_window_hidden / anchor_window_lost layering
+
+    /// The bare code for an UNANCHORED annotation (or one whose anchor is
+    /// still `.tracking`) is unchanged: this is the pre-existing behaviour
+    /// `testReducerReportsIndependentWindowServerAndViewFailures` already
+    /// pins, repeated here explicitly against the new `anchorState`
+    /// parameter's two "no substitution" values.
+    func testUnanchoredOrTrackingAnchorKeepsTheBareVisibleSetFailure() {
+        XCTAssertEqual(
+            PresentationReadiness.failureReasons(for: input(visible: false, anchorState: nil)),
+            ["annotation_not_in_current_visible_set"]
+        )
+        XCTAssertEqual(
+            PresentationReadiness.failureReasons(for: input(visible: false, anchorState: .tracking)),
+            ["annotation_not_in_current_visible_set"]
+        )
+    }
+
+    /// THE LAYERING FIX: a `.hidden` anchor state is the ACTIONABLE reason
+    /// the annotation dropped out of the visible set (its target window is
+    /// minimised/on another Space/its app is hidden), so it is reported
+    /// INSTEAD OF the bare, less useful `annotation_not_in_current_visible_set` --
+    /// the same "do not emit a second, misleading failure" layering this file
+    /// already applies to `windowserver_bounds_mismatch`.
+    func testHiddenAnchorReplacesTheBareVisibleSetFailure() {
+        let failures = PresentationReadiness.failureReasons(for: input(visible: false, anchorState: .hidden))
+        XCTAssertEqual(failures, ["anchor_window_hidden"])
+        XCTAssertFalse(failures.contains("annotation_not_in_current_visible_set"),
+                       "the bare code must not also be emitted alongside the actionable anchor reason")
+    }
+
+    /// Same layering for `.lost`: the target window is gone (or a recycled
+    /// id now belongs to a different app), which is permanent and distinct
+    /// from `.hidden`'s "temporarily off screen".
+    func testLostAnchorReplacesTheBareVisibleSetFailure() {
+        let failures = PresentationReadiness.failureReasons(for: input(visible: false, anchorState: .lost))
+        XCTAssertEqual(failures, ["anchor_window_lost"])
+        XCTAssertFalse(failures.contains("annotation_not_in_current_visible_set"))
+    }
+
+    /// The substitution is scoped to the visible-set slot only: every other
+    /// independent failure (WindowServer entry, alpha, level, ...) must still
+    /// be reported alongside it, exactly as `testReducerReportsIndependentWindowServerAndViewFailures`
+    /// pins for the unanchored case.
+    func testAnchorFailureCoexistsWithOtherIndependentFailures() {
+        let failures = PresentationReadiness.failureReasons(for: input(
+            visible: false, appKitVisible: false, allEntry: false, onScreenEntry: false, anchorState: .hidden
+        ))
+        XCTAssertEqual(failures, [
+            "anchor_window_hidden",
+            "appkit_window_not_visible",
+            "windowserver_entry_missing",
+            "windowserver_window_not_on_screen"
+        ])
+    }
+
+    /// Suspension still outranks everything, including an anchor state --
+    /// the existing `annotations_suspended`-only layering
+    /// (`testReducerReportsOnlyDedicatedReasonForIntentionalSuspension`) must
+    /// not gain a competing anchor code.
+    func testSuspensionStillOutranksAnAnchorState() {
+        XCTAssertEqual(
+            PresentationReadiness.failureReasons(for: input(
+                visible: false, annotationsSuspended: true, anchorState: .hidden
+            )),
+            ["annotations_suspended"]
+        )
+    }
+
+    func testVisibilityAbsenceReasonPureMapping() {
+        XCTAssertEqual(PresentationReadiness.visibilityAbsenceReason(anchorState: nil), "annotation_not_in_current_visible_set")
+        XCTAssertEqual(PresentationReadiness.visibilityAbsenceReason(anchorState: .tracking), "annotation_not_in_current_visible_set")
+        XCTAssertEqual(PresentationReadiness.visibilityAbsenceReason(anchorState: .hidden), "anchor_window_hidden")
+        XCTAssertEqual(PresentationReadiness.visibilityAbsenceReason(anchorState: .lost), "anchor_window_lost")
+    }
+
+    // MARK: - Capture-honesty block (`captureExclusion` / `captureHonestyNote`)
+
+    func testCaptureExclusionSummaryRestatesADecisionWithoutRecomputing() {
+        let decision = CaptureExclusionPolicy.Decision.includeSuppressedForRemoteSession(signals: ["Parsec (parsecd)"])
+        let summary = PresentationCaptureExclusionSummary(decision: decision)
+        XCTAssertEqual(summary.excludesFromCapture, false)
+        XCTAssertEqual(summary.reasonCode, "included-suppressed-remote-session")
+        XCTAssertEqual(summary.signals, ["Parsec (parsecd)"])
+        XCTAssertEqual(summary.environmentVariable, CaptureExclusionPolicy.environmentVariableName)
+        XCTAssertEqual(summary.note, decision.explanation)
+    }
+
+    func testCaptureExclusionSummaryForOrdinaryExcludedDesktop() {
+        let summary = PresentationCaptureExclusionSummary(decision: .exclude)
+        XCTAssertEqual(summary.excludesFromCapture, true)
+        XCTAssertEqual(summary.reasonCode, "excluded")
+        XCTAssertEqual(summary.signals, [])
+    }
+
+    /// The note must be FACTUAL and CONDITIONED on the live decision, never a
+    /// static claim that could contradict `captureExclusion.excludesFromCapture`
+    /// in the same response -- the exact bug CAPTURE_GAP.md reports
+    /// (`presentationReady: true` with no mention of capture exclusion at
+    /// all).
+    func testCaptureHonestyNoteDiffersByExclusionStateAndNamesTheRemedy() {
+        let excluded = PresentationReadiness.captureHonestyNote(excludesFromCapture: true)
+        XCTAssertTrue(excluded.contains("will NOT contain"), excluded)
+        XCTAssertTrue(excluded.contains("set_capture_visible(true)"), excluded)
+        XCTAssertTrue(excluded.contains("get_annotation_bounds"), excluded)
+
+        let included = PresentationReadiness.captureHonestyNote(excludesFromCapture: false)
+        XCTAssertFalse(included.contains("will NOT contain"), included)
+        XCTAssertTrue(included.contains("get_annotation_bounds"), included)
+        XCTAssertNotEqual(excluded, included)
     }
 }

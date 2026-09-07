@@ -591,6 +591,50 @@ def main():
         assert {"draw_path", "draw_shape", "draw_image", "draw_text", "draw_batch", "suspend_annotations", "resume_annotations", "verify_annotation", "verify_presentation"}.issubset(tools)
         assert not {"draw_circle", "draw_arrow", "draw_box", "draw_label", "draw_grid"}.intersection(tools)
 
+        print("\n2a. Testing 'get_overlay_state's anchorTracking object before any draw/suspend/resume call...", flush=True)
+        # No draw_*, suspend_annotations, or resume_annotations request has
+        # been sent yet, and no draw call in this whole script ever creates a
+        # REAL window anchor (every anchor="window" request exercised below is
+        # a deterministic rejection) -- so anchored/tracking/hidden/lost must
+        # all be exactly zero for the rest of this run, and with nothing ever
+        # anchored, AnchorTracker's sampling timer never starts: sampleIntervalMs
+        # must stay real JSON null (parsed here to Python None, not an absent
+        # key and not the string "null") for the rest of the script too -- see
+        # jsonValue(_ value: Int?) in MCPToolHandlers+Payloads.swift, the one
+        # place that widening happens.
+        #
+        # lastSampleAgeMs is deliberately NOT pinned to null here:
+        # AnchorTracker.shared.kick() -- which stamps a fresh sample time even
+        # when there is nothing anchored to sample, see performTick()'s early
+        # `guard !snapshots.isEmpty` branch -- fires on any real
+        # NSWorkspace.didActivateApplicationNotification, including one this
+        # freshly-launched process can trigger for itself while creating its
+        # own overlay window. That already happens before this very first
+        # tools/call on some machines/timings, so both null and a small
+        # non-negative age are legitimate, non-flaky observations; only the
+        # TYPE is pinned here. Section 12 below separately proves the
+        # populated case is real once resume_annotations' own kick() has
+        # unambiguously fired.
+        early_overlay_state_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "get_overlay_state", "arguments": {}},
+        }, args.timeout)
+        early_overlay_state = json.loads(early_overlay_state_res["result"]["content"][0]["text"])
+        assert "anchorTracking" in early_overlay_state, early_overlay_state
+        early_anchor_tracking = early_overlay_state["anchorTracking"]
+        assert set(early_anchor_tracking.keys()) == {
+            "anchored", "tracking", "hidden", "lost", "sampleIntervalMs", "lastSampleAgeMs",
+        }, early_anchor_tracking
+        assert early_anchor_tracking["anchored"] == 0, early_anchor_tracking
+        assert early_anchor_tracking["tracking"] == 0, early_anchor_tracking
+        assert early_anchor_tracking["hidden"] == 0, early_anchor_tracking
+        assert early_anchor_tracking["lost"] == 0, early_anchor_tracking
+        assert early_anchor_tracking["sampleIntervalMs"] is None, early_anchor_tracking
+        early_last_sample_age = early_anchor_tracking["lastSampleAgeMs"]
+        assert early_last_sample_age is None or (
+            isinstance(early_last_sample_age, int) and early_last_sample_age >= 0
+        ), early_anchor_tracking
+
         print("\n3. Testing SVG 'draw_path' for a free-drawn circle...", flush=True)
         path_res = send_request(proc, reader, {
             "jsonrpc": "2.0",
@@ -1004,7 +1048,341 @@ def main():
         assert not any(annotation.get("appId") == "com.example.ClearTarget" for annotation in after_clear)
         assert any(annotation.get("appId") == "com.example.PreserveTarget" for annotation in after_clear)
 
-        print("\nAll draw, shape, suspension/resume, persistence-metadata, annotation-list, image-verification, and explicit-clear MCP tests PASSED!", flush=True)
+        print("\n9. Testing anchor/anchor_resize rejection paths on draw_path (deterministic, no live window needed)...", flush=True)
+        # Every rejection below is pure string/appId validation that runs
+        # BEFORE any process or window lookup -- see DrawRequest
+        # .parseAnchorArguments's own doc comment -- so it needs no live
+        # target window and is exactly as deterministic as any other
+        # argument-shape rejection already covered above.
+        # sendErrorResult always prepends "Error: " to the message text (see
+        # MCPServer.sendErrorResult); every literal below matches the full
+        # wire text, not just MCP_SURFACE.md's bare message.
+        anchor_resize_reject_text = (
+            "Error: anchor_resize is only valid with anchor=\"window\": it selects how a drawing reacts to "
+            "its anchor window being resized, and there is no anchor window without one. Nothing was "
+            "drawn; remove anchor_resize, or add anchor=\"window\"."
+        )
+        anchor_resize_without_anchor_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_path", "arguments": {
+                "path_data": "M 10 10 L 20 20", "app": "", "anchor_resize": "pin",
+            }},
+        }, args.timeout)
+        assert anchor_resize_without_anchor_res["result"].get("isError") is True, anchor_resize_without_anchor_res
+        assert anchor_resize_without_anchor_res["result"]["content"][0]["text"] == anchor_resize_reject_text
+
+        anchor_resize_with_none_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_path", "arguments": {
+                "path_data": "M 10 10 L 20 20", "app": "", "anchor": "none", "anchor_resize": "scale",
+            }},
+        }, args.timeout)
+        assert anchor_resize_with_none_res["result"].get("isError") is True, anchor_resize_with_none_res
+        assert anchor_resize_with_none_res["result"]["content"][0]["text"] == anchor_resize_reject_text, (
+            "explicit anchor=\"none\" must reject anchor_resize with the identical literal text as an absent anchor"
+        )
+
+        unknown_anchor_reject_text = "Error: anchor must be one of \"none\", \"window\" when supplied."
+        unknown_anchor_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_path", "arguments": {
+                "path_data": "M 10 10 L 20 20", "app": "", "anchor": "sideways",
+            }},
+        }, args.timeout)
+        assert unknown_anchor_res["result"].get("isError") is True, unknown_anchor_res
+        assert unknown_anchor_res["result"]["content"][0]["text"] == unknown_anchor_reject_text
+
+        non_string_anchor_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_path", "arguments": {
+                "path_data": "M 10 10 L 20 20", "app": "", "anchor": 42,
+            }},
+        }, args.timeout)
+        assert non_string_anchor_res["result"].get("isError") is True, non_string_anchor_res
+        assert non_string_anchor_res["result"]["content"][0]["text"] == unknown_anchor_reject_text, (
+            "a non-string anchor must be rejected with the same literal text as an unrecognised string value"
+        )
+
+        # app="" is a GLOBAL/untagged drawing -- no appId at all -- so this
+        # rejects before any process/window enumeration ever runs (see
+        # DrawRequest.resolveWindowAnchor's `guard let appId else` branch)
+        # and is therefore just as deterministic as the four checks above,
+        # despite naming "a target application".
+        window_anchor_on_global_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_path", "arguments": {
+                "path_data": "M 10 10 L 20 20", "app": "", "anchor": "window",
+            }},
+        }, args.timeout)
+        assert window_anchor_on_global_res["result"].get("isError") is True, window_anchor_on_global_res
+        assert window_anchor_on_global_res["result"]["content"][0]["text"] == (
+            "Error: anchor=\"window\" requires a target application, because it anchors the drawing to one "
+            "of that application's windows. Nothing was drawn; pass app explicitly, or draw without "
+            "anchor to place this at fixed display coordinates."
+        )
+
+        print("\n10. Testing highlight_element's three-value anchor validation and anchor_resize rejection...", flush=True)
+        # highlight_element validates anchor/anchor_resize itself, BEFORE
+        # resolving any running process or touching Accessibility (see
+        # parseHighlightAnchorArguments's own doc comment) -- so, like
+        # section 9 above, none of this needs a live target app.
+        highlight_non_string_anchor_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "highlight_element", "arguments": {
+                "label": "Anchor Validation Probe", "anchor": 7,
+            }},
+        }, args.timeout)
+        assert highlight_non_string_anchor_res["result"].get("isError") is True, highlight_non_string_anchor_res
+        highlight_unknown_anchor_reject_text = "Error: anchor must be one of \"element\", \"window\", \"none\" when supplied."
+        assert highlight_non_string_anchor_res["result"]["content"][0]["text"] == highlight_unknown_anchor_reject_text
+
+        highlight_unknown_anchor_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "highlight_element", "arguments": {
+                "label": "Anchor Validation Probe", "anchor": "diagonal",
+            }},
+        }, args.timeout)
+        assert highlight_unknown_anchor_res["result"].get("isError") is True, highlight_unknown_anchor_res
+        assert highlight_unknown_anchor_res["result"]["content"][0]["text"] == highlight_unknown_anchor_reject_text
+
+        for anchor_value in ("element", "none"):
+            highlight_resize_res = send_request(proc, reader, {
+                "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+                "params": {"name": "highlight_element", "arguments": {
+                    "label": "Anchor Validation Probe", "anchor": anchor_value, "anchor_resize": "scale",
+                }},
+            }, args.timeout)
+            assert highlight_resize_res["result"].get("isError") is True, (anchor_value, highlight_resize_res)
+            assert highlight_resize_res["result"]["content"][0]["text"] == anchor_resize_reject_text, anchor_value
+
+        # anchor omitted defaults to "element" (MCP_SURFACE.md's default
+        # table -- the opposite default from every draw_* tool), so
+        # anchor_resize must be rejected identically even with no explicit
+        # anchor argument at all.
+        highlight_default_anchor_resize_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "highlight_element", "arguments": {
+                "label": "Anchor Validation Probe", "anchor_resize": "pin",
+            }},
+        }, args.timeout)
+        assert highlight_default_anchor_resize_res["result"].get("isError") is True, highlight_default_anchor_resize_res
+        assert highlight_default_anchor_resize_res["result"]["content"][0]["text"] == anchor_resize_reject_text
+
+        print("\n11. Testing 'list_annotations' omits the anchor key entirely for an unanchored drawing...", flush=True)
+        unanchored_probe_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_path", "arguments": {
+                "path_data": "M 5 5 L 15 15", "app": "", "stroke_color": "#123456",
+            }},
+        }, args.timeout)
+        unanchored_probe_text = unanchored_probe_res["result"]["content"][0]["text"]
+        unanchored_probe_id = unanchored_probe_text.split("annotation: ", 1)[1].split()[0]
+        unanchored_list_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "list_annotations", "arguments": {}},
+        }, args.timeout)
+        unanchored_list = json.loads(unanchored_list_res["result"]["content"][0]["text"])["annotations"]
+        unanchored_entry = next((a for a in unanchored_list if a.get("id") == unanchored_probe_id), None)
+        assert unanchored_entry is not None, unanchored_list
+        # The contract is "omitted, never null": an agent branches on
+        # presence alone, so a stray `"anchor": null` would be just as much
+        # of a regression as a fabricated `{"mode": "none"}` placeholder.
+        assert "anchor" not in unanchored_entry, (
+            f"an ordinary unanchored annotation must OMIT the anchor key entirely: {unanchored_entry!r}"
+        )
+
+        print("\n12. Testing 'get_overlay_state' still reports anchorTracking correctly after resume_annotations' kick()...", flush=True)
+        overlay_state_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "get_overlay_state", "arguments": {}},
+        }, args.timeout)
+        overlay_state = json.loads(overlay_state_res["result"]["content"][0]["text"])
+        assert "anchorTracking" in overlay_state, overlay_state
+        anchor_tracking = overlay_state["anchorTracking"]
+        assert set(anchor_tracking.keys()) == {
+            "anchored", "tracking", "hidden", "lost", "sampleIntervalMs", "lastSampleAgeMs",
+        }, anchor_tracking
+        # No call anywhere in this script ever creates a REAL window anchor
+        # (every anchor="window" request above is a deterministic rejection),
+        # so every count must still be exactly zero and no sampling timer is
+        # running -- sampleIntervalMs must still serialize as real JSON null
+        # (parsed here to Python None). But section 6a's resume_annotations
+        # already called AnchorTracker.shared.kick() (see
+        # OverlayWindowController.setAnnotationsSuspended's doc comment: every
+        # resume kicks one immediate sample so a moved window is corrected
+        # promptly), and performTick() records lastTickAt even when there is
+        # nothing anchored to sample -- so unlike section 2a's genuinely
+        # first-ever check above, lastSampleAgeMs here is a real, present,
+        # non-negative JSON number, NOT null. Together, 2a and this section
+        # pin BOTH serializations of the same optional field.
+        assert anchor_tracking["anchored"] == 0, anchor_tracking
+        assert anchor_tracking["tracking"] == 0, anchor_tracking
+        assert anchor_tracking["hidden"] == 0, anchor_tracking
+        assert anchor_tracking["lost"] == 0, anchor_tracking
+        assert anchor_tracking["sampleIntervalMs"] is None, anchor_tracking
+        assert isinstance(anchor_tracking["lastSampleAgeMs"], int) and anchor_tracking["lastSampleAgeMs"] >= 0, (
+            anchor_tracking
+        )
+
+        print("\n13. Testing 'get_annotation_bounds' backing-pixel geometry, screenshot-space scaling, and the both-or-neither rejection...", flush=True)
+        bounds_rect = {"x": 80, "y": 60, "width": 160, "height": 100}
+        bounds_draw_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_shape", "arguments": {
+                "shape": "rect",
+                "x": bounds_rect["x"], "y": bounds_rect["y"],
+                "width": bounds_rect["width"], "height": bounds_rect["height"],
+                "stroke_width": 0, "fill_color": "#00FF00", "fill_opacity": 1,
+                "app": "",
+            }},
+        }, args.timeout)
+        bounds_draw_text = bounds_draw_res["result"]["content"][0]["text"]
+        bounds_annotation_id = bounds_draw_text.split("annotation: ", 1)[1].split()[0]
+
+        def bounds_rect_close(actual, expected, tolerance, context):
+            for key in ("x", "y", "width", "height"):
+                assert abs(actual[key] - expected[key]) <= tolerance, (key, actual, expected, context)
+
+        backing_bounds_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "get_annotation_bounds", "arguments": {
+                "annotation_id": bounds_annotation_id,
+            }},
+        }, args.timeout)
+        assert not backing_bounds_res["result"].get("isError", False), backing_bounds_res
+        backing_bounds = json.loads(backing_bounds_res["result"]["content"][0]["text"])
+        print("get_annotation_bounds (backing only):", json.dumps(backing_bounds, sort_keys=True), flush=True)
+        assert backing_bounds["annotationId"] == bounds_annotation_id
+        assert backing_bounds["screenId"] == main_screen["id"]
+        assert "anchor" not in backing_bounds, "a plain fill-only rect has no anchor to report"
+        # A fill-only rect (stroke_width=0) painted at an integer backing-pixel
+        # rect should come back matching the drawn geometry almost exactly;
+        # the small tolerance only absorbs edge anti-aliasing.
+        bounds_rect_close(backing_bounds["paintedBoundsBackingPx"], bounds_rect, 1.5, "fill-only rect, no stroke overflow")
+
+        both_or_neither_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "get_annotation_bounds", "arguments": {
+                "annotation_id": bounds_annotation_id, "screenshot_width": preview_width,
+            }},
+        }, args.timeout)
+        assert both_or_neither_res["result"].get("isError") is True, both_or_neither_res
+        assert both_or_neither_res["result"]["content"][0]["text"] == (
+            "Error: screenshot_width and screenshot_height must be supplied together (both, or neither): "
+            "one is meaningless without the other for mapping bounds into that screenshot's pixel space."
+        )
+
+        screenshot_bounds_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "get_annotation_bounds", "arguments": {
+                "annotation_id": bounds_annotation_id,
+                "screenshot_width": preview_width, "screenshot_height": preview_height,
+            }},
+        }, args.timeout)
+        assert not screenshot_bounds_res["result"].get("isError", False), screenshot_bounds_res
+        screenshot_bounds = json.loads(screenshot_bounds_res["result"]["content"][0]["text"])
+        scale_x = preview_width / main_screen["widthPx"]
+        scale_y = preview_height / main_screen["heightPx"]
+        assert abs(screenshot_bounds["screenshotScale"]["x"] - scale_x) < 1e-9
+        assert abs(screenshot_bounds["screenshotScale"]["y"] - scale_y) < 1e-9
+        expected_screenshot_rect = {
+            "x": backing_bounds["paintedBoundsBackingPx"]["x"] * scale_x,
+            "y": backing_bounds["paintedBoundsBackingPx"]["y"] * scale_y,
+            "width": backing_bounds["paintedBoundsBackingPx"]["width"] * scale_x,
+            "height": backing_bounds["paintedBoundsBackingPx"]["height"] * scale_y,
+        }
+        bounds_rect_close(
+            screenshot_bounds["paintedBoundsScreenshotPx"], expected_screenshot_rect, 1.5, "screenshot-space scaling"
+        )
+
+        print("\n13a. Testing the target_bounds_screenshot_px offset-correction round trip actually closes the placement loop...", flush=True)
+        painted_screenshot = screenshot_bounds["paintedBoundsScreenshotPx"]
+        target_bounds_screenshot_px = {
+            "x": painted_screenshot["x"] + 30, "y": painted_screenshot["y"] + 20,
+            "width": painted_screenshot["width"], "height": painted_screenshot["height"],
+        }
+        correction_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "get_annotation_bounds", "arguments": {
+                "annotation_id": bounds_annotation_id,
+                "screenshot_width": preview_width, "screenshot_height": preview_height,
+                "target_bounds_screenshot_px": target_bounds_screenshot_px,
+            }},
+        }, args.timeout)
+        assert not correction_res["result"].get("isError", False), correction_res
+        correction_payload = json.loads(correction_res["result"]["content"][0]["text"])
+        print("get_annotation_bounds correction:", json.dumps(correction_payload, sort_keys=True), flush=True)
+        assert abs(correction_payload["targetDeltaScreenshotPx"]["dx"] - 30) < 0.05
+        assert abs(correction_payload["targetDeltaScreenshotPx"]["dy"] - 20) < 0.05
+        correction = correction_payload["correctionBackingPx"]
+        assert isinstance(correction["offsetX"], (int, float))
+        assert isinstance(correction["offsetY"], (int, float))
+
+        # THE round trip: feed the ABSOLUTE offset_x/offset_y straight into
+        # update_annotation exactly as an agent would (these REPLACE the
+        # stored offset; they are not a delta to add), then re-query bounds
+        # and confirm the painted centre actually landed on the target. This
+        # is what proves the whole "verify placement without the overlay in
+        # your screenshot" loop closes end to end, not just that the
+        # arithmetic is self-consistent.
+        apply_correction_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "update_annotation", "arguments": {
+                "annotation_id": bounds_annotation_id,
+                "offset_x": correction["offsetX"], "offset_y": correction["offsetY"],
+            }},
+        }, args.timeout)
+        assert not apply_correction_res["result"].get("isError", False), apply_correction_res
+        # Unanchored annotations keep update_annotation's plain-text response
+        # byte-for-byte -- the same regression guard as draw_*'s own
+        # unanchored response (see section 14 below).
+        assert apply_correction_res["result"]["content"][0]["text"] == f"Updated annotation {bounds_annotation_id} in place."
+
+        reverify_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "get_annotation_bounds", "arguments": {
+                "annotation_id": bounds_annotation_id,
+                "screenshot_width": preview_width, "screenshot_height": preview_height,
+            }},
+        }, args.timeout)
+        assert not reverify_res["result"].get("isError", False), reverify_res
+        reverified_rect = json.loads(reverify_res["result"]["content"][0]["text"])["paintedBoundsScreenshotPx"]
+        reverified_center = (
+            reverified_rect["x"] + reverified_rect["width"] / 2,
+            reverified_rect["y"] + reverified_rect["height"] / 2,
+        )
+        target_center = (
+            target_bounds_screenshot_px["x"] + target_bounds_screenshot_px["width"] / 2,
+            target_bounds_screenshot_px["y"] + target_bounds_screenshot_px["height"] / 2,
+        )
+        assert abs(reverified_center[0] - target_center[0]) <= 1.5, (reverified_center, target_center)
+        assert abs(reverified_center[1] - target_center[1]) <= 1.5, (reverified_center, target_center)
+
+        print("\n14. Testing every UNANCHORED draw_*/update_annotation response stays byte-identical plain text (no JSON)...", flush=True)
+        # Existing callers -- including this very script's `"annotation: "`
+        # splitting above -- parse this response as a bare string, so an
+        # unanchored call silently switching to a JSON payload is a real
+        # regression, not a cosmetic change.
+        for tool_label, response_text in [
+            ("draw_path (section 3)", path_text),
+            ("draw_shape (section 3a)", shape_text),
+            ("draw_image (section 4)", image_res["result"]["content"][0]["text"]),
+            ("draw_text (section 5)", text_draw_message),
+            ("draw_path (section 11 probe)", unanchored_probe_text),
+            ("draw_shape (section 13 probe)", bounds_draw_text),
+        ]:
+            assert isinstance(response_text, str) and response_text.startswith("Created "), (tool_label, response_text)
+            try:
+                json.loads(response_text)
+            except json.JSONDecodeError:
+                pass
+            else:
+                raise AssertionError(
+                    f"{tool_label}'s unanchored response parsed as JSON; it must remain plain text "
+                    f"since existing callers parse it with a bare string split: {response_text!r}"
+                )
+
+        print("\nAll draw, shape, suspension/resume, persistence-metadata, annotation-list, image-verification, explicit-clear, window-anchoring-validation, and annotation-bounds MCP tests PASSED!", flush=True)
     except Exception:
         failed = True
         raise

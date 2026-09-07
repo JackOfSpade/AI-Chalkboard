@@ -266,6 +266,24 @@ public final class ActiveAppTracker: NSObject {
         // `OverlayWindowController.setup()`, and assigning it here would clobber
         // the repaint-on-mutation path. We call the controller directly instead.
         OverlayWindowController.shared.refreshViews()
+
+        // An app-scoped anchored annotation is not painted while its app is in
+        // the background (see `AnnotationStore.isVisible`'s app filter). Its
+        // window can still move during that time -- `AnchorTracker` has no
+        // notion of which app is frontmost and keeps polling every anchored
+        // window regardless -- but with nothing on screen to reveal it, the
+        // tracker's own cadence backs off toward `.idle` (as slow as 1
+        // sample/s) exactly like any other stretch with no observed change,
+        // so a move late in that window can be up to a full idle interval
+        // stale by the time the app is back in front. Sampling immediately
+        // here forces a fresh read right as the app becomes visible again,
+        // instead of waiting out whatever cadence the tracker happened to be
+        // at. This narrows the window, it does not close it: `kick()` only
+        // enqueues a sample onto `AnchorTracker`'s own serial queue and
+        // returns immediately (see its doc comment), so one stale frame is
+        // still possible if this activation's repaint above is serviced
+        // before that enqueued sample completes.
+        AnchorTracker.shared.kick()
     }
 
     /// Folds a newly-frontmost app into `current` and `fallback`, applying the
@@ -914,6 +932,21 @@ public final class ActiveAppTracker {
             // and the same reason it is not routed through
             // `AnnotationStore.onStoreChanged` -- see that branch's comment.
             OverlayWindowController.shared.refreshViews()
+
+            // Gated on `changed`, same as the repaint just above and for the
+            // same reason: `EVENT_SYSTEM_FOREGROUND` also fires on a
+            // window-level focus move WITHIN one already-frontmost app (two
+            // Chrome windows, a modal dialog), which is not "the app came back
+            // from the background" and has nothing stale to correct. When the
+            // tracked app identity genuinely changes, see the macOS branch's
+            // identical `kick()` call in `appDidActivate` for the full
+            // rationale (an app-scoped anchor is not painted while its app is
+            // backgrounded, so a move made during that stretch can be as
+            // stale as `AnchorTracker`'s idle cadence by the time the app is
+            // frontmost again) and the same honest caveat: this narrows the
+            // stale-position window, it does not close it, because `kick()`
+            // only enqueues a sample and returns immediately.
+            AnchorTracker.shared.kick()
         }
     }
 

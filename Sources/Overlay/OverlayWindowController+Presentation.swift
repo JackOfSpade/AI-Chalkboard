@@ -284,6 +284,27 @@ extension OverlayWindowController {
                 orderAllWindowsOffScreen()
             } else {
                 refreshViewsNow()
+
+                // Nothing about `AnchorTracker`'s own sampling loop is paused
+                // or resumed by suspension -- it has no notion of
+                // "suspended" and keeps polling every anchored annotation's
+                // window on its own cadence throughout. What suspension DOES
+                // do is stop repainting, which creates the same class of
+                // problem app backgrounding creates for `ActiveAppTracker`'s
+                // activation handlers (see `AnchorTracker.shared.kick()`'s
+                // call sites there): whatever cadence the tracker had backed
+                // off to (as slow as 1 sample/s at `.idle`) while nothing was
+                // being painted, that lag was invisible with nothing on
+                // screen to reveal it. Kicking here forces one fresh sample
+                // right as painting resumes, so the first frame drawn after
+                // resume is far less likely to show a stale position than
+                // whatever the idle cadence's next scheduled tick would have
+                // produced. Same honest caveat as those call sites: this
+                // narrows the window, it does not close it -- `kick()` only
+                // enqueues a sample onto `AnchorTracker`'s own serial queue
+                // and returns immediately, so one stale frame is still
+                // possible.
+                AnchorTracker.shared.kick()
             }
 
             // A same-value, same-generation reapplication is a self-heal (see

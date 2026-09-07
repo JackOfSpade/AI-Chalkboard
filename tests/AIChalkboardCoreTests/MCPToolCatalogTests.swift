@@ -19,7 +19,7 @@ final class MCPToolCatalogTests: XCTestCase {
     func testToolNamesAndOrderAreExactlyTheFreeDrawSurface() {
         XCTAssertEqual(MCPToolCatalog.tools.map { $0["name"] as? String }, [
             "get_screens", "get_overlay_state", "get_accessibility_status", "draw_path", "draw_shape", "draw_image", "draw_text", "highlight_element", "draw_batch", "update_annotation", "suspend_annotations", "resume_annotations", "clear", "list_annotations",
-            "verify_annotation", "verify_presentation", "get_active_app", "set_capture_visible"
+            "verify_annotation", "verify_presentation", "get_annotation_bounds", "get_active_app", "set_capture_visible"
         ])
     }
 
@@ -38,6 +38,50 @@ final class MCPToolCatalogTests: XCTestCase {
             XCTAssertEqual((props["app"] as? [String: Any])?["type"] as? String, "string")
             XCTAssertEqual((props["screen_id"] as? [String: Any])?["maxLength"] as? Int, 128)
         }
+    }
+
+    /// `anchor`/`anchor_resize` are advertised on every `draw_*` tool
+    /// (top-level, via `sharedDrawProperties`) with the exact enum values and
+    /// defaults MCP_SURFACE.md specifies, and are NOT advertised as a
+    /// per-item key on `draw_batch`'s flat item schema -- an anchor is one
+    /// per ANNOTATION, not per batch item, so a batch item cannot supply its
+    /// own.
+    func testEveryFreeDrawToolAdvertisesAnchorAndAnchorResize() throws {
+        for name in ["draw_path", "draw_shape", "draw_image", "draw_text", "draw_batch"] {
+            let props = properties(try XCTUnwrap(toolsByName[name], name))
+            let anchor = try XCTUnwrap(props["anchor"] as? [String: Any], "\(name) is missing 'anchor'")
+            XCTAssertEqual(anchor["type"] as? String, "string", name)
+            XCTAssertEqual(anchor["enum"] as? [String], ["none", "window"], name)
+            let anchorResize = try XCTUnwrap(props["anchor_resize"] as? [String: Any], "\(name) is missing 'anchor_resize'")
+            XCTAssertEqual(anchorResize["type"] as? String, "string", name)
+            XCTAssertEqual(anchorResize["enum"] as? [String], ["pin", "scale"], name)
+        }
+        let batchItemProperties = MCPToolCatalog.batchItemProperties
+        XCTAssertNil(batchItemProperties["anchor"], "draw_batch items must not carry their own anchor -- anchoring is per annotation, not per item")
+        XCTAssertNil(batchItemProperties["anchor_resize"])
+    }
+
+    /// The catalog description guidance MCP_SURFACE.md specifies: what the
+    /// value does, when to choose each `anchor_resize` policy, and that
+    /// style dimensions stay backing pixels under both policies. Checked
+    /// once against `draw_path`'s copy since `sharedDrawProperties` is one
+    /// shared dictionary reused verbatim by all five tools.
+    func testAnchorDescriptionsAnswerTheCatalogGuidanceQuestions() throws {
+        let props = properties(try XCTUnwrap(toolsByName["draw_path"]))
+        let anchorDescription = try XCTUnwrap(props["anchor"] as? [String: Any])["description"] as? String ?? ""
+        XCTAssertTrue(anchorDescription.contains("moves"), "anchor description must say what happens when the window moves")
+        XCTAssertTrue(anchorDescription.localizedCaseInsensitiveContains("sampled"),
+                      "anchor description must state that tracking is sampled, not event-driven")
+        XCTAssertTrue(anchorDescription.contains("trails"),
+                      "anchor description must say the drawing trails the window while actively dragged")
+
+        let resizeDescription = try XCTUnwrap(props["anchor_resize"] as? [String: Any])["description"] as? String ?? ""
+        XCTAssertTrue(resizeDescription.contains("toolbar") || resizeDescription.contains("chrome") || resizeDescription.localizedCaseInsensitiveContains("chrome"),
+                      "anchor_resize description must say when to choose pin (window chrome)")
+        XCTAssertTrue(resizeDescription.localizedCaseInsensitiveContains("canvas") || resizeDescription.localizedCaseInsensitiveContains("content"),
+                      "anchor_resize description must say when to choose scale (content that scales with the window)")
+        XCTAssertTrue(resizeDescription.contains("stroke width") && resizeDescription.contains("font size") && resizeDescription.contains("padding"),
+                      "anchor_resize description must say stroke width/font size/padding stay backing pixels under both policies")
     }
 
     func testRequiredArraysMatchTheThreeFreeDrawTools() {

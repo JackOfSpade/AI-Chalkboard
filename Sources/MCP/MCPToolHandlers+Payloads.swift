@@ -27,6 +27,17 @@ extension MCPServer {
         return value
     }
 
+    /// Same `NSNull`-widening trick as `jsonValue(_ value: String?)` above,
+    /// for an optional integer -- `get_overlay_state`'s new `anchorTracking`
+    /// object is this file's first caller with an `Int?` that must serialize
+    /// as an explicit JSON `null` (rather than an absent key) when there is
+    /// no sampling timer running yet, or no sample has completed yet. See
+    /// `anchorTrackingJSON(_:)`.
+    func jsonValue(_ value: Int?) -> Any {
+        guard let value = value else { return NSNull() }
+        return value
+    }
+
     /// Encodes a `Codable` value and immediately decodes it back through
     /// `JSONSerialization`, producing plain `[String: Any]`/`[Any]`-shaped
     /// data. Used where an `Encodable` model (`[ScreenInfo]`, an
@@ -151,6 +162,39 @@ extension MCPServer {
             )
             object["type"] = annotation.kind.typeName
             object["scope"] = annotation.appId == nil ? "global" : "app-linked"
+            // Replace the raw Codable-encoded `anchor`/`staticAdjustment`/
+            // `anchorProjection` keys -- `jsonObject(annotation)` above
+            // already emitted all three, in `Annotation`'s own internal
+            // storage shape -- with the single flat `anchor` object
+            // MCP_SURFACE.md's "Success payload" section specifies, shared
+            // byte-for-byte with `draw_*`/`highlight_element`/
+            // `update_annotation` via `DrawRequest.anchorResponsePayload`
+            // (see that function's own doc comment for why reusing it,
+            // rather than re-deriving the same shape here, is what keeps
+            // every tool's `anchor` object identically shaped). Unanchored
+            // annotations OMIT the key entirely -- never `null`, never a
+            // `{"mode":"none"}` placeholder -- so a caller can branch on
+            // presence alone. `staticAdjustment` is internal frozen-adjustment
+            // bookkeeping with no place in the documented wire contract, so
+            // it is dropped rather than left to leak through unexplained.
+            object.removeValue(forKey: "staticAdjustment")
+            object.removeValue(forKey: "anchorProjection")
+            object.removeValue(forKey: "anchor")
+            if let anchor = annotation.anchor {
+                // A REAL anchor is never observed with a nil projection --
+                // see `Annotation.anchorPermitsPainting`'s doc comment -- so
+                // this fallback (an identity, just-created-looking
+                // projection) is unreachable outside a hand-built
+                // annotation; it exists so this function never has to
+                // silently drop an anchored annotation's `anchor` key.
+                let projection = annotation.anchorProjection ?? AnchorProjection(
+                    state: .tracking, adjustment: .identity, effectiveScreenId: annotation.screenId,
+                    currentWindowFrame: nil, sampledAt: annotation.createdAt, elementResolutionIssue: nil
+                )
+                object["anchor"] = DrawRequest.anchorResponsePayload(
+                    DrawRequest.DrawAnchorResolution(anchor: anchor, projection: projection)
+                )
+            }
             // Built from the hoisted page snapshot rather than re-reading
             // OverlayWindowController per entry: this is the same rule
             // verify_annotation reports, so it comes from the one shared
@@ -159,7 +203,8 @@ extension MCPServer {
                 annotationsSuspended: annotationsSuspended,
                 captureVisible: captureVisible,
                 annotationAppId: annotation.appId,
-                activeAppId: activeId
+                activeAppId: activeId,
+                anchorPermitsPainting: annotation.anchorPermitsPainting
             )
             object["wouldBeVisibleWithoutSuspension"] = visibility.wouldBeVisibleWithoutSuspension
             object["isVisibleNow"] = visibility.isVisibleNow
@@ -268,6 +313,33 @@ extension MCPServer {
             return .failure("Failed to encode annotation list.")
         }
         return .success(text)
+    }
+
+    /// The `anchorTracking` object `get_overlay_state` adds to its payload
+    /// (see MCP_SURFACE.md's `get_overlay_state` section): a snapshot of
+    /// whether window/element tracking is live right now, sourced from
+    /// `AnchorTracker.shared.statusSummary()`.
+    ///
+    /// Pulled out as its own pure function -- rather than left inline in the
+    /// `get_overlay_state` case body, which writes straight to stdout via
+    /// `sendTextResult` and is therefore not a usable test seam (see
+    /// `MCPShapeGeometryTests`' header comment on why `send*`-adjacent code
+    /// stays untested directly) -- purely so this exact null-vs-value
+    /// serialization is unit-testable without a live MCP round-trip.
+    /// `sampleIntervalMs`/`lastSampleAgeMs` must serialize as a real JSON
+    /// `null`, not an absent key or the string `"null"`, when no timer is
+    /// running or no sample has completed yet -- `jsonValue(_ value: Int?)`
+    /// is the one place that widening happens.
+    // internal: called from handleToolsCall in MCPToolHandlers.swift.
+    func anchorTrackingJSON(_ status: AnchorTrackerStatus) -> [String: Any] {
+        [
+            "anchored": status.anchoredCount,
+            "tracking": status.trackingCount,
+            "hidden": status.hiddenCount,
+            "lost": status.lostCount,
+            "sampleIntervalMs": jsonValue(status.sampleIntervalMs),
+            "lastSampleAgeMs": jsonValue(status.lastSampleAgeMs)
+        ]
     }
 
     /// `get_active_app` output.

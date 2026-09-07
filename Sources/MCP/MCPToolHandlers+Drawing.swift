@@ -1,5 +1,78 @@
 import Foundation
 
+// MARK: - `update_annotation` anchor-patch types
+
+/// `patchedAnnotation`'s result: the fully built replacement `Annotation`,
+/// plus -- for the anchor operations that must REPLACE the tracker's
+/// last-known projection outright (detach, re-anchor, and a resize-policy
+/// change) -- the exact `AnchorProjection` override to install, ATOMICALLY
+/// alongside the replacement itself, through
+/// `AnnotationStore.updateWithOutcome(id:expectedRevision:transform:)`.
+///
+/// WHY THIS EXISTS AT ALL: `AnnotationStore.updateWithOutcome` unconditionally
+/// carries the OLD annotation's `anchorProjection` forward onto ANY
+/// replacement, regardless of what the replacement itself carries (see that
+/// method's own doc comment: exactly right for an ordinary restyle, which has
+/// nothing to say about tracking state). Detaching, re-anchoring, and
+/// rebaselining a resize policy all DO have something to say about it -- each
+/// must make the drawing's painted position hold exactly steady across the
+/// change, which requires either neutralizing the carried-forward projection
+/// (detach) or replacing it with a freshly computed one (re-anchor, resize
+/// rebaseline) -- and the plain replacement has no field that can express
+/// that. `handleUpdateAnnotation` supplies this override via the
+/// transform-based overload's return value, so the store installs both the
+/// replacement and the override in the SAME locked section instead of a
+/// second, later write -- see `finalizeAnchorPatch` below for why a later
+/// write (this type's OWN previous behavior, before this fix) can race a
+/// tracker sample and silently discard it.
+struct AnnotationPatchResult {
+    let annotation: Annotation
+    let projectionOverride: AnchorProjection?
+    /// The anchor intent this patch resolved. `annotation`'s anchor-related
+    /// fields (`screenId`, `anchor`, `staticAdjustment`) and
+    /// `projectionOverride` above are only PROVISIONAL for `.detach`/
+    /// `.reanchor`/`.changeResizePolicy`: they were computed from whatever
+    /// snapshot `patchedAnnotation` was handed, which is not necessarily
+    /// what `AnnotationStore` still holds by the time this patch actually
+    /// commits. `handleUpdateAnnotation` threads this intent into
+    /// `finalizeAnchorPatch`, which RECOMPUTES those fields against the
+    /// live store annotation at commit time -- seeing whatever
+    /// `AnchorTracker` most recently wrote instead of a stale read -- which
+    /// is the actual fix for BUG 1 in the adversarial review this addresses.
+    let anchorIntent: AnchorPatchIntent
+}
+
+/// The four `update_annotation` anchor behaviors, decided purely from
+/// `anchor`/`anchor_resize`'s STRING values plus whether the annotation is
+/// CURRENTLY anchored -- no process lookup, no window sampling. See
+/// `MCPServer.parseAnchorPatch`.
+enum AnchorPatchIntent: Equatable {
+    /// Neither `anchor` nor `anchor_resize` was supplied: every anchor field
+    /// carries forward untouched, exactly as MCP_SURFACE.md's
+    /// `update_annotation` section requires.
+    case unchanged
+    /// `anchor: "none"`: detach and freeze in place.
+    case detach
+    /// `anchor: "window"`, with the effective resize policy -- `.pin` when
+    /// `anchor_resize` was not also supplied, matching every other tool's
+    /// documented default.
+    case reanchor(resize: AnchorResizeBehavior)
+    /// `anchor_resize` alone, with no `anchor` argument, on an ALREADY
+    /// anchored annotation: change the policy in place.
+    case changeResizePolicy(resize: AnchorResizeBehavior)
+}
+
+/// One `update_annotation` anchor operation's resolved effect on the three
+/// fields it can change, plus the projection override to write AFTER the
+/// store update (see `AnnotationPatchResult`'s doc comment for why that
+/// second write exists at all).
+struct AnchorPatchResolution {
+    let screenId: String
+    let anchor: AnnotationAnchor?
+    let staticAdjustment: AnchorAdjustment
+    let projectionOverride: AnchorProjection?
+}
+
 extension MCPServer {
     // MARK: - Free-draw primitives
 
@@ -379,6 +452,7 @@ extension MCPServer {
     }
 
     // internal: called from handleToolsCall in MCPToolHandlers.swift.
+    // internal: called from handleToolsCall in MCPToolHandlers.swift.
     func handleUpdateAnnotation(id: Any, args: [String: Any]) {
         guard let annotationID = (args["annotation_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !annotationID.isEmpty else {
@@ -389,16 +463,36 @@ extension MCPServer {
             sendErrorResult(id: id, text: "Annotation \(annotationID) was not found. It may already have been cleared; call list_annotations for the current set.")
             return
         }
-        let patched: Annotation
+        let patch: AnnotationPatchResult
         switch patchedAnnotation(current, args: args) {
         case .failure(let error): sendErrorResult(id: id, text: error); return
-        case .success(let annotation): patched = annotation
+        case .success(let result): patch = result
         }
-        switch AnnotationStore.shared.updateWithOutcome(
-            id: annotationID, with: patched, expectedRevision: current.revision
-        ) {
+        // Committing through the transform-based overload -- not
+        // `updateWithOutcome(id:with:expectedRevision:)` -- is what fixes
+        // BUG 1: `finalizeAnchorPatch` recomputes `patch`'s freeze-dependent
+        // fields against whatever `AnnotationStore` is ACTUALLY holding for
+        // this id at commit time, under its own lock, instead of trusting
+        // `patch` as built from `current` (a snapshot read before this call
+        // even started). `committedAnchor`/`committedProjection` capture
+        // what the transform decided, purely for the response text below --
+        // the closure runs synchronously, at most once, before
+        // `updateWithOutcome` returns, so reading them afterward is safe.
+        var committedAnchor = patch.annotation.anchor
+        var committedProjection = patch.projectionOverride ?? current.anchorProjection
+        let outcome = AnnotationStore.shared.updateWithOutcome(
+            id: annotationID, expectedRevision: current.revision
+        ) { live in
+            let finalized = finalizeAnchorPatch(patch, live: live)
+            committedAnchor = finalized.annotation.anchor
+            committedProjection = finalized.projection ?? live.anchorProjection
+            return finalized
+        }
+        switch outcome {
         case .updated:
-            sendTextResult(id: id, text: "Updated annotation \(annotationID) in place.")
+            sendTextResult(id: id, text: updateAnnotationResponseText(
+                annotationID: annotationID, anchor: committedAnchor, projection: committedProjection
+            ))
         case .notFound:
             sendErrorResult(id: id, text: "Annotation \(annotationID) was not found; it may have been cleared while this update was being prepared.")
         case .stale:
@@ -421,8 +515,15 @@ extension MCPServer {
         }
     }
 
-    private func patchedAnnotation(_ current: Annotation, args: [String: Any]) -> DrawOutcome<Annotation> {
-        let commonFields: Set<String> = ["annotation_id", "offset_x", "offset_y", "opacity", "z_index"]
+    /// `internal`, not `private`, so it can be exercised directly by
+    /// `UpdateAnnotationAnchorTests` -- matching `MCPShapeGeometryTests`'
+    /// precedent of calling MCPServer's own pure validation helpers
+    /// (`makeShapeKind` et al.) directly rather than only through the live
+    /// stdout transport `handleUpdateAnnotation` writes to (see that test
+    /// file's header comment on why `send*`-adjacent code is not a usable
+    /// test seam).
+    func patchedAnnotation(_ current: Annotation, args: [String: Any]) -> DrawOutcome<AnnotationPatchResult> {
+        let commonFields: Set<String> = ["annotation_id", "offset_x", "offset_y", "opacity", "z_index", "anchor", "anchor_resize"]
         let kindFields: Set<String>
         switch current.kind {
         case .text:
@@ -441,6 +542,19 @@ extension MCPServer {
         guard !supplied.subtracting(["annotation_id"]).isEmpty else {
             return .failure("update_annotation requires at least one patch field in addition to annotation_id.")
         }
+
+        // Pure string validation of `anchor`/`anchor_resize`, BEFORE any of
+        // the heavier per-kind/process/window work below -- the same
+        // "cheap checks first" ordering `DrawRequest.parseAnchorArguments`
+        // documents for draw_*, and for the identical reason: a typo'd enum
+        // value must never trigger a process lookup only to fail afterward
+        // anyway.
+        let anchorIntent: AnchorPatchIntent
+        switch parseAnchorPatch(args, currentlyAnchored: current.anchor != nil) {
+        case .failure(let error): return .failure(error)
+        case .success(let intent): anchorIntent = intent
+        }
+
         if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["offset_x", "offset_y", "opacity"]) {
             return .failure("\(key) must be a finite number when supplied.")
         }
@@ -463,15 +577,354 @@ extension MCPServer {
         case .failure(let error): return .failure(error)
         case .success(let value): kind = value
         }
+
+        // Heavy anchor work (process resolution, window sampling) only NOW
+        // -- after every cheap validation above has already passed --
+        // mirroring `DrawRequest.finish`'s identical ordering rationale.
+        let anchorResolution: AnchorPatchResolution
+        switch resolveAnchorPatch(anchorIntent, current: current) {
+        case .failure(let error): return .failure(error)
+        case .success(let value): anchorResolution = value
+        }
+
         let patched = Annotation(
-            id: current.id, screenId: current.screenId, kind: kind, colorHex: current.colorHex,
+            id: current.id, screenId: anchorResolution.screenId, kind: kind, colorHex: current.colorHex,
             label: current.label, appId: current.appId, appName: current.appName,
             opacity: opacity,
             offsetX: offsetX, offsetY: offsetY,
             zIndex: MCPArgument.integer(args["z_index"]) ?? current.zIndex,
+            anchor: anchorResolution.anchor,
+            staticAdjustment: anchorResolution.staticAdjustment,
             createdAt: current.createdAt
         )
-        return .success(patched)
+        return .success(AnnotationPatchResult(
+            annotation: patched, projectionOverride: anchorResolution.projectionOverride, anchorIntent: anchorIntent
+        ))
+    }
+
+    /// MCP_SURFACE.md's literal text for "`anchor_resize` is REJECTED
+    /// whenever the effective anchor mode is `"none"`" -- the source document
+    /// names THREE trigger conditions for this ONE shared string: an absent
+    /// `anchor` (paired here with an UNANCHORED annotation -- an absent
+    /// `anchor` on an already-anchored one is `.changeResizePolicy`, not a
+    /// rejection), an explicit `anchor="none"`, and `update_annotation`
+    /// detaching. All three ship this exact string, "Nothing was drawn"
+    /// included, because MCP_SURFACE.md gives one literal for every tool
+    /// rather than a per-tool variant.
+    private static let anchorResizeRequiresWindowRejection =
+        "anchor_resize is only valid with anchor=\"window\": it selects how a drawing reacts to its anchor window being resized, and there is no anchor window without one. Nothing was drawn; remove anchor_resize, or add anchor=\"window\"."
+
+    /// Validates ONLY the `anchor`/`anchor_resize` argument STRINGS for
+    /// `update_annotation` -- no process lookup, no window enumeration.
+    /// Mirrors `DrawRequest.parseAnchorArguments`'s "reject before heavier
+    /// work" precedent (see that function's doc comment) for the identical
+    /// reason. `internal`, not `private`, for the same direct-testability
+    /// reason as `patchedAnnotation` above.
+    func parseAnchorPatch(_ args: [String: Any], currentlyAnchored: Bool) -> DrawOutcome<AnchorPatchIntent> {
+        if args.keys.contains("anchor"), !(args["anchor"] is String) {
+            return .failure("anchor must be one of \"none\", \"window\" when supplied.")
+        }
+        let anchorRaw = args["anchor"] as? String
+        if let anchorRaw, anchorRaw != "none", anchorRaw != "window" {
+            return .failure("anchor must be one of \"none\", \"window\" when supplied.")
+        }
+        if args.keys.contains("anchor_resize"), !(args["anchor_resize"] is String) {
+            return .failure("anchor_resize must be one of \"pin\", \"scale\" when supplied.")
+        }
+        let resizeRaw = args["anchor_resize"] as? String
+        if let resizeRaw, resizeRaw != "pin", resizeRaw != "scale" {
+            return .failure("anchor_resize must be one of \"pin\", \"scale\" when supplied.")
+        }
+        let resize: AnchorResizeBehavior? = resizeRaw.map { $0 == "scale" ? .scale : .pin }
+
+        switch anchorRaw {
+        case "none":
+            // `anchor_resize` names a policy for reacting to the anchor
+            // window's resize; detaching leaves no anchor window for it to
+            // apply to, so supplying it here is unambiguous evidence of an
+            // intent this call cannot honour (same reject-over-ignore rule
+            // as `DrawRequest.parseAnchorArguments`).
+            guard resize == nil else {
+                return .failure(Self.anchorResizeRequiresWindowRejection)
+            }
+            return .success(.detach)
+        case "window":
+            return .success(.reanchor(resize: resize ?? .pin))
+        default:
+            // `anchor` was not supplied at all.
+            guard let resize else { return .success(.unchanged) }
+            guard currentlyAnchored else {
+                return .failure(Self.anchorResizeRequiresWindowRejection)
+            }
+            return .success(.changeResizePolicy(resize: resize))
+        }
+    }
+
+    /// The impure half of anchor patching: `.reanchor` resolves a running
+    /// process and samples its windows. This cannot simply call
+    /// `DrawRequest.resolveWindowAnchor` -- that method is `private` to
+    /// `DrawRequest` and is shaped around a brand-NEW annotation being
+    /// created right now (it takes the draw call's own resolved screen and
+    /// freshly parsed `kind`), whereas this call is re-anchoring an EXISTING
+    /// annotation from its current, already-adjusted painted position. The
+    /// pure decision underneath both (`DrawRequest.buildWindowAnchor`) and
+    /// the shared process lookup (`MCPServer.runningProcessIds(forAppId:)`)
+    /// ARE reused, so the two paths cannot silently diverge on which window
+    /// wins or what gets written into the resulting anchor. `internal`, not
+    /// `private`, for the same direct-testability reason as
+    /// `patchedAnnotation` above.
+    func resolveAnchorPatch(_ intent: AnchorPatchIntent, current: Annotation) -> DrawOutcome<AnchorPatchResolution> {
+        switch intent {
+        case .unchanged:
+            return .success(AnchorPatchResolution(
+                screenId: current.screenId, anchor: current.anchor,
+                staticAdjustment: current.staticAdjustment, projectionOverride: nil
+            ))
+
+        case .detach:
+            // DETACH AND FREEZE IN PLACE. Folding the live adjustment into
+            // `staticAdjustment` -- rather than simply dropping `anchor` and
+            // leaving `staticAdjustment` at whatever it was -- is what keeps
+            // `effectiveAdjustment` (and therefore every painted pixel)
+            // numerically IDENTICAL immediately before and after this call:
+            // see `AnchorAdjustment.concatenating(_:)`'s own doc comment for
+            // why composing with `.identity` cannot introduce drift. Also
+            // freezes the current EFFECTIVE screen (not the annotation's
+            // original `screenId`, which is stale if the tracked window had
+            // crossed onto a different display) so the frozen geometry keeps
+            // being interpreted on the display it is actually sitting on.
+            let frozenAdjustment = current.effectiveAdjustment
+            let frozenScreenId = current.effectiveScreenId
+            // `updateWithOutcome` carries the OLD `anchorProjection` forward
+            // unconditionally (see `AnnotationPatchResult`'s doc comment),
+            // which -- left alone -- would double-apply the very adjustment
+            // just folded into `staticAdjustment` above (`effectiveAdjustment`
+            // = `staticAdjustment.concatenating(anchorProjection.adjustment)`
+            // would compose the same delta twice, moving the drawing instead
+            // of freezing it). The override is skipped only when there is
+            // nothing to neutralize: an annotation that was ALREADY
+            // unanchored has no live projection whose composition could
+            // double anything.
+            let override: AnchorProjection? = current.anchor == nil ? nil : AnchorProjection(
+                state: .tracking, adjustment: .identity, effectiveScreenId: frozenScreenId,
+                currentWindowFrame: nil, sampledAt: Date(), elementResolutionIssue: nil
+            )
+            return .success(AnchorPatchResolution(
+                screenId: frozenScreenId, anchor: nil,
+                staticAdjustment: frozenAdjustment, projectionOverride: override
+            ))
+
+        case .reanchor(let resize):
+            guard let appId = current.appId else {
+                return .failure("anchor=\"window\" cannot be applied to a global annotation: it has no target application whose window to anchor to. Re-create the drawing with an app link, or leave it unanchored.")
+            }
+            let displayName = current.appName ?? appId
+            let pids = MCPServer.shared.runningProcessIds(forAppId: appId)
+            guard pids.count == 1, let pid = pids.first else {
+                if pids.isEmpty {
+                    return .failure("anchor=\"window\" requires \(displayName) to be a running application so its windows can be sampled, but no running process matches. The annotation was left unchanged; bring that application to the front and retry, or omit anchor.")
+                }
+                return .failure("anchor=\"window\" cannot choose a window for \(displayName) because it has \(pids.count) running processes and anchoring refuses to guess which one owns the intended window. The annotation was left unchanged; quit the extra instance(s) and retry, or omit anchor.")
+            }
+            let screens = OverlayWindowController.shared.screenSnapshot().screens
+            let samples = TargetWindowProbe.shared.windows(forProcessId: pid, screens: screens)
+            let frozenAdjustment = current.effectiveAdjustment
+            let frozenScreenId = current.effectiveScreenId
+            // The window that should win this contest is whichever one the
+            // drawing is ACTUALLY over right now -- not where it was
+            // originally created, and not its raw stored geometry, which is
+            // pre-adjustment. `PaintedBounds.paintedBounds` gives the stored
+            // (pre-offset, pre-adjustment) bounds; adding the offset and then
+            // applying the CURRENT effective adjustment reproduces exactly
+            // what the renderer paints today (see
+            // `AnnotationRenderer.drawAnnotations`'s "stored geometry ->
+            // + offset -> adjustment" ordering).
+            let storedBounds = PaintedBounds.paintedBounds(of: current.kind) ?? .zero
+            let currentPaintedBounds = frozenAdjustment.apply(
+                to: storedBounds.offsetBy(dx: current.offsetX, dy: current.offsetY)
+            )
+            guard let resolution = DrawRequest.buildWindowAnchor(
+                processId: pid, appId: appId, samples: samples,
+                paintedBounds: currentPaintedBounds, resize: resize, now: Date()
+            ) else {
+                return .failure("anchor=\"window\" found no eligible on-screen window for \(displayName) (pid \(pid)). The annotation was left unchanged: a window anchor with no window would silently behave like an unanchored drawing. Bring a window of that application on screen and retry, or omit anchor.")
+            }
+            // Freeze the PRE-re-anchor position into `staticAdjustment`
+            // FIRST: `buildWindowAnchor` always starts a fresh anchor's
+            // projection at `.identity` (see that function's own doc
+            // comment), so without this fold the drawing would snap back to
+            // its raw, un-adjusted stored position the instant it re-anchors.
+            return .success(AnchorPatchResolution(
+                screenId: frozenScreenId, anchor: resolution.anchor,
+                staticAdjustment: frozenAdjustment, projectionOverride: resolution.projection
+            ))
+
+        case .changeResizePolicy(let resize):
+            guard let existingAnchor = current.anchor else {
+                // Unreachable: `parseAnchorPatch`'s `currentlyAnchored` guard
+                // already rejects this combination before this method is
+                // ever called. Kept as an actionable fallback rather than
+                // `fatalError`, matching this file's standing preference for
+                // failing loudly with text over trapping on a state a future
+                // refactor might make reachable by accident.
+                return .failure("anchor_resize requires an existing anchor, or anchor=\"window\" in the same call. The annotation was left unchanged.")
+            }
+            // Re-baselines `referenceWindowFrame`/`referenceScreenId` to the
+            // window's CURRENT sampled frame (not its ORIGINAL reference
+            // frame) so a resize-policy change does not retroactively
+            // reinterpret however much the window has moved/resized since
+            // the anchor was created, under the NEW policy -- e.g. switching
+            // pin -> scale after the window has doubled in size must not
+            // suddenly double the drawing too. `current.anchorProjection` is
+            // the tracker's live sample; falling back to the anchor's own
+            // reference is only for a hand-built annotation that skipped
+            // ever being sampled (see `Annotation.anchorPermitsPainting`'s
+            // doc comment -- a real anchor never observes this).
+            let referenceFrame = current.anchorProjection?.currentWindowFrame ?? existingAnchor.referenceWindowFrame
+            let referenceScreen = current.anchorProjection?.effectiveScreenId ?? existingAnchor.referenceScreenId
+            let rebaselined = AnnotationAnchor(
+                mode: existingAnchor.mode, resize: resize, target: existingAnchor.target,
+                referenceWindowFrame: referenceFrame, referenceScreenId: referenceScreen,
+                element: existingAnchor.element, createdAt: existingAnchor.createdAt
+            )
+            // Same "freeze then reset to identity against the NEW reference"
+            // shape as `.detach`/`.reanchor` above: folding the live
+            // adjustment into `staticAdjustment` and reporting a fresh
+            // identity projection (reference == current, by construction)
+            // keeps `effectiveAdjustment` numerically unchanged RIGHT NOW,
+            // and lets the very next tracker tick compute a correct delta
+            // from the NEW policy/reference instead of one more tick's worth
+            // of stale drift measured under the OLD policy.
+            let frozenAdjustment = current.effectiveAdjustment
+            let preservedState = current.anchorProjection?.state ?? .tracking
+            let override = AnchorProjection(
+                state: preservedState, adjustment: .identity, effectiveScreenId: referenceScreen,
+                currentWindowFrame: referenceFrame, sampledAt: Date(),
+                elementResolutionIssue: current.anchorProjection?.elementResolutionIssue
+            )
+            return .success(AnchorPatchResolution(
+                screenId: current.effectiveScreenId, anchor: rebaselined,
+                staticAdjustment: frozenAdjustment, projectionOverride: override
+            ))
+        }
+    }
+
+    /// Re-finalizes an anchor patch's freeze-dependent fields against
+    /// `live` -- the annotation `AnnotationStore` is handing this transform
+    /// right now, under its OWN lock -- instead of trusting `patch`, which
+    /// `patchedAnnotation` built from whatever snapshot
+    /// `handleUpdateAnnotation` read BEFORE this commit even started. THIS
+    /// IS THE FIX FOR BUG 1: without it, `staticAdjustment`/the projection
+    /// override were baked from a stale read, so a tracker sample landing in
+    /// the gap between that read and this commit was silently discarded the
+    /// instant the old two-write pattern (see `AnnotationPatchResult`'s doc
+    /// comment) installed the stale numbers over it.
+    ///
+    /// Only called from inside `AnnotationStore.updateWithOutcome(id:
+    /// expectedRevision:transform:)`'s transform, so it MUST stay pure --
+    /// see that method's doc comment for why: no store calls, no
+    /// `notifyChange()`, nothing that could call back into the store while
+    /// its lock is held.
+    ///
+    /// `.reanchor`'s resolved WINDOW (`patch.annotation.anchor`/
+    /// `patch.projectionOverride`) is reused exactly as `patchedAnnotation`
+    /// built it, not re-derived here: it came from `buildWindowAnchor`,
+    /// which depends on sampled OS windows -- impure work this function
+    /// must never perform. That resolved window does not depend on
+    /// `current.anchorProjection` at all (only on `appId`, the sampled
+    /// windows, and the resize policy), so there is nothing about it to
+    /// re-derive against `live`. Only its FREEZE fields
+    /// (`staticAdjustment`/the frozen `screenId`) still need `live`, exactly
+    /// like the other two intents.
+    ///
+    /// `.unchanged`/`.detach`/`.changeResizePolicy` never perform I/O at
+    /// all, so their entire resolution is simply re-run against `live`
+    /// through `resolveAnchorPatch` -- cheap, pure, and the single existing
+    /// source of truth for that freeze arithmetic instead of a second copy
+    /// of it living here. `resolveAnchorPatch`'s only failure path among
+    /// these three (`.changeResizePolicy` when `current.anchor == nil`)
+    /// cannot fire here: `AnnotationStore.updateWithOutcome(id:
+    /// expectedRevision:transform:)` only calls this transform once its own
+    /// compare-and-swap has proven `live` agrees with the snapshot
+    /// `patchedAnnotation` validated against on every field a genuine MCP
+    /// edit (as opposed to a tracker sample) can change -- `anchor`'s
+    /// nil-ness included.
+    func finalizeAnchorPatch(
+        _ patch: AnnotationPatchResult,
+        live: Annotation
+    ) -> (annotation: Annotation, projection: AnchorProjection?) {
+        let resolution: AnchorPatchResolution
+        if case .reanchor = patch.anchorIntent {
+            resolution = AnchorPatchResolution(
+                screenId: live.effectiveScreenId,
+                anchor: patch.annotation.anchor,
+                staticAdjustment: live.effectiveAdjustment,
+                projectionOverride: patch.projectionOverride
+            )
+        } else {
+            switch resolveAnchorPatch(patch.anchorIntent, current: live) {
+            case .success(let value):
+                resolution = value
+            case .failure:
+                // Unreachable in practice -- see this function's own doc
+                // comment for why. Falls back to a true no-op (`live`'s own
+                // anchor state, untouched) rather than a trap, matching this
+                // file's standing preference for failing safe over failing
+                // loud on a state a future refactor might make reachable by
+                // accident (see `resolveAnchorPatch`'s own
+                // `.changeResizePolicy` fallback for the identical
+                // precedent).
+                resolution = AnchorPatchResolution(
+                    screenId: live.effectiveScreenId, anchor: live.anchor,
+                    staticAdjustment: live.staticAdjustment, projectionOverride: nil
+                )
+            }
+        }
+        let finalAnnotation = Annotation(
+            id: patch.annotation.id, screenId: resolution.screenId, kind: patch.annotation.kind,
+            colorHex: patch.annotation.colorHex, label: patch.annotation.label,
+            appId: patch.annotation.appId, appName: patch.annotation.appName,
+            opacity: patch.annotation.opacity, offsetX: patch.annotation.offsetX, offsetY: patch.annotation.offsetY,
+            zIndex: patch.annotation.zIndex, anchor: resolution.anchor, staticAdjustment: resolution.staticAdjustment,
+            createdAt: patch.annotation.createdAt
+        )
+        return (finalAnnotation, resolution.projectionOverride)
+    }
+
+    /// Builds `update_annotation`'s success text: today's exact plain string
+    /// when the patched annotation is unanchored (byte-for-byte, matching
+    /// `DrawRequest.finish`'s identical "unanchored keeps today's response"
+    /// rule -- see that method's own doc comment), or a JSON object carrying
+    /// the same message plus the shared `anchor` block (MCP_SURFACE.md's
+    /// "Success payload" section) when it is anchored, exactly like
+    /// `draw_*`'s own anchored response -- reusing
+    /// `DrawRequest.anchorResponsePayload` so the shape can never drift
+    /// between tools. `projection` is resolved by the caller (the fresh
+    /// override when this call produced one, else whatever was already on
+    /// record), never fabricated here.
+    private func updateAnnotationResponseText(
+        annotationID: String, anchor: AnnotationAnchor?, projection: AnchorProjection?
+    ) -> String {
+        let baseText = "Updated annotation \(annotationID) in place."
+        guard let anchor, let projection else {
+            // `projection == nil` alongside a non-nil `anchor` is
+            // unreachable for a REAL anchor (see
+            // `Annotation.anchorPermitsPainting`'s doc comment: "a real
+            // anchor is never observed with a nil projection"); falls back
+            // to the plain response rather than fabricating placeholder
+            // geometry for a state this type never actually produces on its
+            // own.
+            return baseText
+        }
+        let payload: [String: Any] = [
+            "message": baseText,
+            "annotationId": annotationID,
+            "anchor": DrawRequest.anchorResponsePayload(DrawRequest.DrawAnchorResolution(anchor: anchor, projection: projection))
+        ]
+        guard let jsonText = jsonString(payload) else {
+            return "\(baseText) It is anchored, but the anchor metadata failed to encode in this response. Call list_annotations to inspect it."
+        }
+        return jsonText
     }
 
     private func patchKind(_ current: AnnotationKind, args: [String: Any]) -> DrawOutcome<AnnotationKind> {

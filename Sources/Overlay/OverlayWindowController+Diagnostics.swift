@@ -42,6 +42,17 @@ extension OverlayWindowController {
     /// painted pixel was not occluded or filtered from somebody else's capture.
     func presentationStatus(for annotationId: String) -> PresentationStatus {
         let suspendedWithoutAnnotation = isAnnotationsSuspended
+        // Read ONCE and restated verbatim into every `PresentationStatus`
+        // returned below (found or not): this is the SAME live decision
+        // `get_screens`/`get_overlay_state`/`set_capture_visible` already
+        // compute (`OverlayWindowController.captureExclusionDecision`,
+        // backed by `CaptureExclusionPolicy`), never recomputed here. It is a
+        // global process fact independent of whether `annotationId`
+        // resolves, which is why it is captured before that lookup rather
+        // than inside either branch below.
+        let decision = captureExclusionDecision
+        let captureExclusionSummary = PresentationCaptureExclusionSummary(decision: decision)
+        let captureHonestyNoteText = PresentationReadiness.captureHonestyNote(excludesFromCapture: decision.excludesFromCapture)
         // A stored annotation is unconditionally live. This used to also
         // screen out an annotation whose duration had elapsed but whose
         // removal had not yet run, because a `get` could hand back something
@@ -93,7 +104,9 @@ extension OverlayWindowController {
                 windowServerEntryInOnScreenList: nil,
                 presentationReady: false,
                 failureReasons: failures,
-                note: "The annotation was not found; it was cleared, or the id is wrong. No live overlay window can be expected for it."
+                note: "The annotation was not found; it was cleared, or the id is wrong. No live overlay window can be expected for it.",
+                captureExclusion: captureExclusionSummary,
+                captureHonestyNote: captureHonestyNoteText
             )
         }
 
@@ -102,13 +115,23 @@ extension OverlayWindowController {
             // store's intentionally asynchronous onStoreChanged repaint.
             refreshViewsNow()
 
-            let visibleIDs = Set(currentlyVisibleAnnotations(forScreenId: annotation.screenId).map(\.id))
+            // EFFECTIVE screen, not the creation screen: an anchored
+            // annotation whose tracked window has crossed onto another
+            // display now PAINTS there (see `Annotation.effectiveScreenId`'s
+            // doc comment and `AnnotationStore.getForScreen(_:visibleForApp:)`,
+            // which already filters on this same field) -- comparing against
+            // the stale `screenId` here would check the wrong overlay window
+            // and the wrong target display's geometry for an annotation that
+            // has moved since it was drawn.
+            let effectiveScreenId = annotation.effectiveScreenId
+            let anchorState = annotation.anchorProjection?.state
+            let visibleIDs = Set(currentlyVisibleAnnotations(forScreenId: effectiveScreenId).map(\.id))
             let annotationIsVisible = visibleIDs.contains(annotation.id)
             let annotationsAreSuspended = annotationsSuspended
             let expectedLevel = NSWindow.Level.statusBar.rawValue
             let expectedAlpha = 1.0
 
-            guard let index = overlayViews.firstIndex(where: { $0.screenId == annotation.screenId }),
+            guard let index = overlayViews.firstIndex(where: { $0.screenId == effectiveScreenId }),
                   index < overlayWindows.count else {
                 let input = PresentationReadinessInput(
                     annotationExists: true,
@@ -127,13 +150,14 @@ extension OverlayWindowController {
                     appKitLevel: nil,
                     windowServerLayer: nil,
                     expectedAlpha: expectedAlpha,
-                    expectedLevel: expectedLevel
+                    expectedLevel: expectedLevel,
+                    anchorState: anchorState
                 )
                 let failures = PresentationReadiness.failureReasons(for: input)
                 return PresentationStatus(
                     annotationId: annotation.id,
                     annotationExists: true,
-                    screenId: annotation.screenId,
+                    screenId: effectiveScreenId,
                     annotationIsInCurrentVisibleSet: annotationIsVisible,
                     annotationsSuspended: annotationsAreSuspended,
                     expectedWindowShouldBeOnScreen: annotationIsVisible && !annotationsAreSuspended,
@@ -153,7 +177,9 @@ extension OverlayWindowController {
                     windowServerEntryInOnScreenList: nil,
                     presentationReady: false,
                     failureReasons: failures,
-                    note: "The annotation's display no longer has a retained overlay window."
+                    note: "The annotation's current display (\(effectiveScreenId)) no longer has a retained overlay window.",
+                    captureExclusion: captureExclusionSummary,
+                    captureHonestyNote: captureHonestyNoteText
                 )
             }
 
@@ -187,7 +213,7 @@ extension OverlayWindowController {
             // `get_screens` reports, so a caller comparing this diagnostic
             // against `get_screens` output cannot be reading two independently
             // derived versions of the same monitor's geometry.
-            let targetInfo = buildScreenInfos().first(where: { $0.id == annotation.screenId })
+            let targetInfo = buildScreenInfos().first(where: { $0.id == effectiveScreenId })
             let expectedFrame = targetInfo.map { presentationRect($0.appKitFrame) }
             let expectedWindowServerFrame = targetInfo.flatMap { info -> PresentationRect? in
                 // `ScreenInfo.windowServerFrame` substitutes a synthetic
@@ -234,13 +260,14 @@ extension OverlayWindowController {
                 appKitLevel: window.level.rawValue,
                 windowServerLayer: allEntry?.layer,
                 expectedAlpha: expectedAlpha,
-                expectedLevel: expectedLevel
+                expectedLevel: expectedLevel,
+                anchorState: anchorState
             )
             let failures = PresentationReadiness.failureReasons(for: input)
             return PresentationStatus(
                 annotationId: annotation.id,
                 annotationExists: true,
-                screenId: annotation.screenId,
+                screenId: effectiveScreenId,
                 annotationIsInCurrentVisibleSet: annotationIsVisible,
                 annotationsSuspended: annotationsAreSuspended,
                 expectedWindowShouldBeOnScreen: annotationIsVisible && !annotationsAreSuspended,
@@ -262,7 +289,9 @@ extension OverlayWindowController {
                 failureReasons: failures,
                 note: annotationsAreSuspended
                     ? "Annotations are suspended: their store entries are retained, but every AI Chalkboard overlay window in this process is intentionally ordered out. Call resume_annotations before expecting presentationReady."
-                    : "presentationReady is WindowServer/AppKit registration and drawable-state evidence, including a bounded WindowServer-bounds check against the target display. It is not proof of unoccluded pixels or inclusion in an independent capture pipeline."
+                    : "presentationReady is WindowServer/AppKit registration and drawable-state evidence, including a bounded WindowServer-bounds check against the target display. It is not proof of unoccluded pixels or inclusion in an independent capture pipeline.",
+                captureExclusion: captureExclusionSummary,
+                captureHonestyNote: captureHonestyNoteText
             )
         }
     }
@@ -360,6 +389,14 @@ extension OverlayWindowController {
     /// every result's `note` says so explicitly.
     func presentationStatus(for annotationId: String) -> PresentationStatus {
         let suspendedWithoutAnnotation = isAnnotationsSuspended
+        // Read ONCE, restated verbatim into every `PresentationStatus`
+        // returned below -- see the macOS branch's identical snapshot for why
+        // this is captured before the annotation lookup rather than inside
+        // either branch: it is a global process fact, not tied to whether
+        // `annotationId` resolves.
+        let decision = captureExclusionDecision
+        let captureExclusionSummary = PresentationCaptureExclusionSummary(decision: decision)
+        let captureHonestyNoteText = PresentationReadiness.captureHonestyNote(excludesFromCapture: decision.excludesFromCapture)
         guard let annotation = AnnotationStore.shared.get(id: annotationId) else {
             return PresentationStatus(
                 annotationId: annotationId,
@@ -391,7 +428,9 @@ extension OverlayWindowController {
                 failureReasons: suspendedWithoutAnnotation
                     ? ["annotation_not_found", "annotations_suspended"]
                     : ["annotation_not_found"],
-                note: "The annotation was not found; it was cleared, or the id is wrong. No live overlay window can be expected for it."
+                note: "The annotation was not found; it was cleared, or the id is wrong. No live overlay window can be expected for it.",
+                captureExclusion: captureExclusionSummary,
+                captureHonestyNote: captureHonestyNoteText
             )
         }
 
@@ -401,7 +440,13 @@ extension OverlayWindowController {
             // `onStoreChanged` repaint.
             refreshViewsNow()
 
-            let visibleIDs = Set(currentlyVisibleAnnotations(forScreenId: annotation.screenId).map(\.id))
+            // EFFECTIVE screen, not the creation screen -- same reasoning as
+            // the macOS branch's identical comment: an anchored annotation
+            // whose tracked window has crossed onto another display now
+            // paints THERE.
+            let effectiveScreenId = annotation.effectiveScreenId
+            let anchorState = annotation.anchorProjection?.state
+            let visibleIDs = Set(currentlyVisibleAnnotations(forScreenId: effectiveScreenId).map(\.id))
             let annotationIsVisible = visibleIDs.contains(annotation.id)
             let annotationsAreSuspended = annotationsSuspended
             let expectedAlpha = 1.0
@@ -409,15 +454,15 @@ extension OverlayWindowController {
             // Both rectangles come from the same `buildScreenInfos()` that
             // `get_screens` reports -- same reasoning as the macOS branch's
             // identical comment.
-            let targetInfo = buildScreenInfos().first(where: { $0.id == annotation.screenId })
+            let targetInfo = buildScreenInfos().first(where: { $0.id == effectiveScreenId })
             let expectedFrame = targetInfo.map { presentationRect($0.appKitFrame) }
 
-            guard let window = overlayWindows.first(where: { $0.screenId == annotation.screenId }) else {
+            guard let window = overlayWindows.first(where: { $0.screenId == effectiveScreenId }) else {
                 let failures = annotationsAreSuspended ? ["annotations_suspended"] : ["overlay_window_missing"]
                 return PresentationStatus(
                     annotationId: annotation.id,
                     annotationExists: true,
-                    screenId: annotation.screenId,
+                    screenId: effectiveScreenId,
                     annotationIsInCurrentVisibleSet: annotationIsVisible,
                     annotationsSuspended: annotationsAreSuspended,
                     expectedWindowShouldBeOnScreen: annotationIsVisible && !annotationsAreSuspended,
@@ -437,7 +482,9 @@ extension OverlayWindowController {
                     windowServerEntryInOnScreenList: nil,
                     presentationReady: false,
                     failureReasons: failures,
-                    note: "The annotation's display no longer has a retained overlay window."
+                    note: "The annotation's current display (\(effectiveScreenId)) no longer has a retained overlay window.",
+                    captureExclusion: captureExclusionSummary,
+                    captureHonestyNote: captureHonestyNoteText
                 )
             }
 
@@ -454,7 +501,14 @@ extension OverlayWindowController {
             if annotationsAreSuspended {
                 failures = ["annotations_suspended"]
             } else {
-                if !annotationIsVisible { failures.append("annotation_not_in_current_visible_set") }
+                // Shares `PresentationReadiness.visibilityAbsenceReason` with
+                // the macOS branch's `failureReasons(for:)` so an anchor's
+                // `.hidden`/`.lost` state is reported INSTEAD OF the bare
+                // `annotation_not_in_current_visible_set` on this platform
+                // too, rather than restating that layering decision by hand.
+                if !annotationIsVisible {
+                    failures.append(PresentationReadiness.visibilityAbsenceReason(anchorState: anchorState))
+                }
                 if !win32Visible { failures.append("win32_window_not_visible") }
                 if !frameMatches { failures.append("win32_window_frame_mismatch") }
                 if !styleMatches { failures.append("win32_extended_style_mismatch") }
@@ -464,7 +518,7 @@ extension OverlayWindowController {
             return PresentationStatus(
                 annotationId: annotation.id,
                 annotationExists: true,
-                screenId: annotation.screenId,
+                screenId: effectiveScreenId,
                 annotationIsInCurrentVisibleSet: annotationIsVisible,
                 annotationsSuspended: annotationsAreSuspended,
                 expectedWindowShouldBeOnScreen: annotationIsVisible && !annotationsAreSuspended,
@@ -501,7 +555,9 @@ extension OverlayWindowController {
                 failureReasons: failures,
                 note: annotationsAreSuspended
                     ? "Annotations are suspended: their store entries are retained, but every AI Chalkboard overlay window in this process is intentionally hidden (SetWindowPos SWP_HIDEWINDOW). Call resume_annotations before expecting presentationReady."
-                    : "WEAKER THAN macOS -- see this method's doc comment. presentationReady here is single-source evidence from this process's OWN Win32 window state (IsWindow/IsWindowVisible/GetWindowRect/extended style), plus DWM's independently-maintained cloaking flag (DwmGetWindowAttribute(DWMWA_CLOAKED)). It is NOT cross-checked against any compositor-maintained bounds/alpha/z-order record the way macOS's windowServerEntryInAllWindows/windowServerEntryInOnScreenList are (both always nil here, on purpose), and it is not proof of unoccluded pixels or of inclusion in any external capture pipeline."
+                    : "WEAKER THAN macOS -- see this method's doc comment. presentationReady here is single-source evidence from this process's OWN Win32 window state (IsWindow/IsWindowVisible/GetWindowRect/extended style), plus DWM's independently-maintained cloaking flag (DwmGetWindowAttribute(DWMWA_CLOAKED)). It is NOT cross-checked against any compositor-maintained bounds/alpha/z-order record the way macOS's windowServerEntryInAllWindows/windowServerEntryInOnScreenList are (both always nil here, on purpose), and it is not proof of unoccluded pixels or of inclusion in any external capture pipeline.",
+                captureExclusion: captureExclusionSummary,
+                captureHonestyNote: captureHonestyNoteText
             )
         }
     }

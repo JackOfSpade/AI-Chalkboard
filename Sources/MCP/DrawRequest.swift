@@ -1,4 +1,9 @@
 import Foundation
+#if os(macOS)
+import AppKit
+#elseif os(Windows)
+import WinSDK
+#endif
 
 /// PLATFORM-ACCURATE NOUNS for the error strings below. These strings reach
 /// the MCP caller (an AI agent deciding how to retry a rejected draw call),
@@ -401,6 +406,204 @@ struct DrawRequest {
         return "duration_seconds is no longer supported: annotations now persist until they are explicitly cleared. Nothing was drawn; remove duration_seconds and call clear (by annotation_id, by app, or scope='all') when you are done with the drawing."
     }
 
+    // MARK: - `anchor`/`anchor_resize` argument parsing
+
+    /// The purely-string-validated outcome of `anchor`/`anchor_resize` for
+    /// one `draw_*` call. `nil` means "anchor=none" (the default, and by far
+    /// the common case): draw exactly as before this feature existed, with
+    /// no `AnnotationAnchor` attached. A non-nil value carries only the
+    /// resize POLICY, not a mode enum, because every `draw_*` tool anchors
+    /// in `.window` mode ONLY -- `AnchorMode.element` is `highlight_element`-
+    /// only (see that case's own doc comment in AnnotationAnchor.swift:
+    /// re-resolving an element requires an `AccessibilityElementRequest` no
+    /// draw_* tool has), so there is nothing else this type needs to say.
+    struct AnchorArgumentRequest: Equatable {
+        let resize: AnchorResizeBehavior
+    }
+
+    /// Validates ONLY the `anchor`/`anchor_resize` argument STRINGS -- no app
+    /// resolution, no process lookup, no window enumeration. This mirrors
+    /// `rejectDurationSecondsIfSupplied`'s "reject before AX/TCC work"
+    /// precedent (see that function's doc comment) for the identical reason:
+    /// `resolveWindowAnchor` below spawns an `NSWorkspace`/
+    /// `CGWindowListCopyWindowInfo` round trip that a typo'd enum value must
+    /// never be allowed to trigger. Called from `finish` before ANY of that
+    /// heavier work -- including the ordinary per-app resolution `finish`
+    /// already does for every draw call -- runs.
+    static func parseAnchorArguments(_ args: [String: Any]) -> DrawOutcome<AnchorArgumentRequest?> {
+        if args.keys.contains("anchor"), !(args["anchor"] is String) {
+            return .failure("anchor must be one of \"none\", \"window\" when supplied.")
+        }
+        let anchorRaw = (args["anchor"] as? String) ?? "none"
+        guard anchorRaw == "none" || anchorRaw == "window" else {
+            return .failure("anchor must be one of \"none\", \"window\" when supplied.")
+        }
+        if args.keys.contains("anchor_resize"), !(args["anchor_resize"] is String) {
+            return .failure("anchor_resize must be one of \"pin\", \"scale\" when supplied.")
+        }
+        let resizeRaw = args["anchor_resize"] as? String
+        if let resizeRaw, resizeRaw != "pin", resizeRaw != "scale" {
+            return .failure("anchor_resize must be one of \"pin\", \"scale\" when supplied.")
+        }
+        guard anchorRaw == "window" else {
+            // `anchor_resize` names a policy for reacting to the anchor
+            // window's resize, and there is no anchor window at all under
+            // the absent/"none" default -- supplying it here is unambiguous
+            // evidence of an intent this call cannot honour, so it is
+            // rejected rather than silently ignored (the same reject-over-
+            // ignore rule `screenshot_width`/`screenshot_height` follow
+            // under the wrong `coordinate_space`; see `coordinateTransform`
+            // above).
+            guard resizeRaw == nil else {
+                return .failure("anchor_resize is only valid with anchor=\"window\": it selects how a drawing reacts to its anchor window being resized, and there is no anchor window without one. Nothing was drawn; remove anchor_resize, or add anchor=\"window\".")
+            }
+            return .success(nil)
+        }
+        let resize: AnchorResizeBehavior = (resizeRaw == "scale") ? .scale : .pin
+        return .success(AnchorArgumentRequest(resize: resize))
+    }
+
+    // MARK: - `anchor="window"` resolution
+
+    /// One fully resolved `anchor="window"` request, ready to attach to a
+    /// brand-new annotation: the `AnnotationAnchor` captured at creation
+    /// time, plus the identity `.tracking` `AnchorProjection` that MUST be
+    /// installed in the very same store write (see `Annotation
+    /// .anchorPermitsPainting`'s doc comment: a real anchor is never
+    /// observed sitting at `anchorProjection == nil`).
+    struct DrawAnchorResolution {
+        let anchor: AnnotationAnchor
+        let projection: AnchorProjection
+    }
+
+    /// The pure DECISION half of window resolution: given windows already
+    /// sampled for `processId` (front-to-back, exactly as
+    /// `TargetWindowSampling.windows(forProcessId:screens:)` documents),
+    /// choose one via `TargetWindowSelection.selectWindow(forRect:among:)`
+    /// and build the anchor/projection a brand-new annotation is stored
+    /// with. `nil` means `samples` offered no candidate at all (an empty
+    /// array; `selectWindow` only returns nil in that case) -- the caller
+    /// turns that into the MCP_SURFACE.md "found no eligible on-screen
+    /// window" rejection.
+    ///
+    /// Deliberately independent of `TargetWindowProbe`/
+    /// `MCPServer.runningProcessIds(forAppId:)`: sampling a live foreign
+    /// window and enumerating real running processes cannot run in a unit
+    /// test, but this decision -- which window wins the largest-
+    /// intersection contest, and exactly what gets written into the anchor/
+    /// projection -- has no such dependency and can be exercised directly
+    /// with hand-built `TargetWindowSample`s (see `TargetWindowProbeTests
+    /// .swift`'s identical split between `TargetWindowAssembly`/
+    /// `TargetWindowSelection` and the two platforms' actual window-list
+    /// readers).
+    static func buildWindowAnchor(
+        processId: Int64,
+        appId: String,
+        samples: [TargetWindowSample],
+        paintedBounds: CGRect,
+        resize: AnchorResizeBehavior,
+        now: Date
+    ) -> DrawAnchorResolution? {
+        guard let selected = TargetWindowSelection.selectWindow(forRect: paintedBounds, among: samples) else {
+            return nil
+        }
+        let anchor = AnnotationAnchor(
+            mode: .window,
+            resize: resize,
+            target: AnchorWindowTarget(processId: processId, windowId: selected.windowId, appId: appId),
+            referenceWindowFrame: AnchorRect(selected.frame),
+            referenceScreenId: selected.screenId,
+            element: nil,
+            createdAt: now
+        )
+        let projection = AnchorProjection(
+            state: .tracking,
+            adjustment: .identity,
+            effectiveScreenId: selected.screenId,
+            currentWindowFrame: AnchorRect(selected.frame),
+            sampledAt: now
+        )
+        return DrawAnchorResolution(anchor: anchor, projection: projection)
+    }
+
+    /// The impure half: resolves `appId` to exactly one RUNNING process,
+    /// samples its windows, and hands the result to `buildWindowAnchor`
+    /// above. Steps and their literal error text follow MCP_SURFACE.md's
+    /// "Window resolution at draw time" contract exactly:
+    ///
+    /// 1. A `nil` `appId` means this annotation has no target application at
+    ///    all (an untagged/global drawing) -- there is no window to anchor
+    ///    to, so this is rejected before any process/window work runs.
+    /// 2. `appId` is resolved to exactly one running pid via the SAME
+    ///    per-platform lookup `highlight_element` uses (see
+    ///    `MCPServer.runningProcessIds(forAppId:)`); zero or several running
+    ///    processes are rejected with wording specific to this call site --
+    ///    unlike `resolveRunningHighlightTarget`'s ambiguity/not-running
+    ///    text, MCP_SURFACE.md prescribes no literal string for this case,
+    ///    so it is worded for a drawing tool rather than reused verbatim
+    ///    from an Accessibility-specific error.
+    /// 3. `TargetWindowProbe.shared.windows(forProcessId:screens:)` samples
+    ///    that pid's windows against every currently connected display
+    ///    (`candidateScreens`, the same snapshot `resolveScreen` already
+    ///    captured for this call).
+    /// 4. `buildWindowAnchor` picks the window and builds the anchor; no
+    ///    eligible window rejects with MCP_SURFACE.md's literal text.
+    private func resolveWindowAnchor(
+        resize: AnchorResizeBehavior,
+        appId: String?,
+        appName: String?,
+        kind: AnnotationKind
+    ) -> DrawOutcome<DrawAnchorResolution> {
+        guard let appId else {
+            return .failure("anchor=\"window\" requires a target application, because it anchors the drawing to one of that application's windows. Nothing was drawn; pass app explicitly, or draw without anchor to place this at fixed display coordinates.")
+        }
+        let displayName = appName ?? appId
+        let pids = MCPServer.shared.runningProcessIds(forAppId: appId)
+        guard pids.count == 1, let pid = pids.first else {
+            if pids.isEmpty {
+                return .failure("anchor=\"window\" requires \(displayName) to be a running application so its windows can be sampled, but no running process matches. Nothing was drawn; bring that application to the front and retry, or draw without anchor.")
+            }
+            return .failure("anchor=\"window\" cannot choose a window for \(displayName) because it has \(pids.count) running processes and anchoring refuses to guess which one owns the intended window. Nothing was drawn; quit the extra instance(s) and retry, or draw without anchor.")
+        }
+        let samples = TargetWindowProbe.shared.windows(forProcessId: pid, screens: candidateScreens)
+        let bounds = PaintedBounds.paintedBounds(of: kind) ?? .zero
+        guard let resolution = DrawRequest.buildWindowAnchor(
+            processId: pid, appId: appId, samples: samples,
+            paintedBounds: bounds, resize: resize, now: Date()
+        ) else {
+            return .failure("anchor=\"window\" found no eligible on-screen window for \(displayName) (pid \(pid)). Nothing was drawn: a window anchor with no window would silently behave like an unanchored drawing. Bring a window of that application on screen and retry, or draw without anchor.")
+        }
+        return .success(resolution)
+    }
+
+    /// Builds the `anchor` object every anchored `draw_*`/`list_annotations`
+    /// response shares (see MCP_SURFACE.md's "Success payload -- the anchor
+    /// object"). Kept independent of `finish` below so the exact key set is
+    /// pinned in one place: `referenceWindowFrame`/`currentWindowFrame`/
+    /// `adjustment` are encoded via `jsonObject` from their own `Codable`
+    /// types (`AnchorRect`, `AnchorAdjustment`) rather than hand-typed,
+    /// so a stray typo in a manually built dictionary can never drift from
+    /// what `AnnotationAnchor`/`AnchorProjection` actually store.
+    static func anchorResponsePayload(_ resolution: DrawAnchorResolution) -> [String: Any] {
+        var payload: [String: Any] = [
+            "mode": resolution.anchor.mode.rawValue,
+            "resize": resolution.anchor.resize.rawValue,
+            "state": resolution.projection.state.rawValue,
+            "windowId": Int(resolution.anchor.target.windowId),
+            "processId": Int(resolution.anchor.target.processId),
+            "screenId": resolution.projection.effectiveScreenId
+        ]
+        payload["referenceWindowFrame"] = MCPServer.shared.jsonObject(resolution.anchor.referenceWindowFrame)
+        if let currentWindowFrame = resolution.projection.currentWindowFrame {
+            payload["currentWindowFrame"] = MCPServer.shared.jsonObject(currentWindowFrame)
+        }
+        payload["adjustment"] = MCPServer.shared.jsonObject(resolution.projection.adjustment)
+        if let issue = resolution.projection.elementResolutionIssue {
+            payload["elementResolutionIssue"] = issue
+        }
+        return payload
+    }
+
     /// Reads the arguments every draw tool shares beyond geometry
     /// (`color`/`app`), resolves the per-app link, builds and stores the
     /// `Annotation`, and returns the worded success text -- or propagates
@@ -428,6 +631,17 @@ struct DrawRequest {
         }
         let zIndex = MCPArgument.integer(args["z_index"]) ?? 0
 
+        // Pure string validation of `anchor`/`anchor_resize`, BEFORE any
+        // process/window work -- including the ordinary per-app resolution
+        // just below, which itself does no AX/TCC work but is still heavier
+        // than a plain string compare. See `parseAnchorArguments`'s own doc
+        // comment for why this ordering matters.
+        let anchorRequest: AnchorArgumentRequest?
+        switch DrawRequest.parseAnchorArguments(args) {
+        case .failure(let err): return .failure(err)
+        case .success(let value): anchorRequest = value
+        }
+
         let appId: String?
         let appName: String?
         if let resolvedTargetApp {
@@ -446,6 +660,18 @@ struct DrawRequest {
             appName = resolvedAppName
         }
 
+        // Only NOW -- after the annotation's own app link is settled -- does
+        // an `anchor="window"` request get to resolve a running process and
+        // enumerate windows. `anchorRequest` is non-nil only once
+        // `parseAnchorArguments` has already validated the strings above.
+        var anchorResolution: DrawAnchorResolution?
+        if let anchorRequest {
+            switch resolveWindowAnchor(resize: anchorRequest.resize, appId: appId, appName: appName, kind: kind) {
+            case .failure(let err): return .failure(err)
+            case .success(let value): anchorResolution = value
+            }
+        }
+
         let annotation = Annotation(
             screenId: screen.id,
             kind: kind,
@@ -453,7 +679,12 @@ struct DrawRequest {
             label: label,
             appId: appId,
             appName: appName,
-            zIndex: zIndex
+            zIndex: zIndex,
+            anchor: anchorResolution?.anchor,
+            // Installed in this SAME store write, per the design contract: a
+            // real anchor is never observed with a nil projection (see
+            // `Annotation.anchorPermitsPainting`'s doc comment).
+            anchorProjection: anchorResolution?.projection
         )
         switch AnnotationStore.shared.addWithOutcome(annotation) {
         case .added:
@@ -469,8 +700,127 @@ struct DrawRequest {
         }
 
         let text = "Created \(noun) annotation: \(annotation.id)\(MCPServer.shared.linkageSuffix(appId: appId, appName: appName))"
-        return .success(text)
+        guard let anchorResolution else {
+            // Unanchored -- BY FAR the common case -- keeps today's exact
+            // plain-text response, byte for byte: existing callers (and
+            // `test_mcp_stdio.py`'s `"annotation: " `-splitting parse of this
+            // exact response) must see no change at all when `anchor` is not
+            // used.
+            return .success(text)
+        }
+        // Anchored: the response becomes a JSON object carrying the same
+        // message text plus the `anchor` block MCP_SURFACE.md's "Success
+        // payload" section specifies, exactly like `highlight_element`'s
+        // existing JSON success payload.
+        let payload: [String: Any] = [
+            "message": text,
+            "annotationId": annotation.id,
+            "anchor": DrawRequest.anchorResponsePayload(anchorResolution)
+        ]
+        guard let jsonText = MCPServer.shared.jsonString(payload) else {
+            return .failure("Created \(noun) annotation \(annotation.id) and anchored it, but failed to encode the anchor metadata in the response. The annotation and its anchor were still stored; call list_annotations to inspect them.")
+        }
+        return .success(jsonText)
     }
+}
+
+// MARK: - Shared running-process lookup
+
+extension MCPServer {
+    /// Running process ids whose identity matches `appId` -- a bundle
+    /// identifier on macOS (`NSWorkspace.runningApplications`), an
+    /// executable name on Windows (`CreateToolhelp32Snapshot`). This is the
+    /// ONE place both `highlight_element`'s single-running-instance
+    /// requirement (`resolveRunningHighlightTarget` in
+    /// MCPToolHandlers+Highlight.swift) and `anchor="window"`'s window-
+    /// owning-process lookup (`DrawRequest.resolveWindowAnchor` above) ask
+    /// "is this app running, and with how many processes" -- extracted here
+    /// so the platform-specific enumeration mechanics (an AppKit main-thread
+    /// hop on macOS, a raw Win32 snapshot walk on Windows) exist exactly
+    /// once instead of twice slowly drifting apart.
+    ///
+    /// Deliberately returns the raw pid list with NO opinion on cardinality:
+    /// "zero matches" and "more than one match" are different failures with
+    /// different wording at each call site (highlight needs an Accessibility
+    /// hierarchy to walk; anchor needs windows to sample), so this stays a
+    /// pure lookup and lets each caller phrase its own rejection. Both
+    /// callers widen/narrow this `Int64` to their own platform's process-id
+    /// type (`pid_t` on macOS, `UInt32` on Windows) at their own call site.
+    func runningProcessIds(forAppId appId: String) -> [Int64] {
+        #if os(macOS)
+        // `NSWorkspace.runningApplications` is AppKit, so this takes the
+        // same main-thread hop every other NSWorkspace query in this
+        // package takes (see `MainThread.sync`'s own doc comment, whose
+        // contract names this exact API). The pids are extracted INSIDE the
+        // hop so no `NSRunningApplication` -- a live, main-thread-owned
+        // object -- escapes back to the caller's (possibly background)
+        // queue; a plain pid is just a number.
+        return MainThread.sync {
+            NSWorkspace.shared.runningApplications
+                .filter { $0.bundleIdentifier == appId && !$0.isTerminated }
+                .map { Int64($0.processIdentifier) }
+        }
+        #elseif os(Windows)
+        return Self.processIDs(forExecutableIdentity: appId).map { Int64($0) }
+        #endif
+    }
+
+    #if os(Windows)
+    /// Enumerates every running process via `CreateToolhelp32Snapshot`
+    /// (`TH32CS_SNAPPROCESS`) and returns the process ids whose executable
+    /// file name -- or that name's extension-less stem -- case-
+    /// insensitively matches `identity`. This is the Windows substitute for
+    /// `NSWorkspace.runningApplications`'s bundle-id filter above: Win32 has
+    /// no bundle-identifier concept, only a per-process executable file name
+    /// (`PROCESSENTRY32W.szExeFile`), so process identity here is that name.
+    /// Matching both the full file name AND its stem tolerates a caller (or
+    /// `ActiveAppTracker`) supplying either `"Resolve.exe"` or `"Resolve"`.
+    ///
+    /// Moved here verbatim from `MCPToolHandlers+Highlight.swift` (where it
+    /// was `resolveRunningHighlightTarget`'s private helper) so it exists in
+    /// exactly one place for both callers -- see `runningProcessIds
+    /// (forAppId:)` above.
+    private static func processIDs(forExecutableIdentity identity: String) -> [UInt32] {
+        let loweredFull = identity.lowercased()
+        let loweredStem = stem(of: identity).lowercased()
+
+        guard let snapshot = CreateToolhelp32Snapshot(DWORD(TH32CS_SNAPPROCESS), 0),
+              snapshot != INVALID_HANDLE_VALUE else {
+            return []
+        }
+        defer { CloseHandle(snapshot) }
+
+        var entry = PROCESSENTRY32W()
+        entry.dwSize = DWORD(MemoryLayout<PROCESSENTRY32W>.size)
+        var matches: [UInt32] = []
+        guard Process32FirstW(snapshot, &entry) else { return [] }
+        repeat {
+            // `szExeFile` is a fixed-size WCHAR[MAX_PATH] C array, imported
+            // as a Swift tuple; reinterpret it as a UTF-16 buffer to decode
+            // it as a String, the standard idiom for a fixed C char array.
+            let exeName = withUnsafePointer(to: &entry.szExeFile) { tuplePointer -> String in
+                tuplePointer.withMemoryRebound(to: UInt16.self, capacity: 260) { wide in
+                    String(decodingCString: wide, as: UTF16.self)
+                }
+            }
+            let loweredExe = exeName.lowercased()
+            if loweredExe == loweredFull || stem(of: exeName).lowercased() == loweredStem {
+                matches.append(entry.th32ProcessID)
+            }
+        } while Process32NextW(snapshot, &entry)
+        return matches
+    }
+
+    /// The extension-less stem of a file name (`"Resolve.exe"` -> `"Resolve"`).
+    /// A tiny local helper rather than `NSString.deletingPathExtension`, to
+    /// avoid depending on Foundation's NSString bridging on this platform
+    /// for a one-line string operation. Moved here alongside
+    /// `processIDs(forExecutableIdentity:)` above.
+    private static func stem(of fileName: String) -> String {
+        guard let dotIndex = fileName.lastIndex(of: ".") else { return fileName }
+        return String(fileName[..<dotIndex])
+    }
+    #endif
 }
 
 // MARK: - Per-app linking
