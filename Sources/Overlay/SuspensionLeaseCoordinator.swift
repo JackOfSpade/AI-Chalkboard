@@ -182,6 +182,30 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     // internal: SuspensionLeaseStorage.swift's writeState calls this
     // immediately before the atomic rename that installs new state.
     let storagePrecommitHook: (() -> Void)?
+    /// Fires once per nonblocking `flock` attempt inside
+    /// `acquirePresentationLock()` -- including the last, failing one.
+    ///
+    /// WHY THIS EXISTS: the only thing `acquirePresentationLock()` actually
+    /// promises is a BOUNDED COUNT of nonblocking attempts
+    /// (`presentationLockAttempts`), each separated by a short fixed
+    /// `Thread.sleep`. It promises nothing about how long that takes on the
+    /// wall clock -- the OS scheduler, not this method, decides how promptly
+    /// a sleeping thread wakes back up, and that latency is elastic under
+    /// contention.
+    /// `SuspensionLeaseCoordinatorTests.testMainThreadPermitAndReconciliationSchedulingDoNotWaitForHeldPeerLock`
+    /// used to measure `systemUptime` before/after `withPresentationPermit`
+    /// and assert the elapsed time was under an arbitrary 250 ms, on the
+    /// theory that was an easy stand-in for "used the fast retry loop, not
+    /// the ~1 s background bounded wait". It was not: with zero source
+    /// changes, the exact same test measured ~10 ms running the compiled
+    /// bundle directly through `xcrun xctest`, and ~260-300 ms running
+    /// through `swift test`'s own driver process (whose extra background
+    /// activity was enough on its own to blow the 250 ms budget in 7 of 8
+    /// consecutive runs) -- while instrumenting each attempt directly showed
+    /// the retry loop itself never took more than its designed ~9 ms. This
+    /// hook lets that test count the real, bounded signal directly instead
+    /// of inferring it from wall-clock noise the scheduler introduces.
+    private let presentationLockAttemptHook: (() -> Void)?
     private let controlsPresentation: Bool
     private let stateLock = NSLock()
     /// Serializes only scheduling bookkeeping.  The actual durable read stays
@@ -305,7 +329,8 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     /// Tests can inject both an isolated directory and a stable boot id.
     public init(storageDirectory: URL? = nil, bootSessionIdentifier: String? = nil,
                 instanceNonce: String? = nil, mutationSettleHook: (() -> Void)? = nil,
-                storagePrecommitHook: (() -> Void)? = nil) {
+                storagePrecommitHook: (() -> Void)? = nil,
+                presentationLockAttemptHook: (() -> Void)? = nil) {
         controlsPresentation = storageDirectory == nil
         self.storageDirectory = Self.resolveStorageDirectory(
             injected: storageDirectory,
@@ -327,6 +352,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
         self.instanceNonce = instanceNonce ?? UUID().uuidString.lowercased()
         self.mutationSettleHook = mutationSettleHook
         self.storagePrecommitHook = storagePrecommitHook
+        self.presentationLockAttemptHook = presentationLockAttemptHook
     }
 
     @discardableResult
@@ -780,7 +806,13 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     /// shorter than the flicker it replaces. It also cannot deadlock against
     /// the peer, because a presentation fence never waits on anything else
     /// while holding this lock.
-    private static let presentationLockAttempts = 4
+    // internal: SuspensionLeaseCoordinatorTests.swift's
+    // testMainThreadPermitAndReconciliationSchedulingDoNotWaitForHeldPeerLock reads
+    // this to assert the retry loop below actually exhausts its bounded attempt
+    // count, rather than inferring that from how long the attempts took on the
+    // wall clock (see `presentationLockAttemptHook`'s doc comment for why the
+    // latter was not sound).
+    static let presentationLockAttempts = 4
     private static let presentationLockRetryDelay: TimeInterval = 0.003
 
     /// Bounded-retry wrapper around the nonblocking acquire. Only the ACQUIRE
@@ -789,6 +821,7 @@ public final class SuspensionLeaseCoordinator: @unchecked Sendable {
     private func acquirePresentationLock() throws -> HeldLock<PlatformBackend> {
         var attempt = 1
         while true {
+            presentationLockAttemptHook?()
             do {
                 return try acquireLock(waitForAvailability: false)
             } catch {

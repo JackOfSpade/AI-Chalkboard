@@ -542,6 +542,26 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
     /// sleep loop. A busy permit is deliberately a fail-closed answer: the
     /// caller may order windows out, but cannot order one front until a later
     /// durable permit proves no acquisition crossed its decision.
+    ///
+    /// FLAKE FIX: this used to measure `systemUptime` immediately before and
+    /// after `withPresentationPermit` and assert the elapsed wall time was
+    /// under an arbitrary 250 ms, on the theory that was an easy stand-in for
+    /// "used the fast bounded-retry loop, not the ~1 s background wait"
+    /// `withLockedState` uses elsewhere. That conflated two different claims:
+    /// `acquirePresentationLock()` really does promise a BOUNDED COUNT of
+    /// nonblocking attempts (`presentationLockAttempts`), but it promises
+    /// nothing about how long the OS scheduler takes to wake the thread back
+    /// up from the `Thread.sleep` between them. That gap was not theoretical:
+    /// with zero source changes, running this exact test through `swift
+    /// test`'s own driver process measured ~260-300 ms and failed the 250 ms
+    /// budget in 7 of 8 consecutive runs, while invoking the identical
+    /// compiled test bundle directly via `xcrun xctest` -- skipping only
+    /// `swift test`'s wrapper -- passed 50/50, and instrumenting each attempt
+    /// directly showed the retry loop itself never took more than its
+    /// designed ~9 ms either way. `presentationLockAttemptHook` now counts
+    /// the real, bounded signal the property is actually about, so the
+    /// assertion no longer depends on how promptly a sleeping thread is
+    /// rescheduled.
     func testMainThreadPermitAndReconciliationSchedulingDoNotWaitForHeldPeerLock() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("AIChalkboardPermitNonblockingTests-\(UUID().uuidString)", isDirectory: true)
@@ -551,7 +571,15 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
         #endif
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let presenter = SuspensionLeaseCoordinator(storageDirectory: directory, instanceNonce: "presenter")
+        // Read only from the platform UI thread, inside `withPresentationPermit`
+        // below -- the same thread this test itself runs `presenter`'s calls
+        // from, so no lock is needed around this counter.
+        var presentationLockAttempts = 0
+        let presenter = SuspensionLeaseCoordinator(
+            storageDirectory: directory,
+            instanceNonce: "presenter",
+            presentationLockAttemptHook: { presentationLockAttempts += 1 }
+        )
         XCTAssertFalse(presenter.bootstrapAndReconcile().annotationsSuspended)
 
         let peerHasLock = DispatchSemaphore(value: 0)
@@ -576,16 +604,12 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
                        "the test must exercise a genuinely held flock")
 
         var bodySnapshot: SuspensionLeaseSnapshot?
-        var permitElapsed = 0.0
         let permit = runOnPlatformUIThread {
             XCTAssertTrue(MainThread.isCurrentUIThread)
-            let permitStarted = ProcessInfo.processInfo.systemUptime
-            let result = presenter.withPresentationPermit { bodySnapshot = $0 }
-            permitElapsed = ProcessInfo.processInfo.systemUptime - permitStarted
-            return result
+            return presenter.withPresentationPermit { bodySnapshot = $0 }
         }
-        XCTAssertLessThan(permitElapsed, 0.25,
-                          "a busy main-thread permit must fail immediately, not retry for one second")
+        XCTAssertEqual(presentationLockAttempts, SuspensionLeaseCoordinator.presentationLockAttempts,
+                       "a busy main-thread permit must exhaust its bounded nonblocking retry budget, not fall back to the ~1s background wait")
         XCTAssertNotNil(permit.error)
         XCTAssertTrue(permit.annotationsSuspended)
         XCTAssertEqual(bodySnapshot, permit, "the fail-closed snapshot reaches the ordering closure")
