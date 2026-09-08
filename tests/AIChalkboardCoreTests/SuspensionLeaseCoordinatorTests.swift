@@ -158,14 +158,28 @@ final class SuspensionLeaseCoordinatorTests: XCTestCase {
     func testExpiryCreatesTombstoneAndCannotLeaveLeaseSuspended() throws {
         try withTemporaryCoordinator { coordinator, _ in
             _ = coordinator.bootstrapAndReconcile()
-            let acquired = coordinator.acquireLease(seconds: 1)
+            // acquireLease() does not return until its own post-write
+            // quiescence check settles: up to three attempts, each sampling
+            // WindowServer/process state whose real cost scales with this
+            // machine's total process count and is not strictly capped by
+            // the nominal one-second-per-attempt budget (that budget only
+            // decides whether a second sample is worth taking, so a slow
+            // first sample is not accounted against it at all). A lease at
+            // the legal minimum of 1 second measured this exact race: on a
+            // loaded host, acquireLease()'s own bookkeeping outlived the
+            // lease it had just created, so `annotationsSuspended` below was
+            // already observed false before the explicit sleep even ran.
+            // 8 seconds gives that bookkeeping generous real-world headroom
+            // while still exercising genuine expiry rather than the 15s
+            // default or the 60s ceiling.
+            let leaseSeconds = 8
+            let acquired = coordinator.acquireLease(seconds: leaseSeconds)
             let token = try XCTUnwrap(acquired.leaseToken)
             XCTAssertTrue(acquired.annotationsSuspended)
 
-            // This is intentionally just beyond the shortest externally
-            // permitted lease. Reconcile is the deterministic unit-level
-            // trigger; process integration covers the scheduled timer path.
-            Thread.sleep(forTimeInterval: 1.15)
+            // Just beyond the lease's own duration -- long enough that ordinary
+            // scheduling jitter during the sleep itself cannot matter.
+            Thread.sleep(forTimeInterval: Double(leaseSeconds) + 0.3)
             let afterExpiry = coordinator.reconcile()
             XCTAssertFalse(afterExpiry.annotationsSuspended)
             XCTAssertEqual(afterExpiry.activeLeaseCount, 0)
