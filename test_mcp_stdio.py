@@ -725,6 +725,13 @@ def main():
         text_draw_message = text_res["result"]["content"][0]["text"]
         print("draw_text response:", text_draw_message, flush=True)
         text_annotation_id = text_draw_message.split("annotation: ", 1)[1].split()[0]
+        # `avoid` is opt-in. The ordinary label path remains a literal legacy
+        # string, because existing agents parse this exact response with the
+        # same bare "annotation: " split above instead of decoding JSON.
+        assert text_draw_message == (
+            f"Created text annotation: {text_annotation_id} "
+            "(GLOBAL: visible over every app)"
+        )
 
         # Validation is intentionally before AppKit layout. This request is
         # syntactically valid but would otherwise ask the unwrapped renderer
@@ -1362,6 +1369,129 @@ def main():
         assert abs(reverified_center[0] - target_center[0]) <= 1.5, (reverified_center, target_center)
         assert abs(reverified_center[1] - target_center[1]) <= 1.5, (reverified_center, target_center)
 
+        print("\n13b. Testing draw-time annotation collision avoidance with exact renderer bounds...", flush=True)
+        # Put an opaque, fill-only highlight at the display centre, then
+        # deliberately ask a text label (with an opaque background) to begin
+        # inside it. Centre placement leaves room on every side without
+        # assuming a particular monitor resolution; assertions below compare
+        # only rectangles returned by the live renderer, never font metrics.
+        avoid_rect_width = min(140, max(80, main_screen["widthPx"] // 6))
+        avoid_rect_height = min(90, max(60, main_screen["heightPx"] // 7))
+        avoid_rect = {
+            "x": (main_screen["widthPx"] - avoid_rect_width) / 2,
+            "y": (main_screen["heightPx"] - avoid_rect_height) / 2,
+            "width": avoid_rect_width,
+            "height": avoid_rect_height,
+        }
+        avoid_shape_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_shape", "arguments": {
+                "shape": "rect", **avoid_rect,
+                "stroke_width": 0, "fill_color": "#4169E1", "fill_opacity": 1,
+                "app": "",
+            }},
+        }, args.timeout)
+        assert not avoid_shape_res["result"].get("isError", False), avoid_shape_res
+        avoid_shape_text = avoid_shape_res["result"]["content"][0]["text"]
+        avoid_shape_id = avoid_shape_text.split("annotation: ", 1)[1].split()[0]
+
+        avoid_text_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_text", "arguments": {
+                # An opaque backing rectangle makes the requested painted
+                # bounds unquestionably overlap the fill-only highlight,
+                # independent of glyph ascent/descent on this machine.
+                "text": "Avoid", "x": avoid_rect["x"] + 4, "y": avoid_rect["y"] + 4,
+                "font_size": 18, "color": "#FFFFFF",
+                "background_color": "#000000", "background_opacity": 1, "padding_px": 4,
+                "avoid": [avoid_shape_id], "app": "",
+            }},
+        }, args.timeout)
+        assert not avoid_text_res["result"].get("isError", False), avoid_text_res
+        avoid_text_payload = json.loads(avoid_text_res["result"]["content"][0]["text"])
+        avoid_text_id = avoid_text_payload["annotationId"]
+        placement = avoid_text_payload["placement"]
+        assert avoid_text_payload["message"] == (
+            f"Created text annotation: {avoid_text_id} (GLOBAL: visible over every app)"
+        )
+        assert placement["avoidedAnnotationIds"] == [avoid_shape_id]
+        assert placement["moved"] is True, placement
+        assert placement["placement"] in {"below", "above", "right", "left"}, placement
+        assert placement["gapPx"] == 8, placement
+        assert placement["scope"] == "draw_time_snapshot", placement
+        assert set(placement["offsetBackingPx"]) == {"x", "y"}, placement
+        assert any(abs(placement["offsetBackingPx"][axis]) > 0 for axis in ("x", "y")), placement
+
+        avoid_shape_bounds_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "get_annotation_bounds", "arguments": {"annotation_id": avoid_shape_id}},
+        }, args.timeout)
+        avoid_text_bounds_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "get_annotation_bounds", "arguments": {"annotation_id": avoid_text_id}},
+        }, args.timeout)
+        assert not avoid_shape_bounds_res["result"].get("isError", False), avoid_shape_bounds_res
+        assert not avoid_text_bounds_res["result"].get("isError", False), avoid_text_bounds_res
+        avoid_shape_bounds = json.loads(avoid_shape_bounds_res["result"]["content"][0]["text"])["paintedBoundsBackingPx"]
+        avoid_text_bounds = json.loads(avoid_text_bounds_res["result"]["content"][0]["text"])["paintedBoundsBackingPx"]
+
+        def rects_intersect(first, second):
+            return (
+                first["x"] < second["x"] + second["width"]
+                and first["x"] + first["width"] > second["x"]
+                and first["y"] < second["y"] + second["height"]
+                and first["y"] + first["height"] > second["y"]
+            )
+
+        assert not rects_intersect(avoid_shape_bounds, avoid_text_bounds), (
+            "the final live-renderer bounds must be disjoint, regardless of font metrics",
+            avoid_shape_bounds,
+            avoid_text_bounds,
+            placement,
+        )
+        for key in ("x", "y", "width", "height"):
+            assert abs(placement["paintedBoundsBackingPx"][key] - avoid_text_bounds[key]) <= 1.5, (
+                key,
+                placement,
+                avoid_text_bounds,
+            )
+
+        # A missing avoided annotation rejects before storage. Snapshot the
+        # whole ID set around the request, so this proves atomicity rather
+        # than merely inspecting an error string.
+        before_missing_avoid_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "list_annotations", "arguments": {}},
+        }, args.timeout)
+        before_missing_avoid_ids = {
+            annotation["id"]
+            for annotation in json.loads(before_missing_avoid_res["result"]["content"][0]["text"])["annotations"]
+        }
+        missing_avoid_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "draw_text", "arguments": {
+                "text": "Missing target", "x": avoid_rect["x"], "y": avoid_rect["y"],
+                "font_size": 18, "avoid": ["does-not-exist"], "app": "",
+            }},
+        }, args.timeout)
+        assert missing_avoid_res["result"].get("isError") is True, missing_avoid_res
+        missing_avoid_text = missing_avoid_res["result"]["content"][0]["text"]
+        assert "avoid" in missing_avoid_text and "do not exist" in missing_avoid_text, missing_avoid_text
+        assert "Nothing was drawn" in missing_avoid_text, missing_avoid_text
+        after_missing_avoid_res = send_request(proc, reader, {
+            "jsonrpc": "2.0", "id": _next_id(), "method": "tools/call",
+            "params": {"name": "list_annotations", "arguments": {}},
+        }, args.timeout)
+        after_missing_avoid_ids = {
+            annotation["id"]
+            for annotation in json.loads(after_missing_avoid_res["result"]["content"][0]["text"])["annotations"]
+        }
+        assert after_missing_avoid_ids == before_missing_avoid_ids, (
+            "a missing avoid ID must reject atomically without creating a partial annotation",
+            before_missing_avoid_ids,
+            after_missing_avoid_ids,
+        )
+
         print("\n14. Testing every UNANCHORED draw_*/update_annotation response stays byte-identical plain text (no JSON)...", flush=True)
         # Existing callers -- including this very script's `"annotation: "`
         # splitting above -- parse this response as a bare string, so an
@@ -1386,7 +1516,7 @@ def main():
                     f"since existing callers parse it with a bare string split: {response_text!r}"
                 )
 
-        print("\nAll draw, shape, suspension/resume, persistence-metadata, annotation-list, image-verification, explicit-clear, window-anchoring-validation, and annotation-bounds MCP tests PASSED!", flush=True)
+        print("\nAll draw, shape, collision-avoidance, suspension/resume, persistence-metadata, annotation-list, image-verification, explicit-clear, window-anchoring-validation, and annotation-bounds MCP tests PASSED!", flush=True)
     except Exception:
         failed = True
         raise

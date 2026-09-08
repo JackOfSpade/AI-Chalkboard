@@ -117,11 +117,14 @@ final class DrawRequestAnchorTests: XCTestCase {
 
     private static let fixtureScreenId = "screen-1"
 
-    private func sample(windowId: UInt64, x: Double, y: Double, width: Double, height: Double, processId: Int64 = 500) -> TargetWindowSample {
+    private func sample(
+        windowId: UInt64, x: Double, y: Double, width: Double, height: Double,
+        processId: Int64 = 500, screenId: String = fixtureScreenId
+    ) -> TargetWindowSample {
         TargetWindowSample(
             windowId: windowId, processId: processId,
             frame: CGRect(x: x, y: y, width: width, height: height),
-            screenId: Self.fixtureScreenId, isOnScreen: true
+            screenId: screenId, isOnScreen: true
         )
     }
 
@@ -164,6 +167,60 @@ final class DrawRequestAnchorTests: XCTestCase {
         XCTAssertEqual(resolution.projection.currentWindowFrame, AnchorRect(CGRect(x: 0, y: 0, width: 200, height: 200)))
         XCTAssertEqual(resolution.projection.sampledAt, now)
         XCTAssertNil(resolution.projection.elementResolutionIssue)
+    }
+
+    /// Avoidance resolves the exact final painted rectangle before the draw
+    /// pipeline selects a window anchor.  The anchor decision must therefore
+    /// use that final rectangle, not the pre-layout request rectangle which
+    /// could sit over a different window.
+    func testBuildWindowAnchorCanChooseUsingAvoidancesExactFinalBounds() throws {
+        let avoidance = DrawRequest.AvoidanceResolution(
+            annotationIds: ["highlight"], avoidanceTokens: [],
+            requestedPaintedBounds: CGRect(x: 20, y: 20, width: 30, height: 30),
+            finalPaintedBounds: CGRect(x: 130, y: 20, width: 30, height: 30),
+            offsetX: 110, offsetY: 0, placement: .right
+        )
+        let samples = [
+            sample(windowId: 1, x: 0, y: 0, width: 100, height: 100),
+            sample(windowId: 2, x: 100, y: 0, width: 100, height: 100)
+        ]
+
+        let resolution = try XCTUnwrap(DrawRequest.buildWindowAnchor(
+            processId: 500, appId: "com.example.App", samples: samples,
+            paintedBounds: avoidance.finalPaintedBounds, resize: .pin, now: Date()
+        ))
+        XCTAssertEqual(resolution.anchor.target.windowId, 2,
+                       "window selection must see avoidance's final renderer bounds")
+    }
+
+    /// `TargetWindowSample.frame` is display-local. A frontmost window on a
+    /// different display can therefore have numerically overlapping local
+    /// coordinates, but it is not a candidate for a drawing stored on this
+    /// display: selecting it would make the identity anchor projection paint
+    /// the source geometry in the wrong coordinate system.
+    func testBuildWindowAnchorIgnoresFrontmostOtherScreenWithSameLocalCoordinates() throws {
+        let paintedBounds = CGRect(x: 40, y: 40, width: 20, height: 20)
+        let samples = [
+            sample(windowId: 1, x: 0, y: 0, width: 200, height: 200, screenId: "screen-2"),
+            sample(windowId: 2, x: 0, y: 0, width: 100, height: 100, screenId: Self.fixtureScreenId)
+        ]
+
+        let resolution = try XCTUnwrap(DrawRequest.buildWindowAnchor(
+            processId: 500, appId: "com.example.App", samples: samples,
+            paintedBounds: paintedBounds, resize: .pin, now: Date(),
+            screenId: Self.fixtureScreenId
+        ))
+        XCTAssertEqual(resolution.anchor.target.windowId, 2)
+        XCTAssertEqual(resolution.projection.effectiveScreenId, Self.fixtureScreenId)
+    }
+
+    func testBuildWindowAnchorReturnsNilWhenNoWindowIsOnTheTargetScreen() {
+        XCTAssertNil(DrawRequest.buildWindowAnchor(
+            processId: 500, appId: "com.example.App",
+            samples: [sample(windowId: 1, x: 0, y: 0, width: 100, height: 100, screenId: "screen-2")],
+            paintedBounds: CGRect(x: 10, y: 10, width: 20, height: 20),
+            resize: .pin, now: Date(), screenId: Self.fixtureScreenId
+        ))
     }
 
     func testBuildWindowAnchorFallsBackToFrontmostWhenNothingIntersects() throws {

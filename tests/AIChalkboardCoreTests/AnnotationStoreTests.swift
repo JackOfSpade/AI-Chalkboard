@@ -85,6 +85,18 @@ final class AnnotationStoreTests: XCTestCase {
         )
     }
 
+    /// Reads an image through a raster lease without assuming which platform
+    /// image type backs it. This mirrors RasterAssetStoreTests' equivalent
+    /// assertion, kept local because this test verifies AnnotationStore's
+    /// lookup-and-lease handoff rather than RasterAssetStore in isolation.
+    private func leasedImageWidth(_ lease: RasterAssetStore.Lease, id: String) -> Int? {
+        #if os(macOS)
+        return lease.image(id: id)?.representations.first?.pixelsWide
+        #elseif os(Windows)
+        return lease.image(id: id)?.pixelWidth
+        #endif
+    }
+
     /// Builds an indirect batch tree without recursive test helpers. `depth`
     /// is the number of `.batch` containers from root to its leaf, matching
     /// AnnotationStore's intake definition exactly.
@@ -125,6 +137,156 @@ final class AnnotationStoreTests: XCTestCase {
         XCTAssertEqual(store.get(id: "target")?.id, "target")
         XCTAssertNil(store.get(id: "missing"))
         XCTAssertEqual(store.getAll().map(\.id), ["first", "target"])
+    }
+
+    func testRenderSnapshotsPreservesRequestedOrderIncludingDuplicates() throws {
+        let store = AnnotationStore()
+        store.add(annotation(id: "first", appId: nil))
+        store.add(annotation(id: "second", appId: nil))
+        store.add(annotation(id: "third", appId: nil))
+
+        let snapshots = try XCTUnwrap(store.renderSnapshots(ids: ["third", "first", "third"]))
+
+        XCTAssertEqual(snapshots.annotations.map(\.id), ["third", "first", "third"])
+    }
+
+    func testRenderSnapshotsRejectsTheWholeRequestWhenAnyIDIsMissing() {
+        let store = AnnotationStore()
+        store.add(annotation(id: "present", appId: nil))
+
+        XCTAssertNil(store.renderSnapshots(ids: ["present", "missing"]))
+        XCTAssertEqual(store.getAll().map(\.id), ["present"],
+                       "a failed multi-id lookup must not mutate or partially consume the store")
+    }
+
+    func testRenderSnapshotsLeaseSurvivesRemovalOfEveryReturnedRasterAnnotation() throws {
+        let store = AnnotationStore()
+        let vector = annotation(id: "vector", appId: nil)
+        let raster = try rasterBackedAnnotation(id: "raster")
+        let assetID = try XCTUnwrap(raster.kind.rasterAssetIds.first)
+        XCTAssertTrue(store.add(vector))
+        XCTAssertTrue(store.add(raster))
+
+        let snapshots = try XCTUnwrap(store.renderSnapshots(ids: ["raster", "vector"]))
+        XCTAssertEqual(snapshots.annotations.map(\.id), ["raster", "vector"])
+
+        XCTAssertTrue(store.remove(id: "raster"))
+        XCTAssertNil(RasterAssetStore.shared.image(id: assetID),
+                     "removal must release the store's ownership once its lock is dropped")
+        XCTAssertEqual(leasedImageWidth(snapshots.rasterLease, id: assetID), 13,
+                       "the multi-id snapshot must already hold strong raster pixels before removal can release them")
+    }
+
+    // MARK: - Revision-guarded insertion for collision avoidance
+
+    func testGuardedAddStoresWhenAvoidedRendererStateStillMatches() throws {
+        let store = AnnotationStore()
+        let avoided = annotation(id: "highlight", appId: nil)
+        XCTAssertEqual(store.addWithOutcome(avoided), .added)
+        let token = AnnotationStoreAvoidanceToken(annotation: try XCTUnwrap(store.get(id: avoided.id)))
+
+        let outcome = store.addWithOutcome(
+            annotation(id: "label", appId: nil), requiringUnchangedAvoidance: [token]
+        )
+
+        guard case let .added(revision) = outcome else {
+            return XCTFail("expected guarded insertion to succeed, got \(outcome)")
+        }
+        XCTAssertGreaterThan(revision, 0)
+        XCTAssertEqual(store.get(id: "label")?.revision, revision,
+                       "guarded insertion must return the exact revision stored under the lock")
+        XCTAssertEqual(store.getAll().map(\.id), ["highlight", "label"])
+    }
+
+    func testGuardedAddRejectsWithoutInsertionWhenAvoidedAnnotationChangedOrDisappeared() throws {
+        let store = AnnotationStore()
+        let edited = annotation(id: "edited", appId: nil)
+        let removed = annotation(id: "removed", appId: nil)
+        XCTAssertEqual(store.addWithOutcome(edited), .added)
+        XCTAssertEqual(store.addWithOutcome(removed), .added)
+        let editedToken = AnnotationStoreAvoidanceToken(annotation: try XCTUnwrap(store.get(id: edited.id)))
+        let removedToken = AnnotationStoreAvoidanceToken(annotation: try XCTUnwrap(store.get(id: removed.id)))
+
+        XCTAssertEqual(store.updateWithOutcome(id: edited.id, with: edited), .updated)
+        XCTAssertEqual(
+            store.addWithOutcome(annotation(id: "label-after-edit", appId: nil),
+                                 requiringUnchangedAvoidance: [editedToken]),
+            .avoidanceChanged
+        )
+        XCTAssertTrue(store.remove(id: removed.id))
+        XCTAssertEqual(
+            store.addWithOutcome(annotation(id: "label-after-clear", appId: nil),
+                                 requiringUnchangedAvoidance: [removedToken]),
+            .avoidanceChanged
+        )
+        XCTAssertEqual(store.getAll().map(\.id), [edited.id],
+                       "a changed or removed avoid target must leave the candidate uninserted")
+    }
+
+    func testGuardedAddAcceptsTimestampOnlyAnchorProjectionRefresh() throws {
+        let store = AnnotationStore()
+        let sampledAt = Date(timeIntervalSinceReferenceDate: 123)
+        let projection = anchorProjection(effectiveScreenId: "1", sampledAt: sampledAt)
+        let avoided = anchoredAnnotation(id: "moving-highlight", projection: projection)
+        XCTAssertEqual(store.addWithOutcome(avoided), .added)
+        let snapshot = try XCTUnwrap(store.get(id: avoided.id))
+        let token = AnnotationStoreAvoidanceToken(annotation: snapshot)
+
+        XCTAssertTrue(store.applyAnchorProjections([
+            avoided.id: anchorProjection(
+                effectiveScreenId: "1", sampledAt: sampledAt.addingTimeInterval(1)
+            )
+        ]))
+        XCTAssertEqual(store.get(id: avoided.id)?.revision, token.revision,
+                       "a timestamp-only tracker refresh must not invalidate the caller-edit revision guard")
+
+        let outcome = store.addWithOutcome(
+            annotation(id: "label", appId: nil), requiringUnchangedAvoidance: [token]
+        )
+        guard case let .added(revision) = outcome else {
+            return XCTFail("timestamp-only refresh should keep the guard valid, got \(outcome)")
+        }
+        XCTAssertEqual(store.get(id: "label")?.revision, revision)
+    }
+
+    func testGuardedAddRejectsRendererAffectingAnchorProjectionChanges() throws {
+        func assertGuardRejects(
+            _ changedProjection: AnchorProjection,
+            context: String
+        ) throws {
+            let store = AnnotationStore()
+            let original = anchorProjection(effectiveScreenId: "1", sampledAt: Date(timeIntervalSinceReferenceDate: 100))
+            let avoided = anchoredAnnotation(id: "highlight", projection: original)
+            XCTAssertEqual(store.addWithOutcome(avoided), .added, context)
+            let token = AnnotationStoreAvoidanceToken(annotation: try XCTUnwrap(store.get(id: avoided.id)))
+
+            XCTAssertTrue(store.applyAnchorProjections([avoided.id: changedProjection]), context)
+            XCTAssertEqual(
+                store.addWithOutcome(annotation(id: "label", appId: nil),
+                                     requiringUnchangedAvoidance: [token]),
+                .avoidanceChanged,
+                context
+            )
+            XCTAssertEqual(store.getAll().map(\.id), [avoided.id],
+                           "\(context): changed renderer geometry/state must leave the candidate uninserted")
+        }
+
+        try assertGuardRejects(
+            anchorProjection(
+                adjustment: AnchorAdjustment(scaleX: 1, scaleY: 1, translateX: 24, translateY: 0),
+                effectiveScreenId: "1"
+            ),
+            context: "translation"
+        )
+        try assertGuardRejects(
+            anchorProjection(
+                adjustment: AnchorAdjustment(scaleX: 1.5, scaleY: 0.75, translateX: 0, translateY: 0),
+                effectiveScreenId: "1"
+            ),
+            context: "scale"
+        )
+        try assertGuardRejects(anchorProjection(effectiveScreenId: "2"), context: "effective screen")
+        try assertGuardRejects(anchorProjection(state: .hidden, effectiveScreenId: "1"), context: "paint state")
     }
 
     // MARK: - Annotations persist until explicitly cleared (no more expiry)
@@ -863,14 +1025,15 @@ final class AnnotationStoreTests: XCTestCase {
     private func anchorProjection(
         state: AnchorTrackingState = .tracking,
         adjustment: AnchorAdjustment = .identity,
-        effectiveScreenId: String = "1"
+        effectiveScreenId: String = "1",
+        sampledAt: Date = Date()
     ) -> AnchorProjection {
         AnchorProjection(
             state: state,
             adjustment: adjustment,
             effectiveScreenId: effectiveScreenId,
             currentWindowFrame: AnchorRect(x: 0, y: 0, width: 200, height: 100),
-            sampledAt: Date()
+            sampledAt: sampledAt
         )
     }
 

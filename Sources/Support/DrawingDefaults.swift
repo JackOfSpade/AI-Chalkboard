@@ -112,6 +112,21 @@ enum DrawingDefaults {
     /// because every component is redrawn together on every repaint.
     static let maxBatchItems = 100
 
+    /// Collision avoidance renders the prospective annotation and each
+    /// referenced existing annotation off-screen to obtain their exact painted
+    /// bounds. Bound the list so one draw call cannot turn into unbounded
+    /// full-display rendering work. The normal highlight-plus-label workflow
+    /// needs one entry; 32 still leaves ample room for a dense guided-workflow
+    /// screen.
+    static let maxAvoidedAnnotations = 32
+
+    /// The visible backing-pixel gap used when an overlapping annotation is
+    /// automatically nudged around an avoided annotation. This is intentionally
+    /// fixed for the first API version: `avoid` promises non-overlap, while a
+    /// caller-controlled layout styling surface can be added independently if
+    /// real use cases need one.
+    static let annotationAvoidanceGapPx = 8.0
+
     /// `AnnotationKind.batch` is indirect, so in-process callers and decoded
     /// persisted data can construct batches inside batches even though the MCP
     /// API only creates one level. Rendering and Codable walk that structure

@@ -393,7 +393,7 @@ extension MCPServer {
     func handleDrawBatch(id: Any, args: [String: Any]) {
         guard let rawItems = args["items"] as? [[String: Any]], !rawItems.isEmpty,
               rawItems.count <= DrawingDefaults.maxBatchItems else {
-            sendErrorResult(id: id, text: "items must contain 1...\(DrawingDefaults.maxBatchItems) path/image/text primitives.")
+            sendErrorResult(id: id, text: "items must contain 1...\(DrawingDefaults.maxBatchItems) path/image/text/shape primitives.")
             return
         }
         let request: DrawRequest
@@ -512,14 +512,16 @@ extension MCPServer {
         // `updateWithOutcome` returns, so reading them afterward is safe.
         var committedAnchor = patch.annotation.anchor
         var committedProjection = patch.projectionOverride ?? current.anchorProjection
-        let outcome = AnnotationStore.shared.updateWithOutcome(
-            id: annotationID, expectedRevision: current.revision
-        ) { live in
-            let finalized = finalizeAnchorPatch(patch, live: live)
-            committedAnchor = finalized.annotation.anchor
-            committedProjection = finalized.projection ?? live.anchorProjection
-            return finalized
-        }
+        let outcome = AnnotationStore.shared.updateIfPossibleWithOutcome(
+            id: annotationID, expectedRevision: current.revision, transform: { live in
+                guard let finalized = finalizeAnchorPatch(patch, live: live) else {
+                    return nil
+                }
+                committedAnchor = finalized.annotation.anchor
+                committedProjection = finalized.projection ?? live.anchorProjection
+                return finalized
+            }
+        )
         switch outcome {
         case .updated:
             // Nudges `AnchorTracker` off whatever cadence it had already
@@ -538,6 +540,8 @@ extension MCPServer {
             sendErrorResult(id: id, text: "Annotation \(annotationID) was not found; it may have been cleared while this update was being prepared.")
         case .stale:
             sendErrorResult(id: id, text: "Annotation \(annotationID) changed while this update was being prepared. It was left unchanged; re-fetch it with list_annotations and retry the patch.")
+        case .aborted:
+            sendErrorResult(id: id, text: "Annotation \(annotationID) was left unchanged because its live tracked position no longer resolves to a safe sampled window for this re-anchor. Retry after the target window is stable.")
         case .rejected(.payloadBytes(let limit, let attempted)):
             sendErrorResult(id: id, text: "The update was not applied because retained vector/text payload would become \(attempted) bytes, exceeding the \(limit)-byte session limit. The existing annotation was left unchanged.")
         case .rejected(.primitiveCount(let limit, let attempted)):
@@ -844,7 +848,8 @@ extension MCPServer {
             )
             guard let resolution = DrawRequest.buildWindowAnchor(
                 processId: pid, appId: appId, samples: samples,
-                paintedBounds: currentPaintedBounds, resize: resize, now: Date()
+                paintedBounds: currentPaintedBounds, resize: resize, now: Date(),
+                screenId: frozenScreenId
             ) else {
                 return .failure("anchor=\"window\" found no eligible on-screen window for \(displayName) (pid \(pid)). The annotation was left unchanged: a window anchor with no window would silently behave like an unanchored drawing. Bring a window of that application on screen and retry, or omit anchor.")
             }
@@ -992,10 +997,17 @@ extension MCPServer {
     func finalizeAnchorPatch(
         _ patch: AnnotationPatchResult,
         live: Annotation
-    ) -> (annotation: Annotation, projection: AnchorProjection?) {
+    ) -> (annotation: Annotation, projection: AnchorProjection?)? {
         let resolution: AnchorPatchResolution
         if case .reanchor = patch.anchorIntent {
-            resolution = reanchorResolution(patch: patch, live: live)
+            guard let reanchored = reanchorResolution(patch: patch, live: live) else {
+                // The target display may have changed since the pre-lock
+                // sample. Never commit its old-display provisional anchor:
+                // the optional store transform turns this into an atomic
+                // no-op rather than installing a stale cross-display link.
+                return nil
+            }
+            resolution = reanchored
         } else {
             switch resolveAnchorPatch(patch.anchorIntent, current: live) {
             case .success(let value):
@@ -1032,23 +1044,12 @@ extension MCPServer {
     /// function's doc comment for the full race this closes. Split out as
     /// its own function only for readability; it has no life of its own
     /// outside that one call site.
-    private func reanchorResolution(patch: AnnotationPatchResult, live: Annotation) -> AnchorPatchResolution {
+    private func reanchorResolution(patch: AnnotationPatchResult, live: Annotation) -> AnchorPatchResolution? {
         guard let context = patch.reanchorContext else {
-            // Unreachable in practice: `patchedAnnotation` always populates
-            // `reanchorContext` whenever `anchorIntent` is `.reanchor` (see
-            // `AnnotationPatchResult`'s doc comment). Falls back to
-            // `patch`'s own pre-lock pick -- NOT a call to
-            // `resolveAnchorPatch`, which would run process lookup and
-            // window sampling INSIDE this lock, exactly the impurity this
-            // function's own doc comment forbids -- and to a safe fallback
-            // rather than a trap, matching this file's standing "fail safe
-            // over fail loud" precedent (see `resolveAnchorPatch`'s own
-            // `.changeResizePolicy` fallback for the identical shape).
-            return AnchorPatchResolution(
-                screenId: live.effectiveScreenId, anchor: patch.annotation.anchor,
-                staticAdjustment: live.effectiveAdjustment, projectionOverride: patch.projectionOverride,
-                reanchorContext: nil
-            )
+            // A re-anchor cannot be safely reconstructed without its sampled
+            // candidates. In particular, using the pre-lock anchor here can
+            // bind the live drawing to a different display, so fail closed.
+            return nil
         }
         // Same formula `resolveAnchorPatch`'s `.reanchor` case used
         // pre-lock, against `current` -- reproduced here against `live`
@@ -1058,22 +1059,22 @@ extension MCPServer {
         let livePaintedBounds = live.effectiveAdjustment.apply(
             to: storedBounds.offsetBy(dx: live.offsetX, dy: live.offsetY)
         )
-        // `context.samples` is exactly the array that already won a
-        // successful `TargetWindowSelection.selectWindow` call pre-lock --
-        // `resolveAnchorPatch` only reaches the success path that builds
-        // `reanchorContext` once `buildWindowAnchor` has already succeeded
-        // against these same samples -- so it can never be empty and this
-        // call can never return `nil` in practice. The `??` fallback below
-        // is defensive, not expected to fire.
-        let reselected = DrawRequest.buildWindowAnchor(
+        guard let reselected = DrawRequest.buildWindowAnchor(
             processId: context.processId, appId: context.appId, samples: context.samples,
-            paintedBounds: livePaintedBounds, resize: context.resize, now: Date()
-        )
+            paintedBounds: livePaintedBounds, resize: context.resize, now: Date(),
+            screenId: live.effectiveScreenId
+        ) else {
+            // A tracker sample can change the effective display between the
+            // pre-lock pick and this locked re-selection. Since samples are
+            // deliberately filtered to the live display, no candidate means
+            // there is no safe replacement to commit.
+            return nil
+        }
         return AnchorPatchResolution(
             screenId: live.effectiveScreenId,
-            anchor: reselected?.anchor ?? patch.annotation.anchor,
+            anchor: reselected.anchor,
             staticAdjustment: live.effectiveAdjustment,
-            projectionOverride: reselected?.projection ?? patch.projectionOverride,
+            projectionOverride: reselected.projection,
             reanchorContext: nil
         )
     }

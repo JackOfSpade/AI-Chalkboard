@@ -242,6 +242,50 @@ final class MCPArgumentValidationTests: XCTestCase {
         XCTAssertTrue(duration.contains("duration_seconds is no longer supported"))
     }
 
+    // MARK: - Annotation avoidance catalog boundary
+
+    /// The catalog validator is the strict protocol boundary: it verifies
+    /// which tools/levels may name `avoid` and validates its inexpensive
+    /// structure before any handler can load batch raster assets.
+    func testAvoidIsAcceptedOnlyForItsThreeTopLevelDrawingTools() throws {
+        for name in ["draw_text", "draw_shape", "draw_batch"] {
+            XCTAssertNil(MCPToolCatalog.validateArguments(
+                toolName: name, args: ["avoid": ["existing-highlight"]]
+            ), "\(name) should accept top-level avoid before its handler validates geometry")
+        }
+
+        for name in ["draw_path", "draw_image"] {
+            let error = try XCTUnwrap(MCPToolCatalog.validateArguments(
+                toolName: name, args: ["avoid": ["existing-highlight"]]
+            ))
+            XCTAssertTrue(error.contains("avoid"), error)
+        }
+
+        let itemError = try XCTUnwrap(MCPToolCatalog.validateArguments(
+            toolName: "draw_batch",
+            args: ["items": [[
+                "type": "text", "text": "Label", "x": 10, "y": 10,
+                "font_size": 16, "avoid": ["existing-highlight"]
+            ]]]
+        ))
+        XCTAssertTrue(itemError.contains("items[0]"), itemError)
+        XCTAssertTrue(itemError.contains("avoid"), itemError)
+    }
+
+    func testMalformedAvoidIsRejectedAtCatalogBoundaryBeforeDispatch() throws {
+        for name in ["draw_text", "draw_shape", "draw_batch"] {
+            let wrongType = try XCTUnwrap(MCPToolCatalog.validateArguments(
+                toolName: name, args: ["avoid": "existing-highlight"]
+            ))
+            XCTAssertTrue(wrongType.contains("array"), "\(name): \(wrongType)")
+
+            let duplicate = try XCTUnwrap(MCPToolCatalog.validateArguments(
+                toolName: name, args: ["avoid": ["same-id", " same-id "]]
+            ))
+            XCTAssertTrue(duplicate.contains("duplicate"), "\(name): \(duplicate)")
+        }
+    }
+
     // MARK: - Coordinate transform safety
 
     private func testScreen(width: Int = 3_024, height: Int = 1_964) -> ScreenInfo {

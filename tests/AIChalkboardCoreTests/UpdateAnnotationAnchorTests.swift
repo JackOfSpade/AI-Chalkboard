@@ -401,9 +401,9 @@ final class UpdateAnnotationAnchorTests: XCTestCase {
     /// they exercise the ACTUAL production code path.
     @discardableResult
     private func commit(_ patch: AnnotationPatchResult, id: String, expectedRevision: UInt64) -> AnnotationStoreUpdateResult {
-        AnnotationStore.shared.updateWithOutcome(id: id, expectedRevision: expectedRevision) { live in
+        AnnotationStore.shared.updateIfPossibleWithOutcome(id: id, expectedRevision: expectedRevision, transform: { live in
             MCPServer.shared.finalizeAnchorPatch(patch, live: live)
-        }
+        })
     }
 
     /// Drives `AnnotationStore.shared` exactly as `handleUpdateAnnotation`
@@ -604,12 +604,12 @@ final class UpdateAnnotationAnchorTests: XCTestCase {
         let nearWindow = TargetWindowSample(
             windowId: 101, processId: 100,
             frame: CGRect(x: 0, y: 0, width: 50, height: 50),
-            screenId: "screen-near", isOnScreen: true
+            screenId: "screen-9", isOnScreen: true
         )
         let farWindow = TargetWindowSample(
             windowId: 202, processId: 100,
             frame: CGRect(x: 500, y: 500, width: 50, height: 50),
-            screenId: "screen-far", isOnScreen: true
+            screenId: "screen-9", isOnScreen: true
         )
         let samples = [nearWindow, farWindow]
 
@@ -671,12 +671,72 @@ final class UpdateAnnotationAnchorTests: XCTestCase {
 
         let after = try XCTUnwrap(store.get(id: id))
         XCTAssertEqual(after.anchor?.target.windowId, 202, "re-anchoring must select the window matching the LIVE painted bounds at commit time, not the stale pre-race pick -- this is BUG 2, the false doc-comment claim that selection could never depend on `current.anchorProjection`")
-        XCTAssertEqual(after.anchor?.referenceScreenId, "screen-far")
+        XCTAssertEqual(after.anchor?.referenceScreenId, "screen-9")
         XCTAssertEqual(after.anchorProjection?.adjustment, .identity, "a freshly (re-)selected window starts tracking at identity, not the pre-commit racing sample")
         XCTAssertEqual(
             after.effectiveAdjustment, expectedFrozenAdjustment,
             "re-anchoring must still freeze the LIVE pixel position at commit time (BUG 1) even though the WINDOW it tracks also changed (BUG 2)"
         )
+    }
+
+    /// A tracker update can also move an annotation to another display after
+    /// the pre-lock window sample. Cross-display filtering intentionally
+    /// leaves no eligible candidate in that case; the update must be an
+    /// atomic no-op, not a commit of the provisional old-display anchor.
+    func testReanchorLeavesAnnotationUnchangedWhenLiveDisplayHasNoSampledWindow() throws {
+        let store = AnnotationStore.shared
+        let id = "update-annotation-anchor-tests-reanchor-missing-live-screen-\(UUID().uuidString)"
+        let original = annotation(
+            id: id,
+            anchor: windowAnchor(windowId: 1, referenceScreenId: "screen-9"),
+            staticAdjustment: .identity,
+            anchorProjection: liveProjection(adjustment: .identity, effectiveScreenId: "screen-9")
+        )
+        XCTAssertEqual(store.addWithOutcome(original), .added)
+        defer { _ = store.remove(id: id) }
+
+        let stored = try XCTUnwrap(store.get(id: id))
+        let sampledWindow = TargetWindowSample(
+            windowId: 101, processId: 100,
+            frame: CGRect(x: 0, y: 0, width: 50, height: 50),
+            screenId: "screen-9", isOnScreen: true
+        )
+        let paintedBounds = stored.effectiveAdjustment.apply(
+            to: (PaintedBounds.paintedBounds(of: stored.kind) ?? .zero).offsetBy(dx: stored.offsetX, dy: stored.offsetY)
+        )
+        let provisional = try XCTUnwrap(DrawRequest.buildWindowAnchor(
+            processId: 100, appId: Self.fixtureAppId, samples: [sampledWindow],
+            paintedBounds: paintedBounds, resize: .pin, now: Date(), screenId: "screen-9"
+        ))
+        let patch = AnnotationPatchResult(
+            annotation: Annotation(
+                id: stored.id, screenId: stored.screenId, kind: stored.kind, colorHex: stored.colorHex,
+                label: stored.label, appId: stored.appId, appName: stored.appName, opacity: stored.opacity,
+                offsetX: stored.offsetX, offsetY: stored.offsetY, zIndex: stored.zIndex,
+                anchor: provisional.anchor, staticAdjustment: stored.staticAdjustment,
+                createdAt: stored.createdAt
+            ),
+            projectionOverride: provisional.projection,
+            anchorIntent: .reanchor(resize: .pin),
+            reanchorContext: ReanchorWindowContext(
+                processId: 100, appId: Self.fixtureAppId, resize: .pin, samples: [sampledWindow]
+            )
+        )
+
+        let racingProjection = liveProjection(
+            adjustment: AnchorAdjustment(scaleX: 1, scaleY: 1, translateX: 500, translateY: 500),
+            effectiveScreenId: "screen-moved-without-sample"
+        )
+        XCTAssertTrue(store.applyAnchorProjections([id: racingProjection]))
+        let immediatelyBeforeCommit = try XCTUnwrap(store.get(id: id))
+
+        XCTAssertEqual(commit(patch, id: id, expectedRevision: stored.revision), .aborted)
+
+        let after = try XCTUnwrap(store.get(id: id))
+        XCTAssertEqual(after.revision, immediatelyBeforeCommit.revision, "an aborted re-anchor must not assign a new revision")
+        XCTAssertEqual(after.anchor, immediatelyBeforeCommit.anchor, "an aborted re-anchor must not install its old-display provisional anchor")
+        XCTAssertEqual(after.staticAdjustment, immediatelyBeforeCommit.staticAdjustment)
+        XCTAssertEqual(after.anchorProjection, immediatelyBeforeCommit.anchorProjection, "the store must retain the racing tracker sample when no replacement commits")
     }
 
     // MARK: - anchorPatchShouldKickTracker (FIX 3): which intents nudge AnchorTracker

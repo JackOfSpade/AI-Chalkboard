@@ -274,6 +274,36 @@ final class HighlightElementAnchorTests: XCTestCase {
         XCTAssertEqual(resolution.anchor.target.windowId, 1)
     }
 
+    /// Sample frames are local to their own screens, so two windows on
+    /// different displays may both appear to contain the same numerical
+    /// element frame. The highlight must only consider the element's actual
+    /// display; otherwise its identity projection would move the highlight
+    /// into a different local coordinate system.
+    func testBuildHighlightAnchorIgnoresFrontmostOtherScreenWithSameLocalCoordinates() throws {
+        let elementFrame = CGRect(x: 40, y: 40, width: 20, height: 20)
+        let samples = [
+            sample(windowId: 1, x: 0, y: 0, width: 200, height: 200, screenId: "screen-2"),
+            sample(windowId: 2, x: 0, y: 0, width: 100, height: 100, screenId: Self.fixtureScreenId)
+        ]
+
+        let resolution = try XCTUnwrap(buildHighlightAnchor(
+            mode: .window, processId: 500, appId: "com.example.App", samples: samples,
+            elementFrame: elementFrame, resize: .pin, elementSpec: nil, now: Date(),
+            screenId: Self.fixtureScreenId
+        ))
+        XCTAssertEqual(resolution.anchor.target.windowId, 2)
+        XCTAssertEqual(resolution.projection.effectiveScreenId, Self.fixtureScreenId)
+    }
+
+    func testBuildHighlightAnchorReturnsNilWhenNoWindowIsOnTheElementScreen() {
+        XCTAssertNil(buildHighlightAnchor(
+            mode: .element, processId: 500, appId: "com.example.App",
+            samples: [sample(windowId: 1, x: 0, y: 0, width: 100, height: 100, screenId: "screen-2")],
+            elementFrame: CGRect(x: 10, y: 10, width: 20, height: 20),
+            resize: .pin, elementSpec: elementSpecFixture(), now: Date(), screenId: Self.fixtureScreenId
+        ))
+    }
+
     /// `resize: .scale` is used here even though `parseHighlightAnchorArguments`
     /// never actually produces `.element` mode with anything but `.pin` (see
     /// that function's own doc comment on why `anchor_resize` is rejected

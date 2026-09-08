@@ -52,6 +52,10 @@ enum DrawOutcome<Success> {
 /// completely before ever calling `resolveTargetApp`).
 struct DrawRequest {
     let screen: ScreenInfo
+    /// Defaults to the process-wide store in production; injectable so the
+    /// collision/layout pipeline can be exercised against an isolated store
+    /// without mutating global test state.
+    let annotationStore: AnnotationStore
 
     /// Every display present in the snapshot `screen` was chosen from.
     ///
@@ -71,10 +75,16 @@ struct DrawRequest {
     /// position, so it is already the one display the geometry can belong to.
     let screenIsDetermined: Bool
 
-    init(screen: ScreenInfo, candidateScreens: [ScreenInfo]? = nil, screenIsDetermined: Bool = true) {
+    init(
+        screen: ScreenInfo,
+        candidateScreens: [ScreenInfo]? = nil,
+        screenIsDetermined: Bool = true,
+        annotationStore: AnnotationStore = .shared
+    ) {
         self.screen = screen
         self.candidateScreens = candidateScreens ?? [screen]
         self.screenIsDetermined = screenIsDetermined
+        self.annotationStore = annotationStore
     }
 
     struct CoordinateTransform {
@@ -463,6 +473,226 @@ struct DrawRequest {
         return .success(AnchorArgumentRequest(resize: resize))
     }
 
+    // MARK: - `avoid` argument parsing and draw-time layout
+
+    /// A validated request to keep a new annotation clear of existing ones.
+    /// IDs are retained in caller order for deterministic response reporting;
+    /// duplicates are rejected instead of silently doing redundant full-screen
+    /// renders.
+    struct AvoidanceArgumentRequest: Equatable {
+        let annotationIds: [String]
+    }
+
+    /// Validates the inexpensive structural part of `avoid` before app/window
+    /// resolution or off-screen rendering begins. The public schema advertises
+    /// the same 1...32 and 1...128 limits, but MCP clients are not trusted to
+    /// enforce schemas on the server's behalf.
+    static func parseAvoidanceArguments(_ args: [String: Any]) -> DrawOutcome<AvoidanceArgumentRequest?> {
+        guard args.keys.contains("avoid") else { return .success(nil) }
+        guard let rawIds = args["avoid"] as? [Any] else {
+            return .failure("avoid must be an array of 1...\(DrawingDefaults.maxAvoidedAnnotations) existing annotation ID strings when supplied. Nothing was drawn.")
+        }
+        guard !rawIds.isEmpty, rawIds.count <= DrawingDefaults.maxAvoidedAnnotations else {
+            return .failure("avoid must contain 1...\(DrawingDefaults.maxAvoidedAnnotations) existing annotation IDs when supplied. Nothing was drawn.")
+        }
+
+        var ids: [String] = []
+        var seen: Set<String> = []
+        ids.reserveCapacity(rawIds.count)
+        for (index, value) in rawIds.enumerated() {
+            guard let rawId = value as? String else {
+                return .failure("avoid[\(index)] must be an annotation ID string. Nothing was drawn.")
+            }
+            let annotationId = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !annotationId.isEmpty, annotationId.count <= 128 else {
+                return .failure("avoid[\(index)] must contain 1...128 non-whitespace characters. Nothing was drawn.")
+            }
+            guard seen.insert(annotationId).inserted else {
+                return .failure("avoid contains duplicate annotation ID '\(annotationId)'. List each annotation once. Nothing was drawn.")
+            }
+            ids.append(annotationId)
+        }
+        return .success(AvoidanceArgumentRequest(annotationIds: ids))
+    }
+
+    /// The exact renderer-derived placement selected for one opt-in `avoid`
+    /// request. `offsetX`/`offsetY` are stored on the annotation container so a
+    /// complete batch moves as one unit and primitive geometry remains intact.
+    struct AvoidanceResolution {
+        let annotationIds: [String]
+        /// Store tokens captured from the exact snapshots whose pixels were
+        /// measured. Besides explicit revisions, these retain renderer-
+        /// relevant anchor projection state so a target that moves between
+        /// measurement and insertion cannot admit a stale collision result.
+        let avoidanceTokens: [AnnotationStoreAvoidanceToken]
+        let requestedPaintedBounds: CGRect
+        let finalPaintedBounds: CGRect
+        let offsetX: Double
+        let offsetY: Double
+        let placement: AnnotationCollisionLayout.Placement
+
+        var moved: Bool { offsetX != 0 || offsetY != 0 }
+    }
+
+    /// Resolves exact painted bounds for both sides of the collision test and
+    /// chooses a nearby non-overlapping annotation-wide offset. This calls the
+    /// same off-screen live renderer as `get_annotation_bounds`; it never takes
+    /// a screenshot or requires capture permission.
+    ///
+    /// Existing annotations are snapshotted together with one raster lease.
+    /// Renderer-relevant tokens from those snapshots are carried into the
+    /// eventual conditional store insert, closing the snapshot/render/insert
+    /// race against clear/restyle operations and anchor motion. Timestamp-only
+    /// tracker refreshes do not invalidate a token; avoidance remains a
+    /// one-time draw-time layout decision rather than a persistent constraint.
+    private func resolveAvoidance(
+        request: AvoidanceArgumentRequest?,
+        kind: AnnotationKind,
+        colorHex: String,
+        label: String?
+    ) -> DrawOutcome<AvoidanceResolution?> {
+        guard let request else { return .success(nil) }
+        guard let snapshots = annotationStore.renderSnapshots(ids: request.annotationIds) else {
+            return .failure("One or more annotation IDs in avoid do not exist anymore (requested: \(request.annotationIds.joined(separator: ", "))). Nothing was drawn; call list_annotations for current IDs and retry.")
+        }
+
+        var avoidedBounds: [CGRect] = []
+        var avoidanceTokens: [AnnotationStoreAvoidanceToken] = []
+        avoidedBounds.reserveCapacity(snapshots.annotations.count)
+        avoidanceTokens.reserveCapacity(snapshots.annotations.count)
+        for annotation in snapshots.annotations {
+            guard annotation.effectiveScreenId == screen.id else {
+                return .failure("avoid annotation '\(annotation.id)' is currently on display \(annotation.effectiveScreenId), but this drawing targets display \(screen.id). Display-local bounds cannot collide across screens, so nothing was drawn; use the matching screen_id or remove that ID from avoid.")
+            }
+            if annotation.anchor != nil, !annotation.anchorPermitsPainting {
+                let state = annotation.anchorProjection?.state.rawValue ?? "unknown"
+                return .failure("avoid annotation '\(annotation.id)' is not currently painted because its anchor state is '\(state)'. Nothing was drawn; wait for that anchor to be visible/tracking again, or remove that ID from avoid.")
+            }
+            let bounds: CGRect?
+            do {
+                bounds = try AnnotationVerificationCompositor.renderedPaintedBounds(
+                    of: annotation, on: screen, rasterLease: snapshots.rasterLease
+                )
+            } catch {
+                Logger.shared.log("Collision-avoidance bounds render failed for existing annotation id=\(annotation.id): \(error.localizedDescription)", level: "WARN")
+                return .failure("Could not measure avoid annotation '\(annotation.id)' with the live renderer. Nothing was drawn; call get_annotation_bounds for that ID to diagnose it, then retry.")
+            }
+            guard let bounds else {
+                return .failure("avoid annotation '\(annotation.id)' has no painted pixels on display \(screen.id), so it cannot be used as a collision target. Nothing was drawn; call get_annotation_bounds for that ID or remove it from avoid.")
+            }
+            avoidedBounds.append(bounds)
+            avoidanceTokens.append(AnnotationStoreAvoidanceToken(annotation: annotation))
+        }
+
+        func candidate(offsetX: Double, offsetY: Double) -> Annotation {
+            Annotation(
+                screenId: screen.id,
+                kind: kind,
+                colorHex: colorHex,
+                label: label,
+                offsetX: offsetX,
+                offsetY: offsetY
+            )
+        }
+
+        let requestedBounds: CGRect
+        do {
+            guard let rendered = try AnnotationVerificationCompositor.renderedPaintedBounds(
+                of: candidate(offsetX: 0, offsetY: 0), on: screen
+            ) else {
+                return .failure("The prospective annotation has no painted pixels on display \(screen.id), so its overlap cannot be checked. Nothing was drawn; move it on-screen or remove avoid.")
+            }
+            requestedBounds = rendered
+        } catch {
+            Logger.shared.log("Collision-avoidance bounds render failed for prospective annotation: \(error.localizedDescription)", level: "WARN")
+            return .failure("Could not measure the prospective annotation with the live renderer, so overlap cannot be checked safely. Nothing was drawn.")
+        }
+
+        let canvas = CGRect(x: 0, y: 0, width: screen.widthPx, height: screen.heightPx)
+        var currentBounds = requestedBounds
+        var totalOffsetX = 0.0
+        var totalOffsetY = 0.0
+        var firstPlacement = AnnotationCollisionLayout.Placement.unchanged
+
+        // The first pass is exact for normal on-screen geometry. Extra bounded
+        // passes handle the unusual case where the proposed annotation was
+        // clipped by a display edge and moving it reveals previously clipped
+        // pixels, changing its renderer-derived bounds.
+        for _ in 0..<4 {
+            guard let layout = AnnotationCollisionLayout.resolve(
+                proposed: currentBounds,
+                avoiding: avoidedBounds,
+                padding: DrawingDefaults.annotationAvoidanceGapPx,
+                within: canvas
+            ) else {
+                return .failure("No non-overlapping on-screen placement could be found for this annotation around the IDs in avoid. Nothing was drawn; choose a clearer starting position, clear space, or omit avoid for intentional stacking.")
+            }
+            if firstPlacement == .unchanged, layout.placement != .unchanged {
+                firstPlacement = layout.placement
+            }
+            totalOffsetX += Double(layout.offset.x)
+            totalOffsetY += Double(layout.offset.y)
+            guard totalOffsetX.isFinite, totalOffsetY.isFinite,
+                  abs(totalOffsetX) <= DrawingDefaults.maxCoordinateMagnitudePx,
+                  abs(totalOffsetY) <= DrawingDefaults.maxCoordinateMagnitudePx else {
+                return .failure("Collision avoidance would require an unsafe annotation offset. Nothing was drawn; choose a nearer starting position.")
+            }
+
+            let renderedBounds: CGRect
+            if layout.offset == .zero {
+                renderedBounds = currentBounds
+            } else {
+                do {
+                    guard let rendered = try AnnotationVerificationCompositor.renderedPaintedBounds(
+                        of: candidate(offsetX: totalOffsetX, offsetY: totalOffsetY), on: screen
+                    ) else {
+                        return .failure("Collision avoidance moved the annotation outside the drawable display. Nothing was drawn; choose a position with more nearby space.")
+                    }
+                    renderedBounds = rendered
+                } catch {
+                    Logger.shared.log("Collision-avoidance final bounds render failed: \(error.localizedDescription)", level: "WARN")
+                    return .failure("Could not verify the collision-free placement with the live renderer. Nothing was drawn.")
+                }
+            }
+
+            if AnnotationCollisionLayout.contains(canvas, renderedBounds),
+               !avoidedBounds.contains(where: { AnnotationCollisionLayout.intersects(renderedBounds, $0) }) {
+                return .success(AvoidanceResolution(
+                    annotationIds: request.annotationIds,
+                    avoidanceTokens: avoidanceTokens,
+                    requestedPaintedBounds: requestedBounds,
+                    finalPaintedBounds: renderedBounds,
+                    offsetX: totalOffsetX,
+                    offsetY: totalOffsetY,
+                    placement: firstPlacement
+                ))
+            }
+            currentBounds = renderedBounds
+        }
+        return .failure("Could not converge on a collision-free renderer-verified placement after bounded retries. Nothing was drawn; choose a clearer starting position and retry.")
+    }
+
+    /// Stable JSON shape returned only when a caller opted into `avoid`.
+    /// `paintedBoundsBackingPx` is the exact final placement the user asked to
+    /// receive; `offsetBackingPx` is also directly usable as update_annotation's
+    /// absolute offset while no later anchor adjustment has occurred.
+    static func avoidanceResponsePayload(_ resolution: AvoidanceResolution) -> [String: Any] {
+        func rect(_ value: CGRect) -> [String: Double] {
+            ["x": value.minX, "y": value.minY, "width": value.width, "height": value.height]
+        }
+        return [
+            "avoidedAnnotationIds": resolution.annotationIds,
+            "requestedPaintedBoundsBackingPx": rect(resolution.requestedPaintedBounds),
+            "paintedBoundsBackingPx": rect(resolution.finalPaintedBounds),
+            "offsetBackingPx": ["x": resolution.offsetX, "y": resolution.offsetY],
+            "moved": resolution.moved,
+            "placement": resolution.placement.rawValue,
+            "gapPx": DrawingDefaults.annotationAvoidanceGapPx,
+            "scope": "draw_time_snapshot",
+            "note": "This prevents overlap at creation time only. Later update_annotation calls or independently moving/resizing anchors can introduce overlap again."
+        ]
+    }
+
     // MARK: - `anchor="window"` resolution
 
     /// One fully resolved `anchor="window"` request, ready to attach to a
@@ -502,9 +732,19 @@ struct DrawRequest {
         samples: [TargetWindowSample],
         paintedBounds: CGRect,
         resize: AnchorResizeBehavior,
-        now: Date
+        now: Date,
+        screenId: String? = nil
     ) -> DrawAnchorResolution? {
-        guard let selected = TargetWindowSelection.selectWindow(forRect: paintedBounds, among: samples) else {
+        // Every sample frame is SCREEN-LOCAL, not virtual-desktop geometry.
+        // Comparing one display-local drawing rect against a window frame from
+        // another display is therefore meaningless even when the numbers happen
+        // to overlap. Production callers pass the drawing's effective screen;
+        // the nil default keeps this pure helper convenient for single-screen
+        // fixtures and source-compatible for in-process callers.
+        let eligibleSamples = screenId.map { target in
+            samples.filter { $0.screenId == target }
+        } ?? samples
+        guard let selected = TargetWindowSelection.selectWindow(forRect: paintedBounds, among: eligibleSamples) else {
             return nil
         }
         let anchor = AnnotationAnchor(
@@ -552,7 +792,8 @@ struct DrawRequest {
         resize: AnchorResizeBehavior,
         appId: String?,
         appName: String?,
-        kind: AnnotationKind
+        kind: AnnotationKind,
+        paintedBoundsOverride: CGRect? = nil
     ) -> DrawOutcome<DrawAnchorResolution> {
         guard let appId else {
             return .failure("anchor=\"window\" requires a target application, because it anchors the drawing to one of that application's windows. Nothing was drawn; pass app explicitly, or draw without anchor to place this at fixed display coordinates.")
@@ -566,12 +807,17 @@ struct DrawRequest {
             return .failure("anchor=\"window\" cannot choose a window for \(displayName) because it has \(pids.count) running processes and anchoring refuses to guess which one owns the intended window. Nothing was drawn; quit the extra instance(s) and retry, or draw without anchor.")
         }
         let samples = TargetWindowProbe.shared.windows(forProcessId: pid, screens: candidateScreens)
-        let bounds = PaintedBounds.paintedBounds(of: kind) ?? .zero
+        // An avoidance-adjusted drawing already has exact renderer-derived
+        // final bounds. Use those for window selection so an annotation nudged
+        // onto a neighbouring window does not anchor to whichever window its
+        // pre-layout origin happened to touch. Calls without `avoid` retain the
+        // established lightweight PaintedBounds path byte-for-byte.
+        let bounds = paintedBoundsOverride ?? (PaintedBounds.paintedBounds(of: kind) ?? .zero)
         guard let resolution = DrawRequest.buildWindowAnchor(
             processId: pid, appId: appId, samples: samples,
-            paintedBounds: bounds, resize: resize, now: Date()
+            paintedBounds: bounds, resize: resize, now: Date(), screenId: screen.id
         ) else {
-            return .failure("anchor=\"window\" found no eligible on-screen window for \(displayName) (pid \(pid)). Nothing was drawn: a window anchor with no window would silently behave like an unanchored drawing. Bring a window of that application on screen and retry, or draw without anchor.")
+            return .failure("anchor=\"window\" found no eligible on-screen window for \(displayName) (pid \(pid)) on display \(screen.id). Nothing was drawn: window frames are display-local and anchoring to a window on a different display would move the drawing into the wrong coordinate system. Bring that application's window onto the target display and retry, choose its screen_id, or draw without anchor.")
         }
         return .success(resolution)
     }
@@ -642,6 +888,12 @@ struct DrawRequest {
         case .success(let value): anchorRequest = value
         }
 
+        let avoidanceRequest: AvoidanceArgumentRequest?
+        switch DrawRequest.parseAvoidanceArguments(args) {
+        case .failure(let err): return .failure(err)
+        case .success(let value): avoidanceRequest = value
+        }
+
         let appId: String?
         let appName: String?
         if let resolvedTargetApp {
@@ -660,47 +912,100 @@ struct DrawRequest {
             appName = resolvedAppName
         }
 
-        // Only NOW -- after the annotation's own app link is settled -- does
-        // an `anchor="window"` request get to resolve a running process and
-        // enumerate windows. `anchorRequest` is non-nil only once
-        // `parseAnchorArguments` has already validated the strings above.
-        var anchorResolution: DrawAnchorResolution?
-        if let anchorRequest {
-            switch resolveWindowAnchor(resize: anchorRequest.resize, appId: appId, appName: appName, kind: kind) {
+        var storedAnnotation: Annotation?
+        var storedAvoidanceResolution: AvoidanceResolution?
+        var storedAnchorResolution: DrawAnchorResolution?
+
+        // Explicit update/clear operations can race the exact-bounds render.
+        // The guarded insertion below detects that at the linearization point;
+        // retry once from a fresh atomic snapshot so the ordinary outcome is
+        // still one successful tool call, while a continuously changing target
+        // fails boundedly rather than storing a stale/possibly-overlapping
+        // placement.
+        insertionAttempts: for attempt in 0..<2 {
+            let avoidanceResolution: AvoidanceResolution?
+            switch resolveAvoidance(
+                request: avoidanceRequest,
+                kind: kind,
+                colorHex: colorHex,
+                label: label
+            ) {
             case .failure(let err): return .failure(err)
-            case .success(let value): anchorResolution = value
+            case .success(let value): avoidanceResolution = value
+            }
+
+            // Only NOW -- after the annotation's own app link and avoidance
+            // placement are settled -- does an `anchor="window"` request
+            // enumerate windows. Passing exact final avoidance bounds prevents
+            // an auto-nudged annotation from choosing its pre-layout window.
+            var anchorResolution: DrawAnchorResolution?
+            if let anchorRequest {
+                switch resolveWindowAnchor(
+                    resize: anchorRequest.resize,
+                    appId: appId,
+                    appName: appName,
+                    kind: kind,
+                    paintedBoundsOverride: avoidanceResolution?.finalPaintedBounds
+                ) {
+                case .failure(let err): return .failure(err)
+                case .success(let value): anchorResolution = value
+                }
+            }
+
+            let annotation = Annotation(
+                screenId: screen.id,
+                kind: kind,
+                colorHex: colorHex,
+                label: label,
+                appId: appId,
+                appName: appName,
+                offsetX: avoidanceResolution?.offsetX ?? 0,
+                offsetY: avoidanceResolution?.offsetY ?? 0,
+                zIndex: zIndex,
+                anchor: anchorResolution?.anchor,
+                // Installed in this SAME store write, per the design contract:
+                // a real anchor is never observed with a nil projection.
+                anchorProjection: anchorResolution?.projection
+            )
+            switch annotationStore.addWithOutcome(
+                annotation,
+                requiringUnchangedAvoidance: avoidanceResolution?.avoidanceTokens ?? []
+            ) {
+            case .added(let revision):
+                // `AnnotationStore` assigns revision while it holds its lock.
+                // Preserve that exact inserted snapshot for callbacks: a
+                // follow-up anchor attach uses it as an expectedRevision CAS
+                // token, and passing the pre-insert value (revision 0) would
+                // make that legitimate follow-up look stale.
+                var committedAnnotation = annotation
+                committedAnnotation.revision = revision
+                storedAnnotation = committedAnnotation
+                storedAvoidanceResolution = avoidanceResolution
+                storedAnchorResolution = anchorResolution
+                break insertionAttempts
+            case .avoidanceChanged:
+                if attempt == 0 { continue insertionAttempts }
+                return .failure("An annotation named in avoid changed, moved, or was cleared repeatedly while its placement was being measured. Nothing was drawn; retry once that annotation is stable.")
+            case .rejected(.payloadBytes(let limit, let attempted)):
+                return .failure("The annotation was not stored because retained vector/text payload would become \(attempted) bytes, exceeding the \(limit)-byte session limit. Clear old annotations or use smaller geometry.")
+            case .rejected(.primitiveCount(let limit, let attempted)):
+                return .failure("The annotation was not stored because retained primitive count would become \(attempted), exceeding the \(limit)-primitive session limit. Clear old annotations or use a smaller batch.")
+            case .rejected(.batchNestingDepth(let limit, let attempted)):
+                return .failure("The annotation was not stored because its batch nesting depth is \(attempted), exceeding the \(limit)-level safety limit. Flatten nested batches and retry.")
+            case .rejected(.annotationCount(let limit, let attempted)):
+                return .failure("The annotation was not stored because the store would hold \(attempted) annotations, exceeding the \(limit)-annotation session limit. Clear annotations you no longer need and retry.")
             }
         }
 
-        let annotation = Annotation(
-            screenId: screen.id,
-            kind: kind,
-            colorHex: colorHex,
-            label: label,
-            appId: appId,
-            appName: appName,
-            zIndex: zIndex,
-            anchor: anchorResolution?.anchor,
-            // Installed in this SAME store write, per the design contract: a
-            // real anchor is never observed with a nil projection (see
-            // `Annotation.anchorPermitsPainting`'s doc comment).
-            anchorProjection: anchorResolution?.projection
-        )
-        switch AnnotationStore.shared.addWithOutcome(annotation) {
-        case .added:
-            onAnnotationCreated?(annotation)
-        case .rejected(.payloadBytes(let limit, let attempted)):
-            return .failure("The annotation was not stored because retained vector/text payload would become \(attempted) bytes, exceeding the \(limit)-byte session limit. Clear old annotations or use smaller geometry.")
-        case .rejected(.primitiveCount(let limit, let attempted)):
-            return .failure("The annotation was not stored because retained primitive count would become \(attempted), exceeding the \(limit)-primitive session limit. Clear old annotations or use a smaller batch.")
-        case .rejected(.batchNestingDepth(let limit, let attempted)):
-            return .failure("The annotation was not stored because its batch nesting depth is \(attempted), exceeding the \(limit)-level safety limit. Flatten nested batches and retry.")
-        case .rejected(.annotationCount(let limit, let attempted)):
-            return .failure("The annotation was not stored because the store would hold \(attempted) annotations, exceeding the \(limit)-annotation session limit. Clear annotations you no longer need and retry.")
+        guard let annotation = storedAnnotation else {
+            return .failure("The annotation could not be stored after bounded collision-layout retries. Nothing was drawn.")
         }
+        let avoidanceResolution = storedAvoidanceResolution
+        let anchorResolution = storedAnchorResolution
+        onAnnotationCreated?(annotation)
 
         let text = "Created \(noun) annotation: \(annotation.id)\(MCPServer.shared.linkageSuffix(appId: appId, appName: appName))"
-        guard let anchorResolution else {
+        guard anchorResolution != nil || avoidanceResolution != nil else {
             // Unanchored -- BY FAR the common case -- keeps today's exact
             // plain-text response, byte for byte: existing callers (and
             // `test_mcp_stdio.py`'s `"annotation: " `-splitting parse of this
@@ -708,17 +1013,22 @@ struct DrawRequest {
             // used.
             return .success(text)
         }
-        // Anchored: the response becomes a JSON object carrying the same
-        // message text plus the `anchor` block MCP_SURFACE.md's "Success
-        // payload" section specifies, exactly like `highlight_element`'s
-        // existing JSON success payload.
-        let payload: [String: Any] = [
+        // Opt-in structured features return one JSON object carrying the
+        // unchanged human-readable message plus their metadata. An anchored
+        // avoidance call includes both blocks; neither feature changes the
+        // absent-feature legacy response above.
+        var payload: [String: Any] = [
             "message": text,
-            "annotationId": annotation.id,
-            "anchor": DrawRequest.anchorResponsePayload(anchorResolution)
+            "annotationId": annotation.id
         ]
+        if let anchorResolution {
+            payload["anchor"] = DrawRequest.anchorResponsePayload(anchorResolution)
+        }
+        if let avoidanceResolution {
+            payload["placement"] = DrawRequest.avoidanceResponsePayload(avoidanceResolution)
+        }
         guard let jsonText = MCPServer.shared.jsonString(payload) else {
-            return .failure("Created \(noun) annotation \(annotation.id) and anchored it, but failed to encode the anchor metadata in the response. The annotation and its anchor were still stored; call list_annotations to inspect them.")
+            return .failure("Created \(noun) annotation \(annotation.id), but failed to encode its placement metadata in the response. The annotation was still stored; call list_annotations and get_annotation_bounds to inspect it.")
         }
         return .success(jsonText)
     }

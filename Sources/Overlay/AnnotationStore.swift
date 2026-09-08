@@ -63,6 +63,42 @@ public enum AnnotationStoreAddResult: Equatable, Sendable {
     case rejected(AnnotationStoreResourceLimit)
 }
 
+/// The renderer-relevant state captured for an annotation a prospective
+/// insertion must avoid. `revision` catches caller edits; the remaining
+/// fields catch AnchorTracker motion without treating bookkeeping-only
+/// projection refreshes (`sampledAt`, current window frame, diagnostics) as
+/// a changed layout.
+public struct AnnotationStoreAvoidanceToken: Equatable, Sendable {
+    public let id: String
+    public let revision: UInt64
+    public let effectiveScreenId: String
+    public let effectiveAdjustment: AnchorAdjustment
+    /// `nil` means the annotation is unanchored (or has not received a
+    /// projection yet). Hidden/lost are distinct from tracking because they
+    /// change whether the renderer paints any pixels at all.
+    public let anchorState: String?
+
+    public init(annotation: Annotation) {
+        id = annotation.id
+        revision = annotation.revision
+        effectiveScreenId = annotation.effectiveScreenId
+        effectiveAdjustment = annotation.effectiveAdjustment
+        anchorState = annotation.anchorProjection?.state.rawValue
+    }
+}
+
+/// Outcome for an insertion guarded by one or more avoided annotations.
+/// Unlike `AnnotationStoreAddResult`, this distinguishes a resource rejection
+/// from a target that was cleared or edited after its bounds were sampled.
+public enum AnnotationStoreGuardedAddResult: Equatable, Sendable {
+    /// The exact revision assigned to the stored copy. Callers that need an
+    /// immediate follow-up compare-and-swap must use this rather than the
+    /// pre-insertion `Annotation` value, whose revision is still zero.
+    case added(revision: UInt64)
+    case avoidanceChanged
+    case rejected(AnnotationStoreResourceLimit)
+}
+
 /// Outcome for replacement.  Keeping `notFound` distinct from `rejected`
 /// lets the update handler retain its current no-such-id message while also
 /// reporting an aggregate-resource failure accurately.
@@ -72,6 +108,11 @@ public enum AnnotationStoreUpdateResult: Equatable, Sendable {
     /// The caller patched a stale snapshot. Re-fetch and rebuild the patch
     /// rather than silently overwriting a newer update.
     case stale
+    /// The caller deliberately declined to produce a replacement after
+    /// inspecting the live annotation under the store lock. Nothing changed.
+    /// This is distinct from `.stale`: the caller's revision was current,
+    /// but the live state made its requested operation unsafe to complete.
+    case aborted
     case rejected(AnnotationStoreResourceLimit)
 }
 
@@ -258,36 +299,77 @@ public final class AnnotationStore: @unchecked Sendable {
     /// which is the inconsistency this resolves.
     @discardableResult
     public func addWithOutcome(_ annotation: Annotation) -> AnnotationStoreAddResult {
+        switch addWithOutcome(annotation, requiringUnchangedAvoidance: []) {
+        case .added:
+            return .added
+        case .rejected(let rejection):
+            return .rejected(rejection)
+        case .avoidanceChanged:
+            // An empty token list cannot observe this outcome. Keeping the
+            // established API as a thin wrapper guarantees ordinary insertions
+            // retain their exact result and notification behavior.
+            preconditionFailure("An unguarded insertion unexpectedly reported changed avoidance")
+        }
+    }
+
+    /// Atomically verifies that every avoidance token still names the same
+    /// renderer-relevant annotation state, then inserts `annotation` subject
+    /// to the ordinary store resource caps. The guard and append share one
+    /// lock, closing the bounds-snapshot -> insertion race without making
+    /// callers hold the store lock while they perform renderer work.
+    ///
+    /// Projection changes that alter translation, scale, effective screen, or
+    /// paint permission invalidate a token. Timestamp-only tracker refreshes
+    /// intentionally do not; see `AnnotationStoreAvoidanceToken`.
+    @discardableResult
+    public func addWithOutcome(
+        _ annotation: Annotation,
+        requiringUnchangedAvoidance avoidance: [AnnotationStoreAvoidanceToken]
+    ) -> AnnotationStoreGuardedAddResult {
         if let rejection = Self.batchNestingLimit(for: annotation.kind) {
             return .rejected(rejection)
         }
         var storedAnnotation = annotation
 
-        let rejection: AnnotationStoreResourceLimit? = withLock {
+        let result: AnnotationStoreGuardedAddResult = withLock {
             defer { assertResourceUsageConsistent() }
+            // A target disappearing is a changed target just as surely as a
+            // revision mismatch: a caller that sampled its former pixels must
+            // rebuild the layout from the current annotation set. This check
+            // deliberately runs before caps, so a stale layout never reports
+            // a misleading capacity error instead.
+            for token in avoidance {
+                guard let current = annotations.first(where: { $0.id == token.id }),
+                      current.revision == token.revision,
+                      current.effectiveScreenId == token.effectiveScreenId,
+                      current.effectiveAdjustment == token.effectiveAdjustment,
+                      current.anchorProjection?.state.rawValue == token.anchorState else {
+                    return .avoidanceChanged
+                }
+            }
             // Checked before the aggregate-resource caps below so a caller
             // who is already at the ceiling gets the specific "too many
             // annotations" reason rather than a payload/primitive rejection
             // that happens to also be true.
             let attemptedCount = annotations.count + 1
             if attemptedCount > DrawingDefaults.maxStoredAnnotations {
-                return .annotationCount(limit: DrawingDefaults.maxStoredAnnotations, attempted: attemptedCount)
+                return .rejected(.annotationCount(limit: DrawingDefaults.maxStoredAnnotations, attempted: attemptedCount))
             }
             // O(1), not a full re-walk of `annotations`: project what the
             // running total would become, WITHOUT mutating the real running
             // total yet, so a rejection below leaves it exactly as it was.
             let candidateUsage = usageAfter(removing: [], adding: [storedAnnotation])
             if let limit = resourceLimit(for: candidateUsage) {
-                return limit
+                return .rejected(limit)
             }
             storedAnnotation.revision = nextRevision()
             annotations.append(storedAnnotation)
             trackAdded(storedAnnotation)
-            return nil
+            return .added(revision: storedAnnotation.revision)
         }
 
-        if let rejection {
-            return .rejected(rejection)
+        guard case .added = result else {
+            return result
         }
 
         notifyChange()
@@ -299,7 +381,7 @@ public final class AnnotationStore: @unchecked Sendable {
         if storedAnnotation.anchor != nil {
             notifyAnchoredSetChanged()
         }
-        return .added
+        return result
     }
 
     public func remove(id: String) -> Bool {
@@ -426,30 +508,51 @@ public final class AnnotationStore: @unchecked Sendable {
         expectedRevision: UInt64?,
         transform: (Annotation) -> (annotation: Annotation, projection: AnchorProjection?)
     ) -> AnnotationStoreUpdateResult {
-        let result: (old: Annotation?, new: Annotation?, rejection: AnnotationStoreResourceLimit?, stale: Bool) = withLock {
+        updateIfPossibleWithOutcome(id: id, expectedRevision: expectedRevision, transform: { live in
+            transform(live)
+        })
+    }
+
+    /// Variant of the live-transform update that lets a pure transform decline
+    /// an otherwise current update. This is for operations whose provisional
+    /// pre-lock result must be revalidated against live tracker state. A nil
+    /// result returns `.aborted` atomically: it assigns no revision, changes
+    /// no projection, emits no notification, and releases no assets.
+    ///
+    /// `transform` runs with the store lock held and must therefore be pure
+    /// and must not call back into this store.
+    @discardableResult
+    public func updateIfPossibleWithOutcome(
+        id: String,
+        expectedRevision: UInt64?,
+        transform: (Annotation) -> (annotation: Annotation, projection: AnchorProjection?)?
+    ) -> AnnotationStoreUpdateResult {
+        let result: (old: Annotation?, new: Annotation?, rejection: AnnotationStoreResourceLimit?, stale: Bool, aborted: Bool) = withLock {
             defer { assertResourceUsageConsistent() }
             guard let index = annotations.firstIndex(where: { $0.id == id }) else {
-                return (nil, nil, nil, false)
+                return (nil, nil, nil, false, false)
             }
             guard expectedRevision == nil || annotations[index].revision == expectedRevision else {
-                return (nil, nil, nil, true)
+                return (nil, nil, nil, true, false)
             }
             // Read live, under the lock, and hand it to `transform` before
             // this closure does anything else -- this is the fix `transform`
             // exists to provide: `old` is whatever `AnchorTracker` most
             // recently wrote, not a snapshot from before this call started.
             let old = annotations[index]
-            let (replacement, projectionOverride) = transform(old)
+            guard let (replacement, projectionOverride) = transform(old) else {
+                return (nil, nil, nil, false, true)
+            }
             var storedReplacement = Self.preservingIdentity(replacement, id: id)
             if let rejection = Self.batchNestingLimit(for: storedReplacement.kind) {
-                return (nil, nil, rejection, false)
+                return (nil, nil, rejection, false, false)
             }
             // O(1): subtract `old`'s usage and add the normalized replacement's
             // instead of re-walking the whole store. A rejection below must leave the
             // real running total untouched, so this is a projection only.
             let candidateUsage = usageAfter(removing: [old], adding: [storedReplacement])
             if let rejection = resourceLimit(for: candidateUsage) {
-                return (nil, nil, rejection, false)
+                return (nil, nil, rejection, false, false)
             }
             // The `id` argument selects the existing annotation. A
             // replacement is a new rendering payload for that stable object,
@@ -475,13 +578,16 @@ public final class AnnotationStore: @unchecked Sendable {
             annotations[index] = storedReplacement
             trackRemoved(old)
             trackAdded(storedReplacement)
-            return (old, storedReplacement, nil, false)
+            return (old, storedReplacement, nil, false, false)
         }
         if let rejection = result.rejection {
             return .rejected(rejection)
         }
         if result.stale {
             return .stale
+        }
+        if result.aborted {
+            return .aborted
         }
         if let old = result.old, let new = result.new {
             let retained = Set(new.kind.rasterAssetIds)
@@ -618,17 +724,53 @@ public final class AnnotationStore: @unchecked Sendable {
         return withAnnotations { $0.first(where: { $0.id == id }) }
     }
 
-    /// Atomically snapshots an annotation and leases all raster pixels it
-    /// references before another thread can remove the annotation. Removal
-    /// releases store ownership only after this store's lock is dropped, so
-    /// acquiring the raster lease while the lock is held closes the lookup →
-    /// compositor handoff race without introducing a lock-order cycle.
-    func renderSnapshot(id: String) -> (annotation: Annotation, rasterLease: RasterAssetStore.Lease)? {
-        withAnnotations { storedAnnotations in
-            guard let annotation = storedAnnotations.first(where: { $0.id == id }) else { return nil }
-            let lease = RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
-            return (annotation, lease)
+    /// Atomically snapshots every requested annotation, in the same order as
+    /// `ids`, and leases every referenced raster before another thread can
+    /// remove any of them. Returns nil if even one requested id is absent;
+    /// callers therefore never receive a partial set whose members came from
+    /// different store states.
+    ///
+    /// The helper deliberately preserves duplicate ids rather than silently
+    /// deduplicating them. Its callers own the policy question of whether a
+    /// repeated requested annotation is meaningful; this store owns only the
+    /// atomic lookup-and-lease handoff.
+    ///
+    /// Removal releases store ownership only after this store's lock is
+    /// dropped, so acquiring the raster lease while that lock is held closes
+    /// the lookup → compositor handoff race without introducing a lock-order
+    /// cycle. One shared lease covers every returned annotation, which avoids
+    /// separately acquiring assets for a batch collision/layout operation.
+    func renderSnapshots(ids: [String]) -> (annotations: [Annotation], rasterLease: RasterAssetStore.Lease)? {
+        withLock {
+            var snapshots: [Annotation] = []
+            var rasterAssetIDs: [String] = []
+            snapshots.reserveCapacity(ids.count)
+
+            for id in ids {
+                guard let annotation = annotations.first(where: { $0.id == id }) else {
+                    return nil
+                }
+                snapshots.append(annotation)
+                rasterAssetIDs.append(contentsOf: annotation.kind.rasterAssetIds)
+            }
+
+            return (
+                annotations: snapshots,
+                rasterLease: RasterAssetStore.shared.lease(ids: rasterAssetIDs)
+            )
         }
+    }
+
+    /// Single-id convenience wrapper around `renderSnapshots(ids:)`. Kept so
+    /// verification's established focused API does not need to construct a
+    /// one-element array, while both paths share the same atomic lease
+    /// discipline.
+    func renderSnapshot(id: String) -> (annotation: Annotation, rasterLease: RasterAssetStore.Lease)? {
+        guard let snapshots = renderSnapshots(ids: [id]),
+              let annotation = snapshots.annotations.first else {
+            return nil
+        }
+        return (annotation, snapshots.rasterLease)
     }
 
     /// Every annotation on `screenId`, with NO per-app filtering.

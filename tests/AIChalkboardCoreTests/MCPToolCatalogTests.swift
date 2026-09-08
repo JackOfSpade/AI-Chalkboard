@@ -61,6 +61,44 @@ final class MCPToolCatalogTests: XCTestCase {
         XCTAssertNil(batchItemProperties["anchor_resize"])
     }
 
+    /// Avoidance is deliberately opt-in and scoped to the common
+    /// highlight-plus-label workflow: callers may ask text, shape, and an
+    /// annotation-wide batch to avoid already-created annotations.  It is
+    /// not a blanket stacking prohibition for every draw primitive, and a
+    /// batch item cannot independently opt out of another item -- the batch
+    /// has exactly one placement and one annotation ID.
+    func testAvoidSchemaIsScopedToTextShapeAndTopLevelBatchOnly() throws {
+        let supported = ["draw_text", "draw_shape", "draw_batch"]
+        for name in supported {
+            let avoid = try XCTUnwrap(
+                properties(try XCTUnwrap(toolsByName[name], name))["avoid"] as? [String: Any],
+                "\(name) is missing top-level avoid"
+            )
+            XCTAssertEqual(avoid["type"] as? String, "array", name)
+            XCTAssertEqual(avoid["minItems"] as? Int, 1, name)
+            XCTAssertEqual(avoid["maxItems"] as? Int, 32, name)
+            XCTAssertEqual(avoid["uniqueItems"] as? Bool, true, name)
+            let item = try XCTUnwrap(avoid["items"] as? [String: Any], name)
+            XCTAssertEqual(item["type"] as? String, "string", name)
+            XCTAssertEqual(item["minLength"] as? Int, 1, name)
+            XCTAssertEqual(item["maxLength"] as? Int, 128, name)
+
+            let description = (avoid["description"] as? String ?? "").lowercased()
+            XCTAssertTrue(description.contains("draw-time"), "\(name): avoid must say it is evaluated only at draw time")
+            XCTAssertTrue(description.contains("overlap"), "\(name): avoid must say it prevents overlap")
+            XCTAssertTrue(description.contains("final placement"), "\(name): avoid must promise the resolved placement in its response")
+        }
+
+        for name in ["draw_path", "draw_image"] {
+            XCTAssertNil(properties(try XCTUnwrap(toolsByName[name], name))["avoid"],
+                         "\(name) must retain deliberate stacking without avoid")
+        }
+
+        let batchItemProperties = MCPToolCatalog.batchItemProperties
+        XCTAssertNil(batchItemProperties["avoid"],
+                     "draw_batch items must not have independent avoidance; it is an annotation-wide placement")
+    }
+
     /// The catalog description guidance MCP_SURFACE.md specifies: what the
     /// value does, when to choose each `anchor_resize` policy, and that
     /// style dimensions stay backing pixels under both policies. Checked

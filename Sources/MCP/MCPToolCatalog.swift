@@ -146,6 +146,22 @@ enum MCPToolCatalog {
         "y": ["type": "number", "description": "rect only: top-left Y in the selected coordinate_space; alternative to center_x/center_y (supply one position pair, not both)."]
     ]
 
+    /// Opt-in collision avoidance is intentionally exposed only on the three
+    /// tools used for the common highlight-plus-label workflow. It is not part
+    /// of `sharedDrawProperties`: keeping it separate preserves draw_path and
+    /// draw_image as unrestricted stacking primitives, and keeps per-item batch
+    /// placement impossible (a batch moves as one annotation).
+    private static let avoidanceProperties: [String: Any] = [
+        "avoid": [
+            "type": "array",
+            "minItems": 1,
+            "maxItems": DrawingDefaults.maxAvoidedAnnotations,
+            "uniqueItems": true,
+            "items": ["type": "string", "minLength": 1, "maxLength": 128],
+            "description": "Existing annotation IDs this new annotation must not overlap. At draw-time, Chalkboard measures exact painted bounds with the live renderer, keeps the requested placement when already clear, or searches nearby for a clear on-screen position and moves the whole new annotation there with an 8 backing-pixel gap. If its bounded search cannot find one, nothing is drawn. The response reports the exact final placement and offset used. This is a one-time draw-time layout decision, not a persistent constraint: later update_annotation calls or independently moving/resizing anchors can introduce overlap again. Omit avoid to retain unrestricted intentional stacking and the legacy response."
+        ]
+    ]
+
     /// `draw_shape` reuses `pathProperties` for its stroke/fill/opacity/dash/
     /// fill_rule styling -- every one of those arguments passes straight
     /// through to the same vector renderer draw_path uses. `path_data` itself
@@ -266,6 +282,17 @@ enum MCPToolCatalog {
             return message
         }
 
+        // Validate the cheap, structural part of collision avoidance at the
+        // protocol boundary. In particular, draw_batch may otherwise decode
+        // raster items and build every primitive before DrawRequest.finish
+        // sees a malformed top-level `avoid` value.
+        if toolsSupportingAvoidance.contains(toolName) {
+            switch DrawRequest.parseAvoidanceArguments(args) {
+            case .failure(let message): return message
+            case .success: break
+            }
+        }
+
         guard toolName == "draw_batch",
               let items = args["items"] as? [[String: Any]] else {
             // The handler supplies the established type/size error for an
@@ -295,6 +322,10 @@ enum MCPToolCatalog {
 
     private static let toolsRejectingRetiredDuration: Set<String> = [
         "draw_path", "draw_shape", "draw_image", "draw_text", "draw_batch", "highlight_element"
+    ]
+
+    private static let toolsSupportingAvoidance: Set<String> = [
+        "draw_shape", "draw_text", "draw_batch"
     ]
 
     private static let batchItemAllowedKeysByType: [String: Set<String>] = [
@@ -357,7 +388,7 @@ enum MCPToolCatalog {
             "description": "Draws a circle, ellipse, or rectangle by centre and radius (or corner), instead of hand-assembling draw_path's raw SVG arc commands. Emits the identical closed-path vector geometry draw_path would, with the same stroke/fill/opacity/dash/fill_rule styling. See shape for the required fields per shape.",
             "inputSchema": [
                 "type": "object",
-                "properties": merged([sharedDrawProperties, pathStyleProperties, shapeProperties]),
+                "properties": merged([sharedDrawProperties, pathStyleProperties, shapeProperties, avoidanceProperties]),
                 "required": ["shape"]
             ]
         ],
@@ -375,7 +406,7 @@ enum MCPToolCatalog {
             "description": "Draws first-class system text at a top-left coordinate with optional background, padding, and opacity. No caller-rendered bitmap is required.",
             "inputSchema": [
                 "type": "object",
-                "properties": merged([sharedDrawProperties, textProperties]),
+                "properties": merged([sharedDrawProperties, textProperties, avoidanceProperties]),
                 "required": ["text", "x", "y", "font_size"]
             ]
         ],
@@ -409,7 +440,7 @@ enum MCPToolCatalog {
             "description": "Atomically adds 1–100 mixed free-draw path/image/text/shape primitives under one annotation ID (maximum \(DrawingDefaults.maxRasterImagesPerBatch) raster items / \(DrawingDefaults.maxRasterDecodedBytesPerBatch / (1_024 * 1_024)) MiB decoded raster data). All items appear, verify, and clear together; if any item is invalid, nothing is added.",
             "inputSchema": [
                 "type": "object",
-                "properties": merged([sharedDrawProperties, [
+                "properties": merged([sharedDrawProperties, avoidanceProperties, [
                     "items": [
                         "type": "array", "minItems": 1, "maxItems": DrawingDefaults.maxBatchItems,
                         "items": [

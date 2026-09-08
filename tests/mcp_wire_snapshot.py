@@ -204,6 +204,17 @@ _TOOL_CALLS: list[tuple[str, str, dict[str, Any]]] = [
         "color": "white", "background_color": "#202020", "background_opacity": 0.8,
         "opacity": 0.9, "z_index": 4, "app": "",
     }),
+    # A positive avoid call needs the freshly-created shape's UUID, so its
+    # draw -> bounds -> disjointness workflow belongs in test_mcp_stdio.py.
+    # Keep this deterministic missing-ID rejection here too: it proves the
+    # new public parameter reaches draw_text's handler and fails before any
+    # annotation can be created, without needing to chain a runtime ID
+    # through this static wire-fixture table.
+    ("call_text_avoid_missing_annotation", "draw_text", {
+        "text": "Avoid", "x": 120, "y": 80, "font_size": 18,
+        "background_color": "#000000", "padding_px": 4,
+        "avoid": ["does-not-exist"], "app": "",
+    }),
     ("call_batch_empty", "draw_batch", {"items": []}),
     ("call_batch_unknown_type", "draw_batch", {"items": [{"type": "circle"}], "app": ""}),
     ("call_batch_path_ok", "draw_batch", {"items": [

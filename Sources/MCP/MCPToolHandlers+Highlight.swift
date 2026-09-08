@@ -271,11 +271,12 @@ func buildHighlightAnchor(
     elementFrame: CGRect,
     resize: AnchorResizeBehavior,
     elementSpec: AnchorElementSpec?,
-    now: Date
+    now: Date,
+    screenId: String? = nil
 ) -> DrawRequest.DrawAnchorResolution? {
     guard let windowResolution = DrawRequest.buildWindowAnchor(
         processId: processId, appId: appId, samples: samples,
-        paintedBounds: elementFrame, resize: resize, now: now
+        paintedBounds: elementFrame, resize: resize, now: now, screenId: screenId
     ) else {
         return nil
     }
@@ -391,7 +392,8 @@ private func attachHighlightAnchor(
     let samples = TargetWindowProbe.shared.windows(forProcessId: processId, screens: screens)
     guard let resolution = buildHighlightAnchor(
         mode: request.mode, processId: processId, appId: appId, samples: samples,
-        elementFrame: elementFrame, resize: request.resize, elementSpec: elementSpec, now: Date()
+        elementFrame: elementFrame, resize: request.resize, elementSpec: elementSpec, now: Date(),
+        screenId: created.screenId
     ) else {
         return (highlightAnchorUnresolvedPayload, highlightAnchorBehaviorNone)
     }
