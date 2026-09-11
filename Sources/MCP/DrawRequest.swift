@@ -198,23 +198,91 @@ struct DrawRequest {
         ))
     }
 
-    /// `resolveScreen(args:)` followed immediately by `coordinateTransform(args:)`
-    /// on the resolved request -- the identical two-step prologue that
-    /// `draw_path`, `handleDrawImage`, `handleDrawText`, and `handleDrawBatch`
-    /// each ran inline before this helper existed. Kept as two switches
-    /// chained here, rather than collapsed into one, so the ordering stays
-    /// self-evidently a screen-then-transform sequence: a caller who sends
-    /// both a bad `screen_id` and a bad `coordinate_space` must still see the
-    /// screen error first, exactly as every call site produced before this
-    /// extraction (see this type's header comment for why that resolve-before-
-    /// validate ordering is load-bearing all the way through `finish`).
+    /// `ScreenshotSpaceExpansion.expand(args:lookup:currentScreen:)` followed
+    /// by the pre-existing `resolveScreen(args:)` / `coordinateTransform(args:)`
+    /// prologue, feeding the EXPANDED arguments into that unchanged sequence
+    /// rather than the caller's originals.
+    ///
+    /// WHY EXPANSION RUNS HERE, BEFORE `resolveScreen`, AND NOT INSIDE
+    /// `coordinateTransform`: a `screenshot_space` carries a DISPLAY IDENTITY
+    /// as well as a pixel grid (`ScreenshotSpace.screenId`), and `resolveScreen`
+    /// is what turns a `screen_id` argument into the `ScreenInfo` every later
+    /// step measures against. If expansion instead lived inside
+    /// `coordinateTransform` -- which only ever runs AFTER `resolveScreen` has
+    /// already picked a screen -- a `screenshot_space` call with no `screen_id`
+    /// of its own would have its screen resolved from nothing (silently
+    /// defaulting to the main display via `ScreenSnapshot.resolve`'s documented
+    /// fallback) and the space's own recorded display would never be
+    /// consulted at all. That is precisely the "self-consistent but wrong"
+    /// silent-misplacement failure `ScreenshotSpace`'s header comment exists
+    /// to prevent, reintroduced one layer up. Running expansion first, so its
+    /// injected `screen_id` is what `resolveScreen` actually sees, is the only
+    /// place in this pipeline where that cannot happen.
+    ///
+    /// This also means every one of the five drawing tools -- and
+    /// `get_annotation_bounds` -- gets `screenshot_space` support for free,
+    /// with no per-tool change, for exactly the reason `coordinateTransform`'s
+    /// own doc comment gives for why its screenshot-dimensions-ignored guard
+    /// covers `draw_batch` without a second check: `handleDrawBatch` resolves
+    /// ONE transform from the batch's TOP-LEVEL arguments via this very
+    /// function and hands that same transform to every item, so funneling
+    /// expansion through this one call site is funneling it through every
+    /// caller of this call site.
+    ///
+    /// CRITICAL ORDERING: expansion's own rejections (unknown space, a stale
+    /// space, a `screen_id`/`coordinate_space` that contradicts the space, or
+    /// `screenshot_width`/`screenshot_height` supplied alongside a space) are
+    /// surfaced by returning `.failure` from the `switch` below BEFORE
+    /// `resolveScreen` or `coordinateTransform` ever run on this call's
+    /// arguments -- deliberately, not merely as an accident of statement
+    /// order. A caller that named a `screenshot_space` has already told this
+    /// pipeline exactly which display and pixel grid it means; reporting
+    /// "Unknown screen_id" (a `resolveScreen` error) for a call that never
+    /// supplied a `screen_id` at all -- because the caller supplied a
+    /// screenshot_space typo instead -- would send that caller looking for
+    /// the wrong missing argument. Expansion diagnoses its own arguments
+    /// first because it is the only step that knows they exist.
+    ///
+    /// `screenIsDetermined` FALLS OUT CORRECTLY FOR A SPACE WITHOUT FURTHER
+    /// CHANGES: `resolveScreen` derives it from whether the ARGUMENTS it is
+    /// given contain a non-blank `screen_id` (see that function's own doc
+    /// comment on the "fallback, not a caller decision" distinction). Rule 8
+    /// of `ScreenshotSpaceExpansion.expand` unconditionally injects
+    /// `expanded["screen_id"] = space.screenId` -- a real, non-blank display
+    /// id -- into the arguments `resolveScreen` receives here, so a call that
+    /// referenced a space is indistinguishable, from `resolveScreen`'s point
+    /// of view, from a call that named that exact `screen_id` by hand. The
+    /// ambiguous-multiple-identical-displays guard in `coordinateTransform`
+    /// (`!screenIsDetermined, accepting.count > 1`) therefore does not fire
+    /// for a space-referenced call even on a desktop with two identically
+    /// sized displays: the space already answered the question that guard
+    /// exists to ask. See `testSpaceOnTwoIdenticallySizedDisplaysDoesNotTriggerAmbiguityRejection`
+    /// in `DrawRequestScreenshotMappingTests.swift`.
+    ///
+    /// Kept as three `switch`es chained here, rather than collapsed into one,
+    /// so the ordering stays self-evidently an expand-then-screen-then-
+    /// transform sequence: a caller who sends both a bad `screen_id` and a
+    /// bad `coordinate_space` must still see the screen error first, exactly
+    /// as every call site produced before `resolveScreen`/`coordinateTransform`
+    /// were extracted (see this type's header comment for why that resolve-
+    /// before-validate ordering is load-bearing all the way through `finish`).
     static func resolveDrawContext(args: [String: Any]) -> DrawOutcome<(DrawRequest, CoordinateTransform)> {
+        let expandedArgs: [String: Any]
+        switch ScreenshotSpaceExpansion.expand(
+            args: args,
+            lookup: { ScreenshotSpaceRegistry.shared.lookup(id: $0) },
+            currentScreen: { OverlayWindowController.shared.screenSnapshot().resolve($0) }
+        ) {
+        case .failure(let err): return .failure(err)
+        case .success(let expanded): expandedArgs = expanded
+        }
+
         let request: DrawRequest
-        switch resolveScreen(args: args) {
+        switch resolveScreen(args: expandedArgs) {
         case .failure(let err): return .failure(err)
         case .success(let resolved): request = resolved
         }
-        switch request.coordinateTransform(args: args) {
+        switch request.coordinateTransform(args: expandedArgs) {
         case .failure(let err): return .failure(err)
         case .success(let transform): return .success((request, transform))
         }

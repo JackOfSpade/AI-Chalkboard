@@ -173,7 +173,22 @@ extension MCPServer {
             let captureMechanismName = "SetWindowDisplayAffinity (WDA_EXCLUDEFROMCAPTURE excludes, WDA_NONE does not; requires Windows 10 version 2004 or later)"
             #endif
             let captureExclusionNote = "\(captureExclusion.explanation) Mechanism on this platform: \(captureMechanismName). Each overlays[].sharingType is a live read-back of what the OS reports for that window, so it is the authoritative record of what was actually applied."
+            // Read the display list ONCE, for the same reason
+            // `captureExclusion` above does: every space in the listing must be
+            // judged against ONE display configuration, or two spaces on the
+            // same display could straddle a reconfiguration and report
+            // contradictory staleness within a single response.
+            let spacesSnapshot = OverlayWindowController.shared.screenSnapshot()
+            let screenshotSpaces = screenshotSpacesJSON(
+                ScreenshotSpaceRegistry.shared.all(),
+                currentScreen: { spacesSnapshot.resolve($0) }
+            )
             let payload: [String: Any] = [
+                // Every registered screenshot space, so an agent can see what
+                // it already has instead of guessing an id. See
+                // `screenshotSpacesJSON` for why staleness is recomputed here
+                // rather than read off the space.
+                "screenshotSpaces": screenshotSpaces,
                 "overlays": overlayJSON,
                 "version": BuildMetadata.productVersion,
                 "buildIdentifier": BuildMetadata.buildIdentifier,
@@ -413,6 +428,24 @@ extension MCPServer {
         case "get_annotation_bounds":
             handleGetAnnotationBounds(id: id, args: args)
 
+        // Filed with the read-mostly get_*/verify_* cases rather than with the
+        // draw_* block above, because that is what they are FOR: both exist to
+        // establish, once, the screenshot-pixels-to-backing-pixels mapping that
+        // every one of those tools would otherwise have to re-guess per call
+        // (see ScreenshotSpace's header comment for the silent-misplacement
+        // failure that guessing causes). register_screenshot_space draws
+        // nothing at all. calibrate_screenshot_space does put four fiducials on
+        // screen during action="begin", but they are scaffolding for a
+        // measurement the caller reads back and then clears via
+        // "resolve"/"cancel" -- not a drawing the caller asked to keep -- so
+        // grouping it with the measurement tools describes its purpose more
+        // honestly than grouping it with the drawing tools would.
+        case "register_screenshot_space":
+            handleRegisterScreenshotSpace(id: id, args: args)
+
+        case "calibrate_screenshot_space":
+            handleCalibrateScreenshotSpace(id: id, args: args)
+
         case "verify_presentation":
             guard let annotationId = (args["annotation_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !annotationId.isEmpty else {
@@ -489,7 +522,28 @@ extension MCPServer {
     /// The tool NAME stays outside the budget and unredacted, so a truncated
     /// line still says which call it belonged to. stderr is not part of the
     /// wire format, so nothing here is protocol-visible.
-    private func redactedArgumentSummary(name: String, args: [String: Any]) -> String {
+    ///
+    /// REDACTION IS PER-ARGUMENT-MEANING, NOT PER-TOOL. Every case below is
+    /// keyed on a tool name only because that is how the switch is written;
+    /// the RULE it encodes is about the value. A caller-supplied absolute
+    /// filesystem path is exactly the text this repo's logging policy says
+    /// must never be persisted -- it leaks the user's account name and their
+    /// project names into a file that outlives the request -- which is why
+    /// `draw_image`/`draw_batch` asset paths and `verify_annotation`'s
+    /// `screenshot_path` are both scrubbed. Any NEW tool that accepts a path
+    /// argument must be added to the matching case in the same commit that
+    /// adds the argument: `register_screenshot_space` was landed with its own
+    /// `screenshot_path` and WITHOUT a case here, so the identical string that
+    /// logged as `<redacted local path>` through `verify_annotation` was
+    /// written verbatim to stderr and to the bounded 5 MiB log file when it
+    /// arrived through `register_screenshot_space` instead. The two tools now
+    /// share one case so the two cannot drift apart again.
+    // Internal rather than private so the redaction policy above is unit
+    // tested directly (MCPToolCallLogRedactionTests, in
+    // ScreenshotSpaceExpansionTests.swift) -- a silent regression here is
+    // invisible at runtime, since the leak is a log line that looks perfectly
+    // normal.
+    func redactedArgumentSummary(name: String, args: [String: Any]) -> String {
         let maximumArgumentBytes = 2 * 1_024
         func capped(_ arguments: [String: Any]) -> String {
             let description = "\(arguments)"
@@ -507,7 +561,17 @@ extension MCPServer {
             if redactedArgs["lease_token"] != nil { redactedArgs["lease_token"] = "<redacted capability>" }
             if redactedArgs["idempotency_key"] != nil { redactedArgs["idempotency_key"] = "<redacted capability>" }
             return "Calling tool: \(name) with sensitive arguments redacted: \(capped(redactedArgs))"
-        case "verify_annotation" where args["screenshot_path"] != nil:
+        case "verify_annotation", "register_screenshot_space":
+            // Both tools take the SAME kind of value under the same key: an
+            // absolute path to the caller's own screenshot file. Redact it for
+            // both, for the reason spelled out on `draw_image` below (local
+            // paths expose usernames and project names). A call that carries
+            // no path at all falls through to the unredacted default so
+            // today's `verify_annotation capture_source=...` log lines are
+            // unchanged.
+            guard args["screenshot_path"] != nil else {
+                return "Calling tool: \(name) with args: \(capped(args))"
+            }
             var redactedArgs = args
             redactedArgs["screenshot_path"] = "<redacted local path>"
             return "Calling tool: \(name) with args: \(capped(redactedArgs))"

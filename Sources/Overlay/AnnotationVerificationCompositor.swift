@@ -436,6 +436,25 @@ enum AnnotationVerificationCompositor {
         return image
     }
 
+    /// Promoted from `loadScreenshot(path:)`'s own decode so
+    /// `register_screenshot_space` (Sources/MCP/MCPToolHandlers+ScreenshotSpace.swift)
+    /// can MEASURE a screenshot file's true pixel dimensions -- the
+    /// strongest of the three provenances a `ScreenshotSpace` can carry (see
+    /// that type's own header comment) -- without a second, independent
+    /// decode path that could silently drift from the one `verify_annotation`
+    /// already trusts for exactly the same file-format/size validation.
+    /// Every guard `loadScreenshot` already applies (absolute-path check via
+    /// `BoundedLocalFile`, the 50 MB input cap, single-frame PNG/JPEG/HEIC/
+    /// TIFF only, the 20-megapixel decode cap) applies here for free, because
+    /// this calls that exact function and only reads `width`/`height` off
+    /// the fully validated result -- see `RasterAssetStore`'s own decoded-
+    /// size cap for the identical "validate once, reuse everywhere"
+    /// precedent this mirrors.
+    static func screenshotPixelDimensions(path: String) throws -> (width: Int, height: Int) {
+        let image = try loadScreenshot(path: path)
+        return (image.width, image.height)
+    }
+
     /// Pure dimension arithmetic used by the ImageIO metadata preflight and
     /// post-decode defense-in-depth check. Division avoids multiplying
     /// attacker-controlled dimensions, so the pixel-limit test cannot
@@ -960,6 +979,18 @@ enum AnnotationVerificationCompositor {
             throw AnnotationVerificationError.imageTooLarge
         }
         return decoded
+    }
+
+    /// Windows twin of the macOS `screenshotPixelDimensions(path:)` above --
+    /// same signature, same contract, same caller
+    /// (`register_screenshot_space`). `WindowsRasterImage` already exposes
+    /// `pixelWidth`/`pixelHeight` post-decode, so this is exactly as thin as
+    /// the macOS branch: no second decode path, and every guard
+    /// `loadScreenshot` applies on this platform (the 50 MB input cap, WIC
+    /// decode failure mapping, the 20-megapixel cap) applies here for free.
+    static func screenshotPixelDimensions(path: String) throws -> (width: Int, height: Int) {
+        let decoded = try loadScreenshot(path: path)
+        return (decoded.pixelWidth, decoded.pixelHeight)
     }
 
     /// Returns painted bounds in raw buffer row coordinates (top-left

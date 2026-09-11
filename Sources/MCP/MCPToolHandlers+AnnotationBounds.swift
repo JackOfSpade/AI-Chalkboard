@@ -166,6 +166,121 @@ enum AnnotationBoundsSupport {
         guard isAnchored, let state, state == .hidden || state == .lost else { return nil }
         return " This annotation's anchor is currently \"\(state.rawValue)\", so it is NOT being painted anywhere right now; the bounds above are where it WOULD paint if its window came back."
     }
+
+    /// Whether `screenshot_space` was actually supplied -- a JSON `null`
+    /// does NOT count, mirroring `ScreenshotSpaceExpansion`'s own identical
+    /// `isSupplied` rule verbatim. Kept as its own small, testable predicate
+    /// (rather than inlined at each call site) so `get_annotation_bounds`'s
+    /// display-mismatch guard below and `verify_annotation`'s equivalent
+    /// guard agree on what "referenced a space" means, instead of each
+    /// re-deriving the rule and risking the two silently drifting apart.
+    static func isScreenshotSpaceSupplied(_ args: [String: Any]) -> Bool {
+        guard let value = args["screenshot_space"] else { return false }
+        return !(value is NSNull)
+    }
+
+    /// The MCP wire shape for one rectangle: `x`/`y`/`width`/`height` as
+    /// plain `Double`s. Shared by `get_annotation_bounds` and
+    /// `verify_annotation`'s `capture_source="none"` verdict (and its
+    /// `expect` comparison payload) so a rect is encoded exactly the same
+    /// way in every one of this package's geometry-only responses -- no
+    /// caller-visible field renamed or reordered between them.
+    static func rectPayload(_ rect: CGRect) -> [String: Double] {
+        ["x": Double(rect.minX), "y": Double(rect.minY), "width": Double(rect.width), "height": Double(rect.height)]
+    }
+
+    /// The base "this is renderer geometry, not captured pixels" sentence
+    /// BOTH `get_annotation_bounds` and `verify_annotation`'s
+    /// `capture_source="none"` verdict must show, word for word: both are
+    /// reporting the exact same kind of answer -- the live renderer's own
+    /// non-transparent pixel bounds from an offscreen render, no capture API
+    /// touched, no Screen Recording permission needed -- and hand-copying
+    /// this sentence into a second file is exactly the kind of drift this
+    /// package's `screenshotRect`/`correctedOffset` reuse discipline exists
+    /// to prevent: an edit to one copy silently stops applying to the other.
+    /// Callers append `notPaintedDisclosure(...)`'s own sentence afterward
+    /// when it applies; this string never includes it.
+    static func rendererGeometryEvidenceSentence(screenId: String, screenWidthPx: Int, screenHeightPx: Int) -> String {
+        "This is renderer geometry, not captured pixels: the exact live AnnotationRenderer painted this annotation ALONE into an offscreen transparent bitmap sized to display \(screenId)'s backing pixels (\(screenWidthPx)x\(screenHeightPx)), and paintedBoundsBackingPx is that render's non-transparent pixel bounds. No screen-capture API and no Screen Recording permission was used or required to produce this answer -- it does NOT prove any pixel reached a framebuffer, was actually displayed, or would appear in any capture pipeline's output. For that kind of evidence use verify_presentation (window-registration proof), or verify_annotation with screenshot_path or capture_source='chalkboard' (a composited proof against an actual screenshot)."
+    }
+
+    /// The rejection text for a `screenshot_space` whose recorded `screenId`
+    /// is NOT the display an annotation actually lives on right now -- shared
+    /// by `get_annotation_bounds` and `verify_annotation`'s
+    /// `capture_source="none"` verdict rather than each hand-writing its own
+    /// wording, for the same reason `AnnotationVerificationCompositor
+    /// .screenshotDisplayMismatchRejection` is a single, testable function
+    /// instead of two inline strings: BOTH tools derive their screen from the
+    /// ANNOTATION alone, never from a caller-supplied `screen_id` (neither
+    /// tool even accepts one), so a space naming a different display
+    /// describes a picture of a different monitor no matter which tool asked
+    /// -- and `ScreenshotSpaceExpansion.expand` has no way to catch this
+    /// itself, since it only ever sees the space's own recorded `screenId`,
+    /// never the annotation whose bounds are being asked about.
+    static func screenshotSpaceDisplayMismatchRejection(
+        toolName: String, annotationId: String, spaceId: String, spaceScreenId: String, annotationScreenId: String
+    ) -> String {
+        "screenshot_space '\(spaceId)' was registered for display \(spaceScreenId), but annotation \(annotationId)'s current display is \(annotationScreenId) -- a screenshot of a different display cannot describe this annotation's placement. Nothing was done; omit screenshot_space (\(toolName) always reports bounds on the annotation's own current display), or register/reference a screenshot_space for display \(annotationScreenId) instead."
+    }
+
+    /// Which of `verify_annotation`'s `expect_element`/`expect_window`/
+    /// `target_bounds_screenshot_px` were actually supplied (a JSON `null`
+    /// does not count, same `isSupplied` rule as everywhere else in this
+    /// package). Pulled out as its own pure, testable predicate -- rather
+    /// than left inline in `resolveExpectationVerdict`
+    /// (MCPToolHandlers+Verification.swift), which is `private` to that file
+    /// and MCPServer-scoped, so this specific rule stays checkable with no
+    /// MCP transport, no live display, and no `@testable` reach into a
+    /// `private` declaration.
+    static func suppliedExpectationKeys(_ args: [String: Any]) -> [String] {
+        func isSupplied(_ key: String) -> Bool {
+            guard let value = args[key] else { return false }
+            return !(value is NSNull)
+        }
+        return ["expect_element", "expect_window", "target_bounds_screenshot_px"].filter(isSupplied)
+    }
+
+    /// The rejection text for supplying more than one of `expect_element`/
+    /// `expect_window`/`target_bounds_screenshot_px` on one `verify_annotation`
+    /// call -- each names a DIFFERENT way to say what the annotation is
+    /// expected to land on, and supplying two is unambiguous evidence of a
+    /// contradiction, not a preference to resolve silently (this repo's
+    /// standing "reject rather than reinterpret" rule). `nil` when at most
+    /// one was supplied -- zero is the ordinary "no expectation asked for"
+    /// case, and exactly one is the normal case this whole feature exists
+    /// for.
+    static func atMostOneExpectationRejection(_ args: [String: Any]) -> String? {
+        let supplied = suppliedExpectationKeys(args)
+        guard supplied.count > 1 else { return nil }
+        return "expect_element, expect_window, and target_bounds_screenshot_px are mutually exclusive -- supply at most one expectation per call. Nothing was verified; remove all but one of: \(supplied.joined(separator: ", "))."
+    }
+
+    /// `verify_annotation`'s rejection when NEITHER `screenshot_path` NOR a
+    /// recognized `capture_source` was supplied at all. Pulled out as a
+    /// constant (rather than left as a string literal inline in
+    /// `handleVerifyAnnotation`) for exactly one reason: THIS is the single
+    /// most important discoverability fix in the Phase B change (see the
+    /// Phase B spec's "Changed MCP tools" section) -- the permission-free
+    /// `capture_source='none'`/`get_annotation_bounds` paths already
+    /// half-existed and callers denied Screen Recording had no way to learn
+    /// about them from this error alone -- so the exact wording is pinned
+    /// here where a unit test can assert on it literally, with no MCP
+    /// transport and no live display, rather than only being checkable by
+    /// eyeballing the handler's source.
+    static let missingCaptureSourceRejection = "Supply screenshot_path, or capture_source='chalkboard' or capture_source='none' (no other capture_source value is accepted), for verification. capture_source='none' and get_annotation_bounds both need NO Screen Recording permission at all; use one of those if you cannot or do not want to grant it."
+
+    /// Appended to `ScreenCaptureProviderError.permissionDenied`'s own
+    /// message (Sources/Overlay/ScreenCaptureProvider.swift, outside this
+    /// file's ownership) when `capture_source='chalkboard'` is refused for
+    /// lacking Screen Recording access. That message correctly explains how
+    /// to GRANT the permission but says nothing about the two paths that
+    /// need no grant at all -- design rule 2 forbids silently falling back
+    /// to renderer geometry instead (a caller that asked for pixel proof
+    /// must not receive geometry labelled as if it were the same thing), so
+    /// this APPENDS discoverability rather than replacing the original
+    /// System-Settings instructions a caller who does intend to grant the
+    /// permission still needs.
+    static let permissionDeniedDiscoverabilityAddendum = "Alternatively, no Screen Recording grant is needed at all for capture_source='none' (a permission-free renderer-geometry verdict on this same annotation) or for get_annotation_bounds (the same geometry, without an image)."
 }
 
 extension MCPServer {
@@ -213,8 +328,54 @@ extension MCPServer {
             return
         }
 
+        // `screenshot_space`, expanded BEFORE `resolveScreenshotDimensions`
+        // runs and into the EXACT `screenshot_width`/`screenshot_height`
+        // shape a hand-declared call already produces -- see
+        // `ScreenshotSpaceExpansion`'s own doc comment for why expansion,
+        // not a second parallel dimension check, is what keeps a referenced
+        // space and a hand-declared call byte-for-byte identical from
+        // `resolveScreenshotDimensions`'s point of view. `args` unchanged
+        // when no space was referenced, so every existing caller of this
+        // tool keeps working exactly as before.
+        let screenshotSpaceId = (args["screenshot_space"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let boundsArgs: [String: Any]
+        switch ScreenshotSpaceExpansion.expand(
+            args: args,
+            lookup: { ScreenshotSpaceRegistry.shared.lookup(id: $0) },
+            currentScreen: { snapshot.resolve($0) }
+        ) {
+        case .failure(let error):
+            sendErrorResult(id: id, text: error)
+            return
+        case .success(let value):
+            boundsArgs = value
+        }
+        // `ScreenshotSpaceExpansion` only knows the space's OWN recorded
+        // `screenId` -- it has no way to know which display THIS annotation
+        // actually lives on, because get_annotation_bounds (unlike a
+        // draw_* call) never takes a `screen_id` argument at all: its
+        // screen is ALWAYS `annotation.effectiveScreenId`, resolved above.
+        // A `screenshot_space` registered for a DIFFERENT display describes
+        // a picture of a different monitor -- silently scaling this
+        // annotation's backing-pixel bounds by that space's scale would
+        // answer "where would this be in a screenshot of a display this
+        // annotation is not even on" and hand back a confidently wrong
+        // number, exactly what this whole feature exists to prevent. This
+        // is the one place both facts (the space's screenId, and the
+        // annotation's effective screenId) are in scope together, so it is
+        // the one place that can catch the mismatch.
+        if AnnotationBoundsSupport.isScreenshotSpaceSupplied(args),
+           let spaceScreenId = boundsArgs["screen_id"] as? String,
+           spaceScreenId != screen.id {
+            sendErrorResult(id: id, text: AnnotationBoundsSupport.screenshotSpaceDisplayMismatchRejection(
+                toolName: "get_annotation_bounds", annotationId: annotationId,
+                spaceId: screenshotSpaceId ?? "?", spaceScreenId: spaceScreenId, annotationScreenId: screen.id
+            ))
+            return
+        }
+
         let screenshotDimensions: (width: Int, height: Int)?
-        switch AnnotationBoundsSupport.resolveScreenshotDimensions(args, screen: screen) {
+        switch AnnotationBoundsSupport.resolveScreenshotDimensions(boundsArgs, screen: screen) {
         case .failure(let error):
             sendErrorResult(id: id, text: error)
             return
@@ -223,7 +384,7 @@ extension MCPServer {
         }
 
         let targetBounds: CGRect?
-        switch AnnotationBoundsSupport.parseTargetBounds(args) {
+        switch AnnotationBoundsSupport.parseTargetBounds(boundsArgs) {
         case .failure(let error):
             sendErrorResult(id: id, text: error)
             return
@@ -260,7 +421,7 @@ extension MCPServer {
             "annotationId": annotation.id,
             "screenId": screen.id,
             "screenBackingPx": ["width": screen.widthPx, "height": screen.heightPx],
-            "paintedBoundsBackingPx": rectPayload(paintedBoundsBacking)
+            "paintedBoundsBackingPx": AnnotationBoundsSupport.rectPayload(paintedBoundsBacking)
         ]
 
         if let screenshotDimensions {
@@ -270,7 +431,14 @@ extension MCPServer {
             let paintedScreenshotRect = AnnotationBoundsSupport.screenshotRect(
                 backingRect: paintedBoundsBacking, scale: (scaleX, scaleY)
             )
-            payload["paintedBoundsScreenshotPx"] = rectPayload(paintedScreenshotRect)
+            payload["paintedBoundsScreenshotPx"] = AnnotationBoundsSupport.rectPayload(paintedScreenshotRect)
+            // Names WHICH registered space produced this scale, when one was
+            // referenced, so a caller juggling several spaces (multi-monitor)
+            // can tell which mapping this particular answer trusts without
+            // re-deriving it from the raw scale numbers.
+            if AnnotationBoundsSupport.isScreenshotSpaceSupplied(args), let screenshotSpaceId {
+                payload["screenshotSpace"] = screenshotSpaceId
+            }
 
             if let targetBounds {
                 let dx = Double(targetBounds.midX - paintedScreenshotRect.midX)
@@ -301,7 +469,17 @@ extension MCPServer {
             )
         }
 
-        var evidence = "This is renderer geometry, not captured pixels: the exact live AnnotationRenderer painted this annotation ALONE into an offscreen transparent bitmap sized to display \(screen.id)'s backing pixels (\(screen.widthPx)x\(screen.heightPx)), and paintedBoundsBackingPx is that render's non-transparent pixel bounds. No screen-capture API and no Screen Recording permission was used or required to produce this answer -- it does NOT prove any pixel reached a framebuffer, was actually displayed, or would appear in any capture pipeline's output. For that kind of evidence use verify_presentation (window-registration proof) or verify_annotation (a composited proof against an actual screenshot)."
+        // `evidenceLevel` is the structured, machine-checkable sibling of
+        // the prose `evidence` sentence below -- every geometry-only payload
+        // this package emits (this tool, and verify_annotation's
+        // capture_source="none" verdict) carries the exact same literal
+        // string here, so a caller can branch on ONE field instead of
+        // pattern-matching the human-readable sentence to tell renderer
+        // geometry apart from a captured-pixel proof.
+        payload["evidenceLevel"] = "renderer_geometry"
+        var evidence = AnnotationBoundsSupport.rendererGeometryEvidenceSentence(
+            screenId: screen.id, screenWidthPx: screen.widthPx, screenHeightPx: screen.heightPx
+        )
         if let disclosure = AnnotationBoundsSupport.notPaintedDisclosure(
             isAnchored: annotation.anchor != nil, state: annotation.anchorProjection?.state
         ) {
@@ -314,9 +492,5 @@ extension MCPServer {
             return
         }
         sendTextResult(id: id, text: text)
-    }
-
-    private func rectPayload(_ rect: CGRect) -> [String: Double] {
-        ["x": Double(rect.minX), "y": Double(rect.minY), "width": Double(rect.width), "height": Double(rect.height)]
     }
 }

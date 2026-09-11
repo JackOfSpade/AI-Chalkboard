@@ -359,4 +359,248 @@ final class DrawRequestScreenshotMappingTests: XCTestCase {
             XCTAssertEqual(transform.scaleY, 2_160.0 / 850.0, accuracy: 1e-9)
         }
     }
+
+    // MARK: - `screenshot_space` wired into `resolveDrawContext`
+
+    /// Registers a `.declared`, IDENTITY-MAPPED space (screenshot px ==
+    /// backing px, so `scaleX == scaleY == 1`) against the REAL current main
+    /// display, and returns it alongside that display's `ScreenInfo`. `nil`
+    /// only in the pathological case of zero connected displays (see
+    /// `resolveScreen`'s own doc comment on why that can happen momentarily).
+    ///
+    /// UNLIKE every fixture-built test above, the tests in this section
+    /// exercise `DrawRequest.resolveDrawContext(args:)` itself, which -- by
+    /// design (see that function's doc comment) -- resolves against the LIVE
+    /// `OverlayWindowController.shared.screenSnapshot()` and
+    /// `ScreenshotSpaceRegistry.shared`: `resolveScreen` has never taken an
+    /// injectable snapshot provider, and this change deliberately keeps that
+    /// shape unchanged rather than widening it. Registering an IDENTITY
+    /// mapping means every assertion below can pin `scaleX`/`scaleY` to
+    /// exactly `1` without ever asserting the test machine's actual
+    /// resolution, and every test that registers a space forgets it again via
+    /// `defer`, so this shared, process-wide registry is left exactly as it
+    /// was found.
+    private func registerIdentitySpaceForMainScreen() -> (space: ScreenshotSpace, mainScreen: ScreenInfo)? {
+        guard let mainScreen = OverlayWindowController.shared.screenSnapshot().resolve(nil) else {
+            return nil
+        }
+        let space = ScreenshotSpaceRegistry.shared.register(
+            screenId: mainScreen.id,
+            widthPx: mainScreen.widthPx,
+            heightPx: mainScreen.heightPx,
+            screenWidthPx: mainScreen.widthPx,
+            screenHeightPx: mainScreen.heightPx,
+            provenance: .declared
+        )
+        return (space, mainScreen)
+    }
+
+    /// THE POINT OF THIS CHANGE: a `screenshot_space` call and the equivalent
+    /// hand-declared `screenshot_pixels` call must produce byte-for-byte the
+    /// same transform, because `resolveDrawContext` feeds both through the
+    /// identical `resolveScreen` -> `coordinateTransform` sequence -- see
+    /// that function's doc comment on why expansion is a rewrite, not a
+    /// second implementation.
+    func testScreenshotSpaceProducesTheSameTransformAsTheEquivalentHandDeclaredCall() {
+        guard let (space, mainScreen) = registerIdentitySpaceForMainScreen() else {
+            XCTFail("this test requires at least one live display to resolve a main screen")
+            return
+        }
+        defer { ScreenshotSpaceRegistry.shared.forget(id: space.id) }
+
+        let viaSpace: DrawRequest.CoordinateTransform
+        switch DrawRequest.resolveDrawContext(args: ["screenshot_space": space.id]) {
+        case .failure(let message):
+            XCTFail("a freshly registered, non-stale space must be accepted: \(message)")
+            return
+        case .success(let (_, transform)):
+            viaSpace = transform
+        }
+
+        let viaHandDeclared: DrawRequest.CoordinateTransform
+        switch DrawRequest.resolveDrawContext(args: [
+            "screen_id": mainScreen.id,
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": mainScreen.widthPx,
+            "screenshot_height": mainScreen.heightPx
+        ]) {
+        case .failure(let message):
+            XCTFail("the equivalent hand-declared call must succeed identically: \(message)")
+            return
+        case .success(let (_, transform)):
+            viaHandDeclared = transform
+        }
+
+        XCTAssertEqual(viaSpace.scaleX, viaHandDeclared.scaleX, accuracy: 1e-9)
+        XCTAssertEqual(viaSpace.scaleY, viaHandDeclared.scaleY, accuracy: 1e-9)
+        // Pins the VALUE too, not just agreement between the two paths: this
+        // space was registered as an identity mapping.
+        XCTAssertEqual(viaSpace.scaleX, 1, accuracy: 1e-9)
+        XCTAssertEqual(viaSpace.scaleY, 1, accuracy: 1e-9)
+    }
+
+    /// A call that never mentions `screenshot_space` at all must be
+    /// completely unaffected by the new expansion prologue -- `Rule 1` of
+    /// `ScreenshotSpaceExpansion.expand` returns `args` unchanged, so
+    /// `resolveDrawContext` must behave exactly as it did before this feature
+    /// existed for every one of today's callers.
+    func testResolveDrawContextWithNoScreenshotSpaceIsCompletelyUnaffected() {
+        switch DrawRequest.resolveDrawContext(args: ["coordinate_space": "backing_pixels"]) {
+        case .failure(let message):
+            XCTFail("an ordinary backing_pixels call must be unaffected by the expansion prologue: \(message)")
+        case .success(let (_, transform)):
+            XCTAssertEqual(transform.scaleX, 1)
+            XCTAssertEqual(transform.scaleY, 1)
+        }
+    }
+
+    /// Rule 3 (unknown id) surfacing through the real pipeline, before either
+    /// `resolveScreen` or `coordinateTransform` ever run.
+    func testUnknownScreenshotSpaceIsRejectedThroughResolveDrawContext() {
+        switch DrawRequest.resolveDrawContext(args: ["screenshot_space": "space-definitely-unregistered-00000000"]) {
+        case .success:
+            XCTFail("an unregistered screenshot_space must never succeed.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("Unknown screenshot_space"), message)
+        }
+    }
+
+    /// Rule 4 (staleness) surfacing through the real pipeline: a space
+    /// registered against a display id that is guaranteed not to be in the
+    /// live snapshot (it is not a real display id and cannot resolve as a
+    /// positional index either) must be rejected as stale, not passed through
+    /// to `resolveScreen` -- which would otherwise report a confusing
+    /// "Unknown screen_id" for a `screen_id` the caller never supplied.
+    func testStaleScreenshotSpaceIsRejectedThroughResolveDrawContext() {
+        let space = ScreenshotSpaceRegistry.shared.register(
+            screenId: "definitely-nonexistent-screen-id-for-testing",
+            widthPx: 1_920, heightPx: 1_080,
+            screenWidthPx: 1_920, screenHeightPx: 1_080,
+            provenance: .declared
+        )
+        defer { ScreenshotSpaceRegistry.shared.forget(id: space.id) }
+
+        switch DrawRequest.resolveDrawContext(args: ["screenshot_space": space.id]) {
+        case .success:
+            XCTFail("a space registered against a display no longer present must be rejected as stale.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("no longer present"), message)
+            XCTAssertTrue(message.contains("Nothing was drawn/computed"), message)
+        }
+    }
+
+    /// Rule 6 (conflicting `screen_id`) surfacing through the real pipeline.
+    func testConflictingScreenIdIsRejectedThroughResolveDrawContext() {
+        guard let (space, _) = registerIdentitySpaceForMainScreen() else {
+            XCTFail("this test requires at least one live display to resolve a main screen")
+            return
+        }
+        defer { ScreenshotSpaceRegistry.shared.forget(id: space.id) }
+
+        switch DrawRequest.resolveDrawContext(args: [
+            "screenshot_space": space.id,
+            "screen_id": "some-other-nonexistent-screen-id-xyz"
+        ]) {
+        case .success:
+            XCTFail("a screen_id that conflicts with the space's own display must be rejected.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("conflicts with screenshot_space"), message)
+        }
+    }
+
+    /// Rule 7 (conflicting `coordinate_space`) surfacing through the real
+    /// pipeline.
+    func testConflictingCoordinateSpaceIsRejectedThroughResolveDrawContext() {
+        guard let (space, _) = registerIdentitySpaceForMainScreen() else {
+            XCTFail("this test requires at least one live display to resolve a main screen")
+            return
+        }
+        defer { ScreenshotSpaceRegistry.shared.forget(id: space.id) }
+
+        switch DrawRequest.resolveDrawContext(args: [
+            "screenshot_space": space.id,
+            "coordinate_space": "normalized"
+        ]) {
+        case .success:
+            XCTFail("a coordinate_space that would discard the space's own mapping must be rejected.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("defines a screenshot pixel grid"), message)
+        }
+    }
+
+    /// Rule 5 (`screenshot_width`/`screenshot_height` alongside a space)
+    /// surfacing through the real pipeline.
+    func testDimensionsAlongsideSpaceAreRejectedThroughResolveDrawContext() {
+        guard let (space, _) = registerIdentitySpaceForMainScreen() else {
+            XCTFail("this test requires at least one live display to resolve a main screen")
+            return
+        }
+        defer { ScreenshotSpaceRegistry.shared.forget(id: space.id) }
+
+        switch DrawRequest.resolveDrawContext(args: [
+            "screenshot_space": space.id,
+            "screenshot_width": 999
+        ]) {
+        case .success:
+            XCTFail("screenshot_width supplied alongside a space is a contradiction and must be rejected.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("already carries its own dimensions"), message)
+        }
+    }
+
+    /// THE `screenIsDetermined` CLAIM, proved end to end without needing a
+    /// real desktop with two identical displays (nothing here can guarantee
+    /// one exists on the machine running this test).
+    ///
+    /// `resolveScreen` derives `screenIsDetermined` purely from whether the
+    /// ARGUMENTS it receives carry a non-blank `screen_id` (see that
+    /// function's own doc comment). `ScreenshotSpaceExpansion.expand`'s rule
+    /// 8 unconditionally injects the space's OWN `screenId` into those
+    /// arguments, so a space-referenced call is indistinguishable, from
+    /// `resolveScreen`'s point of view, from an explicit hand-declared
+    /// `screen_id` naming that same display -- which
+    /// `testIdenticalDisplaysWithExplicitScreenIdSucceedUnambiguously` above
+    /// already proves does not trip `coordinateTransform`'s ambiguity guard.
+    ///
+    /// This test chains the REAL `ScreenshotSpaceExpansion.expand` (against
+    /// hand-built fixtures, exactly as `ScreenshotSpaceExpansionTests` does)
+    /// into a hand-built `DrawRequest` whose `screenIsDetermined` (`true`)
+    /// and `candidateScreens` (both twins) are exactly what `resolveScreen`
+    /// would have produced had it resolved the space's injected `screen_id`
+    /// against a live snapshot containing two identically sized displays --
+    /// proving the composition end to end without depending on real
+    /// hardware, the same reasoning `resolveDrawContext`'s own doc comment
+    /// gives for why this case falls out correctly with no extra code.
+    func testSpaceOnTwoIdenticallySizedDisplaysDoesNotTriggerAmbiguityRejection() {
+        let a = screen(id: "display-A", width: 3_840, height: 2_160, isMain: true)
+        let b = screen(id: "display-B", width: 3_840, height: 2_160)
+        let fixtureSpace = ScreenshotSpace(
+            id: "space-twins", screenId: "display-A",
+            widthPx: 3_840, heightPx: 2_160,
+            screenWidthPx: 3_840, screenHeightPx: 2_160,
+            provenance: .declared
+        )
+        let lookup: (String) -> ScreenshotSpace? = { $0 == fixtureSpace.id ? fixtureSpace : nil }
+        let currentScreen: (String) -> ScreenInfo? = { id in
+            id == "display-A" ? a : (id == "display-B" ? b : nil)
+        }
+
+        let expandedArgs: [String: Any]
+        switch ScreenshotSpaceExpansion.expand(args: ["screenshot_space": fixtureSpace.id], lookup: lookup, currentScreen: currentScreen) {
+        case .failure(let message):
+            XCTFail("expansion of a valid, non-stale space must succeed: \(message)")
+            return
+        case .success(let expanded):
+            expandedArgs = expanded
+        }
+
+        let request = DrawRequest(screen: a, candidateScreens: [a, b], screenIsDetermined: true)
+        switch request.coordinateTransform(args: expandedArgs) {
+        case .failure(let message):
+            XCTFail("a screenshot_space naming one of two identically sized displays must not trip the ambiguity guard: \(message)")
+        case .success(let transform):
+            XCTAssertEqual(transform.scaleX, 1, accuracy: 1e-12)
+            XCTAssertEqual(transform.scaleY, 1, accuracy: 1e-12)
+        }
+    }
 }

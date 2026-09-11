@@ -342,6 +342,50 @@ extension MCPServer {
         ]
     }
 
+    /// The `screenshotSpaces` array `get_overlay_state` adds to its payload:
+    /// every registered `ScreenshotSpace`'s own `payload` -- byte-identical to
+    /// what `register_screenshot_space`/`calibrate_screenshot_space` returned
+    /// when they minted it -- plus `stale`, and `staleReason` when it is.
+    ///
+    /// Exists so an agent can SEE what is already registered instead of
+    /// guessing an id or needlessly re-registering a mapping it already has.
+    ///
+    /// Pulled out as its own PURE function for the same reason
+    /// `anchorTrackingJSON` above is: the `get_overlay_state` case body writes
+    /// straight to stdout via `sendTextResult` and is not a usable test seam,
+    /// and the one property that matters here -- that this listing can never
+    /// disagree with what a draw call naming the same id would decide -- is
+    /// worth proving with hand-built fixtures and no live display.
+    ///
+    /// `currentScreen` is a LOOK-UP CLOSURE, not a screen list, and the caller
+    /// must back it with a FRESH snapshot taken at request time. Staleness is
+    /// deliberately recomputed here through the very same
+    /// `ScreenshotSpace.stalenessRejection` the draw path calls, rather than
+    /// read from anything cached on the space: the space's own recorded
+    /// display numbers are exactly the thing under suspicion, so trusting them
+    /// to describe their own validity would defeat the check. `staleReason` is
+    /// therefore verbatim the rejection prose a draw call would fail with,
+    /// which is what lets a caller act on this listing without a second round
+    /// trip to find out why.
+    // internal: called from handleToolsCall in MCPToolHandlers.swift.
+    func screenshotSpacesJSON(
+        _ spaces: [ScreenshotSpace],
+        currentScreen: (String) -> ScreenInfo?
+    ) -> [[String: Any]] {
+        spaces.map { space in
+            var entry = space.payload
+            let reason = ScreenshotSpace.stalenessRejection(
+                space: space,
+                currentScreen: currentScreen(space.screenId)
+            )
+            entry["stale"] = reason != nil
+            if let reason {
+                entry["staleReason"] = reason
+            }
+            return entry
+        }
+    }
+
     /// `get_active_app` output.
     // internal: called from handleToolsCall in MCPToolHandlers.swift.
     func buildActiveAppJSON() -> String {

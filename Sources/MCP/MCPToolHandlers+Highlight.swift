@@ -9,7 +9,10 @@ import WinSDK
 /// The process-id type `resolveRunningHighlightTarget`/`AccessibilityElementResolver.resolve`
 /// share on this platform -- unchanged from before this file gained a
 /// Windows branch.
-private typealias HighlightProcessID = pid_t
+/// internal (not private): `handleCalibrateScreenshotSpaceElements` in
+/// MCPToolHandlers+ScreenshotSpace.swift names this type when it calls
+/// `resolveRunningHighlightTarget`, and `private` at file scope would hide it.
+typealias HighlightProcessID = pid_t
 #elseif os(Windows)
 /// `pid_t` does not exist on the Windows Swift toolchain (confirmed by a
 /// direct compile attempt: `error: cannot find type 'pid_t' in scope`).
@@ -19,7 +22,8 @@ private typealias HighlightProcessID = pid_t
 /// Windows branch in DrawRequest.swift), so it is the natural Windows
 /// analogue used throughout this file's Windows
 /// branch and by `AccessibilityElementResolver.resolve(processID:...)`.
-private typealias HighlightProcessID = UInt32
+/// internal (not private), for the same cross-file reason as the macOS twin above.
+typealias HighlightProcessID = UInt32
 #endif
 
 /// The outline traced around an Accessibility element's padded bounds.
@@ -692,7 +696,11 @@ extension MCPServer {
     }
 
     #if os(macOS)
-    private func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, pid: HighlightProcessID)> {
+    /// internal, not private: called from `handleCalibrateScreenshotSpaceElements`
+    /// in MCPToolHandlers+ScreenshotSpace.swift, so that the element-anchored
+    /// calibration route resolves `app` through THIS one helper rather than
+    /// growing a second app-resolution path free to disagree with it.
+    func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, pid: HighlightProcessID)> {
         if args.keys.contains("app"), !(args["app"] is String) {
             return .failure("app must be a running app's bundle id or display name when supplied.")
         }
@@ -776,7 +784,11 @@ extension MCPServer {
     ///     this snapshot and the UI Automation query that follows: the
     ///     process can exit, or a second instance can launch, in either
     ///     window.
-    private func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, pid: HighlightProcessID)> {
+    /// internal, not private: called from `handleCalibrateScreenshotSpaceElements`
+    /// in MCPToolHandlers+ScreenshotSpace.swift, so that the element-anchored
+    /// calibration route resolves `app` through THIS one helper rather than
+    /// growing a second app-resolution path free to disagree with it.
+    func resolveRunningHighlightTarget(_ args: [String: Any]) -> DrawOutcome<(app: AppRef, pid: HighlightProcessID)> {
         if args.keys.contains("app"), !(args["app"] is String) {
             return .failure("app must be a running app's executable name or display name when supplied.")
         }

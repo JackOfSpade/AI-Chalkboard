@@ -281,4 +281,83 @@ final class AnnotationBoundsSupportTests: XCTestCase {
     func testNotPaintedDisclosureAbsentForAnAnchoredAnnotationWithNoStateYet() {
         XCTAssertNil(AnnotationBoundsSupport.notPaintedDisclosure(isAnchored: true, state: nil))
     }
+
+    // MARK: - isScreenshotSpaceSupplied (Phase B: screenshot_space plumbing)
+
+    /// A JSON `null` must NOT count as supplied -- the SAME rule
+    /// `ScreenshotSpaceExpansion`'s own `isSupplied` documents, and this
+    /// predicate exists precisely so `get_annotation_bounds`'s and
+    /// `verify_annotation`'s display-mismatch guards agree with expansion
+    /// about what "referenced a space" means.
+    func testIsScreenshotSpaceSuppliedRules() {
+        XCTAssertFalse(AnnotationBoundsSupport.isScreenshotSpaceSupplied([:]))
+        XCTAssertFalse(AnnotationBoundsSupport.isScreenshotSpaceSupplied(["screenshot_space": NSNull()]))
+        XCTAssertTrue(AnnotationBoundsSupport.isScreenshotSpaceSupplied(["screenshot_space": "space-ab12cd34"]))
+    }
+
+    // MARK: - rectPayload: the shared rect wire shape
+
+    func testRectPayloadEncodesAllFourFields() {
+        let payload = AnnotationBoundsSupport.rectPayload(CGRect(x: 1, y: 2, width: 3, height: 4))
+        XCTAssertEqual(payload["x"], 1)
+        XCTAssertEqual(payload["y"], 2)
+        XCTAssertEqual(payload["width"], 3)
+        XCTAssertEqual(payload["height"], 4)
+    }
+
+    // MARK: - rendererGeometryEvidenceSentence: shared verbatim with verify_annotation
+
+    /// `get_annotation_bounds` and `verify_annotation`'s `capture_source=
+    /// "none"` verdict both show this sentence word for word (see
+    /// `handleVerifyAnnotationGeometry` in MCPToolHandlers+Verification.swift)
+    /// -- covering it here as a pure function is what makes that sharing
+    /// checkable without a live display.
+    func testRendererGeometryEvidenceSentenceNamesDisplayAndDisclaimsProof() {
+        let sentence = AnnotationBoundsSupport.rendererGeometryEvidenceSentence(
+            screenId: "screen-1", screenWidthPx: 3_840, screenHeightPx: 2_160
+        )
+        XCTAssertTrue(sentence.contains("screen-1"), sentence)
+        XCTAssertTrue(sentence.contains("3840x2160"), sentence)
+        XCTAssertTrue(sentence.contains("renderer geometry"), sentence)
+        XCTAssertTrue(sentence.contains("No screen-capture API"), sentence)
+        XCTAssertTrue(sentence.contains("Screen Recording"), sentence)
+        // Must point back at the paths that DO produce pixel proof, worded so
+        // it stays true whether it is read from get_annotation_bounds or
+        // from verify_annotation's own capture_source="none" branch (never
+        // "use verify_annotation" bare, which would be circular from inside
+        // verify_annotation itself).
+        XCTAssertTrue(sentence.contains("verify_presentation"), sentence)
+        XCTAssertTrue(sentence.contains("capture_source='chalkboard'"), sentence)
+    }
+
+    // MARK: - screenshotSpaceDisplayMismatchRejection: the Phase B addendum guard
+
+    /// Both `get_annotation_bounds` and `verify_annotation` derive their
+    /// screen from the ANNOTATION alone, never from a caller-supplied
+    /// `screen_id` -- so a `screenshot_space` registered for a different
+    /// display must be rejected naming BOTH display ids, the annotation id,
+    /// and which tool is refusing, rather than silently scaling by the wrong
+    /// space's numbers.
+    func testScreenshotSpaceDisplayMismatchRejectionNamesBothDisplaysAnnotationAndTool() {
+        let message = AnnotationBoundsSupport.screenshotSpaceDisplayMismatchRejection(
+            toolName: "get_annotation_bounds", annotationId: "ann-1",
+            spaceId: "space-ab12cd34", spaceScreenId: "screen-2", annotationScreenId: "screen-1"
+        )
+        XCTAssertTrue(message.contains("space-ab12cd34"), message)
+        XCTAssertTrue(message.contains("screen-2"), message)
+        XCTAssertTrue(message.contains("screen-1"), message)
+        XCTAssertTrue(message.contains("ann-1"), message)
+        XCTAssertTrue(message.contains("get_annotation_bounds"), message)
+        XCTAssertTrue(message.contains("Nothing was done"), message)
+    }
+
+    /// Same helper, different tool name -- proves the wording actually
+    /// substitutes the caller's tool name rather than hard-coding one.
+    func testScreenshotSpaceDisplayMismatchRejectionNamesVerifyAnnotationToo() {
+        let message = AnnotationBoundsSupport.screenshotSpaceDisplayMismatchRejection(
+            toolName: "verify_annotation", annotationId: "ann-1",
+            spaceId: "space-ab12cd34", spaceScreenId: "screen-2", annotationScreenId: "screen-1"
+        )
+        XCTAssertTrue(message.contains("verify_annotation"), message)
+    }
 }

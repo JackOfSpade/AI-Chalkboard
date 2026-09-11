@@ -581,7 +581,7 @@ def main():
         # version bump should be a conscious edit here too, not something that
         # silently drifts. Keep this in step with
         # BuildMetadata.productVersion.
-        assert server_info["version"] == "2.2.0"
+        assert server_info["version"] == "2.3.0"
         assert isinstance(server_info["buildIdentifier"], str) and server_info["buildIdentifier"]
 
         print("\n2. Testing 'tools/list'...", flush=True)
