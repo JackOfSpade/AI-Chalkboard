@@ -1,7 +1,7 @@
 import XCTest
 @testable import AIChalkboardCore
 
-/// Pins `AccessibilityAnchorElementResolver`'s two testable-without-live-AX
+/// Pins `AccessibilityAnchorElementResolver`'s testable-without-live-AX
 /// surfaces:
 ///
 /// 1. `reasonCode(for:)` -- the pure, exhaustive mapping from every
@@ -15,6 +15,13 @@ import XCTest
 ///    Windows) must fail closed with `.issue("not_found")` BEFORE ever
 ///    reaching `AccessibilityElementResolver.resolve`, which is likewise
 ///    exercisable with no live AX session.
+/// 3. `conversionSurvivedWalk(match:screensAfterWalk:)` -- the pure core of
+///    `reresolve`'s post-walk display-layout guard, exercised with
+///    hand-built matches and screen snapshots. The guard's PLUMBING (the
+///    injected `currentScreens` closure firing after a real walk) is not
+///    coverable here for the same reason a genuinely successful re-resolve
+///    is not: it sits on the far side of a live
+///    `AccessibilityElementResolver.resolve` call.
 ///
 /// A genuinely successful re-resolve (a live match rebuilding a highlight's
 /// geometry) is NOT covered here -- that needs a real running process and a
@@ -201,6 +208,73 @@ final class AccessibilityAnchorElementResolverTests: XCTestCase {
 
         let result = resolver.reresolve(annotation: annotation, spec: spec, target: target, screens: [])
         assertIssue(result, "not_found")
+    }
+    #endif
+
+    // MARK: - Post-walk display-layout guard (pure core)
+
+    // macOS-only, like the rest of this file's per-platform sections: the
+    // fixtures below drive the macOS `backingRect` conversion (zero-origin
+    // AppKit anchoring, points-times-scale), whose inputs differ on Windows.
+    // `conversionSurvivedWalk` itself is platform-neutral.
+    #if os(macOS)
+    private func snapshot(scale: Double) -> [ScreenInfo] {
+        // One zero-origin display -- `backingRect`'s macOS conversion
+        // requires the (0,0)-AppKit-origin screen to anchor its y-flip.
+        let frame = ScreenCoordinateRect(x: 0, y: 0, width: 2_000, height: 1_200)
+        return [
+            ScreenInfo(
+                id: "main", index: 0, name: "main",
+                widthPx: Int(2_000 * scale), heightPx: Int(1_200 * scale),
+                widthPt: 2_000, heightPt: 1_200,
+                backingScaleFactor: scale, isMain: true,
+                appKitFrame: frame, windowServerFrame: frame, displayID: 1
+            )
+        ]
+    }
+
+    /// Builds a match exactly the way `resolve` does: `backingFrame`
+    /// converted from `accessibilityFrame` against the PRE-walk snapshot.
+    private func makeMatch(preWalkScreens: [ScreenInfo]) throws -> AccessibilityElementMatch {
+        let axFrame = AccessibilityScreenRect(x: 100, y: 50, width: 200, height: 40)
+        let backing = try XCTUnwrap(AccessibilityElementResolver.backingRect(
+            forAccessibilityFrame: axFrame, screens: preWalkScreens
+        ))
+        return AccessibilityElementMatch(
+            matchedAttribute: "AXTitle", matchedLabel: "OK", role: nil,
+            accessibilityFrame: axFrame, backingFrame: backing
+        )
+    }
+
+    func testConversionSurvivesAnUnchangedDisplayLayout() throws {
+        let pre = snapshot(scale: 2)
+        let match = try makeMatch(preWalkScreens: pre)
+        XCTAssertTrue(
+            AccessibilityAnchorElementResolver.conversionSurvivedWalk(match: match, screensAfterWalk: pre),
+            "an unchanged layout must re-derive the identical backing frame and pass"
+        )
+    }
+
+    func testConversionIsRejectedWhenTheDisplayWasRescaledMidWalk() throws {
+        let match = try makeMatch(preWalkScreens: snapshot(scale: 2))
+        // Same display id, same point geometry, HALF the density: the fresh
+        // conversion yields a well-formed rect at different pixel
+        // coordinates -- exactly the silent misplacement the guard exists
+        // to catch.
+        XCTAssertFalse(
+            AccessibilityAnchorElementResolver.conversionSurvivedWalk(
+                match: match, screensAfterWalk: snapshot(scale: 1)
+            ),
+            "a mid-walk density change must be reported, never committed as anchor geometry"
+        )
+    }
+
+    func testConversionIsRejectedWhenTheDisplayWasDisconnectedMidWalk() throws {
+        let match = try makeMatch(preWalkScreens: snapshot(scale: 2))
+        XCTAssertFalse(
+            AccessibilityAnchorElementResolver.conversionSurvivedWalk(match: match, screensAfterWalk: []),
+            "a frame that no longer maps onto any connected display must be rejected"
+        )
     }
     #endif
 

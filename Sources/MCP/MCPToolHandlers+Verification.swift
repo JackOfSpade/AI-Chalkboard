@@ -145,6 +145,20 @@ extension MCPServer {
             sendErrorResult(id: id, text: "request_permission is only valid with capture_source='chalkboard'.")
             return
         }
+        // Validated up front, before any capture/render work, exactly like
+        // every other argument-shape rejection in this prologue: an
+        // apply_correction with nothing to correct toward is a mistaken call
+        // shape, not a preference to resolve by silently applying nothing.
+        switch AnnotationBoundsSupport.parseApplyCorrection(args) {
+        case .failure(let error):
+            sendErrorResult(id: id, text: error)
+            return
+        case .success(let requested):
+            if requested, AnnotationBoundsSupport.suppliedExpectationKeys(args).isEmpty {
+                sendErrorResult(id: id, text: "apply_correction requires an expectation to correct toward: supply exactly one of expect_element, expect_window, or target_bounds_screenshot_px alongside it. Nothing was changed.")
+                return
+            }
+        }
         // The mirror image of the guard immediately above, and rejected rather
         // than ignored for the same reason: a caller that supplies
         // `screenshot_screen_id` alongside `capture_source` believes it is
@@ -426,16 +440,64 @@ extension MCPServer {
             } else {
                 compositeScreenshotScale = nil
             }
+            // A screenshot_space and a decoded screenshot_path are two
+            // assertions of the SAME pixel grid, and until here only their
+            // DISPLAY halves were reconciled (the screen-id check above).
+            // If their dimensions disagree, every screenshot-pixel number in
+            // this call -- `target_bounds_screenshot_px` most damagingly --
+            // was measured on the space's grid but would silently be
+            // interpreted in the file's grid, scaling the target rect by the
+            // ratio between them and reporting a placement error that does
+            // not exist. Both supplied and agreeing is a harmless
+            // restatement; disagreeing is a contradiction rejected outright,
+            // the same rule as `screenshot_screen_id` vs the space above.
+            // Tolerance is one pixel per axis, the same rounding slack a
+            // dimension legitimately picks up from registration.
+            if let spaceWidthPx, let spaceHeightPx, let scale = compositeScreenshotScale {
+                let imageWidth = scale.x * Double(screen.widthPx)
+                let imageHeight = scale.y * Double(screen.heightPx)
+                if abs(Double(spaceWidthPx) - imageWidth) > 1 || abs(Double(spaceHeightPx) - imageHeight) > 1 {
+                    sendErrorResult(id: id, text: "screenshot_space '\(screenshotSpaceId ?? "?")' records \(spaceWidthPx)x\(spaceHeightPx), but the decoded screenshot_path image is \(Int(imageWidth.rounded()))x\(Int(imageHeight.rounded())) -- two different pixel grids for the same call. Screenshot-pixel arguments (target_bounds_screenshot_px) would silently be interpreted in the file's grid while you measured on the space's, scaling every number by their ratio. Nothing was verified; pass the screenshot file the space was registered from, re-register the space from this file (register_screenshot_space with screenshot_path), or drop one of the two arguments.")
+                    return
+                }
+            }
             switch resolveExpectationVerdict(
-                args: args, annotation: annotation, screen: screen, snapshot: snapshot,
+                args: args, annotation: annotation, screen: screen, screens: snapshot.screens,
                 rasterLease: renderSnapshot.rasterLease, precomputedPaintedBoundsBacking: nil,
                 screenshotToBackingScale: compositeScreenshotScale
             ) {
             case .failure(let error):
                 sendErrorResult(id: id, text: error)
                 return
-            case .success(let expectPayload):
-                if let expectPayload {
+            case .success(let verdict):
+                if let verdict {
+                    var expectPayload = verdict.payload
+                    // Entry-point validation already rejected a malformed
+                    // apply_correction and one supplied without any
+                    // expectation, so this local re-parse can only see
+                    // false or a validated true.
+                    var applyCorrection = false
+                    if case .success(let value) = AnnotationBoundsSupport.parseApplyCorrection(args) {
+                        applyCorrection = value
+                    }
+                    if applyCorrection {
+                        if let corrected = verdict.correctedOffset {
+                            expectPayload["appliedCorrection"] = applyCorrectionAndReport(
+                                annotationId: annotation.id,
+                                expectedRevision: annotation.revision,
+                                correctedOffsetX: corrected.offsetX,
+                                correctedOffsetY: corrected.offsetY,
+                                targetBoundsBacking: verdict.targetBoundsBacking,
+                                screen: screen,
+                                screenshotScale: compositeScreenshotScale
+                            )
+                        } else {
+                            expectPayload["appliedCorrection"] = [
+                                "applied": false,
+                                "reason": "No correction could be computed (see correctionUnavailableReason), so there was nothing to apply."
+                            ] as [String: Any]
+                        }
+                    }
                     metadata["expect"] = expectPayload
                 }
             }
@@ -671,16 +733,48 @@ extension MCPServer {
         }
         payload["evidence"] = evidence
 
+        // Entry-point validation already rejected a malformed
+        // apply_correction and one supplied without any expectation, so this
+        // local re-parse can only see false or a validated true.
+        var applyCorrection = false
+        if case .success(let value) = AnnotationBoundsSupport.parseApplyCorrection(args) {
+            applyCorrection = value
+        }
         switch resolveExpectationVerdict(
-            args: args, annotation: annotation, screen: screen, snapshot: snapshot,
+            args: args, annotation: annotation, screen: screen, screens: snapshot.screens,
             rasterLease: renderSnapshot.rasterLease, precomputedPaintedBoundsBacking: paintedBoundsBacking,
             screenshotToBackingScale: screenshotToBackingScale
         ) {
         case .failure(let error):
             sendErrorResult(id: id, text: error)
             return
-        case .success(let expectPayload):
-            if let expectPayload {
+        case .success(let verdict):
+            if let verdict {
+                var expectPayload = verdict.payload
+                if applyCorrection {
+                    if let corrected = verdict.correctedOffset {
+                        // Reporting scale is screenshot px per backing px --
+                        // the same convention `screenshotScale` above was
+                        // built with -- so `appliedCorrection`'s
+                        // post-correction bounds come back in the caller's
+                        // own screenshot pixels whenever a space supplied
+                        // one.
+                        expectPayload["appliedCorrection"] = applyCorrectionAndReport(
+                            annotationId: annotation.id,
+                            expectedRevision: annotation.revision,
+                            correctedOffsetX: corrected.offsetX,
+                            correctedOffsetY: corrected.offsetY,
+                            targetBoundsBacking: verdict.targetBoundsBacking,
+                            screen: screen,
+                            screenshotScale: screenshotToBackingScale
+                        )
+                    } else {
+                        expectPayload["appliedCorrection"] = [
+                            "applied": false,
+                            "reason": "No correction could be computed (see correctionUnavailableReason), so there was nothing to apply."
+                        ] as [String: Any]
+                    }
+                }
                 payload["expect"] = expectPayload
             }
         }
@@ -727,15 +821,37 @@ extension MCPServer {
     /// SCREENSHOT-pixel painted rect on hand, not a backing-pixel one) --
     /// either way it is the live renderer's own answer, never a second,
     /// independently-computed estimate.
-    private func resolveExpectationVerdict(
+    /// What one resolved expectation verdict carries beyond its MCP payload:
+    /// the machine-usable halves (`correctedOffset`, the absolute
+    /// `offset_x`/`offset_y` that would centre the painted bounds on the
+    /// target; `targetBoundsBacking`, the resolved target in the screen's
+    /// backing pixels) that `apply_correction` needs WITHOUT re-parsing them
+    /// back out of the wire payload it just built. The payload's
+    /// `correctionBackingPx` and these fields are written from the same
+    /// computation, so they cannot disagree.
+    struct ExpectationVerdictOutcome {
+        let payload: [String: Any]
+        let correctedOffset: (offsetX: Double, offsetY: Double)?
+        let targetBoundsBacking: CGRect
+    }
+
+    // internal, not private: also called from `DrawRequest.finish`
+    // (DrawRequest.swift) for draw-time expectations -- the SAME parse,
+    // resolution, comparison, and payload as `verify_annotation`, so a
+    // verdict attached to a draw response can never disagree in shape or
+    // semantics with one asked for afterwards. Takes bare `screens` rather
+    // than a `ScreenSnapshot` because the draw path holds only its
+    // resolve-time screen list (`DrawRequest.candidateScreens`), and nothing
+    // here needs more than the array.
+    func resolveExpectationVerdict(
         args: [String: Any],
         annotation: Annotation,
         screen: ScreenInfo,
-        snapshot: ScreenSnapshot,
+        screens: [ScreenInfo],
         rasterLease: RasterAssetStore.Lease,
         precomputedPaintedBoundsBacking: CGRect?,
         screenshotToBackingScale: (x: Double, y: Double)? = nil
-    ) -> DrawOutcome<[String: Any]?> {
+    ) -> DrawOutcome<ExpectationVerdictOutcome?> {
         // Both the "which keys were supplied" question and the "more than
         // one is a contradiction" rejection text live in
         // `AnnotationBoundsSupport` (a pure, directly-testable predicate)
@@ -808,7 +924,7 @@ extension MCPServer {
                 match = try AccessibilityElementResolver.resolve(
                     processID: narrowedPID,
                     request: AccessibilityElementRequest(label: label, role: role, matchMode: matchMode, occurrence: occurrence),
-                    screens: snapshot.screens
+                    screens: screens
                 )
             } catch {
                 return .failure("expect_element: \(error.localizedDescription)")
@@ -819,7 +935,12 @@ extension MCPServer {
             // for several seconds, and a display reconfiguration in between
             // would silently move the answer if converted against the
             // pre-walk snapshot.
-            let screensAfterWalk = OverlayWindowController.shared.screenSnapshot().screens
+            // `.live`, not the default cached read: this re-read EXISTS to
+            // detect a display reconfiguration that happened during the
+            // walk, and a cached snapshot served before the reconfiguration
+            // notification lands would compare the pre-walk layout against
+            // itself and miss exactly the change it is looking for.
+            let screensAfterWalk = OverlayWindowController.shared.screenSnapshot(freshness: .live).screens
             guard let confirmedFrame = AccessibilityElementResolver.backingRect(
                       forAccessibilityFrame: match.accessibilityFrame, screens: screensAfterWalk
                   ), confirmedFrame == match.backingFrame else {
@@ -843,7 +964,7 @@ extension MCPServer {
             case .failure(let error): return .failure("expect_window: \(error)")
             case .success(let value): process = value
             }
-            let samples = TargetWindowProbe.shared.windows(forProcessId: process.pid, screens: snapshot.screens)
+            let samples = TargetWindowProbe.shared.windows(forProcessId: process.pid, screens: screens)
             // Only windows already on the ANNOTATION's own display are
             // eligible -- a window's frame on a different display cannot be
             // compared against this annotation's backing-pixel bounds any
@@ -885,6 +1006,15 @@ extension MCPServer {
 
         let comparison = AnnotationGeometryVerdict.compare(painted: paintedBoundsBacking, target: targetBoundsBacking)
         var payload: [String: Any] = comparison.payload
+        // `compare` ran on two BACKING-pixel rects, so `centerDeltaX`/
+        // `centerDeltaY` are backing pixels -- unlike
+        // `get_annotation_bounds`'s `targetDeltaScreenshotPx`, whose very
+        // name carries its unit. These field names carry none, and an agent
+        // that assumed screenshot pixels (every sibling delta it sees IS
+        // screenshot pixels) would scale its own correction by the backing
+        // factor. Say the unit explicitly rather than relying on the reader
+        // to trace which space the operands were in.
+        payload["centerDeltaUnit"] = "backing_px"
         payload["targetSource"] = targetSource
         payload["targetBoundsBackingPx"] = AnnotationBoundsSupport.rectPayload(targetBoundsBacking)
         payload["paintedBoundsBackingPx"] = AnnotationBoundsSupport.rectPayload(paintedBoundsBacking)
@@ -902,17 +1032,22 @@ extension MCPServer {
         // conversion is already done -- passing scale (1, 1) makes its first
         // multiply a no-op and leaves only the anchor-adjustment division,
         // which is still needed exactly as `get_annotation_bounds` needs it.
-        if let corrected = AnnotationBoundsSupport.correctedOffset(
+        let corrected = AnnotationBoundsSupport.correctedOffset(
             currentOffsetX: annotation.offsetX, currentOffsetY: annotation.offsetY,
             deltaScreenshotX: comparison.centerDeltaX, deltaScreenshotY: comparison.centerDeltaY,
             screenshotToBackingScale: (1, 1), adjustment: annotation.effectiveAdjustment
-        ) {
+        )
+        if let corrected {
             payload["correctionBackingPx"] = ["offsetX": corrected.offsetX, "offsetY": corrected.offsetY]
         } else {
             payload["correctionUnavailableReason"] = "The annotation's current anchor adjustment scale is zero, non-finite, or otherwise degenerate, so a single offset_x/offset_y correction cannot be computed safely. Check anchor.state before retrying."
         }
 
-        return .success(payload)
+        return .success(ExpectationVerdictOutcome(
+            payload: payload,
+            correctedOffset: corrected.map { (offsetX: $0.offsetX, offsetY: $0.offsetY) },
+            targetBoundsBacking: targetBoundsBacking
+        ))
     }
 
     /// Resolves the `app` field nested inside `expect_element`/

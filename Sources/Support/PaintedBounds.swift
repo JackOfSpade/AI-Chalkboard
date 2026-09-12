@@ -31,7 +31,7 @@ enum PaintedBounds {
     /// items independently return `nil`.
     static func paintedBounds(of kind: AnnotationKind) -> CGRect? {
         switch kind {
-        case let .vectorPath(data, _, _, _, _, _, _, _, coordinateScaleX, coordinateScaleY):
+        case let .vectorPath(data, _, strokeWidth, _, _, _, _, _, coordinateScaleX, coordinateScaleY):
             // `SVGPathCache` memoises the parse by content (see that type's
             // own doc comment), so re-parsing here is at worst a cache hit,
             // never a second full tokenisation of a path up to
@@ -39,19 +39,51 @@ enum PaintedBounds {
             // `ChalkPath.bounds` is the TIGHT SVG-source-space box (curve
             // extrema included -- see `ChalkPath`'s own doc comment on why
             // it matches `boundingBoxOfPath`, not the looser `boundingBox`);
-            // this function's only remaining job is to scale that box into
-            // the same backing-pixel space every other kind below is
-            // already stored in, exactly as `AnnotationRenderer` scales the
-            // same path by the same two factors at paint time.
+            // this function scales that box into the same backing-pixel
+            // space every other kind below is already stored in, exactly as
+            // `AnnotationRenderer` scales the same path by the same two
+            // factors at paint time.
             guard let path = try? SVGPathCache.path(for: data) else { return nil }
             let bounds = path.bounds
             guard bounds.origin.x.isFinite, bounds.origin.y.isFinite,
                   bounds.size.width.isFinite, bounds.size.height.isFinite else { return nil }
-            return CGRect(
+            let scaled = CGRect(
                 x: bounds.origin.x * coordinateScaleX,
                 y: bounds.origin.y * coordinateScaleY,
                 width: bounds.size.width * coordinateScaleX,
                 height: bounds.size.height * coordinateScaleY
+            )
+            // The GEOMETRIC box alone is the wrong answer for a stroked
+            // path: a flat stroke (`M 100 500 L 400 500`) has a zero-HEIGHT
+            // geometric box, and a zero-area rect defeats
+            // `TargetWindowSelection.selectWindow`'s largest-intersection
+            // contest the same way the `.text` case below documents for a
+            // zero-size sentinel -- every candidate ties at area 0 and the
+            // selection silently falls back to "front-most window", exactly
+            // as if the stroke sat over NO window at all. What the renderer
+            // actually paints extends `strokeWidth / 2` beyond the geometric
+            // path on every side (half the pen width perpendicular to each
+            // segment, and the same again past each endpoint via the fixed
+            // round caps/joins -- see `DrawingContext.stroke`), so inflate by
+            // that much. `strokeWidth` is a STYLE dimension, always backing
+            // pixels and never multiplied by `coordinateScaleX/Y` (see
+            // `AnnotationRenderer.drawKind`'s "STYLE dimensions" contract),
+            // which is why it is added AFTER the scale, not before. The
+            // `> 0` gate mirrors the renderer's own paint condition
+            // (`drawVectorPath` strokes exactly when `strokeWidth > 0`);
+            // `isFinite` keeps a hand-built kind from poisoning the rect,
+            // per this function's "no assumption about its caller's
+            // history" stance. Still an ESTIMATE per this type's header --
+            // good enough to pick a window, never claimed pixel-exact (a
+            // rotated join can slightly exceed it; a fill-only degenerate
+            // path genuinely paints nothing and stays degenerate).
+            guard strokeWidth.isFinite, strokeWidth > 0 else { return scaled }
+            let inset = strokeWidth / 2
+            return CGRect(
+                x: scaled.origin.x - inset,
+                y: scaled.origin.y - inset,
+                width: scaled.size.width + strokeWidth,
+                height: scaled.size.height + strokeWidth
             )
 
         case let .image(_, x, y, width, height, _, _):

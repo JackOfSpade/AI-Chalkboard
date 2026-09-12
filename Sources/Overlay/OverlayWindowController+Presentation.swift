@@ -65,6 +65,73 @@ public protocol OverlayPresentationBackend: AnyObject {
     func setCaptureAffinity(includeInCapture: Bool)
 }
 
+/// Pure decision function for `refreshViewsNow(under:)`'s per-screen ordering
+/// step: given that a screen has content, should this repaint actually issue
+/// `orderOnScreen()`?
+///
+/// WHY NOT SIMPLY `if !isOnScreen { orderOnScreen() }`: on macOS,
+/// `orderOnScreen()` is `orderFrontRegardless()`, and being FRONT is doing
+/// real work beyond being VISIBLE. The overlay sits at `.statusBar` (25),
+/// which EXACTLY TIES the level of Control Center's menu-bar status glyphs --
+/// the empirical probe documented on `window.level` in
+/// `OverlayWindowController.swift` found the overlay wins that tie only
+/// because AppKit orders a newly-fronted window ahead of existing windows at
+/// the same level. `isOnScreen` (`NSWindow.isVisible`) does NOT flip when
+/// another same-level window later orders itself above us -- losing the tie
+/// is a z-order matter, not a visibility matter -- so a bare `isOnScreen`
+/// guard would fire once and then never again, and an annotation over the
+/// menu bar could stay buried under Control Center for the rest of its life.
+/// The unconditional per-repaint reassertion was, in other words, deliberate
+/// armor for that fight, not sloppiness.
+///
+/// WHY NOT KEEP IT UNCONDITIONAL: `orderFrontRegardless()` is a synchronous
+/// WindowServer ordering transaction, and `refreshViewsNow` runs on every
+/// repaint -- at `AnchorTracker`'s 30Hz drag cadence that was 30 transactions
+/// per second PER DISPLAY, each re-fighting a tie it almost always already
+/// held, on the same main thread every geometry-touching MCP call used to
+/// queue behind.
+///
+/// SO: reassert, but at most once per `reassertInterval` per window while it
+/// is already on screen -- cutting the steady-state cost 30x at drag cadence
+/// while bounding a lost tie's lifetime to one interval instead of forever --
+/// and keep the IMMEDIATE assertion for every off-screen -> on-screen
+/// transition, which must never wait (that path is how content first
+/// appears, and how suspend/resume self-heals).
+///
+/// Pure and platform-neutral (house pattern: the decision is pinned by
+/// `OverlayOrderingPolicyTests`, which cannot construct live windows). The
+/// caller supplies `now` from `ProcessInfo.processInfo.systemUptime`: a
+/// monotonic-while-awake clock, so a wall-clock adjustment cannot mute
+/// reassertion; across a sleep/wake the elapsed reading only UNDER-counts,
+/// which delays one reassertion by at most one interval.
+enum OverlayOrderingPolicy {
+    /// One second: long enough that the 30Hz repaint cadence stops paying
+    /// per-frame WindowServer transactions (30x fewer), short enough that an
+    /// overlay buried by a same-level rival -- something a human is actively
+    /// looking at, or a verification screenshot is about to sample -- recovers
+    /// within one repaint cycle after the interval elapses.
+    static let reassertInterval: TimeInterval = 1.0
+
+    static func shouldOrderOnScreen(
+        alreadyOnScreen: Bool,
+        lastAssertedAt: TimeInterval?,
+        now: TimeInterval
+    ) -> Bool {
+        // The off-screen -> on-screen transition is never throttled.
+        guard alreadyOnScreen else { return true }
+        // On screen with no recorded assertion: this process cannot prove it
+        // ever fronted this window (e.g. the timestamp map was cleared), so
+        // assert rather than assume.
+        guard let lastAssertedAt else { return true }
+        let elapsed = now - lastAssertedAt
+        // A negative reading means the timestamp cannot be trusted (it
+        // should be impossible with a monotonic source); fail toward
+        // reasserting, the behavior that was previously unconditional.
+        if elapsed < 0 { return true }
+        return elapsed >= reassertInterval
+    }
+}
+
 /// De-duplicates the "unrecognised `AI_CHALKBOARD_CAPTURE_EXCLUSION` value"
 /// warning down to one line per distinct value.
 ///
@@ -577,9 +644,32 @@ extension OverlayWindowController {
             // can no longer observe different states of the store.
             let hasContent = presentPixels(window: window, screenId: screenId)
             if hasContent {
-                window.orderOnScreen()
+                // Throttled, not unconditional and not a bare
+                // `!window.isOnScreen` guard -- see `OverlayOrderingPolicy`'s
+                // doc comment for why both extremes are wrong (the
+                // unconditional call was 30 WindowServer transactions/sec/
+                // display at drag cadence; the bare guard would permanently
+                // forfeit the same-level tie with Control Center that
+                // `orderFrontRegardless()` re-wins, because losing that tie
+                // never flips `isOnScreen`). The repeated suspend/resume
+                // self-heal `setAnnotationsSuspended(_:)` documents survives
+                // intact: suspend orders windows OUT, so the resume that
+                // follows always takes the never-throttled off-screen path.
+                let now = ProcessInfo.processInfo.systemUptime
+                if OverlayOrderingPolicy.shouldOrderOnScreen(
+                    alreadyOnScreen: window.isOnScreen,
+                    lastAssertedAt: lastOrderOnScreenAssertion[screenId],
+                    now: now
+                ) {
+                    window.orderOnScreen()
+                    lastOrderOnScreenAssertion[screenId] = now
+                }
             } else {
                 window.orderOffScreen()
+                // Dropping the timestamp is what the policy's "on screen with
+                // no recorded assertion" branch pairs with: after any hide,
+                // the next show is provably immediate.
+                lastOrderOnScreenAssertion.removeValue(forKey: screenId)
             }
         }
     }

@@ -266,7 +266,8 @@ extension MCPServer {
                 label: nil,
                 defaultsToGlobal: false,
                 kind: kind,
-                noun: "free-draw SVG path"
+                noun: "free-draw SVG path",
+                transform: transform
             ) {
             case .failure(let err):
                 sendErrorResult(id: id, text: err)

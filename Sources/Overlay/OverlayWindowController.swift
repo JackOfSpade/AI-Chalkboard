@@ -43,6 +43,34 @@ public final class OverlayWindowController: NSObject {
     var overlayWindows: [NSWindow] = []
     var overlayViews: [OverlayView] = []
 
+    /// The cached immutable display-layout snapshot behind
+    /// `screenSnapshot(freshness:)` (ScreenSnapshot.swift). Readable from any
+    /// thread under the cache's own lock; written from exactly one place --
+    /// `rebuildOverlayWindows()` below -- so the cache is refreshed by the
+    /// SAME handler, in the SAME main-thread turn, that rebuilds the overlay
+    /// windows on `NSApplication.didChangeScreenParametersNotification`. See
+    /// `ScreenSnapshotCache`'s doc comment for the single-writer discipline
+    /// and `screenSnapshot(freshness:)`'s for the staleness contract this
+    /// pairing is what makes true.
+    let screenSnapshotCache = ScreenSnapshotCache()
+
+    /// PRESENTATION-THREAD-ONLY. Monotonic uptime
+    /// (`ProcessInfo.systemUptime`) of the most recent `orderOnScreen()` this
+    /// process issued per screen id, or absent when that screen's window was
+    /// last ordered off (or never ordered on). Consumed by
+    /// `refreshViewsNow(under:)`'s repaint loop through
+    /// `OverlayOrderingPolicy` (OverlayWindowController+Presentation.swift)
+    /// to throttle the per-repaint front-of-tie reassertion -- see that
+    /// policy's doc comment for why the reassertion is throttled rather than
+    /// removed. Keyed by screen id, not window identity: ids are stable
+    /// across `rebuildOverlayWindows()` for the same physical display, and an
+    /// object-identity key could silently alias a recycled allocation.
+    /// Cleared on rebuild -- fresh windows start off screen, and off-screen
+    /// windows are always ordered on immediately, so a stale entry could
+    /// never delay them; clearing just keeps the map from accreting ids of
+    /// long-unplugged displays.
+    var lastOrderOnScreenAssertion: [String: TimeInterval] = [:]
+
     /// MAIN-THREAD-ONLY. Suspension is deliberately presentation state, not
     /// store state: annotations, their stable IDs, and creation dates remain
     /// untouched so resume can make the exact same set visible again.
@@ -199,6 +227,24 @@ public final class OverlayWindowController: NSObject {
         // `refreshViews()` below reconcile unconditionally, which is also what
         // repairs the state if any window failed to be created above.
         lastAppliedIncludeInCapture = nil
+        // Same reasoning for the ordering-assertion timestamps: they describe
+        // windows that just ceased to exist. See the property's doc comment
+        // for why clearing is hygiene rather than correctness (fresh windows
+        // start off screen, and the off-screen path always orders
+        // immediately).
+        lastOrderOnScreenAssertion.removeAll()
+
+        // Refresh the cached display snapshot HERE, before the window loop,
+        // so both `setup()` (startup population) and
+        // `screenParametersChanged()` (re-population on the notification)
+        // funnel through this one write -- the cache and the windows change
+        // together, or not at all. `buildScreenInfos()` performs its own
+        // `NSScreen.screens` read, but it and the read below happen in the
+        // same main-thread turn, and AppKit only revises its screen list as
+        // the app processes a reconfiguration event, which cannot interleave
+        // mid-turn -- so the cache and the windows built below describe the
+        // same layout.
+        screenSnapshotCache.store(ScreenSnapshot(screens: buildScreenInfos()))
 
         let screens = NSScreen.screens
         for (idx, screen) in screens.enumerated() {
@@ -429,6 +475,18 @@ public final class OverlayWindowController {
     /// every foreground switch: it only pushes when the answer actually moved.
     var lastAppliedIncludeInCapture: Bool?
 
+    /// UI-THREAD-ONLY. Same contract, and the same doc comment, as the macOS
+    /// branch's identical property: monotonic uptime of the most recent
+    /// `orderOnScreen()` per screen id, consumed by
+    /// `refreshViewsNow(under:)`'s repaint loop through
+    /// `OverlayOrderingPolicy` to throttle the per-repaint ordering
+    /// reassertion. The z-order fight it bounds is a macOS story
+    /// (Control Center's same-level tie -- see the policy's doc comment),
+    /// but the syscall saving applies here identically:
+    /// `SetWindowPos`+`SWP_SHOWWINDOW` on an already-visible window is just
+    /// as redundant per repaint as `orderFrontRegardless()` is.
+    var lastOrderOnScreenAssertion: [String: TimeInterval] = [:]
+
     public var onCaptureVisibleChanged: ((Bool) -> Void)?
 
     /// Cancelable stand-in for the macOS branch's `Timer`-based auto-revert.
@@ -543,6 +601,10 @@ public final class OverlayWindowController {
         // clearing it makes the `refreshViewsNow()` below reconcile
         // unconditionally.
         lastAppliedIncludeInCapture = nil
+        // And the same hygiene as the macOS branch's identical line -- the
+        // ordering-assertion timestamps describe windows that just ceased to
+        // exist.
+        lastOrderOnScreenAssertion.removeAll()
 
         // Newly (re)created windows are born with whatever capture-debug
         // request is currently in effect, mirroring the macOS branch's

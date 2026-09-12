@@ -1,6 +1,9 @@
 import Foundation
 import XCTest
 @testable import AIChalkboardCore
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
 
 /// Covers `ChalkTransform` and `ChalkPath` -- the platform-neutral stand-ins
 /// for `CGAffineTransform`/`CGPath` that let `SVGPathParser` and its callers
@@ -93,5 +96,57 @@ final class ChalkGeometryTests: XCTestCase {
         // recomputes bounds from the mapped curve instead of transforming
         // the old rectangle.)
         XCTAssertEqual(rotated.bounds, CGRect(x: -50, y: 0, width: 50, height: 100))
+    }
+
+    // MARK: - ChalkPath.bounds after a close
+
+    func testBoundsSolveACurveAfterCloseFromTheSubpathStart() {
+        // SVG/CGPath closepath semantics: after a close, the current point
+        // is the CLOSED SUBPATH'S START -- `SVGPathParser` honors this
+        // (`current = subpathStart` in its `Z` handler), and so does
+        // `CGMutablePath.closeSubpath`. So the quad below begins at
+        // (100, 100), the subpath's start, NOT at (200, 200), the point the
+        // close was issued from.
+        //
+        // Re-derived independently, from the (100, 100) start the fix
+        // restores: the quad's x(t) has p0=100, p1=300, p2=100, giving an
+        // interior extremum at t=0.5 of exactly 200 -- no wider than the
+        // triangle's own max X -- and its y(t) (p0=100, p1=300, p2=300) has
+        // its candidate root at t=1 (an endpoint, excluded), so max Y is the
+        // endpoint's 300. Tight box: (100, 100, 100, 200) -- exactly what
+        // `CGPath.boundingBoxOfPath` reports for this path (the contract in
+        // `ChalkPath`'s header). Solving from the STALE pre-close point
+        // (200, 200) instead (p0=200, p1=300, p2=100, t=1/3) manufactured a
+        // phantom x extremum of 233.33 -- a 33px overreport of max X.
+        let path = ChalkPath(elements: [
+            .move(CGPoint(x: 100, y: 100)),
+            .line(CGPoint(x: 200, y: 100)),
+            .line(CGPoint(x: 200, y: 200)),
+            .close,
+            .quad(control: CGPoint(x: 300, y: 300), to: CGPoint(x: 100, y: 300))
+        ])
+        XCTAssertEqual(path.bounds, CGRect(x: 100, y: 100, width: 100, height: 200))
+
+        #if canImport(CoreGraphics)
+        // Cross-check the header contract directly against Core Graphics on
+        // the platform that has it: the same elements, replayed into a
+        // `CGMutablePath` exactly as `CoreGraphicsDrawingContext.cgPath(from:)`
+        // replays them, must yield the same tight box. Component-wise with
+        // an epsilon rather than whole-rect equality, because
+        // `boundingBoxOfPath` promotes the quad to a cubic internally (2/3-
+        // weighted control points), whose extremum solve need not be
+        // bit-exact even though ours is.
+        let cgPath = CGMutablePath()
+        cgPath.move(to: CGPoint(x: 100, y: 100))
+        cgPath.addLine(to: CGPoint(x: 200, y: 100))
+        cgPath.addLine(to: CGPoint(x: 200, y: 200))
+        cgPath.closeSubpath()
+        cgPath.addQuadCurve(to: CGPoint(x: 100, y: 300), control: CGPoint(x: 300, y: 300))
+        let reference = cgPath.boundingBoxOfPath
+        XCTAssertEqual(path.bounds.minX, reference.minX, accuracy: 1e-9)
+        XCTAssertEqual(path.bounds.minY, reference.minY, accuracy: 1e-9)
+        XCTAssertEqual(path.bounds.maxX, reference.maxX, accuracy: 1e-9)
+        XCTAssertEqual(path.bounds.maxY, reference.maxY, accuracy: 1e-9)
+        #endif
     }
 }

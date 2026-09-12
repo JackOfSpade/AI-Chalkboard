@@ -320,13 +320,73 @@ enum ScreenshotCalibration {
     /// genuine misread on any screenshot size this tool will plausibly see.
     private static let minimumAbsoluteTolerancePx = 4.0
 
-    /// The relative half of every tolerance below: 1% of the relevant solved
-    /// span/dimension, so a large screenshot's proportionally larger
-    /// measurement noise does not trip a guard sized for a small one.
-    private static let relativeTolerance = 0.01
+    /// The relative half of the SPAN-SCALED tolerance: 1% of the relevant
+    /// solved span/dimension. Used ONLY for quantities whose expected error
+    /// genuinely grows in proportion to the whole span -- see
+    /// `spanTolerance(for:)`.
+    private static let spanRelativeTolerance = 0.01
 
-    private static func tolerance(for span: Double) -> Double {
-        max(minimumAbsoluteTolerancePx, relativeTolerance * span)
+    /// The relative half of the READ-NOISE-SCALED tolerance: 0.25% of the
+    /// relevant solved span/dimension. Used for quantities whose expected
+    /// error is the size of a fiducial READING error, not of the span -- see
+    /// `readNoiseTolerance(for:)` for why this is relative at all rather
+    /// than a flat pixel bound.
+    private static let readNoiseRelativeTolerance = 0.0025
+
+    /// Tolerance for SPAN-SCALED quantities: the snap-distance checks in
+    /// `snapToDisplayConsistentSize` (how far the raw per-axis solve sits
+    /// from the nearest uniform downsample of the display) and the
+    /// within-noise overshoot clamp that feeds them.
+    ///
+    /// WHY 1% IS RIGHT FOR THESE AND ONLY THESE: the snap distance is the
+    /// disagreement between a whole solved DIMENSION and the display's own
+    /// geometry. Every pixel of marker-reading error is amplified 1/0.8 =
+    /// 1.25x by the inset spread division on its way into that dimension
+    /// (see `markers`' "PRECISION COST" note), the two axes' independent
+    /// errors are then averaged into one uniform scale and multiplied back
+    /// up by the display's full size -- so the quantity under test really
+    /// does carry error proportional to the span, and a guard sized for a
+    /// 1470px downsample would misfire constantly at 5K. This budget is what
+    /// the snap step exists to absorb; do not reuse it for residuals whose
+    /// expected error never left reading-noise scale (that reuse was a real
+    /// bug -- see `readNoiseTolerance(for:)`).
+    private static func spanTolerance(for span: Double) -> Double {
+        max(minimumAbsoluteTolerancePx, spanRelativeTolerance * span)
+    }
+
+    /// Tolerance for READ-NOISE-SCALED quantities: the origin residuals
+    /// (both routes' crop check), the marker route's pair-disagreement
+    /// redundancy checks, and the element route's off-baseline fit
+    /// residuals.
+    ///
+    /// THE BUG THIS SPLIT FIXES: these residuals used to share the 1%-of-
+    /// span tolerance above, but their expected error is the size of a
+    /// fiducial READING error -- a pair disagreement is the difference of
+    /// two reads of the same coordinate, an origin residual is a mean of
+    /// reads minus a fixed fraction of the solved span -- and never grows to
+    /// 1% of a large image. Worked example: a 40px left crop of a 5120px-
+    /// wide native capture leaves an origin residual of exactly 40px, and
+    /// the 1% gate (51.2px at 5120) waved it through -- registering a space
+    /// that misplaced every subsequent drawing by 40px and silently
+    /// defeating the origin residual, which this file's own comments call
+    /// the only signal that can tell a same-aspect crop apart from a
+    /// downsample. The crop detector was weakest exactly where a crop costs
+    /// the most pixels.
+    ///
+    /// WHY NOT A FLAT PIXEL BOUND: read noise DOES scale somewhat with
+    /// image size, because agents read large screenshots through fixed-
+    /// resolution vision pipelines -- a +-2px read against a ~1500px viewed
+    /// image is ~7px of error against the same content at 5120 -- and a
+    /// pair disagreement is the DIFFERENCE of two such reads. A flat 6-8px
+    /// bound would therefore reject honest readings of large captures.
+    /// 0.25% of span is the budget that keeps both cases: 12.8px at 5K
+    /// admits realistic +-8px reads while rejecting the 40px crop above,
+    /// and at the common 1470px downsample the relative term (~3.7px) falls
+    /// below the 4px floor, so the floor governs -- deliberately tighter
+    /// than the 14.7px the old 1% term allowed there, because at 1470 a
+    /// +-2px read never produces a 14px residual either.
+    private static func readNoiseTolerance(for span: Double) -> Double {
+        max(minimumAbsoluteTolerancePx, readNoiseRelativeTolerance * span)
     }
 
     /// Solves the true `(widthPx, heightPx)` of a screenshot from four
@@ -420,12 +480,15 @@ enum ScreenshotCalibration {
         let bottomPairDisagreement = abs(bottomLeft.y - bottomRight.y)
         let verticalPairDisagreement = max(topPairDisagreement, bottomPairDisagreement)
 
-        let horizontalRedundancyTolerance = tolerance(for: observedWidth)
+        // READ-NOISE-scaled, not span-scaled: a pair disagreement is the
+        // difference of two reads of the same coordinate, so its expected
+        // size is reading error, never a percentage of the whole image.
+        let horizontalRedundancyTolerance = readNoiseTolerance(for: observedWidth)
         guard horizontalPairDisagreement <= horizontalRedundancyTolerance else {
             let offendingPair = leftPairDisagreement >= rightPairDisagreement ? "TL/BL" : "TR/BR"
             return .failure("Marker pair \(offendingPair) disagree on their observed x by \(horizontalPairDisagreement) px, exceeding the \(horizontalRedundancyTolerance) px tolerance for a ~\(observedWidth) px-wide image. These two markers share the same normalized x, so their observed x should match closely. Nothing was registered; re-check the \(offendingPair) markers' centres and re-measure.")
         }
-        let verticalRedundancyTolerance = tolerance(for: observedHeight)
+        let verticalRedundancyTolerance = readNoiseTolerance(for: observedHeight)
         guard verticalPairDisagreement <= verticalRedundancyTolerance else {
             let offendingPair = topPairDisagreement >= bottomPairDisagreement ? "TL/TR" : "BL/BR"
             return .failure("Marker pair \(offendingPair) disagree on their observed y by \(verticalPairDisagreement) px, exceeding the \(verticalRedundancyTolerance) px tolerance for a ~\(observedHeight) px-tall image. These two markers share the same normalized y, so their observed y should match closely. Nothing was registered; re-check the \(offendingPair) markers' centres and re-measure.")
@@ -454,11 +517,17 @@ enum ScreenshotCalibration {
         let originX = (topLeft.x + bottomLeft.x) / 2 - markerInsetFraction * observedWidth
         let originY = (topLeft.y + topRight.y) / 2 - markerInsetFraction * observedHeight
 
-        let originXTolerance = tolerance(for: observedWidth)
+        // READ-NOISE-scaled ON PURPOSE -- this residual IS the crop
+        // detector, and gating it at 1% of span was a real hole: a 40px
+        // left crop of a 5120px-wide capture left an origin residual of
+        // exactly 40px, inside the old 51.2px budget, and registered a
+        // space that misplaced every drawing by those 40px. See
+        // `readNoiseTolerance(for:)`.
+        let originXTolerance = readNoiseTolerance(for: observedWidth)
         guard abs(originX) <= originXTolerance else {
             return .failure("The implied left edge of the image is \(originX) px away from zero, exceeding the \(originXTolerance) px tolerance for a ~\(observedWidth) px-wide image. Nothing was registered; the image appears cropped or is not a full-display capture -- re-capture an uncropped screenshot of the whole display and retry.")
         }
-        let originYTolerance = tolerance(for: observedHeight)
+        let originYTolerance = readNoiseTolerance(for: observedHeight)
         guard abs(originY) <= originYTolerance else {
             return .failure("The implied top edge of the image is \(originY) px away from zero, exceeding the \(originYTolerance) px tolerance for a ~\(observedHeight) px-tall image. Nothing was registered; the image appears cropped or is not a full-display capture -- re-capture an uncropped screenshot of the whole display and retry.")
         }
@@ -698,9 +767,15 @@ enum ScreenshotCalibration {
 
         // Named here rather than at the end because both remaining checks
         // size their tolerance against it: this axis's span in the
-        // screenshot's own pixels is what "1% of the dimension" is 1% OF.
+        // screenshot's own pixels is what the relative term is a fraction
+        // OF. READ-NOISE-scaled for both: an off-baseline element's fit
+        // residual is one read's distance from a line two other reads
+        // define, and the origin residual is this route's crop detector --
+        // neither ever legitimately grows to 1% of a large image, and the
+        // 1% gate both used to share is exactly what let a 40px crop of a
+        // 5120px-wide capture pass. See `readNoiseTolerance(for:)`.
         let observedSpan = scale * axis.displaySizePx
-        let residualTolerance = tolerance(for: observedSpan)
+        let residualTolerance = readNoiseTolerance(for: observedSpan)
 
         // MARK: (d) Redundancy check against every off-baseline element
 
@@ -1009,7 +1084,7 @@ enum ScreenshotCalibration {
         // axis independently rounded -- precisely the shape
         // `ScreenshotGeometry.fullDisplayScale` was written to accept -- so
         // the final validation below can go back to enforcing ITS strict
-        // tolerance instead of the looser `tolerance(for:)` measurement
+        // tolerance instead of the looser `spanTolerance(for:)` measurement
         // budget this step has already spent.
         let sx = observedWidth / Double(screen.widthPx)
         let sy = observedHeight / Double(screen.heightPx)
@@ -1039,11 +1114,17 @@ enum ScreenshotCalibration {
         // -- and is deliberately NOT clamped, so it still flows through to
         // the "LARGER than display" rejection below with its existing
         // wording.
+        // SPAN-scaled, matching the snap-distance checks below: the
+        // overshoot is a whole solved DIMENSION's distance past the
+        // display, the same amplified-and-rescaled quantity those checks
+        // budget for, so the clamp and the rejection it pre-empts must
+        // share one measurement budget or a reading could be too noisy to
+        // clamp yet clean enough to pass.
         let widthOvershoot = observedWidth - Double(screen.widthPx)
         let heightOvershoot = observedHeight - Double(screen.heightPx)
         let overshootIsWithinMeasurementNoise =
-            widthOvershoot <= tolerance(for: observedWidth)
-            && heightOvershoot <= tolerance(for: observedHeight)
+            widthOvershoot <= spanTolerance(for: observedWidth)
+            && heightOvershoot <= spanTolerance(for: observedHeight)
         let snapScale = overshootIsWithinMeasurementNoise ? min(uniformScale, 1.0) : uniformScale
 
         let snappedWidth = (snapScale * Double(screen.widthPx)).rounded()
@@ -1060,7 +1141,8 @@ enum ScreenshotCalibration {
         // non-finite values, each route's parser checks only that the
         // reported coordinates are finite numbers, and every guard before
         // this point -- both routes' redundancy checks and origin residuals
-        // -- uses a purely RELATIVE tolerance (1% of the solved span). A
+        // -- uses a purely RELATIVE tolerance (a percentage of the solved
+        // span). A
         // self-consistent reading of, say, 4e19 px therefore satisfies all of
         // them and arrives here intact. The guards that WOULD have caught it
         // as absurd (the snap-distance checks just below, and the no-upscale
@@ -1095,13 +1177,17 @@ enum ScreenshotCalibration {
         // is the signal. This is a REAL rejection, not bookkeeping: without
         // it, a same-aspect-mismatched reading would silently snap to a
         // plausible-looking but wrong size instead of being caught.
+        // SPAN-scaled: the snap distance is a whole dimension's disagreement
+        // with the display's geometry, carrying the full inset-amplified,
+        // axis-averaged, rescaled measurement error -- the one quantity in
+        // this solver whose honest noise genuinely grows with the span.
         let widthSnapPx = Double(widthPx) - observedWidth
-        let widthSnapTolerance = tolerance(for: observedWidth)
+        let widthSnapTolerance = spanTolerance(for: observedWidth)
         guard abs(widthSnapPx) <= widthSnapTolerance else {
             return .failure("The measured width (~\(observedWidth) px) is not close to any uniform downsample of display \(screen.id) (\(screen.widthPx)x\(screen.heightPx) backing px): the nearest display-consistent width is \(widthPx) px, \(abs(widthSnapPx)) px away, exceeding the \(widthSnapTolerance) px tolerance for a ~\(observedWidth) px-wide image. Nothing was registered; confirm \(vocabulary.fiducialPlacementClause) -- and observed from -- display \(screen.id), and re-measure.")
         }
         let heightSnapPx = Double(heightPx) - observedHeight
-        let heightSnapTolerance = tolerance(for: observedHeight)
+        let heightSnapTolerance = spanTolerance(for: observedHeight)
         guard abs(heightSnapPx) <= heightSnapTolerance else {
             return .failure("The measured height (~\(observedHeight) px) is not close to any uniform downsample of display \(screen.id) (\(screen.widthPx)x\(screen.heightPx) backing px): the nearest display-consistent height is \(heightPx) px, \(abs(heightSnapPx)) px away, exceeding the \(heightSnapTolerance) px tolerance for a ~\(observedHeight) px-tall image. Nothing was registered; confirm \(vocabulary.fiducialPlacementClause) -- and observed from -- display \(screen.id), and re-measure.")
         }
@@ -1115,7 +1201,7 @@ enum ScreenshotCalibration {
         //
         // These are `ScreenshotGeometry.fullDisplayScale` /
         // `.isPlausibleFullDisplayCapture` rather than the looser
-        // `tolerance(for:)` measurement budget a previous pass once
+        // `spanTolerance(for:)` measurement budget a previous pass once
         // substituted here. That substitution WAS the bug this file exists to
         // fix: it let the solver accept a pair that
         // `DrawRequest.coordinateTransform`'s own strict guard would then

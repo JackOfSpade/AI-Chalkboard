@@ -66,6 +66,13 @@ struct ReanchorWindowContext {
     let appId: String
     let resize: AnchorResizeBehavior
     let samples: [TargetWindowSample]
+    /// The screen snapshot `samples` was probed against, carried forward for
+    /// the same reason `samples` is: `finalizeAnchorPatch` runs inside the
+    /// store's lock and must stay pure, and `buildWindowAnchor` uses this
+    /// only to record the selected window's display backing scale
+    /// (`AnnotationAnchor.referenceScreenScale`) for pin-mode density
+    /// compensation -- see that property's doc comment.
+    let screens: [ScreenInfo]
 }
 
 /// The four `update_annotation` anchor behaviors, decided purely from
@@ -125,6 +132,35 @@ extension MCPServer {
         }
         guard coordinateTransform.canTransform(geometry) else {
             return .failure("path_data contains coordinates that cannot be represented safely in the selected display's backing-pixel space.")
+        }
+        // Screenshot-grid sanity: a path measured on the declared screenshot
+        // must at least TOUCH it. Control points legitimately swing outside
+        // an image, so this uses the lax entirely-outside rule
+        // (`positionIsBounds: true` -- see `sourceGeometryRejection`'s doc
+        // comment) over the min/max of every point INCLUDING controls: that
+        // envelope only ever over-covers, so a rejection here means no part
+        // of the path could have come from the declared image.
+        if coordinateTransform.screenshotGrid != nil {
+            var minX = Double.infinity, minY = Double.infinity
+            var maxX = -Double.infinity, maxY = -Double.infinity
+            func cover(_ point: CGPoint) {
+                minX = min(minX, Double(point.x)); maxX = max(maxX, Double(point.x))
+                minY = min(minY, Double(point.y)); maxY = max(maxY, Double(point.y))
+            }
+            for element in geometry.elements {
+                switch element {
+                case let .move(point), let .line(point): cover(point)
+                case let .quad(control, to: point): cover(control); cover(point)
+                case let .cubic(control1, control2, to: point): cover(control1); cover(control2); cover(point)
+                case .close: break
+                }
+            }
+            if minX <= maxX, let rejection = coordinateTransform.sourceGeometryRejection(
+                minX: minX, minY: minY, maxX: maxX, maxY: maxY,
+                what: "path_data's geometry", positionIsBounds: true
+            ) {
+                return .failure(rejection)
+            }
         }
 
         if let key = MCPArgument.firstInvalidSuppliedDouble(args, keys: ["stroke_width", "stroke_opacity", "fill_opacity"]) {
@@ -246,6 +282,13 @@ extension MCPServer {
               let y = MCPArgument.double(args["y"]) else {
             return .failure("Missing required parameters: image_path, x, y")
         }
+        // Same declared-screenshot position check as `makeTextKind`; see
+        // `sourceGeometryRejection`'s doc comment.
+        if let rejection = coordinateTransform.sourceGeometryRejection(
+            minX: x, minY: y, maxX: x, maxY: y, what: "x/y"
+        ) {
+            return .failure(rejection)
+        }
         guard let backingX = coordinateTransform.transformedX(x),
               let backingY = coordinateTransform.transformedY(y) else {
             return .failure("Image coordinates cannot be represented safely in the selected display's backing-pixel space.")
@@ -311,6 +354,15 @@ extension MCPServer {
         let backgroundOpacity = MCPArgument.double(args["background_opacity"]) ?? 1
         let padding = MCPArgument.double(args["padding_px"]) ?? 0
         let opacity = MCPArgument.double(args["opacity"]) ?? 1
+        // A text POSITION beyond the declared screenshot cannot have been
+        // measured on it -- see `sourceGeometryRejection`'s doc comment for
+        // the mistake this catches (full-res coordinates declared at
+        // client-resized dimensions, silently doubling every position).
+        if let rejection = coordinateTransform.sourceGeometryRejection(
+            minX: x, minY: y, maxX: x, maxY: y, what: "x/y"
+        ) {
+            return .failure(rejection)
+        }
         guard let backingX = coordinateTransform.transformedX(x),
               let backingY = coordinateTransform.transformedY(y) else {
             return .failure("Text coordinates cannot be represented safely in the selected display's backing-pixel space.")
@@ -358,7 +410,7 @@ extension MCPServer {
         }
         switch request.finish(
             args: args, defaultColor: "#FFFFFF", label: nil, defaultsToGlobal: false,
-            kind: kind, noun: "free-draw raster image"
+            kind: kind, noun: "free-draw raster image", transform: transform
         ) {
         case .failure(let err):
             for assetId in kind.rasterAssetIds { _ = RasterAssetStore.shared.release(id: assetId) }
@@ -382,7 +434,7 @@ extension MCPServer {
         }
         switch request.finish(
             args: args, defaultColor: DrawingDefaults.textColor, label: nil, defaultsToGlobal: false,
-            kind: kind, noun: "text"
+            kind: kind, noun: "text", transform: transform
         ) {
         case .failure(let err): sendErrorResult(id: id, text: err)
         case .success(let message): sendTextResult(id: id, text: message)
@@ -476,7 +528,7 @@ extension MCPServer {
         let kind = AnnotationKind.batch(items: components)
         switch request.finish(
             args: args, defaultColor: DrawingDefaults.pathColor, label: nil, defaultsToGlobal: false,
-            kind: kind, noun: "atomic free-draw batch (\(components.count) items)"
+            kind: kind, noun: "atomic free-draw batch (\(components.count) items)", transform: transform
         ) {
         case .failure(let err): fail(err)
         case .success(let message): sendTextResult(id: id, text: message)
@@ -849,7 +901,7 @@ extension MCPServer {
             guard let resolution = DrawRequest.buildWindowAnchor(
                 processId: pid, appId: appId, samples: samples,
                 paintedBounds: currentPaintedBounds, resize: resize, now: Date(),
-                screenId: frozenScreenId
+                screenId: frozenScreenId, screens: screens
             ) else {
                 return .failure("anchor=\"window\" found no eligible on-screen window for \(displayName) (pid \(pid)). The annotation was left unchanged: a window anchor with no window would silently behave like an unanchored drawing. Bring a window of that application on screen and retry, or omit anchor.")
             }
@@ -861,7 +913,7 @@ extension MCPServer {
             return .success(AnchorPatchResolution(
                 screenId: frozenScreenId, anchor: resolution.anchor,
                 staticAdjustment: frozenAdjustment, projectionOverride: resolution.projection,
-                reanchorContext: ReanchorWindowContext(processId: pid, appId: appId, resize: resize, samples: samples)
+                reanchorContext: ReanchorWindowContext(processId: pid, appId: appId, resize: resize, samples: samples, screens: screens)
             ))
 
         case .changeResizePolicy(let resize):
@@ -890,6 +942,15 @@ extension MCPServer {
             let rebaselined = AnnotationAnchor(
                 mode: existingAnchor.mode, resize: resize, target: existingAnchor.target,
                 referenceWindowFrame: referenceFrame, referenceScreenId: referenceScreen,
+                // The recorded density (see `AnnotationAnchor
+                // .referenceScreenScale`) is only carried forward while it
+                // still describes the SAME display this re-baseline anchors
+                // to; re-baselining onto a different display makes the old
+                // recording wrong by exactly the ratio the pin compensation
+                // exists to fix, so it is dropped and the tracker's live
+                // lookup by referenceScreenId takes over.
+                referenceScreenScale: referenceScreen == existingAnchor.referenceScreenId
+                    ? existingAnchor.referenceScreenScale : nil,
                 element: existingAnchor.element, createdAt: existingAnchor.createdAt
             )
             // Same "freeze then reset to identity against the NEW reference"
@@ -1062,7 +1123,7 @@ extension MCPServer {
         guard let reselected = DrawRequest.buildWindowAnchor(
             processId: context.processId, appId: context.appId, samples: context.samples,
             paintedBounds: livePaintedBounds, resize: context.resize, now: Date(),
-            screenId: live.effectiveScreenId
+            screenId: live.effectiveScreenId, screens: context.screens
         ) else {
             // A tracker sample can change the effective display between the
             // pre-lock pick and this locked re-selection. Since samples are

@@ -642,7 +642,7 @@ final class UpdateAnnotationAnchorTests: XCTestCase {
             ),
             projectionOverride: provisionalPick.projection,
             anchorIntent: .reanchor(resize: .pin),
-            reanchorContext: ReanchorWindowContext(processId: 100, appId: Self.fixtureAppId, resize: .pin, samples: samples)
+            reanchorContext: ReanchorWindowContext(processId: 100, appId: Self.fixtureAppId, resize: .pin, samples: samples, screens: [])
         )
 
         // The race: a tracker sample lands AFTER `stored`/`provisionalPick`
@@ -719,7 +719,7 @@ final class UpdateAnnotationAnchorTests: XCTestCase {
             projectionOverride: provisional.projection,
             anchorIntent: .reanchor(resize: .pin),
             reanchorContext: ReanchorWindowContext(
-                processId: 100, appId: Self.fixtureAppId, resize: .pin, samples: [sampledWindow]
+                processId: 100, appId: Self.fixtureAppId, resize: .pin, samples: [sampledWindow], screens: []
             )
         )
 

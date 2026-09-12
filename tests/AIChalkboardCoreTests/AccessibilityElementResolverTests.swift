@@ -1088,6 +1088,309 @@ final class AccessibilityElementResolverTests: XCTestCase {
         }
     }
 
+    // MARK: - Batched per-node attribute fetch (one IPC round trip per visited node)
+    //
+    // The BFS now fetches kAXRole/kAXTitle/kAXDescription/kAXValue/kAXChildren
+    // for every visited node through ONE AXUIElementCopyMultipleAttributeValues
+    // round trip instead of up to five sequential blocking ones. The IPC call
+    // itself needs a live target app plus TCC Accessibility consent, so what
+    // is pinned headlessly is the pure decode seam the batch feeds through:
+    // raw result-array slots (real values, AXError sentinels, NULL-ish
+    // placeholders) -> the same nil-tolerant per-attribute optionals the old
+    // individual AXUIElementCopyAttributeValue reads produced. Every fixture
+    // object here is a plain CF construction -- AXValueCreate for sentinels,
+    // AXUIElementCreateApplication for child tokens -- neither of which
+    // performs IPC or requires a permission grant.
+    //
+    // Windows-only note: the whole section below is macOS-only. The batch
+    // decode, `matchLabel`'s cascade, `InternalMatch`, and `resolvedMatch`
+    // are all internals of macOS's AXUIElement-based walk; the Windows
+    // resolver's traversal happens inside the C++ shim (chalk_uia.cpp),
+    // opaque to Swift, so none of these symbols exist there.
+    #if os(macOS)
+    private func errorSentinel(_ code: AXError) throws -> AXValue {
+        var code = code
+        return try XCTUnwrap(AXValueCreate(.axError, &code))
+    }
+
+    func testBatchedAttributeNamesPinTheOrderTheDecoderIndexesBy() {
+        // The batch result array is positional: the decoder reads slot 0 as
+        // the role, slot 1 as the title, and so on. A silent reorder of the
+        // attribute-name constant would swap attributes with no type-system
+        // complaint anywhere, so the order is pinned verbatim.
+        XCTAssertEqual(
+            AccessibilityElementResolver.batchedNodeAttributeNames,
+            [kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute,
+             kAXValueAttribute, kAXChildrenAttribute]
+        )
+    }
+
+    func testDecodeWithAllFiveSlotsPresentYieldsEveryAttribute() {
+        let child = AXUIElementCreateApplication(4_242)
+        let decoded = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots([
+            "AXButton", "Render", "Starts a render", "42%", [child]
+        ])
+        XCTAssertEqual(decoded.role, "AXButton")
+        XCTAssertEqual(decoded.title, "Render")
+        XCTAssertEqual(decoded.description, "Starts a render")
+        XCTAssertEqual(decoded.value, "42%")
+        XCTAssertEqual(decoded.children?.count, 1)
+    }
+
+    func testOneMissingAttributeDecodesToNilWithoutDisturbingItsNeighbours() throws {
+        // THE per-slot contract the batching relies on: with .stopOnError NOT
+        // set, a slot whose attribute failed comes back as an AXValue-wrapped
+        // AXError while every other slot still carries its real value --
+        // exactly the old behavior, where one failed individual read returned
+        // nil for that attribute and the other four reads proceeded
+        // untouched. An element with no title but a matching description
+        // (common for AXStaticText) must therefore resolve identically before
+        // and after the batching change.
+        let decoded = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots([
+            "AXStaticText",
+            try errorSentinel(.noValue),
+            "Tracking",
+            try errorSentinel(.attributeUnsupported),
+            try errorSentinel(.noValue)
+        ])
+        XCTAssertEqual(decoded.role, "AXStaticText")
+        XCTAssertNil(decoded.title)
+        XCTAssertEqual(decoded.description, "Tracking")
+        XCTAssertNil(decoded.value)
+        XCTAssertNil(decoded.children)
+    }
+
+    func testEveryAXErrorSentinelCodeDecodesToNilLikeAnyFailedIndividualRead() throws {
+        // The old rule was "any non-.success status becomes nil", never a
+        // per-code decision, so the sentinel decode must treat every wrapped
+        // AXError identically -- kAXErrorNoValue markers included.
+        for code: AXError in [.noValue, .attributeUnsupported, .cannotComplete, .failure] {
+            let decoded = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots([
+                try errorSentinel(code), try errorSentinel(code), try errorSentinel(code),
+                try errorSentinel(code), try errorSentinel(code)
+            ])
+            XCTAssertNil(decoded.role, "role must decode to nil for sentinel \(code)")
+            XCTAssertNil(decoded.title, "title must decode to nil for sentinel \(code)")
+            XCTAssertNil(decoded.description, "description must decode to nil for sentinel \(code)")
+            XCTAssertNil(decoded.value, "value must decode to nil for sentinel \(code)")
+            XCTAssertNil(decoded.children, "children must decode to nil for sentinel \(code)")
+        }
+    }
+
+    func testNullAndShortSlotArraysAreToleratedDefensively() {
+        // On-device sentinel behavior cannot be assumed uniform: a NULL-ish
+        // placeholder or a short result array must degrade to the same nil
+        // a failed individual read produced, never trap on an index.
+        let nullSlots = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots([
+            NSNull(), NSNull(), NSNull(), NSNull(), NSNull()
+        ])
+        XCTAssertNil(nullSlots.role)
+        XCTAssertNil(nullSlots.title)
+        XCTAssertNil(nullSlots.description)
+        XCTAssertNil(nullSlots.value)
+        XCTAssertNil(nullSlots.children)
+
+        let short = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots(["AXButton", "Render"])
+        XCTAssertEqual(short.role, "AXButton")
+        XCTAssertEqual(short.title, "Render")
+        XCTAssertNil(short.description)
+        XCTAssertNil(short.value)
+        XCTAssertNil(short.children)
+
+        let empty = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots([])
+        XCTAssertNil(empty.role)
+        XCTAssertNil(empty.children)
+    }
+
+    func testNonErrorAXValueInTheValueSlotIsNotTreatedAsASentinelButStillIsNotAString() throws {
+        // A real kAXValue can legitimately BE an AXValue (a point, size, or
+        // range). That is not a failure sentinel -- only .axError-typed
+        // AXValues are -- but it is also not a String, so it must decode to
+        // nil exactly the way the old `value as? String` rejected it.
+        var point = CGPoint(x: 10, y: 20)
+        let pointValue = try XCTUnwrap(AXValueCreate(.cgPoint, &point))
+        XCTAssertNotNil(AccessibilityElementResolver.batchSlotPayload(pointValue),
+                        "a non-error AXValue is a real payload, not a sentinel")
+        let decoded = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots([
+            "AXSlider", try errorSentinel(.noValue), try errorSentinel(.noValue), pointValue,
+            try errorSentinel(.noValue)
+        ])
+        XCTAssertEqual(decoded.role, "AXSlider")
+        XCTAssertNil(decoded.value)
+    }
+
+    func testChildrenSlotFiltersNonElementEntriesAndKeepsARealEmptyArrayDistinctFromFailure() throws {
+        // Same filtering the old `elements(attribute:of:)` helper applied:
+        // only real AXUIElements survive, junk entries are dropped, and a
+        // successful-but-empty children array stays [] (a real "no children"
+        // answer) rather than collapsing into nil (an unreadable attribute).
+        let childA = AXUIElementCreateApplication(4_242)
+        let childB = AXUIElementCreateApplication(4_243)
+        let mixed = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots([
+            "AXGroup", try errorSentinel(.noValue), try errorSentinel(.noValue),
+            try errorSentinel(.noValue), [childA, "junk", childB] as [Any]
+        ])
+        XCTAssertEqual(mixed.children?.count, 2)
+
+        let emptyChildren = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots([
+            "AXGroup", try errorSentinel(.noValue), try errorSentinel(.noValue),
+            try errorSentinel(.noValue), [Any]()
+        ])
+        XCTAssertNotNil(emptyChildren.children, "a real empty children array is an answer, not a failure")
+        XCTAssertEqual(emptyChildren.children?.isEmpty, true)
+
+        let nonArray = AccessibilityElementResolver.decodeBatchedNodeAttributeSlots([
+            "AXGroup", try errorSentinel(.noValue), try errorSentinel(.noValue),
+            try errorSentinel(.noValue), "not an array"
+        ])
+        XCTAssertNil(nonArray.children)
+    }
+
+    // MARK: - matchLabel cascade over batch-fetched values: priority equivalence
+    //
+    // With batching, all three label attributes sit in hand before the
+    // cascade runs, so the one semantic that could most plausibly have
+    // drifted is match PRIORITY and the short-circuit shape of `sampled`.
+    // These pin both to the old sequential-read behavior exactly.
+
+    func testMatchPriorityTitleBeatsDescriptionAndValueEvenWhenAllThreeWouldMatch() {
+        let result = AccessibilityElementResolver.matchLabel(
+            title: "Render", description: "Render", value: "Render",
+            query: "Render", mode: .exact
+        )
+        XCTAssertEqual(result.match?.attribute, kAXTitleAttribute)
+        XCTAssertEqual(result.match?.value, "Render")
+    }
+
+    func testMatchPriorityDescriptionBeatsValueWhenTitleDoesNotMatch() {
+        let result = AccessibilityElementResolver.matchLabel(
+            title: "Something else", description: "Render", value: "Render",
+            query: "Render", mode: .exact
+        )
+        XCTAssertEqual(result.match?.attribute, kAXDescriptionAttribute)
+    }
+
+    func testValueMatchIsStillReachedWhenTitleAndDescriptionExistButDoNotMatch() {
+        let result = AccessibilityElementResolver.matchLabel(
+            title: "Toolbar", description: "A field", value: "needle in a haystack",
+            query: "needle", mode: .contains
+        )
+        XCTAssertEqual(result.match?.attribute, kAXValueAttribute)
+        // The raw value is returned for matching purposes; publishing it is
+        // separately bounded/queried through `publishedMatchLabel`, pinned by
+        // `testValueMatchPublishesTheQueryNotSurroundingEditableContent`.
+        XCTAssertEqual(result.match?.value, "needle in a haystack")
+    }
+
+    func testSampledStopsAtTheMatchingAttributeExactlyLikeTheOldSequentialShortCircuit() {
+        // Before batching, a title match meant the description was never READ,
+        // so it never entered `sampled`. The description is now fetched up
+        // front regardless (it rides the same single round trip), but the
+        // exposed-label sample must keep its exact historical contents -- so
+        // the cascade still stops sampling at the first matching attribute.
+        let titleMatch = AccessibilityElementResolver.matchLabel(
+            title: "Render", description: "Also present", value: nil,
+            query: "Render", mode: .exact
+        )
+        XCTAssertEqual(titleMatch.sampled.map { $0.attribute }, [kAXTitleAttribute])
+        XCTAssertEqual(titleMatch.sampled.map { $0.value }, ["Render"])
+
+        // A non-matching title IS sampled before the cascade moves on -- the
+        // old loop appended each present title/description before its match
+        // check, and that order must survive.
+        let descriptionMatch = AccessibilityElementResolver.matchLabel(
+            title: "Toolbar", description: "Render", value: nil,
+            query: "Render", mode: .exact
+        )
+        XCTAssertEqual(descriptionMatch.sampled.map { $0.attribute },
+                       [kAXTitleAttribute, kAXDescriptionAttribute])
+    }
+
+    func testSampledExcludesValueContentEvenWhenValueIsTheOnlyMatch() {
+        // kAXValue is frequently the user's own document content; it must
+        // never enter the exposed-label sample, matched or not -- identical
+        // to the pre-batching privacy rule.
+        let result = AccessibilityElementResolver.matchLabel(
+            title: "Toolbar", description: "A field", value: "private draft with needle inside",
+            query: "needle", mode: .contains
+        )
+        XCTAssertEqual(result.match?.attribute, kAXValueAttribute)
+        XCTAssertEqual(result.sampled.map { $0.attribute },
+                       [kAXTitleAttribute, kAXDescriptionAttribute])
+        XCTAssertFalse(result.sampled.contains { $0.value.contains("private draft") })
+    }
+
+    func testMissingAttributesAreSkippedWithoutEndingTheCascadeAndNoMatchSamplesEverythingPresent() {
+        // nil attributes (per-slot batch failures) are skipped exactly like
+        // the old failed individual reads: the cascade continues past them.
+        let noTitle = AccessibilityElementResolver.matchLabel(
+            title: nil, description: "Tracking", value: nil,
+            query: "Tracking", mode: .exact
+        )
+        XCTAssertEqual(noTitle.match?.attribute, kAXDescriptionAttribute)
+        XCTAssertEqual(noTitle.sampled.map { $0.attribute }, [kAXDescriptionAttribute])
+
+        // And with no match anywhere, `sampled` covers every present
+        // title/description -- the exact input `.noMatches`' exposed-label
+        // sample is built from.
+        let noMatch = AccessibilityElementResolver.matchLabel(
+            title: "Toolbar", description: "Inspector", value: "content",
+            query: "Render", mode: .exact
+        )
+        XCTAssertNil(noMatch.match)
+        XCTAssertEqual(noMatch.sampled.map { $0.value }, ["Toolbar", "Inspector"])
+    }
+
+    // MARK: - resolvedMatch: an already-selected match survives (deadline re-check removed)
+
+    func testResolvedMatchReturnsAnAlreadySelectedMatchInsteadOfSecondGuessingTheDeadline() throws {
+        // THE BUG THIS PINS THE FIX FOR: `resolvedMatch` used to take
+        // `startedAt`/`timeout` and re-check the wall-clock deadline AFTER
+        // selection had already completed, throwing `traversalTimedOut` and
+        // discarding a match every IPC of which was already done -- the
+        // final node's own IPC nudging the clock past the deadline was
+        // enough to turn a correct, in-budget answer into a timeout error.
+        // The fix removes the re-check (and the two parameters with it), so
+        // a selected match is published unconditionally; genuine timeouts
+        // are still thrown by `resolve()`'s loop-top check for walks that
+        // never finish selecting. The signature itself is part of the pin:
+        // with no clock inputs at all, no future edit can quietly
+        // reintroduce a post-selection timeout path here.
+        let frame = AccessibilityScreenRect(x: 100, y: 50, width: 120, height: 30)
+        let backingFrame = AccessibilityBackingRect(screenId: "main", x: 200, y: 100, width: 240, height: 60)
+        let selected = AccessibilityElementResolver.InternalMatch(
+            frame: frame,
+            candidate: AccessibilityElementCandidate(
+                matchedAttribute: kAXTitleAttribute, matchedLabel: "Render",
+                role: "AXButton", backingFrame: backingFrame
+            )
+        )
+        let match = try AccessibilityElementResolver.resolvedMatch(selected)
+        XCTAssertEqual(match.matchedAttribute, kAXTitleAttribute)
+        XCTAssertEqual(match.matchedLabel, "Render")
+        XCTAssertEqual(match.role, "AXButton")
+        XCTAssertEqual(match.accessibilityFrame, frame)
+        XCTAssertEqual(match.backingFrame, backingFrame)
+    }
+
+    func testResolvedMatchStillRejectsAMatchWhoseFrameMapsOntoNoSingleDisplay() {
+        // The one failure `resolvedMatch` legitimately still owns: a match
+        // whose (usable) AX frame fits on no single connected display. That
+        // must keep throwing `frameCannotBeMapped` -- removing the deadline
+        // re-check must not have widened into removing this check too.
+        let selected = AccessibilityElementResolver.InternalMatch(
+            frame: AccessibilityScreenRect(x: -10, y: 100, width: 30, height: 20),
+            candidate: AccessibilityElementCandidate(
+                matchedAttribute: kAXTitleAttribute, matchedLabel: "Render",
+                role: "AXButton", backingFrame: nil
+            )
+        )
+        XCTAssertThrowsError(try AccessibilityElementResolver.resolvedMatch(selected)) { error in
+            XCTAssertEqual(error as? AccessibilityElementResolverError, .frameCannotBeMapped)
+        }
+    }
+    #endif
+
     // MARK: - AccessibilityElementResolverError.workerPoolExhausted (Windows CHALK_ERR_UIA_TOO_MANY_PENDING)
     //
     // Regression coverage for a documented shim status

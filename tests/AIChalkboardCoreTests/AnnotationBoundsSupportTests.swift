@@ -360,4 +360,33 @@ final class AnnotationBoundsSupportTests: XCTestCase {
         )
         XCTAssertTrue(message.contains("verify_annotation"), message)
     }
+
+    // MARK: - apply_correction argument parsing
+
+    func testApplyCorrectionAbsentAndNullBothMeanFalse() {
+        switch AnnotationBoundsSupport.parseApplyCorrection([:]) {
+        case .failure(let message): XCTFail(message)
+        case .success(let value): XCTAssertFalse(value)
+        }
+        switch AnnotationBoundsSupport.parseApplyCorrection(["apply_correction": NSNull()]) {
+        case .failure(let message): XCTFail(message)
+        case .success(let value): XCTAssertFalse(value)
+        }
+    }
+
+    func testApplyCorrectionTrueParses() {
+        switch AnnotationBoundsSupport.parseApplyCorrection(["apply_correction": true]) {
+        case .failure(let message): XCTFail(message)
+        case .success(let value): XCTAssertTrue(value)
+        }
+    }
+
+    /// A string "true" is a caller-side serializer bug this tool must
+    /// surface, not paper over -- the standing reject-over-reinterpret rule.
+    func testApplyCorrectionRejectsAStringifiedBoolean() {
+        switch AnnotationBoundsSupport.parseApplyCorrection(["apply_correction": "true"]) {
+        case .success: XCTFail("A stringified boolean must be rejected, not coerced.")
+        case .failure(let message): XCTAssertTrue(message.contains("apply_correction"), message)
+        }
+    }
 }

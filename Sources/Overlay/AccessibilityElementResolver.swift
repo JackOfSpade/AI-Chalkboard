@@ -481,7 +481,14 @@ public enum AccessibilityElementResolver {
             // before any attribute (including children or frame) is read.
             configureMessagingTimeout(element)
 
-            let role = stringAttribute(kAXRoleAttribute, of: element)
+            // ONE cross-process round trip per visited node, not five: the
+            // role, all three label attributes, and the children list ride a
+            // single `AXUIElementCopyMultipleAttributeValues` message. See
+            // `batchedNodeAttributes` for the per-slot error contract, and
+            // for why the batched call observes exactly the messaging
+            // timeout `configureMessagingTimeout` just set on this element.
+            let batch = batchedNodeAttributes(of: element)
+            let role = batch.role
             // THE LABEL INSPECTION IS UNCONDITIONAL; ONLY MATCH SELECTION IS
             // ROLE-GATED. This inspection used to sit inside the role gate
             // together with everything below, which made a wrong or
@@ -498,22 +505,20 @@ public enum AccessibilityElementResolver {
             // independent of the caller's role guess.
             //
             // COST. `matchLabel`'s own work (two/three string comparisons)
-            // is free; its ATTRIBUTE READS are not -- each is a cross-process
-            // AX IPC round trip, up to three per node (title, description,
-            // value), against a walk that already spends two (role,
-            // children). So this can add roughly 1.5x to a walk's IPC count
-            // -- but ONLY when a `role` was supplied AND does not match the
-            // node, because with `role == nil` the gate was already open for
-            // every node and nothing changes at all. That narrow extra cost
-            // is bought on exactly the paths that currently return a WRONG
-            // answer (role rejected everything, or role-filtered ambiguity),
-            // never on the common unfiltered lookup, and it stays bounded by
-            // the same `maxNodes`/`timeoutSeconds` budgets as before.
-            let inspection = matchLabel(on: element, query: normalized.label, mode: normalized.matchMode)
-            // `inspection.sampled` is exactly the title/description reads
-            // `matchLabel` already performed while looking for a match on
-            // THIS node -- recording them costs no extra IPC. This runs
-            // whether or not the node matched, because the overall
+            // is free, and its inputs now arrive in the SAME single batched
+            // round trip that fetches the role and children (see
+            // `batchedNodeAttributes`), so inspecting them unconditionally
+            // costs no extra IPC at all -- not even on the role-mismatch
+            // paths where the old per-attribute reads could add up to three
+            // additional round trips per node.
+            let inspection = matchLabel(
+                title: batch.title, description: batch.description, value: batch.value,
+                query: normalized.label, mode: normalized.matchMode
+            )
+            // `inspection.sampled` is exactly the title/description values
+            // the node's one batched read already fetched while looking for
+            // a match on THIS node -- recording them costs no extra IPC.
+            // This runs whether or not the node matched, because the overall
             // traversal's outcome (a clean match vs. eventual `.noMatches`)
             // is not yet known; if any match is found anywhere,
             // `exposedSample` is simply never read.
@@ -585,12 +590,11 @@ public enum AccessibilityElementResolver {
                         // cannot consume an occurrence slot or shift the
                         // numbering of the highlightable matches that follow
                         // it. Later nodes cannot alter the identity of the
-                        // Nth highlightable match, so avoid needless child
-                        // IPC (and a much larger traversal) once that
+                        // Nth highlightable match, so end the walk -- and
+                        // every remaining node's IPC -- the moment that
                         // requested match is found.
                         if let occurrence = normalized.occurrence, matches.count == occurrence {
-                            return try resolvedMatch(match, startedAt: startedAt,
-                                                     timeout: normalized.timeoutSeconds)
+                            return try resolvedMatch(match)
                         }
                     } else {
                         // No usable bounds: this element can never be
@@ -619,7 +623,7 @@ public enum AccessibilityElementResolver {
                 }
             }
 
-            if let children = children(of: element) {
+            if let children = batch.children {
                 // Do not recurse: deeply nested DOM-like trees can otherwise
                 // overflow the process stack before the maximum-node guard is
                 // reached.
@@ -685,8 +689,7 @@ public enum AccessibilityElementResolver {
             selected = matches[0]
         }
 
-        return try resolvedMatch(selected, startedAt: startedAt,
-                                 timeout: normalized.timeoutSeconds)
+        return try resolvedMatch(selected)
     }
 
     /// How a frame that does not sit wholly inside a single display is
@@ -970,7 +973,11 @@ public enum AccessibilityElementResolver {
     /// `AXUIElement` kept around across the rest of the BFS walk (which can
     /// take seconds against a large tree) could otherwise go stale before
     /// `resolvedMatch` ever used it.
-    private struct InternalMatch {
+    ///
+    /// Internal (not private) so `resolvedMatch`'s selected-match contract
+    /// can be constructed and pinned headlessly -- see that function's doc
+    /// comment.
+    struct InternalMatch {
         let frame: AccessibilityScreenRect
         let candidate: AccessibilityElementCandidate
 
@@ -1023,34 +1030,56 @@ public enum AccessibilityElementResolver {
                                            timeoutSeconds: request.timeoutSeconds)
     }
 
-    /// `sampled` carries every kAXTitle/kAXDescription value this call
-    /// actually read while looking for a match, independent of whether that
-    /// attribute (or any other) matched.  Reusing exactly the reads this
-    /// function was already going to make -- rather than issuing separate
-    /// attribute requests -- is what lets the `.noMatches` exposed-label
-    /// sample cost zero extra IPC: on a traversal that ends in `.noMatches`,
-    /// nothing ever matched, so this loop never short-circuits early and
-    /// `sampled` ends up covering every title/description this element had.
+    /// Pure title/description/value matching cascade over attribute values
+    /// that have ALREADY been fetched (by `batchedNodeAttributes`' single
+    /// per-node round trip). This used to take the `AXUIElement` and issue
+    /// one `AXUIElementCopyAttributeValue` per attribute itself; only that
+    /// IPC pattern changed -- the MATCH SEMANTICS here are deliberately
+    /// byte-for-byte the old ones. In particular the cascade still runs in
+    /// the same deterministic order (a single element which happens to
+    /// repeat a label in multiple attributes is still one candidate, with
+    /// its visible title preferred over its description/value), still skips
+    /// absent attributes without ending the cascade, and still SHORT-
+    /// CIRCUITS at the first matching attribute even though all three
+    /// values now sit in hand -- so `sampled` keeps its exact historical
+    /// contents: on a node whose title matches, the description is not
+    /// sampled, exactly as when the sequential reads never reached it.
+    ///
+    /// `sampled` carries every kAXTitle/kAXDescription value the cascade
+    /// actually considered while looking for a match, independent of whether
+    /// that attribute (or any other) matched.  Reusing exactly the values
+    /// the batched read was already going to fetch -- rather than issuing
+    /// separate attribute requests -- is what lets the `.noMatches`
+    /// exposed-label sample cost zero extra IPC: on a traversal that ends in
+    /// `.noMatches`, nothing ever matched, so this loop never short-circuits
+    /// early and `sampled` ends up covering every title/description this
+    /// element had.
     /// kAXValue is deliberately excluded from `sampled` even though it IS
-    /// read for matching purposes: an AXValue is frequently the user's own
+    /// used for matching purposes: an AXValue is frequently the user's own
     /// document content (e.g. text typed into a field), and echoing it back
     /// inside an MCP error message would turn a UI-discovery hint into
     /// content disclosure. A matching kAXValue is likewise published only as
     /// the caller's query via `publishedMatchLabel`, never as the raw value.
-    private static func matchLabel(on element: AXUIElement, query: String,
-                                   mode: AccessibilityLabelMatchMode)
+    ///
+    /// Internal (not private), and pure on purpose: match PRIORITY is the
+    /// one semantic the batching change could most plausibly have disturbed,
+    /// so it must be pinnable headlessly, without an AX/TCC session.
+    static func matchLabel(title: String?, description: String?, value: String?,
+                           query: String, mode: AccessibilityLabelMatchMode)
     -> (match: (attribute: String, value: String)?, sampled: [(attribute: String, value: String)]) {
         var sampled: [(attribute: String, value: String)] = []
-        // Keep the order deterministic.  A single element which happens to
-        // repeat a label in multiple attributes is still one candidate, with
-        // its visible title preferred over its description/value.
-        for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute] {
-            guard let value = stringAttribute(attribute, of: element) else { continue }
+        let candidates: [(attribute: String, value: String?)] = [
+            (kAXTitleAttribute, title),
+            (kAXDescriptionAttribute, description),
+            (kAXValueAttribute, value)
+        ]
+        for (attribute, candidate) in candidates {
+            guard let candidate else { continue }
             if attribute != kAXValueAttribute {
-                sampled.append((attribute, value))
+                sampled.append((attribute, candidate))
             }
-            if labelMatches(value, query: query, mode: mode) {
-                return (match: (attribute, value), sampled: sampled)
+            if labelMatches(candidate, query: query, mode: mode) {
+                return (match: (attribute, candidate), sampled: sampled)
             }
         }
         return (match: nil, sampled: sampled)
@@ -1089,19 +1118,196 @@ public enum AccessibilityElementResolver {
         roles.append(role)
     }
 
+    /// The five attributes the BFS needs from EVERY visited node, in the one
+    /// fixed order `decodeBatchedNodeAttributeSlots` decodes them by index.
+    /// Declared as a named constant (and internal, not private) so a test
+    /// can pin that order against the decoder's indexes: the batch result
+    /// array is positional, so a silent reorder here would swap, say, every
+    /// node's title and role without any type system complaint.
+    static let batchedNodeAttributeNames: [String] = [
+        kAXRoleAttribute,
+        kAXTitleAttribute,
+        kAXDescriptionAttribute,
+        kAXValueAttribute,
+        kAXChildrenAttribute
+    ]
+
+    /// One visited node's batch-fetched attributes, already decoded to the
+    /// SAME nil-tolerant optionals the old per-attribute
+    /// `AXUIElementCopyAttributeValue` reads produced: a `nil` field means
+    /// exactly what a failed individual read used to mean (attribute absent,
+    /// unreadable, or not the expected type), so everything downstream --
+    /// the role gate, `matchLabel`'s cascade, `appendBounded`'s child
+    /// handling -- consumes these without knowing the IPC pattern changed.
+    struct BatchedNodeAttributes {
+        let role: String?
+        let title: String?
+        let description: String?
+        let value: String?
+        /// Same shape the old `children(of:)` helper returned: `nil` when
+        /// the attribute was unreadable or not an array (non-fatal in the
+        /// BFS, exactly as before), otherwise the array filtered to real
+        /// `AXUIElement`s -- possibly empty, which is a real "no children"
+        /// answer, not a failure.
+        let children: [AXUIElement]?
+    }
+
+    /// Fetches all five per-node attributes in ONE cross-process round trip
+    /// via `AXUIElementCopyMultipleAttributeValues` (available since macOS
+    /// 10.4), replacing what used to be up to five sequential blocking AX
+    /// IPC calls per visited node: kAXRole, then `matchLabel`'s
+    /// kAXTitle/kAXDescription/kAXValue cascade, then kAXChildren. At the
+    /// measured ~5,200 elements/s that sequential pattern made the default
+    /// 3,000-node budget cost about 0.6s and the 10,000-node ceiling about
+    /// 1.9s -- almost all of it spent waiting on round trips whose payloads
+    /// could have shared one message.
+    ///
+    /// PER-SLOT ERROR CONTRACT. The options argument deliberately does NOT
+    /// set `.stopOnError`: in that mode the call reports per-attribute
+    /// failures per-slot in the returned array -- a slot whose attribute
+    /// could not be fetched carries an `AXValue` of type `.axError` wrapping
+    /// the failing code (e.g. kAXErrorNoValue, kAXErrorAttributeUnsupported)
+    /// while every other slot still carries its real value. That is exactly
+    /// the old nil-tolerant per-node semantics: one absent attribute never
+    /// disturbed the other four reads, and it must not disturb the other
+    /// four slots now. Decoding (and its defensiveness about sentinel
+    /// shapes that on-device behavior might vary -- NULL-ish slots included)
+    /// lives in `decodeBatchedNodeAttributeSlots`, kept pure so it can be
+    /// pinned headlessly.
+    ///
+    /// MESSAGING TIMEOUT. `AXUIElementSetMessagingTimeout` is state carried
+    /// by the element itself (see `configureMessagingTimeout`, which
+    /// `resolve()`'s loop applies to every node BEFORE any attribute is
+    /// read), so this one batched message observes the same
+    /// `perElementMessagingTimeout` each of the five individual calls did.
+    /// The worst-case wait on a hung element actually improves: one bounded
+    /// wait instead of five back-to-back ones.
+    ///
+    /// WHY BFS ORDER AND OCCURRENCE SEMANTICS ARE UNTOUCHED. This changes
+    /// only how one node's attributes travel, never which nodes are visited
+    /// or in what order: the queue, `inspected` accounting, deadline checks,
+    /// and `appendBounded`'s caps all run exactly as before, and the
+    /// children slot carries the same array `kAXChildren` returned to the
+    /// individual copy. Match selection consumes the same values through
+    /// the same `matchLabel` cascade in the same title-before-description-
+    /// before-value priority, so the Nth highlightable match -- the
+    /// occurrence contract -- is the same element it always was.
+    ///
+    /// FALLBACK. If the batched call itself is rejected as unsupported or
+    /// malformed (`.notImplemented`, `.illegalArgument`) rather than merely
+    /// failing to answer, fall back to the historical per-attribute reads
+    /// for this node so behavior degrades to exactly the old pattern
+    /// instead of silently treating the whole node as attribute-less. Any
+    /// OTHER whole-call failure (timeout, dead element) decodes to all-nil,
+    /// which is precisely what five individual reads against that same
+    /// element would have produced.
+    private static func batchedNodeAttributes(of element: AXUIElement) -> BatchedNodeAttributes {
+        var rawValues: CFArray?
+        let status = AXUIElementCopyMultipleAttributeValues(
+            element,
+            batchedNodeAttributeNames as CFArray,
+            AXCopyMultipleAttributeOptions(),
+            &rawValues
+        )
+        switch status {
+        case .success:
+            guard let slots = (rawValues as CFTypeRef?) as? [Any] else {
+                // `.success` with no decodable array is not a documented
+                // shape; treat it like an unanswered node rather than
+                // crashing or guessing.
+                return BatchedNodeAttributes(role: nil, title: nil, description: nil,
+                                             value: nil, children: nil)
+            }
+            return decodeBatchedNodeAttributeSlots(slots)
+        case .notImplemented, .illegalArgument:
+            return BatchedNodeAttributes(
+                role: stringAttribute(kAXRoleAttribute, of: element),
+                title: stringAttribute(kAXTitleAttribute, of: element),
+                description: stringAttribute(kAXDescriptionAttribute, of: element),
+                value: stringAttribute(kAXValueAttribute, of: element),
+                children: children(of: element)
+            )
+        default:
+            return BatchedNodeAttributes(role: nil, title: nil, description: nil,
+                                         value: nil, children: nil)
+        }
+    }
+
+    /// Pure decode of one batch result array into per-attribute optionals,
+    /// indexed by `batchedNodeAttributeNames`' declared order. Split out of
+    /// `batchedNodeAttributes` (and internal, not private) because the AX
+    /// call itself needs a live target app plus TCC consent, while THIS is
+    /// the part where a mistake would silently change matching semantics --
+    /// so it must be pinnable headlessly with hand-built slots.
+    ///
+    /// Defensive on purpose about what a slot may hold, because on-device
+    /// sentinel behavior cannot be assumed uniform across apps and OS
+    /// versions: a failed slot is DOCUMENTED to be an `.axError` `AXValue`,
+    /// but a `kCFNull` placeholder or a short/missing array entry is decoded
+    /// to the same `nil` a failed individual read produced rather than
+    /// trusted to never occur. A slot holding an unexpected but real type
+    /// (say, a CFNumber where a string was hoped for) also decodes to `nil`
+    /// for the string fields -- identical to the old `value as? String`
+    /// behavior on an individual read.
+    static func decodeBatchedNodeAttributeSlots(_ slots: [Any]) -> BatchedNodeAttributes {
+        func payload(_ index: Int) -> Any? {
+            guard index < slots.count else { return nil }
+            return batchSlotPayload(slots[index])
+        }
+        // Indexes 0...4 follow `batchedNodeAttributeNames`' declared order:
+        // role, title, description, value, children.
+        return BatchedNodeAttributes(
+            role: payload(0) as? String,
+            title: payload(1) as? String,
+            description: payload(2) as? String,
+            value: payload(3) as? String,
+            children: (payload(4) as? [Any]).map { list in
+                list.compactMap { object -> AXUIElement? in
+                    guard CFGetTypeID(object as CFTypeRef) == AXUIElementGetTypeID() else { return nil }
+                    return (object as! AXUIElement)
+                }
+            }
+        )
+    }
+
+    /// Unwraps one raw batch slot to its usable payload, or `nil` for every
+    /// "this attribute was not fetched" sentinel: an `.axError` `AXValue`
+    /// (the documented per-slot failure marker -- ANY wrapped code counts,
+    /// mirroring the old "any non-`.success` status becomes nil" rule, so
+    /// kAXErrorNoValue and kAXErrorAttributeUnsupported land identically)
+    /// and `kCFNull` (coded for defensively; see
+    /// `decodeBatchedNodeAttributeSlots`). A non-error `AXValue` (a point,
+    /// size, or range in the kAXValue slot, say) is NOT a sentinel and is
+    /// passed through -- the type-specific casts downstream reject it the
+    /// same way `as? String` always rejected it on an individual read.
+    static func batchSlotPayload(_ slot: Any) -> Any? {
+        let ref = slot as CFTypeRef
+        if CFGetTypeID(ref) == CFNullGetTypeID() { return nil }
+        if CFGetTypeID(ref) == AXValueGetTypeID(), AXValueGetType(ref as! AXValue) == .axError {
+            return nil
+        }
+        return slot
+    }
+
+    // Now used only by `batchedNodeAttributes`' unsupported-batch fallback
+    // path -- the BFS's ordinary per-node reads all travel through the
+    // batched call above.
     private static func stringAttribute(_ attribute: String, of element: AXUIElement) -> String? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else { return nil }
         return value as? String
     }
 
+    // Like `stringAttribute` above, now reached only through
+    // `batchedNodeAttributes`' unsupported-batch fallback path.
     private static func children(of element: AXUIElement) -> [AXUIElement]? {
         elements(attribute: kAXChildrenAttribute, of: element)
     }
 
-    // Nil-tolerant: used only by the per-node BFS traversal, where one
-    // unreadable child (of any AXError, timeout included) must stay
-    // non-fatal so a single hung grandchild cannot fail the whole lookup.
+    // Nil-tolerant: used only by the per-node BFS traversal (via the
+    // fallback path above), where one unreadable child (of any AXError,
+    // timeout included) must stay non-fatal so a single hung grandchild
+    // cannot fail the whole lookup.
     // Do NOT use this for the top-level application fetch -- see
     // `copyElements` below and `resolveInitialElements`'s call site for why
     // that fetch needs to keep the AXError instead of discarding it.
@@ -1156,24 +1362,34 @@ public enum AccessibilityElementResolver {
         return isUsable(frame) ? frame : nil
     }
 
-    private static func resolvedMatch(_ selected: InternalMatch,
-                                      startedAt: TimeInterval,
-                                      timeout: TimeInterval) throws -> AccessibilityElementMatch {
-        // `selected.frame` was already read (and confirmed usable) back in
-        // the BFS loop, at the moment this element's label matched -- see
-        // the long comment there for why that is both cheaper (the frame
-        // IPC happens once per LABEL MATCH, not again per selection) and
-        // more correct (no TOCTOU gap between "this element matched" and
-        // "this is the frame we drew a highlight around"). There is nothing
-        // left to re-read here -- and, since the BFS loop now also performs
-        // the (pure) backing-pixel conversion at the same moment so an
-        // ambiguity list can show each candidate's geometry, nothing left to
-        // re-convert either. `screens` is therefore no longer a parameter:
-        // there is exactly one conversion per match, at match time.
-        if traversalDeadlineExceeded(startedAt: startedAt, now: ProcessInfo.processInfo.systemUptime,
-                                     timeout: timeout) {
-            throw AccessibilityElementResolverError.traversalTimedOut(seconds: timeout)
-        }
+    /// Publishes an already-SELECTED match. `selected.frame` was read (and
+    /// confirmed usable) back in the BFS loop, at the moment this element's
+    /// label matched -- see the long comment there for why that is both
+    /// cheaper (the frame IPC happens once per LABEL MATCH, not again per
+    /// selection) and more correct (no TOCTOU gap between "this element
+    /// matched" and "this is the frame we drew a highlight around"). There
+    /// is nothing left to re-read here -- and, since the BFS loop also
+    /// performs the (pure) backing-pixel conversion at the same moment so an
+    /// ambiguity list can show each candidate's geometry, nothing left to
+    /// re-convert either. `screens` is therefore not a parameter: there is
+    /// exactly one conversion per match, at match time.
+    ///
+    /// THIS FUNCTION DELIBERATELY PERFORMS NO DEADLINE CHECK, which is why
+    /// it no longer takes `startedAt`/`timeout` at all. It used to re-check
+    /// the wall-clock deadline here and throw `traversalTimedOut`,
+    /// discarding a match the walk had ALREADY finished selecting: every
+    /// IPC this result depends on is complete by the time this function
+    /// runs (see the paragraph above), so the only thing that re-check
+    /// could ever do was convert a real, selected answer into a timeout
+    /// error whenever the final node's own IPC nudged the clock past the
+    /// deadline -- reporting failure to the caller while holding the
+    /// correct rect in hand. Walks that truly fail to finish selecting
+    /// still time out exactly as before, via `resolve()`'s check at the top
+    /// of every BFS iteration (and its post-initial-fetch check); those are
+    /// the checks that bound the walk, and they are untouched. Internal
+    /// (not private) so this selected-match-survives contract can be pinned
+    /// headlessly.
+    static func resolvedMatch(_ selected: InternalMatch) throws -> AccessibilityElementMatch {
         guard let backingFrame = selected.backingFrame else {
             throw AccessibilityElementResolverError.frameCannotBeMapped
         }

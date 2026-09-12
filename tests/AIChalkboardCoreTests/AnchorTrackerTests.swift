@@ -34,6 +34,31 @@ final class AnchorTrackerTests: XCTestCase {
         ]
     }
 
+    /// Two connected displays with DIFFERENT backing densities -- the
+    /// cross-density drag scenario the `.pin` compensation exists for. The
+    /// tracker only reads `id` and `backingScaleFactor` from these; the
+    /// frames just need to be plausible and non-overlapping.
+    private func mixedDensityScreens() -> [ScreenInfo] {
+        let retinaFrame = ScreenCoordinateRect(x: 0, y: 0, width: 1_600, height: 1_000)
+        let externalFrame = ScreenCoordinateRect(x: 1_600, y: 0, width: 2_000, height: 1_200)
+        return [
+            ScreenInfo(
+                id: "retina", index: 0, name: "retina",
+                widthPx: 3_200, heightPx: 2_000,
+                widthPt: retinaFrame.width, heightPt: retinaFrame.height,
+                backingScaleFactor: 2, isMain: true,
+                appKitFrame: retinaFrame, windowServerFrame: retinaFrame, displayID: 1
+            ),
+            ScreenInfo(
+                id: "external", index: 1, name: "external",
+                widthPx: 2_000, heightPx: 1_200,
+                widthPt: externalFrame.width, heightPt: externalFrame.height,
+                backingScaleFactor: 1, isMain: false,
+                appKitFrame: externalFrame, windowServerFrame: externalFrame, displayID: 2
+            )
+        ]
+    }
+
     private func makeTarget(windowId: UInt64 = 1, processId: Int64 = 100) -> AnchorWindowTarget {
         AnchorWindowTarget(processId: processId, windowId: windowId, appId: "com.example.app")
     }
@@ -75,6 +100,7 @@ final class AnchorTrackerTests: XCTestCase {
     /// itself never produces.
     private func makeAnnotation(
         id: String = UUID().uuidString, anchor: AnnotationAnchor, kind: AnnotationKind? = nil,
+        staticAdjustment: AnchorAdjustment = .identity,
         at sampledAt: Date = Date(timeIntervalSince1970: 0)
     ) -> Annotation {
         let projection = AnchorProjection(
@@ -88,7 +114,7 @@ final class AnchorTrackerTests: XCTestCase {
                 fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false,
                 coordinateScaleX: 1, coordinateScaleY: 1
             ),
-            anchor: anchor, anchorProjection: projection
+            anchor: anchor, staticAdjustment: staticAdjustment, anchorProjection: projection
         )
     }
 
@@ -161,6 +187,63 @@ final class AnchorTrackerTests: XCTestCase {
         }
     }
 
+    /// A resolver whose walk BLOCKS until the test releases it -- the
+    /// deterministic stand-in for a slow AX traversal, so a test can move
+    /// the window (and run sampling ticks) WHILE a resolve is provably still
+    /// in flight, then let it finish. `release()` must be called exactly
+    /// once per expected `reresolve` call, and always BEFORE
+    /// `testOnlyWaitForElementQueueIdle()` (which would otherwise deadlock
+    /// behind the blocked walk).
+    private final class GatedElementResolver: AnchorElementResolving, @unchecked Sendable {
+        private let gate = DispatchSemaphore(value: 0)
+        private let entered = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var _callCount = 0
+        private var _result: AnchorElementReresolution
+
+        init(result: AnchorElementReresolution) { _result = result }
+
+        var callCount: Int { lock.lock(); defer { lock.unlock() }; return _callCount }
+
+        func setResult(_ result: AnchorElementReresolution) {
+            lock.lock(); _result = result; lock.unlock()
+        }
+
+        func release() { gate.signal() }
+
+        /// Blocks (bounded) until `reresolve` has actually been ENTERED on
+        /// `elementQueue`. The trigger tick only ENQUEUES the walk, so a
+        /// test asserting `callCount` straight after the tick would race
+        /// the queue; waiting here makes the assertion deterministic.
+        @discardableResult
+        func awaitWalkStart(timeout: TimeInterval = 5) -> Bool {
+            entered.wait(timeout: .now() + timeout) == .success
+        }
+
+        func reresolve(annotation: Annotation, spec: AnchorElementSpec, target: AnchorWindowTarget,
+                       screens: [ScreenInfo]) -> AnchorElementReresolution {
+            lock.lock()
+            _callCount += 1
+            lock.unlock()
+            entered.signal()
+            gate.wait()
+            lock.lock()
+            let result = _result
+            lock.unlock()
+            return result
+        }
+    }
+
+    /// Thread-safe tally for `AnnotationStore.onStoreChanged` firings, so a
+    /// test can assert exactly how many repaint-driving notifications one
+    /// operation produced.
+    private final class ChangeCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _count = 0
+        var count: Int { lock.lock(); defer { lock.unlock() }; return _count }
+        func increment() { lock.lock(); _count += 1; lock.unlock() }
+    }
+
     // MARK: - Test-double wiring helper
 
     /// Builds a tracker with the real timer disabled and, when `store`
@@ -171,10 +254,13 @@ final class AnchorTrackerTests: XCTestCase {
     private func makeTracker(
         store: AnnotationStore, probe: TargetWindowSampling, clock: FakeClock,
         elementResolver: AnchorElementResolving? = nil,
-        appIdentity: ((Int64) -> String?)? = nil
+        appIdentity: ((Int64) -> String?)? = nil,
+        screens: [ScreenInfo]? = nil
     ) -> AnchorTracker {
+        let snapshot = screens
         let tracker = AnchorTracker(
-            store: store, probe: probe, screens: { [weak self] in self?.fixtureScreens() ?? [] },
+            store: store, probe: probe,
+            screens: { [weak self] in snapshot ?? self?.fixtureScreens() ?? [] },
             elementResolver: elementResolver, now: clock.now, appIdentity: appIdentity
         )
         tracker.testDisableRealTimer = true
@@ -263,6 +349,117 @@ final class AnchorTrackerTests: XCTestCase {
         let updated = store.get(id: ann.id)!.anchorProjection!
         XCTAssertEqual(updated.state, .tracking, "an unmappable frame must never demote a still-present window out of .tracking")
         XCTAssertEqual(updated.adjustment, priorAdjustment, "a nil mapping result must hold the previous adjustment, never fall back to identity")
+    }
+
+    // MARK: - Pin across backing densities
+
+    func testPinAcrossDisplaysCompensatesBackingScaleDensity() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, screens: mixedDensityScreens())
+
+        let tgt = makeTarget()
+        // 400x300 pt window at pt(50,50) on the 2x display: reference frame
+        // (100,100,800,600) in retina backing pixels.
+        let anchor = windowAnchor(
+            target: tgt, referenceFrame: CGRect(x: 100, y: 100, width: 800, height: 600),
+            resize: .pin, referenceScreenId: "retina"
+        )
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        // Same window dragged onto the 1x display: (300,200,400,300) in
+        // external backing pixels.
+        probe.setResult(
+            windowSample(frame: CGRect(x: 300, y: 200, width: 400, height: 300), screenId: "external"),
+            for: tgt.windowId
+        )
+        tracker.testOnlyTick()
+
+        let projection = store.get(id: ann.id)!.anchorProjection!
+        XCTAssertEqual(projection.state, .tracking)
+        XCTAssertEqual(projection.effectiveScreenId, "external")
+        XCTAssertEqual(
+            projection.adjustment,
+            AnchorAdjustment(scaleX: 0.5, scaleY: 0.5, translateX: 250, translateY: 150),
+            "pin across 2x -> 1x must scale by the density ratio, not translate raw pixel deltas"
+        )
+
+        // A ring centre stored at in-window offset (200pt,150pt) --
+        // (400,300) px from the 2x window origin, absolute (500,400) -- must
+        // keep that in-window POINT offset on the 1x display: absolute
+        // (500,350). The old translate-only mapping painted it at in-window
+        // (400,300) pt and at double the intended size.
+        let painted = projection.adjustment.apply(to: CGPoint(x: 500, y: 400))
+        XCTAssertEqual(painted, CGPoint(x: 500, y: 350),
+                       "the in-window point offset must be invariant across the density change")
+        // "Size doubles in neither direction": extents shrink by exactly the
+        // density ratio (40 px on 2x == 20 pt == 20 px on 1x), so the
+        // on-screen POINT size is unchanged.
+        XCTAssertEqual(projection.adjustment.scaleX, 0.5)
+        XCTAssertEqual(projection.adjustment.scaleY, 0.5)
+    }
+
+    func testPinFallsBackToDensityBlindMappingWhenReferenceScreenIsGone() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, screens: mixedDensityScreens())
+
+        let tgt = makeTarget()
+        // The reference display is no longer in the snapshot AND the anchor
+        // never recorded its scale -- the one case where the stored pixel
+        // density is unknowable, documented to fall back to the legacy
+        // translate-only mapping.
+        let anchor = windowAnchor(
+            target: tgt, referenceFrame: CGRect(x: 100, y: 100, width: 800, height: 600),
+            resize: .pin, referenceScreenId: "unplugged"
+        )
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        probe.setResult(
+            windowSample(frame: CGRect(x: 300, y: 200, width: 400, height: 300), screenId: "external"),
+            for: tgt.windowId
+        )
+        tracker.testOnlyTick()
+
+        XCTAssertEqual(
+            store.get(id: ann.id)!.anchorProjection!.adjustment,
+            AnchorAdjustment(scaleX: 1, scaleY: 1, translateX: 200, translateY: 100),
+            "an unresolvable reference density must degrade to the pre-density behavior, never invent a scale"
+        )
+    }
+
+    func testPinAcrossDisplaysUsesTheRecordedReferenceScaleWhenTheReferenceScreenIsGone() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, screens: mixedDensityScreens())
+
+        let tgt = makeTarget()
+        // Reference display disconnected, but its 2x density WAS recorded at
+        // anchor (re-)baseline time -- the recorded value must win, keeping
+        // the compensation correct with the display gone.
+        let anchor = AnnotationAnchor(
+            mode: .window, resize: .pin, target: tgt,
+            referenceWindowFrame: AnchorRect(CGRect(x: 100, y: 100, width: 800, height: 600)),
+            referenceScreenId: "unplugged", referenceScreenScale: 2
+        )
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        probe.setResult(
+            windowSample(frame: CGRect(x: 300, y: 200, width: 400, height: 300), screenId: "external"),
+            for: tgt.windowId
+        )
+        tracker.testOnlyTick()
+
+        XCTAssertEqual(
+            store.get(id: ann.id)!.anchorProjection!.adjustment,
+            AnchorAdjustment(scaleX: 0.5, scaleY: 0.5, translateX: 250, translateY: 150)
+        )
     }
 
     // MARK: - Hidden / lost / recycled
@@ -474,6 +671,49 @@ final class AnchorTrackerTests: XCTestCase {
         XCTAssertGreaterThan(probe.callCount(for: lostTarget.windowId), 3,
                              "removing an unrelated annotation must still reset lost bookkeeping, giving the remaining lost target a fresh chance")
         XCTAssertEqual(store.get(id: lostAnnotation.id)!.anchorProjection!.state, .tracking)
+    }
+
+    // MARK: - Display reconfiguration must not leave a live window .lost
+
+    func testDisplayReconfigurationResetsLostVerdictsAndResumesTracking() {
+        // A monitor unplug/rearrange makes a live window unmappable onto any
+        // connected display for the duration of the reconfiguration -- at
+        // the .active cadence, easily 3 consecutive nil samples, i.e. a
+        // false `.lost`. `handleDisplayReconfiguration()` (wired to
+        // NSApplication.didChangeScreenParametersNotification in production;
+        // called directly here, since tests must not post AppKit
+        // notifications) must clear the verdict and restart polling so the
+        // window is re-acquired the moment the layout settles.
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let tracker = makeTracker(store: store, probe: probe, clock: clock)
+
+        let tgt = makeTarget()
+        let anchor = windowAnchor(target: tgt, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        tracker.testOnlyTick() // absence 1 (mid-reconfiguration: no display can map the frame)
+        tracker.testOnlyTick() // absence 2
+        tracker.testOnlyTick() // absence 3 -> falsely .lost; all-lost set stops the timer
+        XCTAssertEqual(store.get(id: ann.id)!.anchorProjection!.state, .lost)
+        XCTAssertFalse(tracker.statusSummary().isRunning)
+        XCTAssertEqual(probe.callCount(for: tgt.windowId), 3)
+
+        // The layout settles: the window maps cleanly again.
+        probe.setResult(windowSample(frame: CGRect(x: 5, y: 5, width: 100, height: 100)), for: tgt.windowId)
+
+        tracker.handleDisplayReconfiguration()
+        tracker.testOnlyFlush()
+        XCTAssertTrue(tracker.statusSummary().isRunning,
+                      "a display reconfiguration must restart polling for a store whose targets were all falsely lost")
+
+        tracker.testOnlyTick()
+        XCTAssertGreaterThan(probe.callCount(for: tgt.windowId), 3,
+                             "the reconfiguration reset must make the target sampled again, not permanently skipped")
+        XCTAssertEqual(store.get(id: ann.id)!.anchorProjection!.state, .tracking,
+                       "a live window falsely lost across a reconfiguration must recover once the layout settles")
     }
 
     // MARK: - Recycled-pid guard (AnchorWindowTarget.appId)
@@ -784,5 +1024,300 @@ final class AnchorTrackerTests: XCTestCase {
         XCTAssertEqual(updated.anchor?.referenceScreenId, Self.screenId)
         XCTAssertEqual(updated.anchorProjection?.adjustment, .identity, "a successful resolve must reset the live adjustment to identity")
         XCTAssertNil(updated.anchorProjection?.elementResolutionIssue, "a successful resolve must clear any previously recorded issue")
+    }
+
+    // MARK: - Element re-resolve: success gate against a stationary window
+
+    private static let resolvedKind = AnnotationKind.vectorPath(
+        data: "M5 5 L6 6", strokeColorHex: "#00FF00", strokeWidth: 3, strokeOpacity: 1,
+        fillColorHex: nil, fillOpacity: 0, dash: [], usesEvenOddFillRule: false,
+        coordinateScaleX: 1, coordinateScaleY: 1
+    )
+
+    func testElementReresolveDoesNotRepeatAfterSuccessWhileTheWindowStaysPut() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let resolver = FakeElementResolver(result: .resolved(kind: Self.resolvedKind, screenId: Self.screenId))
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, elementResolver: resolver)
+
+        let tgt = makeTarget()
+        let anchor = elementAnchor(target: tgt, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100), spec: elementSpec())
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        probe.setResult(windowSample(frame: CGRect(x: 10, y: 10, width: 100, height: 100)), for: tgt.windowId)
+        tracker.testOnlyTick() // first observation
+
+        clock.advance(by: 0.25)
+        tracker.testOnlyTick() // settled -> attempt #1 succeeds and is applied
+        tracker.testOnlyWaitForElementQueueIdle()
+        tracker.testOnlyFlush()
+        XCTAssertEqual(resolver.callCount, 1)
+
+        let afterSuccess = store.get(id: ann.id)!
+        let revisionAfterSuccess = afterSuccess.revision
+        let projectionAfterSuccess = afterSuccess.anchorProjection
+
+        // The window then sits perfectly still. Every 0.6 s advance clears
+        // the 0.5 s rate limit again, `settledFor` only grows, and the
+        // failure count is zero -- before the success gate, EVERY one of
+        // these ticks re-ran a full AX tree walk plus two no-op store
+        // writes, forever.
+        for _ in 0..<5 {
+            clock.advance(by: 0.6)
+            tracker.testOnlyTick()
+            tracker.testOnlyWaitForElementQueueIdle()
+            tracker.testOnlyFlush()
+        }
+        XCTAssertEqual(resolver.callCount, 1,
+                       "a resolved, stationary window must not be re-walked just because the rate limit re-armed")
+        let later = store.get(id: ann.id)!
+        XCTAssertEqual(later.revision, revisionAfterSuccess,
+                       "no writes may land against a resolved, stationary window (a revision bump can spuriously stale a caller's CAS)")
+        XCTAssertEqual(later.anchorProjection, projectionAfterSuccess,
+                       "not even a fresh sampledAt may be written against a resolved, stationary window")
+
+        // A REAL window change re-arms the gate: after it settles, exactly
+        // one new resolve runs.
+        probe.setResult(windowSample(frame: CGRect(x: 60, y: 80, width: 100, height: 100)), for: tgt.windowId)
+        clock.advance(by: 0.6)
+        tracker.testOnlyTick() // frame change observed -> gate lifted, debounce restarts
+        clock.advance(by: 0.25)
+        tracker.testOnlyTick() // settled again -> attempt #2
+        tracker.testOnlyWaitForElementQueueIdle()
+        tracker.testOnlyFlush()
+        XCTAssertEqual(resolver.callCount, 2,
+                       "a new frame change followed by a settle must lift the success gate")
+    }
+
+    // MARK: - Element re-resolve: no-op writes are skipped entirely
+
+    func testElementReresolveSkipsTheStoreWriteWhenTheResolveReproducesStoredState() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let resolver = FakeElementResolver(result: .resolved(kind: Self.resolvedKind, screenId: Self.screenId))
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, elementResolver: resolver)
+
+        let tgt = makeTarget()
+        let anchor = elementAnchor(target: tgt, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100), spec: elementSpec())
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        let frameA = CGRect(x: 10, y: 10, width: 100, height: 100)
+        probe.setResult(windowSample(frame: frameA), for: tgt.windowId)
+        tracker.testOnlyTick() // first observation
+
+        clock.advance(by: 0.25)
+        tracker.testOnlyTick() // attempt #1: applied (kind replaced, anchor re-baselined to frameA)
+        tracker.testOnlyWaitForElementQueueIdle()
+        tracker.testOnlyFlush()
+        XCTAssertEqual(resolver.callCount, 1)
+        let revisionAfterFirstApply = store.get(id: ann.id)!.revision
+
+        // Jiggle the window away and straight back without letting it
+        // settle in between: two real frame changes (each lifts the success
+        // gate) that leave the window EXACTLY where the applied resolve
+        // already baselined it.
+        probe.setResult(windowSample(frame: CGRect(x: 40, y: 40, width: 100, height: 100)), for: tgt.windowId)
+        clock.advance(by: 0.1)
+        tracker.testOnlyTick()
+        probe.setResult(windowSample(frame: frameA), for: tgt.windowId)
+        clock.advance(by: 0.1)
+        tracker.testOnlyTick()
+        let projectionBeforeRetry = store.get(id: ann.id)!.anchorProjection
+
+        clock.advance(by: 0.6)
+        tracker.testOnlyTick() // settled at frameA -> attempt #2 runs...
+        tracker.testOnlyWaitForElementQueueIdle()
+        tracker.testOnlyFlush()
+
+        XCTAssertEqual(resolver.callCount, 2, "the resolve itself must run -- this exercises the write suppression, not the gate")
+        let after = store.get(id: ann.id)!
+        XCTAssertEqual(after.revision, revisionAfterFirstApply,
+                       "a resolve that reproduces exactly what is stored must not consume a revision")
+        XCTAssertEqual(after.anchorProjection, projectionBeforeRetry,
+                       "sampledAt freshness alone must not count as a difference: the projection must not be rewritten either")
+        if case .vectorPath(let data, _, _, _, _, _, _, _, _, _) = after.kind {
+            XCTAssertEqual(data, "M5 5 L6 6")
+        } else {
+            XCTFail("the previously applied rebuilt kind must survive the skipped write")
+        }
+    }
+
+    // MARK: - Element re-resolve: a window that moves during the walk
+
+    func testResolveApplyIsRejectedWhenTheWindowMovedDuringTheWalk() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let resolver = GatedElementResolver(result: .resolved(kind: Self.resolvedKind, screenId: Self.screenId))
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, elementResolver: resolver)
+
+        let tgt = makeTarget()
+        let referenceFrame = CGRect(x: 0, y: 0, width: 100, height: 100)
+        let anchor = elementAnchor(target: tgt, referenceFrame: referenceFrame, spec: elementSpec())
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        let frameA = CGRect(x: 10, y: 10, width: 100, height: 100)
+        probe.setResult(windowSample(frame: frameA), for: tgt.windowId)
+        tracker.testOnlyTick() // first observation
+
+        clock.advance(by: 0.25)
+        tracker.testOnlyTick() // settled -> attempt #1 triggers
+        XCTAssertTrue(resolver.awaitWalkStart(), "attempt #1 must start; the walk is now BLOCKED on the gate")
+        XCTAssertEqual(resolver.callCount, 1)
+
+        // The window moves while the walk is provably still in flight, and
+        // a sampling tick observes the move (ticks never stop for a walk --
+        // the two run on separate queues by design).
+        let frameB = CGRect(x: 200, y: 220, width: 100, height: 100)
+        probe.setResult(windowSample(frame: frameB), for: tgt.windowId)
+        clock.advance(by: 0.1)
+        tracker.testOnlyTick()
+
+        resolver.release() // the walk finally returns geometry resolved around frameA
+        tracker.testOnlyWaitForElementQueueIdle()
+        tracker.testOnlyFlush()
+
+        let afterReject = store.get(id: ann.id)!
+        if case .vectorPath(let data, _, _, _, _, _, _, _, _, _) = afterReject.kind {
+            XCTAssertEqual(data, "M0 0 L1 1", "geometry resolved against a superseded frame must not be installed")
+        } else {
+            XCTFail("the original kind must survive a rejected apply")
+        }
+        XCTAssertEqual(afterReject.anchor?.referenceWindowFrame.cgRect, referenceFrame,
+                       "a rejected apply must not re-baseline the anchor to the stale pre-walk frame")
+        XCTAssertEqual(afterReject.anchorProjection?.adjustment,
+                       AnchorAdjustment(scaleX: 1, scaleY: 1, translateX: 200, translateY: 220),
+                       "the live projection must keep tracking the window's REAL position throughout")
+
+        // Once the window settles at its new position, a fresh resolve runs
+        // and THIS one applies -- the rejection is a deferral, not a dead end.
+        clock.advance(by: 0.6)
+        tracker.testOnlyTick() // settled at frameB -> attempt #2 triggers
+        XCTAssertTrue(resolver.awaitWalkStart(), "the rejected apply must not block a retry once the window settles")
+        XCTAssertEqual(resolver.callCount, 2)
+        resolver.release()
+        tracker.testOnlyWaitForElementQueueIdle()
+        tracker.testOnlyFlush()
+
+        let afterRetry = store.get(id: ann.id)!
+        if case .vectorPath(let data, _, _, _, _, _, _, _, _, _) = afterRetry.kind {
+            XCTAssertEqual(data, "M5 5 L6 6")
+        } else {
+            XCTFail("the retry against the settled frame must apply")
+        }
+        XCTAssertEqual(afterRetry.anchor?.referenceWindowFrame.cgRect, frameB)
+        XCTAssertEqual(afterRetry.anchorProjection?.adjustment, .identity)
+    }
+
+    // MARK: - Element re-resolve: frozen staticAdjustment must not offset rebuilt geometry
+
+    func testSuccessfulResolveClearsAFrozenStaticAdjustment() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let resolver = FakeElementResolver(result: .resolved(kind: Self.resolvedKind, screenId: Self.screenId))
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, elementResolver: resolver)
+
+        let tgt = makeTarget()
+        let anchor = elementAnchor(target: tgt, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100), spec: elementSpec())
+        // An `anchor_resize` policy change keeps `.element` mode while
+        // folding the live adjustment into `staticAdjustment` -- exactly the
+        // state that used to leave the ring permanently offset after the
+        // next resolve installed absolute geometry underneath it.
+        let frozen = AnchorAdjustment(scaleX: 1, scaleY: 1, translateX: 37, translateY: -12)
+        let ann = makeAnnotation(anchor: anchor, staticAdjustment: frozen)
+        store.add(ann)
+
+        probe.setResult(windowSample(frame: CGRect(x: 10, y: 10, width: 100, height: 100)), for: tgt.windowId)
+        tracker.testOnlyTick()
+        clock.advance(by: 0.25)
+        tracker.testOnlyTick()
+        tracker.testOnlyWaitForElementQueueIdle()
+        tracker.testOnlyFlush()
+        XCTAssertEqual(resolver.callCount, 1)
+
+        let updated = store.get(id: ann.id)!
+        if case .vectorPath(let data, _, _, _, _, _, _, _, _, _) = updated.kind {
+            XCTAssertEqual(data, "M5 5 L6 6")
+        } else {
+            XCTFail("the rebuilt kind must be installed")
+        }
+        XCTAssertEqual(updated.staticAdjustment, .identity,
+                       "installing absolutely-positioned rebuilt geometry must absorb any frozen adjustment")
+        XCTAssertEqual(updated.anchorProjection?.adjustment, .identity)
+        XCTAssertEqual(updated.effectiveAdjustment, .identity,
+                       "the rebuilt geometry must paint exactly where it was resolved -- no residual offset")
+    }
+
+    // MARK: - Element re-resolve: kind, anchor, and projection commit atomically
+
+    func testSuccessfulResolveCommitsKindAnchorAndProjectionInOneStoreNotification() {
+        let store = AnnotationStore()
+        let probe = FakeProbe()
+        let clock = FakeClock()
+        let resolver = GatedElementResolver(result: .resolved(kind: Self.resolvedKind, screenId: Self.screenId))
+        let tracker = makeTracker(store: store, probe: probe, clock: clock, elementResolver: resolver)
+
+        let tgt = makeTarget()
+        let anchor = elementAnchor(target: tgt, referenceFrame: CGRect(x: 0, y: 0, width: 100, height: 100), spec: elementSpec())
+        let ann = makeAnnotation(anchor: anchor)
+        store.add(ann)
+
+        let frameA = CGRect(x: 10, y: 10, width: 100, height: 100)
+        probe.setResult(windowSample(frame: frameA), for: tgt.windowId)
+        tracker.testOnlyTick()
+        clock.advance(by: 0.25)
+        tracker.testOnlyTick() // trigger; the walk blocks on the gate, so nothing can write yet
+        XCTAssertTrue(resolver.awaitWalkStart())
+        XCTAssertEqual(resolver.callCount, 1)
+
+        // `notifyChange` delivers `onStoreChanged` via `MainThread.enqueue`
+        // (a NEW main-queue turn -- see that method's doc comment), and each
+        // queued block resolves `self?.onStoreChanged` at EXECUTION time. So
+        // before attaching the counter, drain every notification already
+        // enqueued by the setup writes above (`store.add`, the ticks'
+        // `applyAnchorProjections`) while the callback is still nil --
+        // otherwise those stale blocks would run against the counter and be
+        // miscounted as commits from the resolve under test. Same discipline
+        // as AnnotationStoreTests' notification-counting tests.
+        let setupDrained = expectation(description: "setup notifications drained")
+        DispatchQueue.main.async { setupDrained.fulfill() }
+        wait(for: [setupDrained], timeout: 2)
+
+        // Count repaint-driving notifications from here on. Safe to assign
+        // now: the walk is blocked on the gate and the sampling queue is
+        // drained, so no writer can race this assignment.
+        let counter = ChangeCounter()
+        store.onStoreChanged = { counter.increment() }
+
+        resolver.release()
+        tracker.testOnlyWaitForElementQueueIdle()
+        tracker.testOnlyFlush()
+
+        // The commit's own notification is now sitting in the main queue;
+        // drain one more turn so it (and any erroneous second one) has
+        // actually run before counting.
+        let drained = expectation(description: "main queue drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 2)
+
+        XCTAssertEqual(counter.count, 1,
+                       "the rebuilt kind, re-baselined anchor, and reset projection must land as ONE store write -- " +
+                       "a second notification would be a paintable frame pairing new geometry with the old adjustment")
+        let updated = store.get(id: ann.id)!
+        if case .vectorPath(let data, _, _, _, _, _, _, _, _, _) = updated.kind {
+            XCTAssertEqual(data, "M5 5 L6 6")
+        } else {
+            XCTFail("the single write must carry the rebuilt kind")
+        }
+        XCTAssertEqual(updated.anchor?.referenceWindowFrame.cgRect, frameA,
+                       "the single write must carry the re-baselined anchor")
+        XCTAssertEqual(updated.anchorProjection?.adjustment, .identity,
+                       "the single write must carry the reset projection")
     }
 }

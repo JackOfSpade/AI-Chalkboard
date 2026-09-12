@@ -9,7 +9,7 @@ import XCTest
 final class PaintedBoundsTests: XCTestCase {
     // MARK: - .vectorPath
 
-    func testVectorPathBoundsAreScaledByCoordinateScale() throws {
+    func testVectorPathBoundsAreScaledByCoordinateScaleThenInflatedByHalfTheStroke() throws {
         // A closed 100x50 rectangle with its top-left corner at (10, 10) --
         // the same "M ... H ... V ... H ... Z" shape `makeShapeKind`/
         // `makeHighlightKind` already emit for a rect.
@@ -22,19 +22,49 @@ final class PaintedBoundsTests: XCTestCase {
         )
         let bounds = try XCTUnwrap(PaintedBounds.paintedBounds(of: kind))
         // Source-space bounds (10, 10, 100, 50) scaled per axis by (2, 3):
-        // origin (20, 30), size (200, 150).
-        XCTAssertEqual(bounds, CGRect(x: 20, y: 30, width: 200, height: 150))
+        // origin (20, 30), size (200, 150). The stroke is a STYLE dimension
+        // in backing pixels -- never multiplied by the coordinate scale --
+        // so its half-width inflation (2 / 2 = 1) is added AFTER scaling,
+        // uniformly on every side: origin (19, 29), size (202, 152).
+        XCTAssertEqual(bounds, CGRect(x: 19, y: 29, width: 202, height: 152))
     }
 
-    func testVectorPathAtIdentityScaleMatchesSourceBoundsExactly() {
+    func testUnstrokedVectorPathAtIdentityScaleMatchesSourceBoundsExactly() {
+        // With no stroke there is nothing painted beyond the geometric box,
+        // so `strokeWidth: 0` pins the pure pass-through: identity scale,
+        // zero inflation. (Stroke inflation has its own pins above/below.)
         let kind = AnnotationKind.vectorPath(
             data: "M 0 0 H 40 V 20 H 0 Z",
-            strokeColorHex: "#FFFFFF", strokeWidth: 1, strokeOpacity: 1,
+            strokeColorHex: "#FFFFFF", strokeWidth: 0, strokeOpacity: 1,
             fillColorHex: nil, fillOpacity: 1, dash: [],
             usesEvenOddFillRule: false,
             coordinateScaleX: 1, coordinateScaleY: 1
         )
         XCTAssertEqual(PaintedBounds.paintedBounds(of: kind), CGRect(x: 0, y: 0, width: 40, height: 20))
+    }
+
+    /// A flat stroke's GEOMETRIC bounds have zero height, and a zero-AREA
+    /// rect would defeat `TargetWindowSelection.selectWindow`'s
+    /// largest-intersection contest exactly like the `.text` 0x0 case
+    /// documented below: every candidate window ties at intersection area
+    /// 0, and the selection silently falls back to the front-most window --
+    /// anchoring a horizontal underline to whatever happened to be in
+    /// front, not the window it was drawn across. What the renderer paints
+    /// is `strokeWidth` tall (half the pen width each side of the line), so
+    /// the estimate must be too.
+    func testFlatStrokeGetsNonZeroAreaEstimatedBounds() throws {
+        let kind = AnnotationKind.vectorPath(
+            data: "M 100 500 L 400 500",
+            strokeColorHex: "#00FF00", strokeWidth: 6, strokeOpacity: 1,
+            fillColorHex: nil, fillOpacity: 0, dash: [],
+            usesEvenOddFillRule: false,
+            coordinateScaleX: 1, coordinateScaleY: 1
+        )
+        let bounds = try XCTUnwrap(PaintedBounds.paintedBounds(of: kind))
+        // Geometric box (100, 500, 300, 0) inflated by strokeWidth/2 = 3 on
+        // every side (round caps extend past the endpoints by the same 3).
+        XCTAssertEqual(bounds, CGRect(x: 97, y: 497, width: 306, height: 6))
+        XCTAssertGreaterThan(bounds.width * bounds.height, 0)
     }
 
     /// Defensive: a `data` string that fails to re-parse must not crash or

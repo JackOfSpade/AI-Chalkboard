@@ -585,6 +585,83 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
         }
     }
 
+    // MARK: - CalibrateScreenshotSpaceSupport.beginGeometryChangeRejection
+
+    /// A calibration session as `begin` records it, carrying the begin-time
+    /// display geometry the fiducials were painted against.
+    private func session(
+        screenId: String = "display-1", widthPx: Int, heightPx: Int, scale: Double
+    ) -> ScreenshotCalibrationRegistry.Session {
+        ScreenshotCalibrationRegistry.Session(
+            id: "calibration-fixed", screenId: screenId,
+            screenWidthPx: widthPx, screenHeightPx: heightPx, screenBackingScaleFactor: scale,
+            token: "ABC123", annotationIds: ["a1"],
+            previousCaptureVisible: false, forcedCaptureVisible: true
+        )
+    }
+
+    /// THE MID-HANDSHAKE MODE-CHANGE BUG THIS GATE CLOSES, in the audit's
+    /// own numbers: `begin` paints fiducials while the display runs a
+    /// 3200x1800 backing mode; the user switches the display to its native
+    /// 5120x2880 before `resolve`; the annotations re-render at the old
+    /// mode's coordinates on the new grid, the agent reads them faithfully,
+    /// and the solve -- against the freshly re-resolved 5120x2880 screen --
+    /// passes every residual check with zeros and registers a 3200x1800
+    /// space (scaleToBackingPx 1.6) for a screenshot that is truly 5120px
+    /// wide. Every subsequent drawing lands off-target, and
+    /// `ScreenshotSpace.stalenessRejection` never fires because the space
+    /// was BORN against the new mode's numbers rather than made stale by a
+    /// later change. Before the Session recorded its begin-time geometry,
+    /// this window was undetectable: `resolve` checked only that the screen
+    /// ID was still present.
+    func testResolveRejectsWhenTheDisplayModeChangedBetweenBeginAndResolve() {
+        let begun = session(widthPx: 3_200, heightPx: 1_800, scale: 1.6)
+        let current = screen(width: 5_120, height: 2_880)
+        guard let message = CalibrateScreenshotSpaceSupport.beginGeometryChangeRejection(
+            session: begun, currentScreen: current
+        ) else {
+            XCTFail("A begin-time 3200x1800 session resolved against a 5120x2880 screen must be rejected, not solved into a constant-factor-wrong space.")
+            return
+        }
+        // The wording family of `ScreenshotSpace.stalenessRejection`: name
+        // the display, quote the begin-time AxB against the current CxD, and
+        // point at a fresh calibration as the fix.
+        XCTAssertTrue(message.contains("display-1"), message)
+        XCTAssertTrue(message.contains("3200x1800"), message)
+        XCTAssertTrue(message.contains("5120x2880"), message)
+        XCTAssertTrue(message.contains("mode changed mid-handshake"), message)
+        XCTAssertTrue(message.contains("fresh calibration"), message)
+    }
+
+    /// The ordinary handshake -- no display change between `begin` and
+    /// `resolve` -- must pass the gate untouched. This is the positive
+    /// control that keeps the rejection above about the GEOMETRY CHANGE and
+    /// not about some other property of the fixtures.
+    func testResolveGateAcceptsAnUnchangedDisplayMode() {
+        let begun = session(widthPx: 5_120, heightPx: 2_880, scale: 1)
+        let current = screen(width: 5_120, height: 2_880)
+        XCTAssertNil(
+            CalibrateScreenshotSpaceSupport.beginGeometryChangeRejection(session: begun, currentScreen: current),
+            "an unchanged display mode must not trip the mid-handshake gate"
+        )
+    }
+
+    /// The gate compares backing DIMENSIONS, not the scale factor: the
+    /// dimensions are what the fiducial centres were computed from
+    /// (`normalized * widthPx`), and a scale-factor difference that leaves
+    /// the backing grid identical leaves every painted fiducial at the same
+    /// physical pixels -- rejecting it would fail an entirely usable
+    /// handshake. The recorded scale exists for the rejection's PROSE, so a
+    /// caller can recognise the mode change in `get_screens`' vocabulary.
+    func testResolveGateIgnoresAScaleFactorChangeThatLeavesTheBackingGridIdentical() {
+        let begun = session(widthPx: 5_120, heightPx: 2_880, scale: 2)
+        let current = screen(width: 5_120, height: 2_880) // fixture scale is 1
+        XCTAssertNil(
+            CalibrateScreenshotSpaceSupport.beginGeometryChangeRejection(session: begun, currentScreen: current),
+            "identical backing dimensions mean identical fiducial pixels; the scale factor alone must not reject"
+        )
+    }
+
     // MARK: - ScreenshotCalibrationMarkerDrawing
 
     func testBackingCenterScalesNormalizedPositionByScreenSize() {
@@ -628,13 +705,20 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
 
     func testRegistryRegisterThenLookupRoundTrips() {
         let registry = ScreenshotCalibrationRegistry(idGenerator: { "calibration-fixed" })
-        let session = registry.register(screenId: "display-1", token: "ABC123", annotationIds: ["a1", "a2"], previousCaptureVisible: false, forcedCaptureVisible: true)
+        let session = registry.register(screenId: "display-1", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "ABC123", annotationIds: ["a1", "a2"], previousCaptureVisible: false, forcedCaptureVisible: true)
         XCTAssertEqual(session.id, "calibration-fixed")
         let found = registry.lookup(id: "calibration-fixed")
         XCTAssertEqual(found?.screenId, "display-1")
         XCTAssertEqual(found?.token, "ABC123")
         XCTAssertEqual(found?.annotationIds, ["a1", "a2"])
         XCTAssertEqual(found?.previousCaptureVisible, false)
+        // The begin-time display geometry must survive the round trip
+        // intact: it is what `resolve`'s mid-handshake mode-change gate
+        // compares a fresh screen snapshot against, and a session that
+        // forgot it would make that gate silently vacuous.
+        XCTAssertEqual(found?.screenWidthPx, 3_840)
+        XCTAssertEqual(found?.screenHeightPx, 2_160)
+        XCTAssertEqual(found?.screenBackingScaleFactor, 2)
     }
 
     func testRegistryLookupOfUnknownIdReturnsNil() {
@@ -644,7 +728,7 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
 
     func testRegistryRemoveConsumesTheSessionExactlyOnce() {
         let registry = ScreenshotCalibrationRegistry(idGenerator: { "calibration-fixed" })
-        registry.register(screenId: "display-1", token: "ABC123", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
+        registry.register(screenId: "display-1", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "ABC123", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
         let removed = registry.remove(id: "calibration-fixed")
         XCTAssertNotNil(removed)
         XCTAssertNil(registry.lookup(id: "calibration-fixed"), "a removed session must no longer be lookup-able")
@@ -654,7 +738,7 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
     func testRegistryExistingSessionForScreenIdFindsTheOutstandingOne() {
         let registry = ScreenshotCalibrationRegistry(idGenerator: { "calibration-fixed" })
         XCTAssertNil(registry.existingSession(forScreenId: "display-1"))
-        registry.register(screenId: "display-1", token: "ABC123", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
+        registry.register(screenId: "display-1", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "ABC123", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
         XCTAssertEqual(registry.existingSession(forScreenId: "display-1")?.id, "calibration-fixed")
         XCTAssertNil(registry.existingSession(forScreenId: "display-2"), "a session for a different display must not match")
     }
@@ -669,7 +753,7 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
             return "calibration-\(counter)"
         })
         for index in 0..<(ScreenshotCalibrationRegistry.maxEntries + 1) {
-            registry.register(screenId: "display-\(index)", token: "T", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
+            registry.register(screenId: "display-\(index)", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "T", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
         }
         XCTAssertNil(registry.lookup(id: "calibration-1"), "the oldest session must have been evicted")
         XCTAssertNotNil(registry.lookup(id: "calibration-\(ScreenshotCalibrationRegistry.maxEntries + 1)"), "the newest session must still be present")
@@ -682,9 +766,9 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
     /// `ScreenshotSpaceRegistry.register`'s equivalent loop.
     func testRegistryBoundedIdCollisionRetryDoesNotHang() {
         let registry = ScreenshotCalibrationRegistry(idGenerator: { "always-the-same-id" })
-        let first = registry.register(screenId: "display-1", token: "T", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
+        let first = registry.register(screenId: "display-1", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "T", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
         XCTAssertEqual(first.id, "always-the-same-id")
-        let second = registry.register(screenId: "display-2", token: "T", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
+        let second = registry.register(screenId: "display-2", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "T", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
         XCTAssertNotEqual(second.id, first.id, "a colliding generator must fail closed to a distinct id, not hang or overwrite the first session")
         XCTAssertNotNil(registry.lookup(id: first.id), "the first session must remain intact")
     }
@@ -706,7 +790,7 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
         // pre-calibration value (false) becomes the shared baseline.
         let baseline1 = registry.claimCaptureBaseline(currentCaptureVisible: false)
         XCTAssertFalse(baseline1, "the first forcing session must record the real pre-calibration value")
-        let d1 = registry.register(screenId: "display-1", token: "T1", annotationIds: ["a"],
+        let d1 = registry.register(screenId: "display-1", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "T1", annotationIds: ["a"],
                                    previousCaptureVisible: baseline1, forcedCaptureVisible: true)
 
         // Display 2 begins while display 1 is still outstanding. The live flag
@@ -714,7 +798,7 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
         // the value the old code recorded as display 2's "previous".
         let baseline2 = registry.claimCaptureBaseline(currentCaptureVisible: true)
         XCTAssertFalse(baseline2, "a second concurrent calibration must inherit the saved baseline, NOT the value the first one just forced")
-        let d2 = registry.register(screenId: "display-2", token: "T2", annotationIds: ["b"],
+        let d2 = registry.register(screenId: "display-2", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "T2", annotationIds: ["b"],
                                    previousCaptureVisible: baseline2, forcedCaptureVisible: true)
 
         // Display 1 resolves first. Display 2 still needs the overlay in the
@@ -734,7 +818,7 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
     func testALoneCalibrationStillRestoresTheBaselineWhenItEnds() {
         let registry = ScreenshotCalibrationRegistry(idGenerator: { "calibration-lone" })
         let baseline = registry.claimCaptureBaseline(currentCaptureVisible: false)
-        let session = registry.register(screenId: "display-1", token: "T", annotationIds: [],
+        let session = registry.register(screenId: "display-1", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "T", annotationIds: [],
                                         previousCaptureVisible: baseline, forcedCaptureVisible: true)
         _ = registry.remove(id: session.id)
         XCTAssertEqual(registry.releaseCaptureBaseline(), false,
@@ -747,7 +831,7 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
         let registry = ScreenshotCalibrationRegistry(idGenerator: { "calibration-on" })
         let baseline = registry.claimCaptureBaseline(currentCaptureVisible: true)
         XCTAssertTrue(baseline, "an already-on capture-debug must be recorded as the baseline")
-        let session = registry.register(screenId: "display-1", token: "T", annotationIds: [],
+        let session = registry.register(screenId: "display-1", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "T", annotationIds: [],
                                         previousCaptureVisible: baseline, forcedCaptureVisible: true)
         _ = registry.remove(id: session.id)
         XCTAssertEqual(registry.releaseCaptureBaseline(), true,
@@ -760,7 +844,7 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
     /// actor set during the handshake window.
     func testANonForcingCalibrationDoesNotParticipateInTheBaselineCount() {
         let registry = ScreenshotCalibrationRegistry(idGenerator: { "calibration-passive" })
-        let session = registry.register(screenId: "display-1", token: "T", annotationIds: [],
+        let session = registry.register(screenId: "display-1", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "T", annotationIds: [],
                                         previousCaptureVisible: true, forcedCaptureVisible: false)
         XCTAssertFalse(session.forcedCaptureVisible, "a set_capture_visible=false begin must be recorded as non-forcing")
         _ = registry.remove(id: session.id)
@@ -770,7 +854,7 @@ final class ScreenshotSpaceHandlerTests: XCTestCase {
 
     func testRegistryRemoveAllClearsEverything() {
         let registry = ScreenshotCalibrationRegistry(idGenerator: { "calibration-fixed" })
-        registry.register(screenId: "display-1", token: "T", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
+        registry.register(screenId: "display-1", screenWidthPx: 3_840, screenHeightPx: 2_160, screenBackingScaleFactor: 2, token: "T", annotationIds: [], previousCaptureVisible: true, forcedCaptureVisible: true)
         registry.removeAll()
         XCTAssertTrue(registry.all().isEmpty)
         XCTAssertNil(registry.lookup(id: "calibration-fixed"))

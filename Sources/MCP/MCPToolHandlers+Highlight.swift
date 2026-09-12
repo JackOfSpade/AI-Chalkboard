@@ -276,11 +276,13 @@ func buildHighlightAnchor(
     resize: AnchorResizeBehavior,
     elementSpec: AnchorElementSpec?,
     now: Date,
-    screenId: String? = nil
+    screenId: String? = nil,
+    screens: [ScreenInfo] = []
 ) -> DrawRequest.DrawAnchorResolution? {
     guard let windowResolution = DrawRequest.buildWindowAnchor(
         processId: processId, appId: appId, samples: samples,
-        paintedBounds: elementFrame, resize: resize, now: now, screenId: screenId
+        paintedBounds: elementFrame, resize: resize, now: now, screenId: screenId,
+        screens: screens
     ) else {
         return nil
     }
@@ -292,6 +294,10 @@ func buildHighlightAnchor(
         target: anchor.target,
         referenceWindowFrame: anchor.referenceWindowFrame,
         referenceScreenId: anchor.referenceScreenId,
+        // Carried from the window resolution above, which recorded the
+        // selected display's backing scale for pin-mode density
+        // compensation -- see `AnnotationAnchor.referenceScreenScale`.
+        referenceScreenScale: anchor.referenceScreenScale,
         element: elementSpec,
         createdAt: anchor.createdAt
     )
@@ -397,7 +403,7 @@ private func attachHighlightAnchor(
     guard let resolution = buildHighlightAnchor(
         mode: request.mode, processId: processId, appId: appId, samples: samples,
         elementFrame: elementFrame, resize: request.resize, elementSpec: elementSpec, now: Date(),
-        screenId: created.screenId
+        screenId: created.screenId, screens: screens
     ) else {
         return (highlightAnchorUnresolvedPayload, highlightAnchorBehaviorNone)
     }
@@ -551,6 +557,20 @@ extension MCPServer {
         // plain, unanchored annotation exactly as it always has.
         finishArgs.removeValue(forKey: "anchor")
         finishArgs.removeValue(forKey: "anchor_resize")
+        // The draw tools' placement-feedback riders are likewise stripped
+        // before `finish` sees them: this tool's response ALREADY reports the
+        // element's exact resolved bounds (`matchedElement`) and its anchor
+        // state -- the very facts the riders exist to fetch -- and `finish`
+        // answering them would return a JSON payload this handler then embeds
+        // as its `message` STRING, nesting one JSON document inside another.
+        // highlight_element's schema does not declare these arguments;
+        // stripping keeps a caller who passes them anyway on the documented
+        // response shape instead of a malformed hybrid.
+        finishArgs.removeValue(forKey: "report_placement")
+        finishArgs.removeValue(forKey: "expect_element")
+        finishArgs.removeValue(forKey: "expect_window")
+        finishArgs.removeValue(forKey: "target_bounds_screenshot_px")
+        finishArgs.removeValue(forKey: "apply_correction")
         let style: HighlightStyle
         switch makeHighlightStyle(args: args) {
         case .failure(let error): sendErrorResult(id: id, text: error); return
@@ -615,7 +635,12 @@ extension MCPServer {
         // reject ordinary window switching. Cost is one extra main-thread
         // hop plus pure arithmetic, against a lookup that just spent
         // milliseconds-to-seconds in cross-process IPC.
-        let screensAfterWalk = OverlayWindowController.shared.screenSnapshot().screens
+        // `.live`, not the default cached read: this re-read EXISTS to detect
+        // a display reconfiguration that happened during the walk, and a
+        // cached snapshot served before the reconfiguration notification
+        // lands would compare the pre-walk layout against itself and miss
+        // exactly the change it is looking for.
+        let screensAfterWalk = OverlayWindowController.shared.screenSnapshot(freshness: .live).screens
         guard let confirmedFrame = AccessibilityElementResolver.backingRect(
                   forAccessibilityFrame: match.accessibilityFrame, screens: screensAfterWalk
               ),

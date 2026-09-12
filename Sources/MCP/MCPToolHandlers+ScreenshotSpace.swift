@@ -383,7 +383,7 @@ enum CalibrateScreenshotSpaceSupport {
         return .success((width, height))
     }
 
-    /// DUPLICATES `ScreenshotCalibration.tolerance(for:)`'s formula
+    /// DUPLICATES `ScreenshotCalibration.spanTolerance(for:)`'s formula
     /// (`max(4px, 1% of span)`) rather than calling it. That private helper
     /// lives in `Sources/Support/ScreenshotCalibration.swift`, which is
     /// EXCLUSIVELY owned in this phase of work by the sibling agent fixing
@@ -397,6 +397,23 @@ enum CalibrateScreenshotSpaceSupport {
     /// "ADDENDUM") produces a disagreement of tens to hundreds of pixels,
     /// far outside either constant's plausible range. If the solver's own
     /// formula ever changes, this pair should be revisited to match.
+    ///
+    /// NOTE ON THE SOLVER'S TOLERANCE SPLIT: the solver has since split its
+    /// one tolerance into a span-scaled budget (`spanTolerance`, still
+    /// `max(4px, 1%)`, for the snap-distance checks) and a tighter
+    /// read-noise budget (`readNoiseTolerance`, `max(4px, 0.25%)`, for the
+    /// origin-residual and redundancy gates -- the change that closed the
+    /// 40px-crop-at-5K hole). THIS cross-check deliberately keeps the
+    /// span-scaled 1%: the gap it inspects is between a SNAPPED solve --
+    /// whose own honest error is the inset-amplified, axis-averaged,
+    /// rescaled reading noise the snap family budgets for -- and a
+    /// tool-declared dimension, so a 0.25% gate here would sit within a few
+    /// pixels of that honest error at 5K. The cost is real and stated: a
+    /// small (tens-of-pixels) top-left-anchored crop at 5K still passes
+    /// this optional check, which is exactly why the begin/limitation prose
+    /// keeps telling callers that `register_screenshot_space` with
+    /// `screenshot_path` -- a direct measurement of the file -- is strictly
+    /// stronger than any extrapolated cross-check.
     private static let crossCheckMinimumAbsoluteTolerancePx = 4.0
     private static let crossCheckRelativeTolerance = 0.01
     /// Rounds one residual to a sane number of decimal places for the WIRE
@@ -529,6 +546,60 @@ enum CalibrateScreenshotSpaceSupport {
             let note = "cross-check passed: observed_width/observed_height (\(observed.width)x\(observed.height)) agreed with the marker solve (\(solution.widthPx)x\(solution.heightPx)) within \(widthTolerance)x\(heightTolerance) px tolerance."
             return .success(Reconciliation(width: solution.widthPx, height: solution.heightPx, provenance: .observed, crossCheckNote: note))
         }
+    }
+
+    /// The mid-handshake display-mode gate: rejects a `resolve` whose
+    /// display no longer reports the backing dimensions it reported when
+    /// `begin` painted the fiducials. Returns `nil` when the geometry is
+    /// unchanged and the solve may proceed; otherwise returns the exact
+    /// rejection prose, shaped like `ScreenshotSpace.stalenessRejection`'s
+    /// resolution-change branch (name the display, quote the recorded AxB
+    /// against the current CxD, say what to do), because it is the same
+    /// class of failure caught one step earlier.
+    ///
+    /// WHY THIS GATE EXISTS -- THE FAILURE IT CLOSES: `resolve` already
+    /// re-resolves the display fresh and rejects when `session.screenId`
+    /// has vanished, but presence is not identity of GEOMETRY. The
+    /// fiducials were painted at backing-pixel centres computed from the
+    /// BEGIN-time screen (`normalized * screen.widthPx`), stored as
+    /// ordinary annotations, and re-interpreted against the CURRENT
+    /// backing scale at render time -- so a display-mode switch during the
+    /// handshake leaves them rendering at the old mode's coordinates on
+    /// the new mode's pixel grid. The solve against the fresh screen then
+    /// passes EVERY check with zero residuals -- the markers' spread reads
+    /// as a perfectly clean uniform downsample -- and mints a space whose
+    /// scale is wrong by exactly the mode-change ratio (worked example: a
+    /// begin on a 3200x1800-mode display resolved after a switch to
+    /// 5120x2880 registers 3200x1800/scale-1.6 for a truly 5120x2880
+    /// screenshot; every drawing lands off-screen). Worse, the space is
+    /// registered against the NEW mode's numbers, so
+    /// `ScreenshotSpace.stalenessRejection` -- the guard for
+    /// mode-changes-after-registration -- can never fire: the space was
+    /// born wrong, not made wrong. Rejecting here, with the begin-time and
+    /// current numbers side by side, is the only place this window is
+    /// visible at all. Reject-over-silently-misplace, as everywhere else
+    /// in this file.
+    ///
+    /// A PURE static function on purpose, exactly like
+    /// `ScreenshotSpace.stalenessRejection`: it takes the recorded session
+    /// and the caller's fresh screen lookup as parameters, so the gate is
+    /// directly unit-testable with hand-built fixtures and no live display.
+    ///
+    /// The gate compares backing DIMENSIONS, not the scale factor: the
+    /// dimensions are what the fiducial geometry was derived from, and a
+    /// scale-factor change that leaves the backing grid identical leaves
+    /// the painted fiducials at the same physical pixels (see
+    /// `Session.screenBackingScaleFactor`). The recorded scale is quoted in
+    /// the prose so the caller can recognise the mode change in
+    /// `get_screens`' own vocabulary.
+    static func beginGeometryChangeRejection(
+        session: ScreenshotCalibrationRegistry.Session, currentScreen: ScreenInfo
+    ) -> String? {
+        guard currentScreen.widthPx != session.screenWidthPx
+                || currentScreen.heightPx != session.screenHeightPx else {
+            return nil
+        }
+        return "Display \(session.screenId) reported \(session.screenWidthPx)x\(session.screenHeightPx) backing pixels (backing scale \(session.screenBackingScaleFactor)) when action=\"begin\" painted this calibration's fiducials, but it now reports \(currentScreen.widthPx)x\(currentScreen.heightPx) (backing scale \(currentScreen.backingScaleFactor)) -- its resolution or HiDPI scale mode changed mid-handshake. The fiducials were positioned from the old mode's geometry and re-rendered on the new mode's pixel grid, so the marker centres in your screenshot read as a perfectly clean downsample while being wrong by exactly the mode-change ratio, and a space solved from them would misplace every drawing without any later check able to notice. Begin a fresh calibration so the fiducials are painted against the display's current mode."
     }
 
     /// The ONE wording every post-lookup `resolve` rejection carries, so that
@@ -1618,6 +1689,44 @@ final class ScreenshotCalibrationRegistry: @unchecked Sendable {
     struct Session {
         let id: String
         let screenId: String
+        /// The display's backing-pixel width AT `begin` TIME -- the geometry
+        /// the fiducials' backing-pixel centres were computed from
+        /// (`ScreenshotCalibrationMarkerDrawing.backingCenter` multiplies
+        /// each marker's normalized position by THESE dimensions).
+        ///
+        /// WHY THE SESSION MUST RECORD THIS: `resolve` re-resolves the
+        /// display fresh, but a presence check on `screenId` alone cannot
+        /// see a display-MODE change during the handshake window (the user
+        /// switching resolution or HiDPI scale between `begin` and
+        /// `resolve`). The painted fiducials are ordinary annotations whose
+        /// coordinates are re-interpreted against the CURRENT backing scale
+        /// at render time, so after a mode change they land at the OLD
+        /// mode's backing coordinates on the NEW mode's pixel grid -- no
+        /// longer at the markers' normalized 0.1/0.9 design points. A solve
+        /// against the fresh screen then looks EXACTLY like a clean uniform
+        /// downsample (zero pair disagreement, zero origin residual, an
+        /// exact display-consistent snap) while being wrong by precisely
+        /// the mode-change ratio: e.g. fiducials painted on a
+        /// 3200x1800-mode display and resolved after a switch to
+        /// 5120x2880 mint a 3200x1800 space with scaleToBackingPx 1.6 for a
+        /// screenshot that is truly 5120 px wide -- every drawing lands
+        /// off-target, and `ScreenshotSpace.stalenessRejection` never fires
+        /// because the space was BORN against the new mode's numbers.
+        /// Recording the begin-time dimensions is what makes that window
+        /// detectable at all; see
+        /// `CalibrateScreenshotSpaceSupport.beginGeometryChangeRejection`.
+        let screenWidthPx: Int
+        /// The begin-time backing-pixel height; see `screenWidthPx`.
+        let screenHeightPx: Int
+        /// The begin-time backing scale factor. Recorded so the rejection
+        /// can NAME the mode change in the same vocabulary `get_screens`
+        /// reports (a Retina mode switch often changes the scale factor,
+        /// not just the pixel counts); the gate itself compares the backing
+        /// DIMENSIONS, because they are what the fiducial geometry was
+        /// derived from -- a scale-factor change that leaves the backing
+        /// grid identical leaves the painted fiducials at the same physical
+        /// pixels and is harmless to the solve.
+        let screenBackingScaleFactor: Double
         let token: String
         let annotationIds: [String]
         let previousCaptureVisible: Bool
@@ -1734,8 +1843,14 @@ final class ScreenshotCalibrationRegistry: @unchecked Sendable {
         return baseline
     }
 
+    /// `screenWidthPx`/`screenHeightPx`/`screenBackingScaleFactor` are the
+    /// begin-time display geometry the fiducials were painted against --
+    /// REQUIRED, not defaulted, because a session registered without them
+    /// cannot detect the mid-handshake display-mode change documented on
+    /// `Session.screenWidthPx`, which is precisely the silent
+    /// constant-factor miscalibration this record exists to prevent.
     @discardableResult
-    func register(screenId: String, token: String, annotationIds: [String], previousCaptureVisible: Bool, forcedCaptureVisible: Bool) -> Session {
+    func register(screenId: String, screenWidthPx: Int, screenHeightPx: Int, screenBackingScaleFactor: Double, token: String, annotationIds: [String], previousCaptureVisible: Bool, forcedCaptureVisible: Bool) -> Session {
         lock.lock()
         defer { lock.unlock() }
 
@@ -1762,7 +1877,7 @@ final class ScreenshotCalibrationRegistry: @unchecked Sendable {
             byId.removeValue(forKey: evicted.id)
         }
 
-        let session = Session(id: id, screenId: screenId, token: token, annotationIds: annotationIds, previousCaptureVisible: previousCaptureVisible, forcedCaptureVisible: forcedCaptureVisible)
+        let session = Session(id: id, screenId: screenId, screenWidthPx: screenWidthPx, screenHeightPx: screenHeightPx, screenBackingScaleFactor: screenBackingScaleFactor, token: token, annotationIds: annotationIds, previousCaptureVisible: previousCaptureVisible, forcedCaptureVisible: forcedCaptureVisible)
         order.append(session)
         byId[id] = session
         return session
@@ -2065,8 +2180,17 @@ extension MCPServer {
             InstanceBroadcast.shared.postSetCaptureVisible(true)
         }
 
+        // The begin-time geometry travels WITH the session, because it is
+        // the geometry the fiducials just painted were computed from --
+        // `resolve` compares it against a fresh snapshot to catch a
+        // display-mode change during the handshake window, the one failure
+        // a presence check on the screen id alone cannot see. See
+        // `ScreenshotCalibrationRegistry.Session.screenWidthPx`.
         let session = ScreenshotCalibrationRegistry.shared.register(
-            screenId: screen.id, token: token,
+            screenId: screen.id,
+            screenWidthPx: screen.widthPx, screenHeightPx: screen.heightPx,
+            screenBackingScaleFactor: screen.backingScaleFactor,
+            token: token,
             annotationIds: drawn.allAnnotationIds,
             previousCaptureVisible: previousCaptureVisible,
             forcedCaptureVisible: shouldSetCaptureVisible
@@ -2179,6 +2303,23 @@ extension MCPServer {
         let snapshot = OverlayWindowController.shared.screenSnapshot()
         guard let screen = snapshot.screens.first(where: { $0.id == session.screenId }) else {
             rejectAndClear("Display \(session.screenId), which calibration '\(calibrationId)' was started against, is no longer connected, so there is no display geometry left to solve these markers against. Call get_screens for the current display list.")
+            return
+        }
+
+        // Presence is not enough: the display may still be here but in a
+        // DIFFERENT MODE than the one `begin` painted the fiducials against,
+        // and a solve against the new mode passes every residual check while
+        // minting a space wrong by exactly the mode-change ratio -- born
+        // wrong, so the registry's own staleness guard can never catch it.
+        // Full mechanism and worked example on
+        // `CalibrateScreenshotSpaceSupport.beginGeometryChangeRejection`.
+        // Through `rejectAndClear`, like every post-lookup rejection: the
+        // stranded fiducials (painted for a mode that no longer exists) are
+        // cleared and capture-visible released.
+        if let geometryChange = CalibrateScreenshotSpaceSupport.beginGeometryChangeRejection(
+            session: session, currentScreen: screen
+        ) {
+            rejectAndClear(geometryChange)
             return
         }
 
@@ -2395,7 +2536,13 @@ extension MCPServer {
         // arrangement that can no longer be identified, so NEITHER answer is
         // trustworthy and choosing between them would only move the
         // misplacement around.
-        let screensAfterWalk = OverlayWindowController.shared.screenSnapshot().screens
+        //
+        // `.live`, not the default cached read: this re-read EXISTS to detect
+        // a display reconfiguration that happened during the walks, and a
+        // cached snapshot served before the reconfiguration notification
+        // lands would compare the pre-walk layout against itself and miss
+        // exactly the change it is looking for.
+        let screensAfterWalk = OverlayWindowController.shared.screenSnapshot(freshness: .live).screens
         var resolved: [CalibrateFromElementsSupport.ResolvedElement] = []
         resolved.reserveCapacity(matches.count)
         for (index, match) in matches.enumerated() {

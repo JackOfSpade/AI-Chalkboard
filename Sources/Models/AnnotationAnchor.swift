@@ -96,9 +96,11 @@ public struct AnchorAdjustment: Codable, Equatable, Sendable {
     ///
     /// `scaleX`/`scaleY` are positive by construction in every adjustment
     /// this type's own factory actually produces today: `.identity` is
-    /// `(1, 1, ...)`, and `mapping(reference:current:behavior:)`'s `.pin`
-    /// branch hard-codes scale to 1 while its `.scale` branch divides two
-    /// positive, finite sizes (see that function's own guards) -- so no LIVE
+    /// `(1, 1, ...)`, and `mapping(reference:current:behavior:...)`'s `.pin`
+    /// branch emits the two displays' backing-density ratio (a quotient of
+    /// two guarded-positive scale factors, falling back to exactly 1) while
+    /// its `.scale` branch divides two positive, finite sizes (see that
+    /// function's own guards) -- so no LIVE
     /// adjustment can carry a negative scale today. But `Annotation
     /// .staticAdjustment` is a frozen, hand-editable value with no live
     /// producer standing permanent guard over it (a future `staticAdjustment`
@@ -137,10 +139,28 @@ public struct AnchorAdjustment: Codable, Equatable, Sendable {
     /// back to `.identity`, which would teleport the drawing back to its
     /// raw, un-adjusted stored position instead of holding its last known
     /// good placement (see the design contract's "no drift" invariant).
+    ///
+    /// `referenceScreenScale`/`currentScreenScale` are the backing scale
+    /// factors of the display `reference` is expressed on and the display
+    /// `current` is expressed on, respectively. They exist because the two
+    /// rects are both "screen-local backing pixels" but not necessarily on
+    /// the SAME screen: a window dragged from a 2x panel to a 1x monitor
+    /// hands this function a reference measured in one pixel density and a
+    /// current frame measured in another, and only the caller knows which
+    /// density each side carries. Only `.pin` consumes them -- see that
+    /// branch. `.scale` deliberately ignores them: its per-axis factor is
+    /// `currentPx / referencePx`, and since each side's pixel count is its
+    /// point extent TIMES its own display's scale factor, the density ratio
+    /// is already folded into the quotient -- multiplying it in again would
+    /// double-apply it. The defaults (1/1) reproduce the density-blind
+    /// mapping exactly, keeping every same-display call site and historical
+    /// caller bit-for-bit unchanged.
     public static func mapping(
         reference: CGRect,
         current: CGRect,
-        behavior: AnchorResizeBehavior
+        behavior: AnchorResizeBehavior,
+        referenceScreenScale: Double = 1,
+        currentScreenScale: Double = 1
     ) -> AnchorAdjustment? {
         let components = [
             reference.origin.x, reference.origin.y, reference.size.width, reference.size.height,
@@ -150,16 +170,50 @@ public struct AnchorAdjustment: Codable, Equatable, Sendable {
 
         switch behavior {
         case .pin:
-            // Pin only ever subtracts origins -- it has no divisor -- so a
-            // reference with zero, negative, or otherwise degenerate size
-            // (a window frame sampled mid-resize, for instance) is still
-            // perfectly mappable. Uses raw `.origin`, not `.minX`/`.minY`,
-            // matching the design contract's formula exactly.
+            // Pin only ever subtracts origins -- it has no divisor over the
+            // WINDOW's geometry -- so a reference with zero, negative, or
+            // otherwise degenerate size (a window frame sampled mid-resize,
+            // for instance) is still perfectly mappable. Uses raw `.origin`,
+            // not `.minX`/`.minY`, matching the design contract's formula
+            // exactly.
+            //
+            // THE DENSITY RATIO IS THE ONE SCALE PIN CARRIES. When the
+            // reference and current displays' backing scale factors differ,
+            // a translate-only mapping silently mixes two pixel densities:
+            // an in-window offset stored as (400, 300) px against a 2x
+            // reference is (200, 150) POINTS, which must paint as
+            // (200, 150) px on a 1x display -- not (400, 300) px, which
+            // would land at the wrong in-window position AND at twice the
+            // intended on-screen size. Scaling every stored coordinate by
+            // `currentScreenScale / referenceScreenScale` re-expresses the
+            // geometry in the current display's density FIRST, then
+            // translates -- so the drawing's position and extent stay
+            // invariant in points, which is the only reading of "pin: keep
+            // the annotation's own size unchanged" that survives a
+            // cross-density move. On a same-density move the ratio is
+            // exactly 1 and this reduces to the original translate-only
+            // mapping, bit for bit.
+            //
+            // Degenerate scale inputs (zero, negative, or non-finite --
+            // nothing this codebase's own screen snapshots produce, but
+            // this is a public entry point) fall back to a ratio of 1, the
+            // density-blind legacy mapping, rather than returning nil: the
+            // window-geometry half of the mapping is still perfectly
+            // derivable, only the cross-density compensation is not, and
+            // degrading to the pre-density behavior loses strictly less
+            // than freezing the previous adjustment would.
+            let densityRatio: Double
+            if referenceScreenScale.isFinite, currentScreenScale.isFinite,
+               referenceScreenScale > 0, currentScreenScale > 0 {
+                densityRatio = currentScreenScale / referenceScreenScale
+            } else {
+                densityRatio = 1
+            }
             return AnchorAdjustment(
-                scaleX: 1,
-                scaleY: 1,
-                translateX: current.origin.x - reference.origin.x,
-                translateY: current.origin.y - reference.origin.y
+                scaleX: densityRatio,
+                scaleY: densityRatio,
+                translateX: current.origin.x - reference.origin.x * densityRatio,
+                translateY: current.origin.y - reference.origin.y * densityRatio
             )
         case .scale:
             // Reference width/height are the divisors below, so <= 0 (a
@@ -354,6 +408,29 @@ public struct AnnotationAnchor: Codable, Equatable, Sendable {
     /// passing to `AnchorAdjustment.mapping(reference:current:behavior:)`.
     public let referenceWindowFrame: AnchorRect
     public let referenceScreenId: String
+    /// Backing scale factor of `referenceScreenId` at the moment
+    /// `referenceWindowFrame` was captured -- the pixel density every
+    /// coordinate in that frame (and in the annotation's own stored
+    /// geometry) is expressed in. `AnchorAdjustment.mapping`'s `.pin`
+    /// branch needs it to compensate a cross-density window move (see that
+    /// branch's own comment for the worked failure it prevents).
+    ///
+    /// OPTIONAL, DEFAULTED, AND RECOVERABLE: nil means "not recorded" --
+    /// an anchor built by a creation path that predates this field, or one
+    /// decoded from a payload without it (the synthesized `Codable`
+    /// conformance uses `decodeIfPresent` for optionals, so older encodings
+    /// keep decoding unchanged). `AnchorTracker` treats nil as "resolve it
+    /// live": it looks `referenceScreenId` up in the current screens
+    /// snapshot each tick, which answers correctly for as long as the
+    /// reference display stays connected -- the overwhelmingly common case
+    /// -- and falls back to the density-blind legacy mapping only when the
+    /// display is gone AND the scale was never recorded, because a density
+    /// that was neither captured nor still observable cannot be recovered
+    /// from any current evidence. This never reaches the MCP wire:
+    /// `DrawRequest.anchorResponsePayload` hand-builds the `anchor` object
+    /// field by field, and `list_annotations` strips the raw Codable
+    /// `anchor` key before emitting (see MCPToolHandlers+Payloads.swift).
+    public let referenceScreenScale: Double?
     /// Non-nil iff `mode == .element`. `AnchorTracker` is the only reader;
     /// `.window`-mode anchors have nothing to re-resolve.
     public let element: AnchorElementSpec?
@@ -365,6 +442,7 @@ public struct AnnotationAnchor: Codable, Equatable, Sendable {
         target: AnchorWindowTarget,
         referenceWindowFrame: AnchorRect,
         referenceScreenId: String,
+        referenceScreenScale: Double? = nil,
         element: AnchorElementSpec? = nil,
         createdAt: Date = Date()
     ) {
@@ -373,6 +451,7 @@ public struct AnnotationAnchor: Codable, Equatable, Sendable {
         self.target = target
         self.referenceWindowFrame = referenceWindowFrame
         self.referenceScreenId = referenceScreenId
+        self.referenceScreenScale = referenceScreenScale
         self.element = element
         self.createdAt = createdAt
     }

@@ -113,6 +113,13 @@ extension MCPServer {
             guard radius > 0 else {
                 return .failure("radius must be greater than 0.")
             }
+            // A centre beyond the declared screenshot cannot have been
+            // measured on it -- see `sourceGeometryRejection`'s doc comment.
+            if let rejection = coordinateTransform.sourceGeometryRejection(
+                minX: centerX, minY: centerY, maxX: centerX, maxY: centerY, what: "center_x/center_y"
+            ) {
+                return .failure(rejection)
+            }
             guard let center = coordinateTransform.transformedPoint(x: centerX, y: centerY) else {
                 return .failure("draw_shape's center_x/center_y contains coordinates that cannot be represented safely in the selected display's backing-pixel space.")
             }
@@ -136,6 +143,12 @@ extension MCPServer {
             }
             guard radiusX > 0, radiusY > 0 else {
                 return .failure("radius_x and radius_y must be greater than 0.")
+            }
+            // Same declared-screenshot centre check as the 'circle' branch.
+            if let rejection = coordinateTransform.sourceGeometryRejection(
+                minX: centerX, minY: centerY, maxX: centerX, maxY: centerY, what: "center_x/center_y"
+            ) {
+                return .failure(rejection)
             }
             guard let center = coordinateTransform.transformedPoint(x: centerX, y: centerY) else {
                 return .failure("draw_shape's center_x/center_y contains coordinates that cannot be represented safely in the selected display's backing-pixel space.")
@@ -207,6 +220,13 @@ extension MCPServer {
                 guard let x = MCPArgument.double(args["x"]), let y = MCPArgument.double(args["y"]) else {
                     return .failure("Missing required parameters for shape='rect' with a corner: x, y.")
                 }
+                // Same declared-screenshot position check as the centre
+                // branches; see `sourceGeometryRejection`'s doc comment.
+                if let rejection = coordinateTransform.sourceGeometryRejection(
+                    minX: x, minY: y, maxX: x, maxY: y, what: "x/y"
+                ) {
+                    return .failure(rejection)
+                }
                 guard let corner = coordinateTransform.transformedPoint(x: x, y: y) else {
                     return .failure("draw_shape's x/y contains coordinates that cannot be represented safely in the selected display's backing-pixel space.")
                 }
@@ -215,6 +235,11 @@ extension MCPServer {
             } else {
                 guard let centerX = MCPArgument.double(args["center_x"]), let centerY = MCPArgument.double(args["center_y"]) else {
                     return .failure("Missing required parameters for shape='rect' with a centre: center_x, center_y.")
+                }
+                if let rejection = coordinateTransform.sourceGeometryRejection(
+                    minX: centerX, minY: centerY, maxX: centerX, maxY: centerY, what: "center_x/center_y"
+                ) {
+                    return .failure(rejection)
                 }
                 guard let center = coordinateTransform.transformedPoint(x: centerX, y: centerY) else {
                     return .failure("draw_shape's center_x/center_y contains coordinates that cannot be represented safely in the selected display's backing-pixel space.")
@@ -259,7 +284,8 @@ extension MCPServer {
             label: nil,
             defaultsToGlobal: false,
             kind: kind,
-            noun: "free-draw shape"
+            noun: "free-draw shape",
+            transform: transform
         ) {
         case .failure(let err):
             sendErrorResult(id: id, text: err)

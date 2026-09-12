@@ -111,6 +111,41 @@ enum OverlayDrawingMetrics {
     }
 }
 
+/// Optional fast path a `DrawingContext` can adopt when it can paint a fill
+/// and a stroke of the SAME path more cheaply than two independent calls.
+///
+/// WHY THIS EXISTS: a filled-AND-stroked vector path used to reach the
+/// platform context as `fill(path:...)` followed by `stroke(path:...)`, and
+/// the macOS implementation converts a `ChalkPath` into a `CGMutablePath`
+/// element-by-element at the top of EACH call -- so every filled+stroked
+/// annotation rebuilt the same converted path twice per frame, on the render
+/// hot path `SVGPathCache` already exists to keep cheap. Adopting this
+/// protocol lets a context do that conversion once and reuse it for both
+/// operations.
+///
+/// WHY A SEPARATE REFINEMENT PROTOCOL, NOT A `DrawingContext` REQUIREMENT OR
+/// A PLAIN EXTENSION METHOD: a non-requirement method added in a protocol
+/// extension is STATICALLY dispatched through the `DrawingContext`
+/// existential the renderer holds, so a platform's own `fillAndStroke` would
+/// be silently ignored -- the exact bug class this comment exists to
+/// prevent. A conditional cast to a refinement protocol restores dynamic
+/// adoption while leaving `DrawingContext`'s surface -- and every existing
+/// conformance (`GDIPlusDrawingContext` keeps its two-call rendering
+/// byte-for-byte, without edits) -- completely unchanged.
+///
+/// CONTRACT: `fillAndStroke` must paint EXACTLY what
+/// `fill(path:color:evenOdd:)` followed by `stroke(path:color:lineWidth:dash:)`
+/// would paint -- fill first, stroke composited on top, same fixed round
+/// cap/join the `stroke` doc comment requires. This is purely a
+/// "convert the geometry once" optimisation; any adopter for which the two
+/// forms could differ by a pixel must not adopt it.
+public protocol CombinedFillStrokeDrawingContext: DrawingContext {
+    func fillAndStroke(
+        path: ChalkPath, fillColor: ChalkColor, evenOdd: Bool,
+        strokeColor: ChalkColor, lineWidth: Double, dash: [Double]
+    )
+}
+
 /// Platform-neutral home for the entire annotation drawing algorithm.
 ///
 /// This is the ENTIRE render algorithm that used to live directly on
@@ -289,12 +324,13 @@ public struct AnnotationRenderer {
         )
         let path = sourcePath.transformed(by: transform)
 
+        var fillColor: ChalkColor?
         if let fillColorHex, fillOpacity > 0 {
             let parsedFill = ColorParser.parse(fillColorHex)
-            let fill = parsedFill.multiplyingAlpha(by: Double(OverlayDrawingMetrics.clampedAlpha(fillOpacity)))
-            context.fill(path: path, color: fill, evenOdd: usesEvenOddFillRule)
+            fillColor = parsedFill.multiplyingAlpha(by: Double(OverlayDrawingMetrics.clampedAlpha(fillOpacity)))
         }
 
+        var strokeParameters: (color: ChalkColor, lineWidth: Double, dash: [Double])?
         if strokeWidth > 0 {
             // The fallback hex is parsed HERE, lazily, rather than by the
             // caller: the annotation-level colour is a safety net that the MCP
@@ -311,7 +347,32 @@ public struct AnnotationRenderer {
             // Round cap and round join are baked into every `DrawingContext.stroke`
             // implementation -- see that protocol method's doc comment -- so
             // they are not parameters here.
-            context.stroke(path: path, color: strokeColor, lineWidth: Double(lineWidth), dash: dashLengths)
+            strokeParameters = (color: strokeColor, lineWidth: Double(lineWidth), dash: dashLengths)
+        }
+
+        if let fillColor, let strokeParameters,
+           let combined = context as? CombinedFillStrokeDrawingContext {
+            // Both operations apply and the context can share the converted
+            // path between them (see `CombinedFillStrokeDrawingContext` for
+            // why this is a pure convert-once optimisation, guaranteed
+            // pixel-identical to the two-call branch below). Fill first,
+            // stroke on top -- the same order the two-call branch has always
+            // painted in.
+            combined.fillAndStroke(
+                path: path, fillColor: fillColor, evenOdd: usesEvenOddFillRule,
+                strokeColor: strokeParameters.color,
+                lineWidth: strokeParameters.lineWidth, dash: strokeParameters.dash
+            )
+        } else {
+            if let fillColor {
+                context.fill(path: path, color: fillColor, evenOdd: usesEvenOddFillRule)
+            }
+            if let strokeParameters {
+                context.stroke(
+                    path: path, color: strokeParameters.color,
+                    lineWidth: strokeParameters.lineWidth, dash: strokeParameters.dash
+                )
+            }
         }
     }
 

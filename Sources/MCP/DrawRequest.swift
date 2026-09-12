@@ -88,14 +88,48 @@ struct DrawRequest {
     }
 
     struct CoordinateTransform {
+        /// The screenshot pixel grid this transform was built FROM, recorded
+        /// so later stages can answer in the caller's own pixels. Non-nil
+        /// exactly when the call selected `coordinate_space="screenshot_pixels"`
+        /// (directly, or via a `screenshot_space` expansion -- `spaceId` says
+        /// which). `nil` for `backing_pixels` and `normalized`, whose callers
+        /// never declared any screenshot at all.
+        ///
+        /// WHY THIS EXISTS: the transform used to keep only the derived
+        /// per-axis scales, which is enough to PLACE geometry but not enough
+        /// to REPORT placement back -- `DrawRequest.finish`'s placement echo
+        /// must convert the painted bounds back into the very grid the caller
+        /// measured on, and must know that grid's extent to reject geometry
+        /// that provably was not measured on it (a coordinate beyond the
+        /// declared image cannot have come from that image -- see
+        /// `sourceGeometryRejection`). Deriving the grid back from the scales
+        /// would be recomputing an input from its own output; recording the
+        /// input is the honest form.
+        struct ScreenshotGrid: Equatable {
+            let widthPx: Double
+            let heightPx: Double
+            /// The `screenshot_space` id the caller referenced, when the grid
+            /// came from a registered space rather than per-call dimensions.
+            /// Echoed in placement payloads so an agent can see WHICH mapping
+            /// answered, exactly as `verify_annotation`'s geometry path does.
+            let spaceId: String?
+        }
+
         let scaleX: Double
         let scaleY: Double
         let requiresUnitInterval: Bool
+        let screenshotGrid: ScreenshotGrid?
 
-        init(scaleX: Double, scaleY: Double, requiresUnitInterval: Bool = false) {
+        init(
+            scaleX: Double,
+            scaleY: Double,
+            requiresUnitInterval: Bool = false,
+            screenshotGrid: ScreenshotGrid? = nil
+        ) {
             self.scaleX = scaleX
             self.scaleY = scaleY
             self.requiresUnitInterval = requiresUnitInterval
+            self.screenshotGrid = screenshotGrid
         }
 
         /// Applies one axis of the public-coordinate transform without
@@ -149,6 +183,71 @@ struct DrawRequest {
                 return nil
             }
             return result
+        }
+
+        /// Fraction of the declared screenshot dimension a POSITION may lie
+        /// outside it before `sourceGeometryRejection` refuses the call. 5%
+        /// tolerates honest edge-of-image measurements (a control hugging a
+        /// screen edge, sub-pixel reads rounded past the boundary) while
+        /// still catching the mistake this check exists for, which
+        /// overshoots by ~100%: coordinates measured on the FULL-RESOLUTION
+        /// image while the client-resized dimensions were declared (or vice
+        /// versa) land at roughly 2x the declared extent, nowhere near this
+        /// margin.
+        private static let screenshotOvershootTolerance = 0.05
+
+        /// Rejects source geometry that provably was not measured on the
+        /// declared screenshot -- the one mistake in this family the existing
+        /// guards cannot see. The aspect and ambiguity guards check the
+        /// DIMENSIONS against the connected displays; nothing checked the
+        /// COORDINATES against the dimensions, so an agent that measured a
+        /// button at x=2200 on its full-resolution 2940-px screenshot but
+        /// declared the client-resized 1470x956 got every coordinate silently
+        /// doubled -- usually wholly off screen, reported as an ordinary
+        /// success. A position beyond the declared image cannot have been
+        /// measured on it, which makes this a rejection, not a guess.
+        ///
+        /// TWO deliberately different strictness levels:
+        /// - A POSITION (`text`/`image` top-left, a shape's centre or corner)
+        ///   must lie within the declared rect plus a small tolerance
+        ///   (`screenshotOvershootTolerance`) per axis.
+        /// - PATH BOUNDS need only INTERSECT the declared rect: a path's
+        ///   tight bounds legitimately overshoot the image when an arrow's
+        ///   control points swing wide, so only a path lying ENTIRELY
+        ///   outside the declared image -- which no measurement on that
+        ///   image can produce -- is rejected. Callers pass
+        ///   `positionIsBounds: true` for that laxer containment rule.
+        ///
+        /// Returns `nil` (no objection) for non-screenshot spaces: backing
+        /// and normalized callers declared no image for coordinates to
+        /// disagree with. `what` names the offending argument in the
+        /// caller's own vocabulary ("x/y", "center_x/center_y", "path
+        /// bounds") so the rejection reads as a one-argument correction.
+        func sourceGeometryRejection(
+            minX: Double, minY: Double, maxX: Double, maxY: Double,
+            what: String, positionIsBounds: Bool = false
+        ) -> String? {
+            guard let grid = screenshotGrid else { return nil }
+            let marginX = grid.widthPx * Self.screenshotOvershootTolerance
+            let marginY = grid.heightPx * Self.screenshotOvershootTolerance
+            let outside: Bool
+            if positionIsBounds {
+                // Entirely-outside test: no part of the bounds touches the
+                // declared rect even with the tolerance applied.
+                outside = maxX < -marginX || minX > grid.widthPx + marginX
+                    || maxY < -marginY || minY > grid.heightPx + marginY
+            } else {
+                outside = minX < -marginX || maxX > grid.widthPx + marginX
+                    || minY < -marginY || maxY > grid.heightPx + marginY
+            }
+            guard outside else { return nil }
+            Logger.shared.log(
+                "Drawing rejected: reason=geometry_outside_declared_screenshot minX=\(minX) minY=\(minY) maxX=\(maxX) maxY=\(maxY) screenshotWidth=\(grid.widthPx) screenshotHeight=\(grid.heightPx)",
+                level: "WARN"
+            )
+            let origin = grid.spaceId.map { "screenshot_space '\($0)' (\(Int(grid.widthPx))x\(Int(grid.heightPx)))" }
+                ?? "the declared \(Int(grid.widthPx))x\(Int(grid.heightPx)) screenshot"
+            return "\(what) lies outside \(origin): coordinates measured on that image can only fall within it, so these numbers were measured on a DIFFERENT image -- most commonly the full-resolution screenshot when the client-resized dimensions were declared, or vice versa. Nothing was drawn; re-measure on the image whose dimensions you declared, or declare (or register a screenshot_space with) the dimensions of the image you actually measured."
         }
     }
 
@@ -282,7 +381,13 @@ struct DrawRequest {
         case .failure(let err): return .failure(err)
         case .success(let resolved): request = resolved
         }
-        switch request.coordinateTransform(args: expandedArgs) {
+        // The ORIGINAL arguments' space id, not the expanded ones': expansion
+        // strips `screenshot_space` while injecting its dimensions, and the
+        // id survives here only as reporting provenance on the transform's
+        // `ScreenshotGrid` (a `null` does not count as supplied, the same
+        // `isSupplied` rule expansion itself applies).
+        let suppliedSpaceId = (args["screenshot_space"] is NSNull) ? nil : args["screenshot_space"] as? String
+        switch request.coordinateTransform(args: expandedArgs, screenshotSpaceId: suppliedSpaceId) {
         case .failure(let err): return .failure(err)
         case .success(let transform): return .success((request, transform))
         }
@@ -291,7 +396,15 @@ struct DrawRequest {
     /// Resolves public geometry coordinates into the backing-pixel geometry
     /// stored by annotations.  The old surface remains the default; source
     /// screenshot dimensions are deliberately required rather than guessed.
-    func coordinateTransform(args: [String: Any]) -> DrawOutcome<CoordinateTransform> {
+    ///
+    /// `screenshotSpaceId` is the `screenshot_space` id from the CALLER'S
+    /// ORIGINAL arguments, when one was supplied -- `ScreenshotSpaceExpansion`
+    /// strips the key while injecting the space's dimensions, so by the time
+    /// the expanded arguments reach this function the id is otherwise gone.
+    /// It is recorded purely as reporting provenance on the resulting
+    /// transform's `ScreenshotGrid` (placement echoes name the space that
+    /// answered); it changes no validation decision here.
+    func coordinateTransform(args: [String: Any], screenshotSpaceId: String? = nil) -> DrawOutcome<CoordinateTransform> {
         if args.keys.contains("coordinate_space"), !(args["coordinate_space"] is String) {
             return .failure("coordinate_space must be 'backing_pixels', 'normalized', or 'screenshot_pixels' when supplied.")
         }
@@ -451,7 +564,42 @@ struct DrawRequest {
                 )
                 return .failure("Ambiguous screenshot mapping rejected: source=\(width)x\(height) px matches \(accepting.count) connected displays (ids: \(accepting.map(\.id).joined(separator: ", "))) and no screen_id was supplied, so the annotation would have silently defaulted to display \(screen.id). A screenshot is the image of one specific display and its dimensions cannot say which. Nothing was drawn; retry with screen_id naming the display the screenshot was taken from.")
             }
-            return .success(CoordinateTransform(scaleX: scaleX, scaleY: scaleY))
+
+            // The DEFAULTED screen must itself be a plausible subject of this
+            // screenshot. The target guard above deliberately tolerates
+            // upscale ("a draw call names its display" -- but on this branch
+            // the caller named NOTHING and `screen` is the silently-defaulted
+            // main), and the ambiguity guard above only fires for MORE than
+            // one accepting display. Between them sat a silent-misplacement
+            // hole: a native 3840x2160 screenshot of a 4K SECONDARY display,
+            // drawn with no screen_id on a 2560x1440 main, has exactly ONE
+            // accepting display (the secondary -- the main fails the
+            // no-upscale rule), passes the upscale-tolerant target guard
+            // against the main (uniform 1.5, aspect exact), and painted on
+            // the WRONG PHYSICAL MONITOR with an ordinary success response.
+            // No screenshot pipeline upscales, so a defaulted screen the
+            // image cannot be a capture of is proof the caller meant a
+            // different display -- reject and name the display(s) the image
+            // DOES fit, the same one-argument correction the target guard's
+            // hint offers. When `accepting` is empty the dimensions fit NO
+            // connected display without upscaling; say that instead of
+            // pointing at a display list that does not exist.
+            if !screenIsDetermined, !accepting.contains(where: { $0.id == screen.id }) {
+                Logger.shared.log(
+                    "Drawing rejected: reason=defaulted_screen_not_plausible_capture sourceWidth=\(widthPixels) sourceHeight=\(heightPixels) defaultedScreenId=\(screen.id) acceptingScreenCount=\(accepting.count)",
+                    level: "WARN"
+                )
+                let direction = accepting.isEmpty
+                    ? "These dimensions match NO connected display without upscaling, so the image cannot be a full-display screenshot of any current display."
+                    : "These dimensions DO match connected display(s) \(accepting.map(\.id).joined(separator: ", ")); pass screen_id naming the display the screenshot was taken from."
+                return .failure("Screenshot mapping rejected: no screen_id was supplied, so the annotation would have defaulted to display \(screen.id) (\(screen.widthPx)x\(screen.heightPx) backing px) -- but a \(width)x\(height) px image cannot be a full-display screenshot of that display (no screenshot pipeline upscales). Drawing there would place every coordinate on the wrong physical monitor. Nothing was drawn. \(direction)")
+            }
+            return .success(CoordinateTransform(
+                scaleX: scaleX, scaleY: scaleY,
+                screenshotGrid: CoordinateTransform.ScreenshotGrid(
+                    widthPx: width, heightPx: height, spaceId: screenshotSpaceId
+                )
+            ))
         default:
             return .failure("coordinate_space must be 'backing_pixels', 'normalized', or 'screenshot_pixels'.")
         }
@@ -801,7 +949,8 @@ struct DrawRequest {
         paintedBounds: CGRect,
         resize: AnchorResizeBehavior,
         now: Date,
-        screenId: String? = nil
+        screenId: String? = nil,
+        screens: [ScreenInfo] = []
     ) -> DrawAnchorResolution? {
         // Every sample frame is SCREEN-LOCAL, not virtual-desktop geometry.
         // Comparing one display-local drawing rect against a window frame from
@@ -821,6 +970,15 @@ struct DrawRequest {
             target: AnchorWindowTarget(processId: processId, windowId: selected.windowId, appId: appId),
             referenceWindowFrame: AnchorRect(selected.frame),
             referenceScreenId: selected.screenId,
+            // Recorded at creation so the pin-mode density compensation
+            // (`AnchorAdjustment.mapping`'s referenceScreenScale/
+            // currentScreenScale -- see that function's doc comment) still
+            // knows the REFERENCE display's backing scale after that display
+            // disconnects; while it stays connected the tracker's live
+            // lookup by referenceScreenId resolves the same value. `screens`
+            // defaults to empty (recording nothing) purely so hand-built
+            // single-screen test fixtures stay source-compatible.
+            referenceScreenScale: screens.first(where: { $0.id == selected.screenId })?.backingScaleFactor,
             element: nil,
             createdAt: now
         )
@@ -883,7 +1041,8 @@ struct DrawRequest {
         let bounds = paintedBoundsOverride ?? (PaintedBounds.paintedBounds(of: kind) ?? .zero)
         guard let resolution = DrawRequest.buildWindowAnchor(
             processId: pid, appId: appId, samples: samples,
-            paintedBounds: bounds, resize: resize, now: Date(), screenId: screen.id
+            paintedBounds: bounds, resize: resize, now: Date(), screenId: screen.id,
+            screens: candidateScreens
         ) else {
             return .failure("anchor=\"window\" found no eligible on-screen window for \(displayName) (pid \(pid)) on display \(screen.id). Nothing was drawn: window frames are display-local and anchoring to a window on a different display would move the drawing into the wrong coordinate system. Bring that application's window onto the target display and retry, choose its screen_id, or draw without anchor.")
         }
@@ -918,10 +1077,93 @@ struct DrawRequest {
         return payload
     }
 
+    /// The validated draw-time placement-feedback request: whether the
+    /// response should carry a `painted` echo, whether an `expect_*`
+    /// expectation rides along, and whether its computed correction should
+    /// be applied in the same call. Parsed BEFORE the store insertion (cheap
+    /// string/shape checks only, per this file's standing reject-before-
+    /// heavier-work ordering), consumed after it.
+    struct PlacementFeedbackRequest {
+        let reportPlacement: Bool
+        let expectationSupplied: Bool
+        let applyCorrection: Bool
+    }
+
+    /// Validates the SHAPE of `report_placement`/`expect_*`/
+    /// `apply_correction` for one draw call -- no store access, no renders,
+    /// no AX. Deep expectation resolution (running the element lookup,
+    /// probing windows) happens after the annotation is stored, through the
+    /// SAME `resolveExpectationVerdict` `verify_annotation` uses; a
+    /// resolution failure there is reported INSIDE the success payload
+    /// (`expect.error`) rather than rejecting a draw whose geometry was
+    /// fully specified and already committed -- the drawing is real either
+    /// way, and silently discarding it because a verification RIDER failed
+    /// would throw away work the caller asked for. Shape mistakes, by
+    /// contrast, are rejected here before anything is drawn.
+    static func parsePlacementFeedbackArguments(
+        _ args: [String: Any],
+        transform: CoordinateTransform?
+    ) -> DrawOutcome<PlacementFeedbackRequest> {
+        let reportPlacement: Bool
+        if let raw = args["report_placement"], !(raw is NSNull) {
+            guard let value = raw as? Bool else {
+                return .failure("report_placement must be a boolean when supplied.")
+            }
+            reportPlacement = value
+        } else {
+            reportPlacement = false
+        }
+
+        if let rejection = AnnotationBoundsSupport.atMostOneExpectationRejection(args) {
+            return .failure(rejection)
+        }
+        let expectationKeys = AnnotationBoundsSupport.suppliedExpectationKeys(args)
+        for key in ["expect_element", "expect_window"] where expectationKeys.contains(key) {
+            guard args[key] is [String: Any] else {
+                return .failure("\(key) must be an object when supplied. Nothing was drawn.")
+            }
+        }
+        if expectationKeys.contains("target_bounds_screenshot_px") {
+            if case .failure(let error) = AnnotationBoundsSupport.parseTargetBounds(args) {
+                return .failure("\(error) Nothing was drawn.")
+            }
+            guard transform?.screenshotGrid != nil else {
+                return .failure("target_bounds_screenshot_px on a draw call requires a screenshot pixel grid to convert from: reference a screenshot_space, or use coordinate_space='screenshot_pixels' with screenshot_width/screenshot_height. Nothing was drawn; expect_element/expect_window need no grid, or add the grid this target was measured on.")
+            }
+        }
+
+        let applyCorrection: Bool
+        switch AnnotationBoundsSupport.parseApplyCorrection(args) {
+        case .failure(let error):
+            return .failure("\(error) Nothing was drawn.")
+        case .success(let value):
+            applyCorrection = value
+        }
+        if applyCorrection, expectationKeys.isEmpty {
+            return .failure("apply_correction requires an expectation to correct toward: supply exactly one of expect_element, expect_window, or target_bounds_screenshot_px alongside it. Nothing was drawn.")
+        }
+        return .success(PlacementFeedbackRequest(
+            reportPlacement: reportPlacement,
+            expectationSupplied: !expectationKeys.isEmpty,
+            applyCorrection: applyCorrection
+        ))
+    }
+
     /// Reads the arguments every draw tool shares beyond geometry
     /// (`color`/`app`), resolves the per-app link, builds and stores the
     /// `Annotation`, and returns the worded success text -- or propagates
     /// `resolveTargetApp`'s error text unchanged.
+    ///
+    /// `transform` is the SAME coordinate transform the caller's geometry
+    /// went through, handed in so the response can speak the caller's own
+    /// pixels: a screenshot-mapped call (a `screenshot_space`, or
+    /// `coordinate_space="screenshot_pixels"`) automatically earns a
+    /// `painted` echo reporting the exact painted bounds in BOTH backing and
+    /// screenshot pixels, and `target_bounds_screenshot_px` expectations
+    /// convert through it. `nil` (highlight_element's path -- its geometry
+    /// is AX-resolved backing pixels, and its response already reports the
+    /// matched element) disables only the screenshot-pixel half; `report_placement`
+    /// still works.
     func finish(
         args: [String: Any],
         defaultColor: String,
@@ -929,6 +1171,7 @@ struct DrawRequest {
         defaultsToGlobal: Bool,
         kind: AnnotationKind,
         noun: String,
+        transform: CoordinateTransform? = nil,
         resolvedTargetApp: AppRef? = nil,
         onAnnotationCreated: ((Annotation) -> Void)? = nil
     ) -> DrawOutcome<String> {
@@ -960,6 +1203,15 @@ struct DrawRequest {
         switch DrawRequest.parseAvoidanceArguments(args) {
         case .failure(let err): return .failure(err)
         case .success(let value): avoidanceRequest = value
+        }
+
+        // Same cheap-checks-first ordering as anchor/avoid above: a typo'd
+        // report_placement/expect_*/apply_correction must reject before any
+        // app resolution or store work runs.
+        let placementFeedback: PlacementFeedbackRequest
+        switch DrawRequest.parsePlacementFeedbackArguments(args, transform: transform) {
+        case .failure(let err): return .failure(err)
+        case .success(let value): placementFeedback = value
         }
 
         let appId: String?
@@ -1073,7 +1325,134 @@ struct DrawRequest {
         onAnnotationCreated?(annotation)
 
         let text = "Created \(noun) annotation: \(annotation.id)\(MCPServer.shared.linkageSuffix(appId: appId, appName: appName))"
-        guard anchorResolution != nil || avoidanceResolution != nil else {
+
+        // The placement echo fires for every screenshot-mapped call
+        // automatically -- a caller that measured its geometry on a
+        // screenshot is exactly the caller that needs to see where the paint
+        // actually landed, in its own pixels, without a second round trip --
+        // and for any other call that opted in with report_placement. An
+        // expectation implies it too: its verdict is computed FROM the same
+        // painted bounds, and reporting a verdict without the bounds it was
+        // judged against would make the answer uncheckable.
+        let wantsPaintedEcho = placementFeedback.reportPlacement
+            || placementFeedback.expectationSupplied
+            || transform?.screenshotGrid != nil
+        var paintedPayload: [String: Any]?
+        var expectPayload: [String: Any]?
+        if wantsPaintedEcho {
+            // One lease spans the echo render, the expectation's own render
+            // (skipped -- it reuses these bounds), and the post-correction
+            // re-measure, so a concurrent clear cannot yank raster assets
+            // out from under any of the three.
+            let lease = RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
+            var painted: CGRect?
+            var paintedUnavailable: String?
+            do {
+                painted = try AnnotationVerificationCompositor.renderedPaintedBounds(
+                    of: annotation, on: screen, rasterLease: lease
+                )
+                if painted == nil {
+                    paintedUnavailable = "The annotation was stored but painted no pixels anywhere on its \(screen.widthPx)x\(screen.heightPx) screen (\(screen.id)). Check that its coordinates fall inside that screen and that its stroke/fill colors and opacity are not fully transparent."
+                }
+            } catch {
+                paintedUnavailable = "The annotation was stored, but measuring its painted bounds failed: \(error.localizedDescription). Call get_annotation_bounds to retry the measurement."
+            }
+
+            var echo: [String: Any] = [:]
+            if let painted {
+                echo["paintedBoundsBackingPx"] = AnnotationBoundsSupport.rectPayload(painted)
+                echo["onScreenClipped"] = AnnotationGeometryVerdict.clippedAtScreenEdge(
+                    painted: painted, screenWidthPx: screen.widthPx, screenHeightPx: screen.heightPx
+                )
+                if let grid = transform?.screenshotGrid {
+                    let scaleX = grid.widthPx / Double(screen.widthPx)
+                    let scaleY = grid.heightPx / Double(screen.heightPx)
+                    echo["screenshotScale"] = ["x": scaleX, "y": scaleY]
+                    echo["paintedBoundsScreenshotPx"] = AnnotationBoundsSupport.rectPayload(
+                        AnnotationBoundsSupport.screenshotRect(backingRect: painted, scale: (scaleX, scaleY))
+                    )
+                    if let spaceId = grid.spaceId {
+                        echo["screenshotSpace"] = spaceId
+                    }
+                    // Style lengths deliberately do NOT go through the
+                    // coordinate transform (the documented contract), which
+                    // surprises agents that measured a stroke width on their
+                    // screenshot. Now that the echo carries the scale, say
+                    // it at the moment it matters instead of only in schema
+                    // prose the model may not have re-read.
+                    echo["styleDimensions"] = "backing_pixels"
+                    echo["styleNote"] = "stroke_width, dash, font_size, and padding_px were interpreted as BACKING pixels, not screenshot pixels; multiply by screenshotScale to convert a value you measured on your screenshot."
+                }
+            } else if let paintedUnavailable {
+                echo["paintedBoundsUnavailableReason"] = paintedUnavailable
+            }
+            // The same visibility diagnostic list_annotations/verify report,
+            // computed at response time: it catches the silent classic where
+            // a draw succeeds but linked to an app that is not frontmost, so
+            // nothing is on screen and the agent has no idea why.
+            let visibility = AnnotationVisibilityDiagnostic(
+                annotationsSuspended: OverlayWindowController.shared.isAnnotationsSuspended,
+                captureVisible: OverlayWindowController.shared.isCaptureVisible,
+                annotationAppId: annotation.appId,
+                activeAppId: ActiveAppTracker.shared.currentApp.bundleId,
+                anchorPermitsPainting: annotation.anchorPermitsPainting
+            )
+            echo["isVisibleNow"] = visibility.isVisibleNow
+            echo["wouldBeVisibleWithoutSuspension"] = visibility.wouldBeVisibleWithoutSuspension
+            echo["evidenceLevel"] = "renderer_geometry"
+            paintedPayload = echo
+
+            if placementFeedback.expectationSupplied {
+                switch MCPServer.shared.resolveExpectationVerdict(
+                    args: args, annotation: annotation, screen: screen, screens: candidateScreens,
+                    rasterLease: lease, precomputedPaintedBoundsBacking: painted,
+                    screenshotToBackingScale: transform?.screenshotGrid.map {
+                        (x: $0.widthPx / Double(screen.widthPx), y: $0.heightPx / Double(screen.heightPx))
+                    }
+                ) {
+                case .failure(let error):
+                    // The drawing is already committed and fully specified
+                    // by its own arguments; a failed verification RIDER must
+                    // not silently discard it. Loud inside the success
+                    // payload instead: the caller sees exactly what failed
+                    // and can verify_annotation with a corrected expectation
+                    // -- or clear and redraw -- without losing the work.
+                    expectPayload = [
+                        "error": error,
+                        "note": "The annotation WAS created (see annotationId); only this expectation failed to resolve. Fix the expectation and re-check with verify_annotation, or clear the annotation if it should not stay."
+                    ]
+                case .success(let verdict):
+                    if let verdict {
+                        var resolved = verdict.payload
+                        if placementFeedback.applyCorrection {
+                            if let corrected = verdict.correctedOffset {
+                                resolved["appliedCorrection"] = MCPServer.shared.applyCorrectionAndReport(
+                                    annotationId: annotation.id,
+                                    expectedRevision: annotation.revision,
+                                    correctedOffsetX: corrected.offsetX,
+                                    correctedOffsetY: corrected.offsetY,
+                                    targetBoundsBacking: verdict.targetBoundsBacking,
+                                    screen: screen,
+                                    screenshotScale: transform?.screenshotGrid.map {
+                                        (x: $0.widthPx / Double(screen.widthPx), y: $0.heightPx / Double(screen.heightPx))
+                                    }
+                                )
+                            } else {
+                                resolved["appliedCorrection"] = [
+                                    "applied": false,
+                                    "reason": "No correction could be computed (see correctionUnavailableReason), so there was nothing to apply."
+                                ] as [String: Any]
+                            }
+                        }
+                        expectPayload = resolved
+                    }
+                }
+            }
+            _ = lease
+        }
+
+        guard anchorResolution != nil || avoidanceResolution != nil
+                || paintedPayload != nil || expectPayload != nil else {
             // Unanchored -- BY FAR the common case -- keeps today's exact
             // plain-text response, byte for byte: existing callers (and
             // `test_mcp_stdio.py`'s `"annotation: " `-splitting parse of this
@@ -1084,7 +1463,9 @@ struct DrawRequest {
         // Opt-in structured features return one JSON object carrying the
         // unchanged human-readable message plus their metadata. An anchored
         // avoidance call includes both blocks; neither feature changes the
-        // absent-feature legacy response above.
+        // absent-feature legacy response above. (A screenshot-mapped call
+        // counts as opted in: declaring a screenshot grid is exactly the
+        // measured-from-an-image workflow the `painted` echo exists for.)
         var payload: [String: Any] = [
             "message": text,
             "annotationId": annotation.id
@@ -1094,6 +1475,12 @@ struct DrawRequest {
         }
         if let avoidanceResolution {
             payload["placement"] = DrawRequest.avoidanceResponsePayload(avoidanceResolution)
+        }
+        if let paintedPayload {
+            payload["painted"] = paintedPayload
+        }
+        if let expectPayload {
+            payload["expect"] = expectPayload
         }
         guard let jsonText = MCPServer.shared.jsonString(payload) else {
             return .failure("Created \(noun) annotation \(annotation.id), but failed to encode its placement metadata in the response. The annotation was still stored; call list_annotations and get_annotation_bounds to inspect it.")

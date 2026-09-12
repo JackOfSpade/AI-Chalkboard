@@ -123,6 +123,87 @@ public struct ScreenSnapshot {
     }
 }
 
+/// Which reading of the display layout `screenSnapshot(freshness:)` serves.
+///
+/// `.cached` is the default and what every ordinary per-call consumer wants:
+/// one coherent, immutable snapshot with no presentation-thread hop. `.live`
+/// exists for exactly one caller shape -- a change-DETECTION re-read taken
+/// after a long-running operation (the post-walk guards in
+/// `MCPToolHandlers+Highlight.swift`, `MCPToolHandlers+Verification.swift`,
+/// and `MCPToolHandlers+ScreenshotSpace.swift`'s calibrate-from-elements
+/// path), whose entire purpose is to observe a layout DIFFERENT from the one
+/// an earlier read returned. Serving both reads from the same cached value
+/// would make such a guard pass trivially whenever the reconfiguration's
+/// notification has not yet been processed; `.live` restores the pre-cache
+/// semantics those guards were written against.
+public enum ScreenSnapshotFreshness {
+    /// Serve the notification-invalidated cached snapshot when one exists;
+    /// build fresh (with a presentation-thread hop) only before the first
+    /// display-change/startup rebuild has populated the cache.
+    case cached
+    /// Always rebuild on the presentation thread, bypassing the cache. Costs
+    /// the main-thread hop the cache exists to avoid -- reach for this only
+    /// when observing a layout CHANGE is the point of the read.
+    case live
+}
+
+/// The lock box behind `OverlayWindowController.screenSnapshot(freshness:)`
+/// on macOS: at most one immutable `ScreenSnapshot`, replaced wholesale by
+/// its single writer and read under a lock from any thread.
+///
+/// SINGLE-WRITER DISCIPLINE, deliberately: `store(_:)` is called from exactly
+/// one place -- the display-change handler that also rebuilds the overlay
+/// windows (`rebuildOverlayWindows()`, reached from `setup()` and from
+/// `NSApplication.didChangeScreenParametersNotification`). `read` never
+/// writes back, even on a `.live` rebuild or a cold-start fallback build.
+/// Two reasons:
+///
+///   1. A fallback build can run mid-reconfiguration, exactly when
+///      `NSScreen.screens` can be momentarily empty (see
+///      `screenSnapshot(freshness:)`'s doc comment). Writing that reading
+///      into the cache would poison every subsequent call until the next
+///      notification; NOT writing it means a degenerate reading is consumed
+///      once, by the one call that was unlucky, and nobody else.
+///   2. It keeps "the cache is exactly as old as the overlay windows" a true
+///      statement -- both are rebuilt by the same handler, from the same
+///      main-thread turn -- which is the honesty claim the staleness story in
+///      `screenSnapshot(freshness:)` rests on.
+///
+/// `read` releases the lock BEFORE invoking `rebuild`: the rebuild closure
+/// hops to the presentation thread, and the presentation thread is also
+/// where `store(_:)` runs, so holding the lock across the hop would be a
+/// deadlock waiting for a display change to trigger it.
+final class ScreenSnapshotCache {
+    private let lock = NSLock()
+    private var value: ScreenSnapshot?
+
+    init() {}
+
+    /// Replaces the cached snapshot. Single caller: the display-change
+    /// handler that rebuilds the overlay windows (see the class doc comment).
+    func store(_ snapshot: ScreenSnapshot) {
+        lock.lock()
+        value = snapshot
+        lock.unlock()
+    }
+
+    /// Serves the cached snapshot for `.cached` reads when populated;
+    /// otherwise (cold start, or `.live`) returns `rebuild()`'s result
+    /// WITHOUT caching it -- see the class doc comment for why the fallback
+    /// build must not become the cached value.
+    func read(freshness: ScreenSnapshotFreshness, rebuild: () -> ScreenSnapshot) -> ScreenSnapshot {
+        if freshness == .cached {
+            lock.lock()
+            let cached = value
+            lock.unlock()
+            if let cached {
+                return cached
+            }
+        }
+        return rebuild()
+    }
+}
+
 #if os(macOS)
 import AppKit
 
@@ -134,12 +215,14 @@ extension OverlayWindowController {
         return String(index)
     }
 
-    /// Takes one snapshot of the display layout with a single main-thread hop,
-    /// then answers every screen question a single MCP tool call needs to ask
-    /// against that same snapshot.
+    /// Takes one snapshot of the display layout -- served from the
+    /// notification-invalidated cache with NO main-thread hop in the steady
+    /// state -- then answers every screen question a single MCP tool call
+    /// needs to ask against that same snapshot.
     ///
-    /// WHY: the old shape -- `resolveScreenId(_:)` and `getScreenInfos()`
-    /// called separately per tool call -- did two independent
+    /// WHY ONE SNAPSHOT PER CALL (unchanged from the pre-cache design): the
+    /// old shape -- `resolveScreenId(_:)` and `getScreenInfos()` called
+    /// separately per tool call -- did two independent
     /// `DispatchQueue.main.sync` + `NSScreen.screens` reads per draw call, and
     /// those two reads were not atomic with each other: the display layout can
     /// change in the gap between them (display reconfiguration/wake is
@@ -149,11 +232,54 @@ extension OverlayWindowController {
     /// returned nil -- producing an annotation permanently orphaned on a
     /// screen id no view will ever match, because the id and its dimensions
     /// were resolved against two different readings of the screen list.
-    /// Taking one snapshot up front and answering every question against THAT
-    /// snapshot closes both the double-hop cost and this TOCTOU gap.
-    public func screenSnapshot() -> ScreenSnapshot {
-        return MainThread.sync {
-            ScreenSnapshot(screens: buildScreenInfos())
+    /// A single snapshot per call closes that TOCTOU gap, and a cached
+    /// IMMUTABLE value preserves it BY CONSTRUCTION: whichever
+    /// `ScreenSnapshot` a call gets handed, every question that call asks is
+    /// answered against that one value -- there is no second read left to
+    /// disagree with the first. The TOCTOU the one-hop design fixed was two
+    /// INDEPENDENT reads straddling a reconfiguration; a
+    /// notification-invalidated cache still has exactly one source.
+    ///
+    /// WHY IT IS NOW CACHED: the per-call `MainThread.sync` rebuild
+    /// (`NSScreen.screens` walk + `localizedName` + `CGDisplayBounds` per
+    /// display) ran on EVERY MCP call that touches geometry -- every draw,
+    /// `get_screens`, `get_overlay_state`, `update_annotation`, and up to
+    /// three times per screenshot_space-referencing call through expansion +
+    /// resolve -- plus `AnchorTracker`'s sampling loop at up to 30Hz. Each
+    /// hop queues behind whatever the main thread is doing; during draw
+    /// bursts that is the previous draw's full-view repaint, so call N's
+    /// repaint sat directly in call N+1's response path. The cache is
+    /// populated on the main thread at startup and re-populated by
+    /// `rebuildOverlayWindows()` from the SAME
+    /// `NSApplication.didChangeScreenParametersNotification` handler that
+    /// rebuilds the overlay windows, so the cache and the windows change
+    /// together, in the same main-thread turn.
+    ///
+    /// STALENESS, HONESTLY: between an actual hardware change and that
+    /// notification's delivery there is a window where the cache is stale.
+    /// But the notification is the SAME signal the overlay windows themselves
+    /// rebuild on -- until it lands, the live windows are sized and
+    /// positioned for the OLD layout too -- so a stale cached read is exactly
+    /// as stale as the windows every annotation is actually painted into.
+    /// (AppKit's own `NSScreen` list is likewise refreshed as the app
+    /// processes the same reconfiguration event, so even a forced rebuild in
+    /// that window is not a hotline to the hardware.) What the cache DOES
+    /// give up is change DETECTION: a deliberate re-read taken to notice a
+    /// mid-operation reconfiguration would, served from the cache, compare a
+    /// value against itself whenever the notification has not yet been
+    /// processed. Callers whose second read exists to detect change --
+    /// the post-walk guards named on `ScreenSnapshotFreshness` -- must pass
+    /// `.live`, which forces the pre-cache presentation-thread rebuild.
+    ///
+    /// THREADING: callable both off the main thread and on it. The cached
+    /// path takes only an `NSLock` (no hop, no deadlock either way); the
+    /// `.live`/cold-start path goes through `MainThread.sync`, which runs the
+    /// work inline when already on main rather than re-dispatching.
+    public func screenSnapshot(freshness: ScreenSnapshotFreshness = .cached) -> ScreenSnapshot {
+        screenSnapshotCache.read(freshness: freshness) {
+            MainThread.sync {
+                ScreenSnapshot(screens: buildScreenInfos())
+            }
         }
     }
 
@@ -211,13 +337,26 @@ import WinSDK
 extension OverlayWindowController {
     /// Takes one snapshot of the Windows display layout and answers every
     /// screen question a single MCP tool call needs to ask against it -- the
-    /// same contract `screenSnapshot()` documents on macOS above, minus that
-    /// branch's specific TOCTOU story (`EnumDisplayMonitors` plus one
-    /// `GetMonitorInfoW`/`GetDpiForMonitor` pair per handle is a synchronous,
-    /// single-threaded walk on the UI thread, not two independently-timed
-    /// reads of a value that can change out from under them).
-    public func screenSnapshot() -> ScreenSnapshot {
-        WindowsUIThread.shared.sync {
+    /// same contract `screenSnapshot(freshness:)` documents on macOS above,
+    /// minus that branch's specific TOCTOU story (`EnumDisplayMonitors` plus
+    /// one `GetMonitorInfoW`/`GetDpiForMonitor` pair per handle is a
+    /// synchronous, single-threaded walk on the UI thread, not two
+    /// independently-timed reads of a value that can change out from under
+    /// them).
+    ///
+    /// `freshness` is accepted for signature parity with the macOS overload
+    /// -- shared MCP code passes `.live` at its post-walk change-detection
+    /// sites and must compile identically on both platforms -- but there is
+    /// NO cache behind it here: both values build live on the UI thread,
+    /// exactly as this method always has. That makes `.live`'s
+    /// change-detection contract trivially satisfied on this platform rather
+    /// than silently weaker. If the macOS branch's cache is ever wanted here
+    /// too, `handleDisplayOrDpiChange()`/`rebuildOverlayWindows()` is the
+    /// invalidation hook that plays the role
+    /// `didChangeScreenParametersNotification` plays there.
+    public func screenSnapshot(freshness: ScreenSnapshotFreshness = .cached) -> ScreenSnapshot {
+        _ = freshness
+        return WindowsUIThread.shared.sync {
             ScreenSnapshot(screens: self.buildScreenInfos())
         }
     }

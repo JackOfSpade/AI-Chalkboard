@@ -537,14 +537,28 @@ enum AnnotationVerificationCompositor {
     ) throws -> (bitmap: NSBitmapImageRep, paintedBounds: CGRect?) {
         // Rendering genuinely needs the main thread -- it goes through
         // AppKit/Core Graphics state (NSGraphicsContext.current, the shared
-        // graphics-state stack). This is race-free: the returned bitmap is a
-        // freshly allocated, self-owned `NSBitmapImageRep` (never a
-        // CGImage-backed or otherwise lazily-produced one -- see
-        // `makeBitmap`), fully written by `flushGraphics()` before this block
-        // returns it, and nothing mutates it afterwards. Handing it from the
-        // main thread to the calling thread here is a one-way, one-time
-        // transfer, not concurrent access.
-        try MainThread.sync {
+        // graphics-state stack). The painted-bounds SCAN does not, so the
+        // `MainThread.sync` block below ends at `flushGraphics()` and
+        // returns only the bitmap; `paintedPixelBounds(in:)` then runs on
+        // the CALLING thread, after the block. That split is the exact
+        // promise `composite(...)`'s own comment above makes ("scanning 20
+        // megapixels ... on the main thread would block AppKit's run
+        // loop"): the scan reads up to `maxImagePixels` of buffer (a full
+        // 5K display is ~14.7 million pixels), every caller reaches this
+        // helper from the MCP background queue, and
+        // `DrawRequest.resolveAvoidance` performs up to 32 avoided-id
+        // measurements plus a bounded convergence loop of them per avoid=
+        // draw -- scanning inside the sync block would stall window
+        // ordering, all other queued `MainThread.sync` work, and the
+        // overlay's own repaints for every one of those scans in turn.
+        //
+        // Handing the bitmap across threads is race-free: it is a freshly
+        // allocated, self-owned `NSBitmapImageRep` (never a CGImage-backed
+        // or otherwise lazily-produced one -- see `makeBitmap`), fully
+        // written by `flushGraphics()` before this block returns it, and
+        // nothing mutates it afterwards. Main thread to calling thread is a
+        // one-way, one-time transfer, not concurrent access.
+        let overlayRep: NSBitmapImageRep = try MainThread.sync {
             guard let overlayRep = makeBitmap(width: widthPx, height: heightPx),
                   let overlayContext = NSGraphicsContext(bitmapImageRep: overlayRep) else {
                 throw AnnotationVerificationError.renderFailed
@@ -586,8 +600,9 @@ enum AnnotationVerificationCompositor {
             cgContext.restoreGState()
             overlayContext.flushGraphics()
             NSGraphicsContext.restoreGraphicsState()
-            return (overlayRep, paintedPixelBounds(in: overlayRep))
+            return overlayRep
         }
+        return (overlayRep, paintedPixelBounds(in: overlayRep))
     }
 
     /// Renders `annotation` ALONE into a transparent bitmap the size of
@@ -615,11 +630,26 @@ enum AnnotationVerificationCompositor {
     /// "annotation alone" pass. Nothing here calls `CGDisplayCreateImage`,
     /// `CGWindowListCreateImage`, ScreenCaptureKit, `screencapture`, or any
     /// other capture entry point.
+    ///
+    /// CACHED: an unchanged annotation's painted bounds are a pure function
+    /// of the cache key (see `PaintedBoundsCacheKey`'s doc comment for the
+    /// field-by-field invalidation reasoning), so this consults
+    /// `paintedBoundsCache` before rendering and populates it after -- a
+    /// repeat measurement of an unchanged annotation costs a dictionary
+    /// lookup instead of a full-display render plus scan, which is what
+    /// `DrawRequest.resolveAvoidance` pays up to 32 times per avoid= draw.
+    /// `composite(...)` deliberately does NOT use this cache: it renders at
+    /// the screenshot's dimensions, not the screen's, and needs the bitmap
+    /// itself, not just the bounds.
     static func renderedPaintedBounds(
         of annotation: Annotation,
         on screen: ScreenInfo,
         rasterLease: RasterAssetStore.Lease? = nil
     ) throws -> CGRect? {
+        let cacheKey = paintedBoundsCacheKey(for: annotation, on: screen)
+        if let cacheKey, let cached = paintedBoundsCache.lookup(cacheKey) {
+            return cached.bounds
+        }
         let lease = rasterLease ?? RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
         let (_, bounds) = try renderAnnotationAlone(
             annotation,
@@ -628,43 +658,30 @@ enum AnnotationVerificationCompositor {
             backingScaleFactor: screen.backingScaleFactor,
             lease: lease
         )
+        if let cacheKey {
+            paintedBoundsCache.store(bounds, for: cacheKey)
+        }
         return bounds
     }
 
     /// Returns painted bounds in raw bitmap row coordinates (top-left origin).
     /// The bitmap starts transparent, so any non-zero byte identifies an
     /// antialiased annotation pixel regardless of channel byte ordering.
+    /// Delegates to the platform-neutral word-scanning core -- see
+    /// `paintedPixelBounds(bytes:width:height:bytesPerPixel:bytesPerRow:)`
+    /// below for why eight-bytes-per-load scanning returns bit-identical
+    /// answers to the byte-at-a-time loop it replaced.
     private static func paintedPixelBounds(in bitmap: NSBitmapImageRep) -> CGRect? {
         guard let data = bitmap.bitmapData, bitmap.samplesPerPixel >= 4 else { return nil }
-        let width = bitmap.pixelsWide
-        let height = bitmap.pixelsHigh
         let bytesPerPixel = bitmap.bitsPerPixel / 8
-        let bytesPerRow = bitmap.bytesPerRow
         guard bytesPerPixel >= 4 else { return nil }
-
-        var minX = width
-        var minY = height
-        var maxX = -1
-        var maxY = -1
-        for y in 0..<height {
-            let row = data.advanced(by: y * bytesPerRow)
-            for x in 0..<width {
-                let pixel = row.advanced(by: x * bytesPerPixel)
-                var painted = false
-                for channel in 0..<bytesPerPixel where pixel[channel] != 0 {
-                    painted = true
-                    break
-                }
-                if painted {
-                    minX = min(minX, x)
-                    minY = min(minY, y)
-                    maxX = max(maxX, x)
-                    maxY = max(maxY, y)
-                }
-            }
-        }
-        guard maxX >= minX, maxY >= minY else { return nil }
-        return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+        return paintedPixelBounds(
+            bytes: UnsafeRawPointer(data),
+            width: bitmap.pixelsWide,
+            height: bitmap.pixelsHigh,
+            bytesPerPixel: bytesPerPixel,
+            bytesPerRow: bitmap.bytesPerRow
+        )
     }
     #elseif os(Windows)
     /// A read-only view over a screenshot's raw premultiplied-BGRA pixel
@@ -998,31 +1015,20 @@ enum AnnotationVerificationCompositor {
     /// any non-zero byte identifies an antialiased annotation pixel --
     /// channel-ordering-agnostic, exactly like the macOS branch's matching
     /// scan, so this works unchanged whether the buffer is BGRA (GDI+'s own
-    /// format) or any other 4-byte-per-pixel layout.
+    /// format) or any other 4-byte-per-pixel layout. Delegates to the SAME
+    /// platform-neutral word-scanning core the macOS branch uses -- see
+    /// `paintedPixelBounds(bytes:width:height:bytesPerPixel:bytesPerRow:)`
+    /// below -- so the two platforms cannot drift on what "painted" means,
+    /// the same one-implementation guarantee `renderAnnotationAlone`'s doc
+    /// comment makes for the render half.
     private static func paintedPixelBounds(bytes: UnsafeMutablePointer<UInt8>, width: Int, height: Int, stride: Int) -> CGRect? {
-        var minX = width
-        var minY = height
-        var maxX = -1
-        var maxY = -1
-        for y in 0..<height {
-            let row = bytes.advanced(by: y * stride)
-            for x in 0..<width {
-                let pixel = row.advanced(by: x * 4)
-                var painted = false
-                for channel in 0..<4 where pixel[channel] != 0 {
-                    painted = true
-                    break
-                }
-                if painted {
-                    minX = min(minX, x)
-                    minY = min(minY, y)
-                    maxX = max(maxX, x)
-                    maxY = max(maxY, y)
-                }
-            }
-        }
-        guard maxX >= minX, maxY >= minY else { return nil }
-        return CGRect(x: CGFloat(minX), y: CGFloat(minY), width: CGFloat(maxX - minX + 1), height: CGFloat(maxY - minY + 1))
+        paintedPixelBounds(
+            bytes: UnsafeRawPointer(bytes),
+            width: width,
+            height: height,
+            bytesPerPixel: 4,
+            bytesPerRow: stride
+        )
     }
 
     /// Renders `annotation` ALONE onto a fresh `widthPx`x`heightPx`
@@ -1078,21 +1084,384 @@ enum AnnotationVerificationCompositor {
     /// `screen`, with no screenshot involved and no capture API touched), so
     /// `get_annotation_bounds`'s one call site compiles and behaves
     /// identically on both platforms. See that overload's doc comment for
-    /// the full contract.
+    /// the full contract, including the shared `paintedBoundsCache` this
+    /// consults and populates for the same reason (the cache and its key are
+    /// pure Foundation, so both platforms share one implementation of them).
     static func renderedPaintedBounds(
         of annotation: Annotation,
         on screen: ScreenInfo,
         rasterLease: RasterAssetStore.Lease? = nil
     ) throws -> CGRect? {
+        let cacheKey = paintedBoundsCacheKey(for: annotation, on: screen)
+        if let cacheKey, let cached = paintedBoundsCache.lookup(cacheKey) {
+            return cached.bounds
+        }
         let lease = rasterLease ?? RasterAssetStore.shared.lease(ids: annotation.kind.rasterAssetIds)
         let (_, bounds) = try renderAnnotationAlone(
             annotation, widthPx: screen.widthPx, heightPx: screen.heightPx,
             pointsSize: CGSize(width: screen.widthPt, height: screen.heightPt),
             backingScaleFactor: screen.backingScaleFactor, lease: lease
         )
+        if let cacheKey {
+            paintedBoundsCache.store(bounds, for: cacheKey)
+        }
         return bounds
     }
     #endif
+
+    /// THE ONE PAINTED-BOUNDS SCAN, shared by both platforms' wrappers
+    /// (macOS's `paintedPixelBounds(in:)` over an `NSBitmapImageRep`,
+    /// Windows's `paintedPixelBounds(bytes:width:height:stride:)` over a
+    /// GDI+ target's raw buffer) so the two can never disagree about what
+    /// "painted" means -- the same one-implementation reasoning
+    /// `renderAnnotationAlone`'s doc comment gives for the render half.
+    /// Internal rather than private so the scalar-equivalence tests can
+    /// drive it directly with synthetic buffers, the same pure-static,
+    /// testable shape `ambiguousDisplayRejection` below uses.
+    ///
+    /// PREDICATE (unchanged from the byte-at-a-time loop this replaced):
+    /// pixel `x` of a row is painted iff ANY of its `bytesPerPixel` bytes is
+    /// non-zero. The canvas starts fully transparent (`CGContext.clear` on
+    /// macOS, `chalk_rt_create` on Windows -- both zero every byte), so a
+    /// non-zero byte in any channel, under any channel ordering, can only
+    /// mean the renderer painted there.
+    ///
+    /// WHY WORD-SCANNING IS BIT-IDENTICAL TO THE SCALAR SCAN: almost every
+    /// row of a full-display canvas is entirely zero, and per row this
+    /// scan's job reduces to "index of the first non-zero byte and of the
+    /// last" within the row's `width * bytesPerPixel` payload bytes (padding
+    /// bytes beyond them, when `bytesPerRow` is larger, are never read --
+    /// the scalar loop's per-pixel ranges never touched them either). A
+    /// `UInt64` load reads exactly eight of those bytes and is non-zero IFF
+    /// at least one of them is: endianness only permutes WHICH bit positions
+    /// a byte's value lands in, never whether any bit is set. So the word
+    /// loop accepts and rejects exactly the byte ranges the scalar loop did,
+    /// and on the first non-zero word it drops back to bytes to recover the
+    /// precise index. The short byte-at-a-time prologue/epilogue exist only
+    /// because an aligned `UInt64` load requires an 8-byte-aligned address
+    /// and a row tail can be narrower than a word. Mapping byte indices back
+    /// to pixels is exact integer division: pixel `x` owns exactly bytes
+    /// `[x * bytesPerPixel, (x + 1) * bytesPerPixel)`, so `firstNonZeroByte
+    /// / bytesPerPixel` IS the row's minimum painted x and `lastNonZeroByte
+    /// / bytesPerPixel` its maximum; scanning rows in the same ascending
+    /// order yields the same minY/maxY.
+    static func paintedPixelBounds(
+        bytes: UnsafeRawPointer,
+        width: Int,
+        height: Int,
+        bytesPerPixel: Int,
+        bytesPerRow: Int
+    ) -> CGRect? {
+        guard width > 0, height > 0, bytesPerPixel > 0 else { return nil }
+        let rowByteCount = width * bytesPerPixel
+        var minX = width
+        var minY = height
+        var maxX = -1
+        var maxY = -1
+        for y in 0..<height {
+            let row = bytes + y * bytesPerRow
+            guard let firstByte = firstNonZeroByteIndex(in: row, count: rowByteCount) else { continue }
+            // A row with a first non-zero byte necessarily has a last one
+            // (they coincide for a single painted byte), so the fallback
+            // exists only to satisfy the optional, never to run.
+            let lastByte = lastNonZeroByteIndex(in: row, count: rowByteCount) ?? firstByte
+            minX = min(minX, firstByte / bytesPerPixel)
+            maxX = max(maxX, lastByte / bytesPerPixel)
+            minY = min(minY, y)
+            maxY = y
+        }
+        guard maxX >= minX, maxY >= minY else { return nil }
+        return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+
+    /// Forward half of the word scan: index of the first non-zero byte in
+    /// `row[0..<count]`, or nil when every byte is zero. Layout: a scalar
+    /// prologue walks up to the first 8-byte-aligned address, aligned
+    /// `UInt64` loads cover the whole words, and a scalar epilogue covers
+    /// the sub-word tail -- see `paintedPixelBounds(bytes:...)`'s doc
+    /// comment for why this partition reads exactly the same bytes to
+    /// exactly the same verdict as a plain byte loop.
+    private static func firstNonZeroByteIndex(in row: UnsafeRawPointer, count: Int) -> Int? {
+        let alignedStart = min((8 - (Int(bitPattern: row) & 7)) & 7, count)
+        var index = 0
+        while index < alignedStart {
+            if row.load(fromByteOffset: index, as: UInt8.self) != 0 { return index }
+            index += 1
+        }
+        let alignedEnd = alignedStart + ((count - alignedStart) & ~7)
+        while index < alignedEnd {
+            if row.load(fromByteOffset: index, as: UInt64.self) != 0 {
+                for byteOffset in index..<(index + 8) where row.load(fromByteOffset: byteOffset, as: UInt8.self) != 0 {
+                    return byteOffset
+                }
+            }
+            index += 8
+        }
+        while index < count {
+            if row.load(fromByteOffset: index, as: UInt8.self) != 0 { return index }
+            index += 1
+        }
+        return nil
+    }
+
+    /// Backward twin of `firstNonZeroByteIndex(in:count:)`: index of the
+    /// LAST non-zero byte, scanning tail-first so a row whose paint hugs its
+    /// right edge is answered without touching the zero bytes before it.
+    /// Same alignment partition as the forward scan, walked in reverse.
+    private static func lastNonZeroByteIndex(in row: UnsafeRawPointer, count: Int) -> Int? {
+        let alignedStart = min((8 - (Int(bitPattern: row) & 7)) & 7, count)
+        let alignedEnd = alignedStart + ((count - alignedStart) & ~7)
+        var index = count - 1
+        while index >= alignedEnd {
+            if row.load(fromByteOffset: index, as: UInt8.self) != 0 { return index }
+            index -= 1
+        }
+        var wordIndex = alignedEnd - 8
+        while wordIndex >= alignedStart {
+            if row.load(fromByteOffset: wordIndex, as: UInt64.self) != 0 {
+                var byteOffset = wordIndex + 7
+                while byteOffset >= wordIndex {
+                    if row.load(fromByteOffset: byteOffset, as: UInt8.self) != 0 { return byteOffset }
+                    byteOffset -= 1
+                }
+            }
+            wordIndex -= 8
+        }
+        index = alignedStart - 1
+        while index >= 0 {
+            if row.load(fromByteOffset: index, as: UInt8.self) != 0 { return index }
+            index -= 1
+        }
+        return nil
+    }
+
+    /// Complete identity of one `renderedPaintedBounds` answer: EVERY input
+    /// that can change where the lone render of an annotation paints is a
+    /// stored property here, so key equality implies a pixel-identical
+    /// render. The verified invalidation reasoning, field by field:
+    ///
+    /// * `annotationId` + `revision`: `AnnotationStore` assigns a fresh
+    ///   `revision` (`nextRevision()`) on EVERY content mutation -- add,
+    ///   replace, and all `updateWithOutcome` variants -- so any change to a
+    ///   STORED annotation's kind, color, opacity, offsets, or anchor
+    ///   retires its key. The single revision-preserving store mutation is
+    ///   `applyAnchorProjections` (deliberately so; see its doc comment),
+    ///   and the render consumes a projection ONLY through
+    ///   `effectiveAdjustment` -- keyed below -- and `effectiveScreenId`,
+    ///   which changes the `screen` a caller resolves and is keyed as
+    ///   `screenId`. A projection's tracking `state` is deliberately NOT
+    ///   keyed: `renderAnnotationAlone` renders unconditionally
+    ///   (`AnnotationRenderer.drawAnnotations` never reads
+    ///   `anchorPermitsPainting`; visibility filtering lives in callers), so
+    ///   a `.tracking`/`.hidden`/`.lost` flip cannot change this answer.
+    /// * `contentFingerprint`: a hash of the exact rendering payload --
+    ///   `kind`, `colorHex`, `opacity`, `offsetX`, `offsetY`, the only
+    ///   `Annotation` fields `drawAnnotations` reads besides
+    ///   `effectiveAdjustment`. id+revision already identify a STORED
+    ///   annotation's content, but this function also measures values that
+    ///   never passed through a store -- `DrawRequest.resolveAvoidance`'s
+    ///   prospective candidates and hand-built test annotations, all at
+    ///   revision 0 -- where id+revision alone cannot identify content. The
+    ///   fingerprint makes the key total instead of trusting provenance the
+    ///   function signature cannot see.
+    /// * Screen geometry (`screenId`, `widthPx`/`heightPx`,
+    ///   `widthPt`/`heightPt`, `backingScaleFactor`): every geometric input
+    ///   `renderAnnotationAlone` consumes -- the physical output resolution,
+    ///   the point canvas it scales up from, and the stroke/font scale via
+    ///   `OverlayDrawingMetrics.rendererScaleFactor`. `widthPt`/`heightPt`
+    ///   are keyed in their own right rather than assumed derivable as
+    ///   px / scale, so a display whose point size disagrees with that
+    ///   arithmetic can never alias another display's key.
+    /// * `adjustment*`: the four components of `effectiveAdjustment`
+    ///   (static ∘ live) -- the exact composed transform the renderer
+    ///   applies, however the tracker got there.
+    ///
+    /// RASTER ASSETS need no field of their own: an image kind's asset ids
+    /// are part of `kind` (fingerprinted above, and revision-bumped when
+    /// changed), and `RasterAssetStore` ids are server-generated UUIDs whose
+    /// decoded pixels are immutable from `load(path:)` to `release(id:)` --
+    /// the store has no replace-in-place. Every release site is either a
+    /// draw request rolling back assets it loaded itself before any
+    /// annotation stored them, or the store releasing a REMOVED/REPLACED
+    /// annotation's assets -- itself a revision-assigning or id-retiring
+    /// event -- so equal keys can never observe two different images behind
+    /// one asset id. The one theoretical divergence: re-measuring a stale
+    /// `Annotation` value AFTER its removal released its assets, WITHOUT the
+    /// pinned lease every production caller captures atomically with its
+    /// snapshot (`AnnotationStore.renderSnapshots`); a fresh render would
+    /// then paint no image where the cached answer measured one. That is a
+    /// race with no defined correct answer, every real call site pins the
+    /// lease that prevents it, and the cached answer is the one the
+    /// annotation actually had while it existed.
+    struct PaintedBoundsCacheKey: Hashable {
+        let annotationId: String
+        let revision: UInt64
+        let contentFingerprint: Int
+        let screenId: String
+        let widthPx: Int
+        let heightPx: Int
+        let widthPt: Double
+        let heightPt: Double
+        let backingScaleFactor: Double
+        let adjustmentScaleX: Double
+        let adjustmentScaleY: Double
+        let adjustmentTranslateX: Double
+        let adjustmentTranslateY: Double
+    }
+
+    /// The exact `Annotation` fields `renderAnnotationAlone`'s render reads
+    /// besides `effectiveAdjustment` (which the key carries as explicit
+    /// components) -- see `PaintedBoundsCacheKey`'s doc comment. `label`,
+    /// `zIndex`, `appId`, `createdAt`, and the anchor payload are
+    /// deliberately absent because a lone offscreen render never consumes
+    /// them: labels are metadata (never painted), zIndex orders annotations
+    /// against EACH OTHER, and app-visibility filtering happens in callers.
+    private struct PaintedContentFingerprintPayload: Encodable {
+        let kind: AnnotationKind
+        let colorHex: String
+        let opacity: Double
+        let offsetX: Double
+        let offsetY: Double
+    }
+
+    /// Builds the complete cache key for measuring `annotation` on `screen`,
+    /// or nil when the rendering payload cannot be fingerprinted (JSON
+    /// refuses non-finite doubles) -- callers then simply skip the cache,
+    /// failing open to a fresh render rather than caching under a lossy key.
+    /// `.sortedKeys` pins the encoded byte stream so equal payloads always
+    /// fingerprint equal within a process; `Hasher`'s per-process seed is
+    /// fine here because this cache never outlives the process, and a
+    /// payload that somehow encoded differently on two calls could only
+    /// cause a spurious MISS (a wasted render), never a false hit.
+    static func paintedBoundsCacheKey(for annotation: Annotation, on screen: ScreenInfo) -> PaintedBoundsCacheKey? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let encoded = try? encoder.encode(PaintedContentFingerprintPayload(
+            kind: annotation.kind,
+            colorHex: annotation.colorHex,
+            opacity: annotation.opacity,
+            offsetX: annotation.offsetX,
+            offsetY: annotation.offsetY
+        )) else { return nil }
+        var hasher = Hasher()
+        // `combine(bytes:)` over the WHOLE buffer, never `combine(encoded)`:
+        // Foundation's `Data.hash(into:)` deliberately hashes only a bounded
+        // prefix of its contents (~80 bytes) for performance, and this
+        // payload's sorted-keys JSON puts `colorHex` and the `kind`
+        // discriminator before the geometry -- so two vectorPaths differing
+        // only in `data` (the exact field a fingerprint exists to see)
+        // hashed IDENTICALLY through the prefix. That is a false cache HIT
+        // waiting to hand one annotation another annotation's painted
+        // bounds, the one failure mode this key must never allow.
+        encoded.withUnsafeBytes { hasher.combine(bytes: $0) }
+        let adjustment = annotation.effectiveAdjustment
+        return PaintedBoundsCacheKey(
+            annotationId: annotation.id,
+            revision: annotation.revision,
+            contentFingerprint: hasher.finalize(),
+            screenId: screen.id,
+            widthPx: screen.widthPx,
+            heightPx: screen.heightPx,
+            widthPt: screen.widthPt,
+            heightPt: screen.heightPt,
+            backingScaleFactor: screen.backingScaleFactor,
+            adjustmentScaleX: adjustment.scaleX,
+            adjustmentScaleY: adjustment.scaleY,
+            adjustmentTranslateX: adjustment.translateX,
+            adjustmentTranslateY: adjustment.translateY
+        )
+    }
+
+    /// Bounded, `NSLock`-guarded, least-recently-used cache of
+    /// `renderedPaintedBounds` answers, shared by both platform branches
+    /// (pure Foundation throughout -- the same `final class ...
+    /// @unchecked Sendable` + `NSLock` shape `ScreenshotSpaceRegistry`
+    /// already establishes for exactly this cross-queue access pattern).
+    ///
+    /// WHY IT EXISTS: `renderedPaintedBounds` costs a full-display offscreen
+    /// render plus a full-bitmap scan per call, and
+    /// `DrawRequest.resolveAvoidance` performs one per avoided id (up to 32)
+    /// on EVERY avoid= draw, while `verify_annotation` and
+    /// `get_annotation_bounds` pay the same per call -- yet an unchanged
+    /// annotation's bounds are a pure function of `PaintedBoundsCacheKey`,
+    /// so every repeat measurement after the first should cost a dictionary
+    /// lookup and zero renders.
+    ///
+    /// A `nil` VALUE is a real, cacheable answer ("rendered fine, painted
+    /// nothing"), which is why `lookup` wraps its result in `CachedBounds?`:
+    /// the outer optional is hit-or-miss, the inner one is the answer.
+    /// Eviction is least-recently-USED at `capacity`, so the annotations an
+    /// agent is actively avoiding or verifying stay resident while
+    /// `resolveAvoidance`'s one-shot candidate measurements (fresh UUID ids,
+    /// never re-measured) age out first; the O(capacity) eviction scan runs
+    /// only on insert-when-full, immediately after a render that costs
+    /// orders of magnitude more. Concurrent misses on one key may each
+    /// render and each store, but they store the same pure-function value,
+    /// so that race is benign by construction.
+    final class PaintedBoundsRenderCache: @unchecked Sendable {
+        /// See the class doc comment: wrapper distinguishing "cache hit
+        /// whose answer is `nil` bounds" from "cache miss".
+        struct CachedBounds {
+            let bounds: CGRect?
+        }
+
+        private struct Entry {
+            let bounds: CGRect?
+            var lastUse: UInt64
+        }
+
+        private let lock = NSLock()
+        private var entries: [PaintedBoundsCacheKey: Entry] = [:]
+        private var useCounter: UInt64 = 0
+        let capacity: Int
+
+        init(capacity: Int) {
+            self.capacity = max(1, capacity)
+        }
+
+        func lookup(_ key: PaintedBoundsCacheKey) -> CachedBounds? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard var entry = entries[key] else { return nil }
+            useCounter &+= 1
+            entry.lastUse = useCounter
+            entries[key] = entry
+            return CachedBounds(bounds: entry.bounds)
+        }
+
+        func store(_ bounds: CGRect?, for key: PaintedBoundsCacheKey) {
+            lock.lock()
+            defer { lock.unlock() }
+            useCounter &+= 1
+            if entries[key] == nil, entries.count >= capacity,
+               let evictee = entries.min(by: { $0.value.lastUse < $1.value.lastUse })?.key {
+                entries.removeValue(forKey: evictee)
+            }
+            entries[key] = Entry(bounds: bounds, lastUse: useCounter)
+        }
+
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return entries.count
+        }
+
+        /// Test-isolation hook; production code never clears the cache
+        /// because `PaintedBoundsCacheKey` already retires stale entries by
+        /// construction (see its doc comment).
+        func removeAll() {
+            lock.lock()
+            defer { lock.unlock() }
+            entries.removeAll()
+        }
+    }
+
+    /// See `PaintedBoundsRenderCache`'s doc comment. 256 entries comfortably
+    /// covers the working set that can be live at once (`avoid` accepts at
+    /// most 32 ids per draw; keys are a few strings and doubles, entries one
+    /// rect) while bounding memory no matter how many one-shot candidates
+    /// `resolveAvoidance` measures over a long session.
+    static let paintedBoundsCache = PaintedBoundsRenderCache(capacity: 256)
 
     /// Refuses to GUESS which display a caller-supplied screenshot is of when
     /// its dimensions fit several connected displays equally well. Pure

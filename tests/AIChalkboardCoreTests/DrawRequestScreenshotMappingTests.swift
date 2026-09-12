@@ -603,4 +603,209 @@ final class DrawRequestScreenshotMappingTests: XCTestCase {
             XCTAssertEqual(transform.scaleY, 1, accuracy: 1e-12)
         }
     }
+
+    // MARK: - Defaulted screen must itself be a plausible capture subject
+
+    /// THE silent-wrong-monitor hole the audit demonstrated: a native 4K
+    /// screenshot of the SECONDARY display, drawn with no screen_id on a
+    /// QHD main. Exactly ONE display accepts these dimensions (the 4K
+    /// sibling -- the QHD main fails the no-upscale rule), so the ambiguity
+    /// guard (count > 1) never fired, and the upscale-tolerant target guard
+    /// passed against the defaulted main (uniform 1.5, aspect exact). Every
+    /// coordinate then painted on the WRONG PHYSICAL MONITOR at 2/3 scale
+    /// with an ordinary success response.
+    func testDefaultedScreenTheImageCannotDepictIsRejectedTowardTheAcceptingSibling() {
+        let main = screen(id: "display-QHD", width: 2_560, height: 1_440, isMain: true)
+        let secondary = screen(id: "display-4K", width: 3_840, height: 2_160)
+        let request = DrawRequest(screen: main, candidateScreens: [main, secondary], screenIsDetermined: false)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": 3_840,
+            "screenshot_height": 2_160
+        ]) {
+        case .success:
+            XCTFail("A 3840x2160 image cannot be a screenshot of a 2560x1440 display; defaulting there paints on the wrong monitor.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("cannot be a full-display screenshot"), message)
+            XCTAssertTrue(message.contains("display-4K"), message)
+            XCTAssertTrue(message.contains("screen_id"), message)
+        }
+    }
+
+    /// The same guard when the dimensions fit NO connected display: the
+    /// rejection must say that plainly instead of pointing at an accepting
+    /// display list that does not exist.
+    func testDimensionsFittingNoDisplayAreRejectedWithoutAPhantomHint() {
+        let main = screen(id: "display-QHD", width: 2_560, height: 1_440, isMain: true)
+        let request = DrawRequest(screen: main, candidateScreens: [main], screenIsDetermined: false)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": 5_000,
+            "screenshot_height": 2_813
+        ]) {
+        case .success:
+            XCTFail("Dimensions larger than every connected display cannot be a screenshot of any of them.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("NO connected display") || message.contains("Unsafe screenshot mapping"), message)
+        }
+    }
+
+    /// An EXPLICIT screen_id keeps today's behavior: the caller answered the
+    /// which-display question, and the upscale-tolerant target guard's
+    /// documented rationale ("a draw call names its display") applies.
+    func testExplicitScreenIdKeepsTheUpscaleTolerantMapping() {
+        let main = screen(id: "display-QHD", width: 2_560, height: 1_440, isMain: true)
+        let secondary = screen(id: "display-4K", width: 3_840, height: 2_160)
+        let request = DrawRequest(screen: main, candidateScreens: [main, secondary], screenIsDetermined: true)
+        switch request.coordinateTransform(args: [
+            "coordinate_space": "screenshot_pixels",
+            "screenshot_width": 3_840,
+            "screenshot_height": 2_160
+        ]) {
+        case .failure(let message):
+            XCTFail("An explicit screen_id is the caller's answer; the defaulted-screen guard must not fire: \(message)")
+        case .success(let transform):
+            XCTAssertEqual(transform.scaleX, 2_560.0 / 3_840.0, accuracy: 1e-12)
+        }
+    }
+
+    // MARK: - ScreenshotGrid metadata
+
+    func testScreenshotPixelsTransformRecordsItsGrid() {
+        let main = screen(id: "display-A", width: 2_940, height: 1_912, isMain: true)
+        let request = DrawRequest(screen: main, candidateScreens: [main], screenIsDetermined: false)
+        switch request.coordinateTransform(
+            args: [
+                "coordinate_space": "screenshot_pixels",
+                "screenshot_width": 1_470,
+                "screenshot_height": 956
+            ],
+            screenshotSpaceId: "space-test1234"
+        ) {
+        case .failure(let message):
+            XCTFail("A clean half-resolution downsample must map: \(message)")
+        case .success(let transform):
+            XCTAssertEqual(transform.screenshotGrid?.widthPx, 1_470)
+            XCTAssertEqual(transform.screenshotGrid?.heightPx, 956)
+            XCTAssertEqual(transform.screenshotGrid?.spaceId, "space-test1234")
+        }
+    }
+
+    func testNonScreenshotSpacesRecordNoGrid() {
+        let main = screen(id: "display-A", width: 2_940, height: 1_912, isMain: true)
+        let request = DrawRequest(screen: main, candidateScreens: [main], screenIsDetermined: true)
+        switch request.coordinateTransform(args: [:]) {
+        case .failure(let message): XCTFail(message)
+        case .success(let transform): XCTAssertNil(transform.screenshotGrid)
+        }
+        switch request.coordinateTransform(args: ["coordinate_space": "normalized"]) {
+        case .failure(let message): XCTFail(message)
+        case .success(let transform): XCTAssertNil(transform.screenshotGrid)
+        }
+    }
+
+    // MARK: - Geometry provably not measured on the declared screenshot
+
+    private func gridTransform(width: Double = 1_470, height: Double = 956) -> DrawRequest.CoordinateTransform {
+        DrawRequest.CoordinateTransform(
+            scaleX: 2, scaleY: 2,
+            screenshotGrid: DrawRequest.CoordinateTransform.ScreenshotGrid(
+                widthPx: width, heightPx: height, spaceId: nil
+            )
+        )
+    }
+
+    /// A POSITION beyond the declared image (plus the 5% edge tolerance)
+    /// cannot have been measured on it -- the doubling signature of
+    /// measuring on the full-resolution screenshot while declaring the
+    /// client-resized dimensions.
+    func testPositionBeyondTheDeclaredScreenshotIsRejected() {
+        let rejection = gridTransform().sourceGeometryRejection(
+            minX: 2_200, minY: 600, maxX: 2_200, maxY: 600, what: "x/y"
+        )
+        XCTAssertNotNil(rejection)
+        XCTAssertTrue(rejection?.contains("measured on a DIFFERENT image") == true, rejection ?? "")
+    }
+
+    func testPositionWithinTheEdgeToleranceIsAccepted() {
+        // 3% past the right edge: an honest edge-of-image read, not a
+        // doubled coordinate.
+        XCTAssertNil(gridTransform().sourceGeometryRejection(
+            minX: 1_470 * 1.03, minY: 100, maxX: 1_470 * 1.03, maxY: 100, what: "x/y"
+        ))
+        XCTAssertNil(gridTransform().sourceGeometryRejection(
+            minX: -20, minY: 0, maxX: -20, maxY: 0, what: "x/y"
+        ))
+    }
+
+    /// Paths use the lax ENTIRELY-OUTSIDE rule: bounds that merely overshoot
+    /// (an arrow's control points swinging wide) stay accepted; bounds with
+    /// no intersection at all cannot have come from the image.
+    func testPathBoundsMerelyOvershootingAreAcceptedButEntirelyOutsideAreRejected() {
+        XCTAssertNil(gridTransform().sourceGeometryRejection(
+            minX: 1_200, minY: 800, maxX: 1_900, maxY: 1_400, what: "path_data's geometry", positionIsBounds: true
+        ))
+        XCTAssertNotNil(gridTransform().sourceGeometryRejection(
+            minX: 1_800, minY: 1_100, maxX: 2_600, maxY: 1_700, what: "path_data's geometry", positionIsBounds: true
+        ))
+    }
+
+    func testNonScreenshotTransformNeverObjectsToGeometry() {
+        let plain = DrawRequest.CoordinateTransform(scaleX: 1, scaleY: 1)
+        XCTAssertNil(plain.sourceGeometryRejection(
+            minX: 99_999, minY: 99_999, maxX: 99_999, maxY: 99_999, what: "x/y"
+        ))
+    }
+
+    // MARK: - Placement-feedback argument parsing
+
+    func testPlacementFeedbackRejectsNonBooleanReportPlacement() {
+        switch DrawRequest.parsePlacementFeedbackArguments(["report_placement": "yes"], transform: nil) {
+        case .success: XCTFail("A string is not a boolean; reject rather than coerce.")
+        case .failure(let message): XCTAssertTrue(message.contains("report_placement"), message)
+        }
+    }
+
+    func testPlacementFeedbackRejectsTwoExpectations() {
+        let args: [String: Any] = [
+            "expect_element": ["label": "OK"],
+            "expect_window": ["app": "TextEdit"]
+        ]
+        switch DrawRequest.parsePlacementFeedbackArguments(args, transform: nil) {
+        case .success: XCTFail("Two expectations contradict each other; at most one is accepted.")
+        case .failure: break
+        }
+    }
+
+    func testPlacementFeedbackRejectsTargetBoundsWithoutAScreenshotGrid() {
+        let args: [String: Any] = [
+            "target_bounds_screenshot_px": ["x": 10, "y": 10, "width": 100, "height": 40]
+        ]
+        switch DrawRequest.parsePlacementFeedbackArguments(args, transform: DrawRequest.CoordinateTransform(scaleX: 1, scaleY: 1)) {
+        case .success: XCTFail("A screenshot-pixel target with no screenshot grid has nothing to convert against.")
+        case .failure(let message): XCTAssertTrue(message.contains("screenshot"), message)
+        }
+    }
+
+    func testPlacementFeedbackRejectsApplyCorrectionWithoutAnExpectation() {
+        switch DrawRequest.parsePlacementFeedbackArguments(["apply_correction": true], transform: nil) {
+        case .success: XCTFail("apply_correction with nothing to correct toward is a mistaken call shape.")
+        case .failure(let message): XCTAssertTrue(message.contains("apply_correction"), message)
+        }
+    }
+
+    func testPlacementFeedbackHappyPathParses() {
+        let args: [String: Any] = [
+            "report_placement": true,
+            "expect_element": ["label": "OK", "app": "TextEdit"],
+            "apply_correction": true
+        ]
+        switch DrawRequest.parsePlacementFeedbackArguments(args, transform: nil) {
+        case .failure(let message): XCTFail(message)
+        case .success(let feedback):
+            XCTAssertTrue(feedback.reportPlacement)
+            XCTAssertTrue(feedback.expectationSupplied)
+            XCTAssertTrue(feedback.applyCorrection)
+        }
+    }
 }

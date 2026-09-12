@@ -164,6 +164,85 @@ final class AnchorAdjustmentTests: XCTestCase {
         XCTAssertNil(AnchorAdjustment.mapping(reference: reference, current: current, behavior: .scale))
     }
 
+    // MARK: - mapping: pin across backing densities
+
+    func testPinMappingCompensatesBackingScaleAcrossDisplays() {
+        // The worked cross-density example: a 400x300 pt window at pt(50,50)
+        // on a 2x display is the reference frame (100,100,800,600) in that
+        // display's backing pixels; the same window dragged onto a 1x
+        // display lands at (300,200,400,300) in THAT display's backing
+        // pixels. s = 1/2.
+        let reference = CGRect(x: 100, y: 100, width: 800, height: 600)
+        let current = CGRect(x: 300, y: 200, width: 400, height: 300)
+        let adjustment = AnchorAdjustment.mapping(
+            reference: reference, current: current, behavior: .pin,
+            referenceScreenScale: 2, currentScreenScale: 1
+        )
+        XCTAssertEqual(adjustment, AnchorAdjustment(scaleX: 0.5, scaleY: 0.5, translateX: 250, translateY: 150))
+
+        // A ring centre stored at in-window offset (200pt, 150pt) --
+        // (400, 300) px from the 2x window origin, absolute (500, 400) --
+        // must land at the SAME in-window point offset on the 1x display:
+        // (200, 150) px past the new origin, i.e. absolute (500, 350). The
+        // density-blind mapping put it at in-window (400, 300) pt instead,
+        // at twice the intended size.
+        let mapped = adjustment?.apply(to: CGPoint(x: 500, y: 400))
+        XCTAssertEqual(mapped, CGPoint(x: 500, y: 350))
+    }
+
+    func testPinMappingWithEqualDensitiesMatchesTheLegacyTranslateOnlyForm() {
+        // 2x -> 2x is still a cross-display move, but the ratio is exactly 1,
+        // so the result must be bit-identical to the density-blind mapping.
+        let reference = CGRect(x: 100, y: 100, width: 800, height: 600)
+        let current = CGRect(x: 300, y: 200, width: 800, height: 600)
+        let compensated = AnchorAdjustment.mapping(
+            reference: reference, current: current, behavior: .pin,
+            referenceScreenScale: 2, currentScreenScale: 2
+        )
+        let legacy = AnchorAdjustment.mapping(reference: reference, current: current, behavior: .pin)
+        XCTAssertEqual(compensated, AnchorAdjustment(scaleX: 1, scaleY: 1, translateX: 200, translateY: 100))
+        XCTAssertEqual(compensated, legacy)
+    }
+
+    func testPinMappingFallsBackToDensityBlindFormForDegenerateScaleInputs() {
+        let reference = CGRect(x: 100, y: 100, width: 800, height: 600)
+        let current = CGRect(x: 300, y: 200, width: 400, height: 300)
+        let legacy = AnchorAdjustment(scaleX: 1, scaleY: 1, translateX: 200, translateY: 100)
+        // Zero, negative, and non-finite scale factors must each degrade to
+        // the legacy mapping -- never nil (the window geometry is still
+        // mappable) and never a poisoned scale.
+        XCTAssertEqual(
+            AnchorAdjustment.mapping(reference: reference, current: current, behavior: .pin,
+                                     referenceScreenScale: 0, currentScreenScale: 1),
+            legacy
+        )
+        XCTAssertEqual(
+            AnchorAdjustment.mapping(reference: reference, current: current, behavior: .pin,
+                                     referenceScreenScale: 2, currentScreenScale: -1),
+            legacy
+        )
+        XCTAssertEqual(
+            AnchorAdjustment.mapping(reference: reference, current: current, behavior: .pin,
+                                     referenceScreenScale: .nan, currentScreenScale: 1),
+            legacy
+        )
+    }
+
+    func testScaleMappingIgnoresDensityParameters() {
+        // `.scale`'s pixel-over-pixel quotient already folds the density
+        // ratio in (each side's pixel count is its point extent times its
+        // own display's scale factor), so passing the scales must change
+        // nothing -- multiplying the ratio in again would double-apply it.
+        let reference = CGRect(x: 100, y: 50, width: 200, height: 100)
+        let current = CGRect(x: 150, y: 80, width: 400, height: 50)
+        let withDensity = AnchorAdjustment.mapping(
+            reference: reference, current: current, behavior: .scale,
+            referenceScreenScale: 2, currentScreenScale: 1
+        )
+        let withoutDensity = AnchorAdjustment.mapping(reference: reference, current: current, behavior: .scale)
+        XCTAssertEqual(withDensity, withoutDensity)
+    }
+
     // MARK: - mapping: scale
 
     func testScaleMappingComputesPerAxisScaleAndTranslate() {

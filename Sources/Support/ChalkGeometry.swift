@@ -189,12 +189,18 @@ public struct ChalkPath: Equatable, Sendable {
         // that violates that ordering is a caller contract this function has
         // no way to detect, exactly as `CGPath` itself would not detect it.
         var current = CGPoint.zero
+        // `subpathStart` is where the OPEN subpath began -- the point a
+        // `.close` snaps the cursor back to. Same placeholder caveat as
+        // `current`: it is only ever read by `.close`, which cannot precede
+        // the first `.move` in any parser-produced path.
+        var subpathStart = CGPoint.zero
 
         for element in elements {
             switch element {
             case let .move(point):
                 include(point)
                 current = point
+                subpathStart = point
             case let .line(point):
                 include(point)
                 current = point
@@ -213,8 +219,20 @@ public struct ChalkPath: Equatable, Sendable {
             case .close:
                 // A close draws a straight line back to the subpath's start,
                 // a point already included by the `.move` that began it --
-                // there is no new extremal geometry to add.
-                break
+                // there is no new extremal geometry to add. But closepath
+                // DOES move the cursor: SVG and `CGPath` both define the
+                // current point after a close as the CLOSED SUBPATH'S START
+                // (`SVGPathParser`'s own `Z` handler sets
+                // `current = subpathStart`, and `CGMutablePath.closeSubpath`
+                // does the same), so a curve that follows a `Z` without an
+                // intervening `M` begins at the subpath's start. Leaving
+                // `current` at the pre-close point here made that curve's
+                // extrema get solved from the WRONG start point, breaking
+                // this type's boundingBoxOfPath-match contract (see the
+                // header comment) for exactly the "curve after Z" shape --
+                // e.g. `M 100 100 L 200 100 L 200 200 Z Q 300 300 100 300`
+                // overreported max X by 33px.
+                current = subpathStart
             }
         }
 

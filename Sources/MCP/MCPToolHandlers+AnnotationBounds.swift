@@ -240,6 +240,24 @@ enum AnnotationBoundsSupport {
         return ["expect_element", "expect_window", "target_bounds_screenshot_px"].filter(isSupplied)
     }
 
+    /// Parses the shared `apply_correction` argument: absent (or JSON
+    /// `null`, the same `isSupplied` rule as everywhere else) means `false`;
+    /// anything supplied must be a real boolean. A string `"true"` is
+    /// rejected rather than coerced -- the repo's standing
+    /// reject-over-reinterpret rule -- because a caller whose serializer
+    /// stringifies booleans has a bug this tool must surface, not paper
+    /// over. The "requires a target/expectation" rule is deliberately NOT
+    /// enforced here: each tool words that rejection in its own argument
+    /// vocabulary (`target_bounds_screenshot_px` for get_annotation_bounds,
+    /// the `expect_*` family for verify_annotation and the draw tools).
+    static func parseApplyCorrection(_ args: [String: Any]) -> DrawOutcome<Bool> {
+        guard let raw = args["apply_correction"], !(raw is NSNull) else { return .success(false) }
+        guard let value = raw as? Bool else {
+            return .failure("apply_correction must be a boolean when supplied.")
+        }
+        return .success(value)
+    }
+
     /// The rejection text for supplying more than one of `expect_element`/
     /// `expect_window`/`target_bounds_screenshot_px` on one `verify_annotation`
     /// call -- each names a DIFFERENT way to say what the annotation is
@@ -303,6 +321,140 @@ extension MCPServer {
     /// a live anchor adjustment. See that method's doc comment for the full
     /// "touches no capture API" contract this tool depends on.
     // internal: called from handleToolsCall in MCPToolHandlers.swift.
+    /// Applies a computed placement correction to a stored annotation and
+    /// re-measures the result, returning the `appliedCorrection` payload
+    /// every correction-capable tool shares (`get_annotation_bounds`,
+    /// `verify_annotation`, and the `draw_*` tools' draw-time expectations).
+    ///
+    /// WHY THE SERVER APPLIES IT: the correction loop used to end with the
+    /// AGENT reading `correctionBackingPx` and passing it back through
+    /// `update_annotation` -- one more round trip, and one more place to
+    /// mis-apply a sign, re-add a delta to an absolute value, or scale by
+    /// the wrong axis (`correctedOffset`'s own doc comment catalogues
+    /// exactly these mistakes). The server already computed the absolute
+    /// offsets; applying them here removes the entire class of caller-side
+    /// arithmetic error, which is the point of the correction feature.
+    ///
+    /// CONCURRENCY: the offsets were computed from a snapshot, so they are
+    /// only valid against exactly that snapshot's state. The store write is
+    /// a compare-and-swap on `expectedRevision`; any concurrent
+    /// update/clear/re-anchor since the snapshot fails the CAS and the
+    /// payload reports `applied: false` with the reason, never a correction
+    /// silently layered onto state it was not computed from.
+    /// (`applyAnchorProjections` deliberately does not bump `revision` --
+    /// see its doc comment -- so routine anchor tracking cannot spuriously
+    /// fail this CAS.)
+    ///
+    /// The returned payload always carries `applied`; on success it adds the
+    /// installed absolute `offsetX`/`offsetY`, the re-rendered
+    /// `paintedBoundsBackingPx` (and `paintedBoundsScreenshotPx` when
+    /// `screenshotScale` -- screenshot px per backing px, `screenshotRect`'s
+    /// convention -- is known), and `verdictAfter`, the SAME
+    /// `AnnotationGeometryVerdict.compare` payload shape as the pre-move
+    /// verdict so a caller reads before/after through one vocabulary.
+    func applyCorrectionAndReport(
+        annotationId: String,
+        expectedRevision: UInt64,
+        correctedOffsetX: Double,
+        correctedOffsetY: Double,
+        targetBoundsBacking: CGRect,
+        screen: ScreenInfo,
+        screenshotScale: (x: Double, y: Double)?
+    ) -> [String: Any] {
+        guard correctedOffsetX.isFinite, correctedOffsetY.isFinite,
+              abs(correctedOffsetX) <= DrawingDefaults.maxCoordinateMagnitudePx,
+              abs(correctedOffsetY) <= DrawingDefaults.maxCoordinateMagnitudePx else {
+            return [
+                "applied": false,
+                "reason": "The corrected offset (\(correctedOffsetX), \(correctedOffsetY)) is non-finite or exceeds the ±\(Int(DrawingDefaults.maxCoordinateMagnitudePx)) backing-pixel offset limit, so it was not applied."
+            ]
+        }
+        var installed: Annotation?
+        let outcome = AnnotationStore.shared.updateWithOutcome(
+            id: annotationId, expectedRevision: expectedRevision
+        ) { live in
+            // A full re-construction, not a mutation: `offsetX`/`offsetY`
+            // are immutable on `Annotation` by design (every mutation flows
+            // through the store as a replacement value), so this rebuilds
+            // the live annotation field-for-field with only the offsets
+            // replaced -- exactly what `patchedAnnotation` does for
+            // update_annotation's own offset patch. `anchorProjection` is
+            // deliberately NOT passed: returning a nil projection tells the
+            // store to carry the LIVE projection forward unchanged (see
+            // `updateWithOutcome`'s contract), so a tracker sample landing
+            // mid-correction is preserved rather than clobbered.
+            let replacement = Annotation(
+                id: live.id, screenId: live.screenId, kind: live.kind,
+                colorHex: live.colorHex, label: live.label,
+                appId: live.appId, appName: live.appName,
+                opacity: live.opacity,
+                offsetX: correctedOffsetX, offsetY: correctedOffsetY,
+                zIndex: live.zIndex, anchor: live.anchor,
+                staticAdjustment: live.staticAdjustment,
+                createdAt: live.createdAt
+            )
+            installed = replacement
+            return (replacement, nil)
+        }
+        switch outcome {
+        case .updated:
+            break
+        case .stale:
+            return [
+                "applied": false,
+                "reason": "Annotation \(annotationId) changed concurrently after this correction was computed (its revision no longer matches), so the correction was NOT applied -- it was derived from state that no longer exists. Re-run the measuring call to compute a fresh correction."
+            ]
+        case .notFound:
+            return [
+                "applied": false,
+                "reason": "Annotation \(annotationId) was cleared before the correction could be applied."
+            ]
+        default:
+            return [
+                "applied": false,
+                "reason": "The corrected annotation could not be stored (store limits rejected the update); the correction was NOT applied."
+            ]
+        }
+        guard let installed else {
+            return ["applied": false, "reason": "Internal error: the store reported success without an installed annotation."]
+        }
+
+        var payload: [String: Any] = [
+            "applied": true,
+            "offsetX": correctedOffsetX,
+            "offsetY": correctedOffsetY
+        ]
+        // Re-measure through the SAME exact renderer that computed the
+        // pre-move bounds. The live projection can have advanced between the
+        // CAS and this render (tracking never stops for a measurement); the
+        // freshly-read store state is exactly what a follow-up
+        // get_annotation_bounds would report, which is the honest thing to
+        // return here.
+        let refreshed = AnnotationStore.shared.renderSnapshot(id: annotationId)
+        let measured = refreshed?.annotation ?? installed
+        do {
+            if let painted = try AnnotationVerificationCompositor.renderedPaintedBounds(
+                of: measured, on: screen, rasterLease: refreshed?.rasterLease
+            ) {
+                payload["paintedBoundsBackingPx"] = AnnotationBoundsSupport.rectPayload(painted)
+                if let screenshotScale {
+                    payload["paintedBoundsScreenshotPx"] = AnnotationBoundsSupport.rectPayload(
+                        AnnotationBoundsSupport.screenshotRect(backingRect: painted, scale: screenshotScale)
+                    )
+                }
+                let after = AnnotationGeometryVerdict.compare(painted: painted, target: targetBoundsBacking)
+                var verdictAfter = after.payload
+                verdictAfter["centerDeltaUnit"] = "backing_px"
+                payload["verdictAfter"] = verdictAfter
+            } else {
+                payload["verdictAfterUnavailableReason"] = "The corrected annotation painted no pixels on its screen, so no post-correction verdict could be measured."
+            }
+        } catch {
+            payload["verdictAfterUnavailableReason"] = "Post-correction re-measurement failed: \(error.localizedDescription)"
+        }
+        return payload
+    }
+
     func handleGetAnnotationBounds(id: Any, args: [String: Any]) {
         guard let annotationId = (args["annotation_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !annotationId.isEmpty else {
@@ -397,6 +549,23 @@ extension MCPServer {
             return
         }
 
+        let applyCorrection: Bool
+        switch AnnotationBoundsSupport.parseApplyCorrection(args) {
+        case .failure(let error):
+            sendErrorResult(id: id, text: error)
+            return
+        case .success(let value):
+            applyCorrection = value
+        }
+        // Rejected up front, before the offscreen render: apply_correction
+        // without a target is a request to move the annotation toward
+        // nothing, which is unambiguous evidence of a mistaken call shape,
+        // not a preference to resolve by silently not applying anything.
+        guard !applyCorrection || targetBounds != nil else {
+            sendErrorResult(id: id, text: "apply_correction requires target_bounds_screenshot_px: the correction moves the annotation's painted centre onto the target's centre, and without a target there is nothing to correct toward. Nothing was changed; supply target_bounds_screenshot_px (with a screenshot_space or screenshot_width/screenshot_height), or omit apply_correction.")
+            return
+        }
+
         let paintedBoundsBacking: CGRect?
         do {
             // NO screen capture, NO Screen Recording permission: this call
@@ -421,7 +590,19 @@ extension MCPServer {
             "annotationId": annotation.id,
             "screenId": screen.id,
             "screenBackingPx": ["width": screen.widthPx, "height": screen.heightPx],
-            "paintedBoundsBackingPx": AnnotationBoundsSupport.rectPayload(paintedBoundsBacking)
+            "paintedBoundsBackingPx": AnnotationBoundsSupport.rectPayload(paintedBoundsBacking),
+            // The same edge-clip signal `verify_annotation`'s geometry path
+            // already reports. Its absence HERE was a real correction-loop
+            // defect: painted bounds clipped at a screen edge bias the
+            // centre-to-centre delta outward (the visible centre is not the
+            // geometric centre of what was asked for), so an agent applying
+            // successive corrections against clipped bounds oscillates
+            // instead of converging -- with no field telling it why. Now the
+            // flag rides with every answer, so a caller can treat a clipped
+            // measurement as "move it on screen first, then fine-tune".
+            "onScreenClipped": AnnotationGeometryVerdict.clippedAtScreenEdge(
+                painted: paintedBoundsBacking, screenWidthPx: screen.widthPx, screenHeightPx: screen.heightPx
+            )
         ]
 
         if let screenshotDimensions {
@@ -453,8 +634,34 @@ extension MCPServer {
                     adjustment: adjustment
                 ) {
                     payload["correctionBackingPx"] = ["offsetX": corrected.offsetX, "offsetY": corrected.offsetY]
+                    if applyCorrection {
+                        // The target arrived in SCREENSHOT pixels; the
+                        // verdict comparison runs in backing pixels, so
+                        // convert the target through the reciprocal of the
+                        // reporting scale -- the same two-space discipline
+                        // `correctedOffset`'s own doc comment walks through.
+                        let targetBacking = CGRect(
+                            x: targetBounds.minX / scaleX, y: targetBounds.minY / scaleY,
+                            width: targetBounds.width / scaleX, height: targetBounds.height / scaleY
+                        )
+                        payload["appliedCorrection"] = applyCorrectionAndReport(
+                            annotationId: annotation.id,
+                            expectedRevision: annotation.revision,
+                            correctedOffsetX: corrected.offsetX,
+                            correctedOffsetY: corrected.offsetY,
+                            targetBoundsBacking: targetBacking,
+                            screen: screen,
+                            screenshotScale: (scaleX, scaleY)
+                        )
+                    }
                 } else {
                     payload["correctionUnavailableReason"] = "The annotation's current anchor adjustment scale is zero, non-finite, or otherwise degenerate, so a single offset_x/offset_y correction cannot be computed safely. Check anchor.state before retrying."
+                    if applyCorrection {
+                        payload["appliedCorrection"] = [
+                            "applied": false,
+                            "reason": "No correction could be computed (see correctionUnavailableReason), so there was nothing to apply."
+                        ] as [String: Any]
+                    }
                 }
             }
         }

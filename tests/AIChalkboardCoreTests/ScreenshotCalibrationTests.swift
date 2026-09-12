@@ -288,8 +288,8 @@ final class ScreenshotCalibrationTests: XCTestCase {
         let base = exactObservations(trueWidth: 3_840, trueHeight: 2_160, scale: 1)
         var observations = base
         let index = observations.firstIndex(where: { $0.label == "TL" })!
-        // Tolerance is max(4, 1% of ~3840) ≈ 38.4px; push TL's x 200px away
-        // from BL's matching x, well past that.
+        // Tolerance is the read-noise budget max(4, 0.25% of ~3840) ≈ 9.6px;
+        // push TL's x 200px away from BL's matching x, well past that.
         observations[index] = Observation(label: "TL", x: observation(base, "TL").x + 200, y: observation(base, "TL").y)
         switch ScreenshotCalibration.solve(observations: observations, screen: display) {
         case .success:
@@ -369,6 +369,110 @@ final class ScreenshotCalibrationTests: XCTestCase {
             XCTAssertEqual(solution.heightPx, 2_160)
             XCTAssertEqual(solution.residuals.originX, 0, accuracy: 1e-9)
             XCTAssertEqual(solution.residuals.originY, 0, accuracy: 1e-9)
+        }
+    }
+
+    /// THE 40PX-CROP-AT-5K HOLE THE TOLERANCE SPLIT CLOSES. A native
+    /// 5120x2880 capture cropped 40px off the left (and the proportional
+    /// 22.5px off the top, preserving the aspect ratio) keeps the marker
+    /// SPREAD exact -- the solve still recovers 5120x2880 to the pixel, the
+    /// snap distance is zero, and both `ScreenshotGeometry` guards pass --
+    /// so the origin residual of exactly 40px is the only trace of the crop.
+    ///
+    /// Under the old single `max(4px, 1% of span)` tolerance, that residual
+    /// sat comfortably inside the 51.2px budget at 5120: the solve
+    /// SUCCEEDED, registered a space with `observed` provenance, and every
+    /// drawing made through it landed 40px off -- the crop detector defeated
+    /// by its own tolerance precisely on the images where a crop costs the
+    /// most pixels. The origin residual is a READ-NOISE-sized quantity (a
+    /// mean of marker reads minus a fixed fraction of the solved width),
+    /// never legitimately 1% of a 5K image, and the read-noise budget
+    /// `max(4px, 0.25% of span)` = 12.8px at 5120 rejects the 40px shift
+    /// while still clearing every honest reading in this file.
+    func testAFortyPixelCropOfAFiveKCaptureIsRejectedByTheOriginResidual() {
+        let display = screen(width: 5_120, height: 2_880)
+        let cropOffsetX = 40.0
+        let cropOffsetY = 22.5 // 40 * 2880/5120: the aspect-preserving share
+        let observations = exactObservations(trueWidth: 5_120, trueHeight: 2_880, scale: 1).map {
+            Observation(label: $0.label, x: $0.x - cropOffsetX, y: $0.y - cropOffsetY)
+        }
+        switch ScreenshotCalibration.solve(observations: observations, screen: display) {
+        case .success(let solution):
+            XCTFail("A 40px crop at 5K must be rejected by the origin residual, not registered as \(solution.widthPx)x\(solution.heightPx) -- that acceptance was the exact hole the read-noise tolerance closes.")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("cropped") || message.contains("not a full-display capture"), message)
+            XCTAssertTrue(message.contains("Nothing was registered"), message)
+        }
+    }
+
+    /// The counterweight that keeps the tightened gate honest at 5K:
+    /// realistic read noise on a 5120x2880 native capture must still pass.
+    ///
+    /// WHY THE NOISE HERE IS LARGER THAN THE 4PX FLOOR: an agent reads a 5K
+    /// screenshot through a fixed-resolution vision pipeline, so a +-2px
+    /// reading error at ~1500 viewed pixels becomes ~7px of error at 5120 --
+    /// read noise scales with image size, just far more slowly than 1% of
+    /// span. This fixture gives every marker up to 8px of error (a
+    /// common-mode bias of +6/-5 px, the dominant real component, plus
+    /// per-marker differential jitter), producing pair disagreements of
+    /// 4-6px and origin residuals of 5-6px. A FLAT 4px bound would reject
+    /// this honest reading on three separate checks; the read-noise budget
+    /// (12.8px horizontal, 7.2px vertical at this size) passes it, and the
+    /// differential jitter cancels pairwise so the solve still lands on the
+    /// display's exact native size.
+    func testRealisticFiveKReadNoisePassesTheReadNoiseGatesAndSolvesToNative() {
+        let display = screen(width: 5_120, height: 2_880)
+        // Errors per marker: x = common +6 with +-2 differential,
+        // y = common -5 with +-3 differential.
+        let observations = [
+            Observation(label: "TL", x: 512 + 8, y: 288 - 2),
+            Observation(label: "TR", x: 4_608 + 8, y: 288 - 8),
+            Observation(label: "BL", x: 512 + 4, y: 2_592 - 8),
+            Observation(label: "BR", x: 4_608 + 4, y: 2_592 - 2)
+        ]
+        switch ScreenshotCalibration.solve(observations: observations, screen: display) {
+        case .failure(let message):
+            XCTFail("Realistic vision-pipeline read noise at 5K must stay within the read-noise tolerance: \(message)")
+        case .success(let solution):
+            XCTAssertEqual(solution.widthPx, 5_120)
+            XCTAssertEqual(solution.heightPx, 2_880)
+            // The residuals a caller sees: pair disagreements of 4px
+            // horizontal / 6px vertical and origin residuals of 6px / -5px
+            // -- all above the 4px floor, all inside the 0.25%-of-span
+            // budget, exactly the regime the relative term exists for.
+            XCTAssertEqual(solution.residuals.horizontalPairDisagreement, 4, accuracy: 1e-9)
+            XCTAssertEqual(solution.residuals.verticalPairDisagreement, 6, accuracy: 1e-9)
+            XCTAssertEqual(solution.residuals.originX, 6, accuracy: 1e-9)
+            XCTAssertEqual(solution.residuals.originY, -5, accuracy: 1e-9)
+        }
+    }
+
+    /// The common MacBook case the tightening also touches: a 1470x956
+    /// downsample of a 2940x1912 display, read with +-2px of ordinary
+    /// jitter. At this size the read-noise budget's relative term (~3.7px)
+    /// falls BELOW the 4px floor, so the floor governs -- deliberately
+    /// tighter than the 14.7px the old 1% term allowed, because a +-2px
+    /// read never produces a 14px residual either. This pins that the floor
+    /// still clears realistic small-image noise: pair disagreements of
+    /// 2-3px, origin residuals ~1px, solved size exactly 1470x956 with the
+    /// 2x scale back into backing pixels.
+    func testFourteenSeventyDownsampleWithTwoPixelReadsStillSolvesCleanly() {
+        let display = screen(width: 2_940, height: 1_912)
+        let jitter: [String: (Double, Double)] = [
+            "TL": (2, -2), "TR": (-1, 1), "BL": (0, 2), "BR": (1, -1)
+        ]
+        let observations = exactObservations(trueWidth: 2_940, trueHeight: 1_912, scale: 0.5).map { obs in
+            let (dx, dy) = jitter[obs.label] ?? (0, 0)
+            return Observation(label: obs.label, x: obs.x + dx, y: obs.y + dy)
+        }
+        switch ScreenshotCalibration.solve(observations: observations, screen: display) {
+        case .failure(let message):
+            XCTFail("+-2px reads of a 1470x956 downsample must stay inside the 4px floor: \(message)")
+        case .success(let solution):
+            XCTAssertEqual(solution.widthPx, 1_470)
+            XCTAssertEqual(solution.heightPx, 956)
+            XCTAssertEqual(solution.scaleToBackingPx.x, 2, accuracy: 1e-9)
+            XCTAssertEqual(solution.scaleToBackingPx.y, 2, accuracy: 1e-9)
         }
     }
 
@@ -854,6 +958,55 @@ final class ScreenshotCalibrationTests: XCTestCase {
         case .failure(let message):
             XCTAssertTrue(message.contains("implied left edge"), message)
             XCTAssertTrue(message.contains("cropped"), message)
+            XCTAssertTrue(message.contains("Nothing was registered"), message)
+        }
+    }
+
+    /// The element route's own 40px-crop-at-5K regression pin, mirroring the
+    /// marker route's. Two elements read exactly, from a native 5120x2880
+    /// capture cropped 40px left / 22.5px top: the separation (and so the
+    /// scale) is untouched, and the origin residual of -40px is the only
+    /// evidence. Under the old shared 1% tolerance the horizontal budget was
+    /// 51.2px and the vertical 28.8px, so BOTH axes waved the crop through
+    /// and the space registered; the read-noise budget (12.8px at 5120)
+    /// rejects it on the first axis solved.
+    func testAFortyPixelCropAtFiveKIsCaughtByTheCorrespondenceOriginResidualToo() {
+        let display = screen(width: 5_120, height: 2_880)
+        let pairs = [
+            element("Back", at: 512, 288, seenAt: 472, 265.5),
+            element("Send", at: 4_608, 2_592, seenAt: 4_568, 2_569.5)
+        ]
+        switch ScreenshotCalibration.solveCorrespondences(pairs, screen: display) {
+        case .success(let solution):
+            XCTFail("A 40px crop at 5K must be rejected on the element route as well, not registered as \(solution.widthPx)x\(solution.heightPx).")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("implied left edge"), message)
+            XCTAssertTrue(message.contains("cropped"), message)
+            XCTAssertTrue(message.contains("Nothing was registered"), message)
+        }
+    }
+
+    /// The off-baseline FIT residual is read-noise-gated too: a third
+    /// element 20px off the line the baseline pair defines at 5K is a
+    /// misidentified or misread fiducial, not measurement noise -- one
+    /// read's distance from a line through two other reads never
+    /// legitimately reaches 1% of a 5K image, and the old 51.2px budget let
+    /// exactly this size of mismatch smear a wrong element into a
+    /// registered space. 20px exceeds the 12.8px read-noise budget and must
+    /// reject by name.
+    func testATwentyPixelOffBaselineResidualAtFiveKIsNowRejected() {
+        let display = screen(width: 5_120, height: 2_880)
+        let pairs = [
+            element("Back", at: 512, 288, seenAt: 512, 288),
+            element("Send", at: 4_608, 2_592, seenAt: 4_608, 2_592),
+            element("Search field", at: 2_560, 1_440, seenAt: 2_580, 1_440)
+        ]
+        switch ScreenshotCalibration.solveCorrespondences(pairs, screen: display) {
+        case .success(let solution):
+            XCTFail("A 20px off-baseline residual at 5K must be rejected, not absorbed into \(solution.widthPx)x\(solution.heightPx).")
+        case .failure(let message):
+            XCTAssertTrue(message.contains("'Search field'"), message)
+            XCTAssertTrue(message.contains("does not fit the horizontal mapping"), message)
             XCTAssertTrue(message.contains("Nothing was registered"), message)
         }
     }

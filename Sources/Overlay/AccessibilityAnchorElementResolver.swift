@@ -47,7 +47,22 @@ import Foundation
 /// off the main thread before this file existed, and nothing about calling
 /// it again from a second background queue changes that.
 public struct AccessibilityAnchorElementResolver: AnchorElementResolving {
-    public init() {}
+    /// Re-reads the display arrangement AFTER the (possibly seconds-long)
+    /// walk, for the post-walk conversion guard in `reresolve` -- see the
+    /// comment there. Injected as a closure so the guard's plumbing is
+    /// exercisable in unit tests with hand-built snapshots (the guard's pure
+    /// core, `conversionSurvivedWalk`, is tested directly); production
+    /// defaults to the SAME `OverlayWindowController.screenSnapshot()`
+    /// single main-thread hop `AnchorTracker`'s own per-tick snapshot
+    /// already comes from, and calling it from `elementQueue` is exactly as
+    /// safe as the tracker calling it from `samplingQueue` every tick.
+    private let currentScreens: @Sendable () -> [ScreenInfo]
+
+    public init(currentScreens: @escaping @Sendable () -> [ScreenInfo] = {
+        OverlayWindowController.shared.screenSnapshot().screens
+    }) {
+        self.currentScreens = currentScreens
+    }
 
     public func reresolve(
         annotation: Annotation, spec: AnchorElementSpec,
@@ -97,6 +112,38 @@ public struct AccessibilityAnchorElementResolver: AnchorElementResolving {
             return .issue("unavailable")
         }
 
+        // RE-READ THE DISPLAY LAYOUT AND RE-VERIFY THE CONVERSION, exactly
+        // as `handleHighlightElement`'s draw path already does after ITS
+        // walk (see MCPToolHandlers+Highlight.swift's post-walk guard), and
+        // for the same reason: `screens` arrived with this call, captured by
+        // `AnchorTracker.performTick` BEFORE a walk `spec.timeoutSeconds`
+        // may legitimately let run for up to 10s (longer still if this walk
+        // queued behind another on `elementQueue`), while the element's
+        // frame was read live, mid-walk, in whatever arrangement was
+        // current AT THAT MOMENT. `match.backingFrame` was converted
+        // against the stale snapshot, and every input to that conversion --
+        // the zero-origin display's height, the containing-screen pick, the
+        // backing scale factor -- changes when a monitor is added, removed,
+        // rearranged, or rescaled. Nothing about that failure is visible on
+        // its own: it is a perfectly well-formed rectangle in the wrong
+        // place, against a screen id that may no longer exist -- which the
+        // tracker would then commit as re-baselined anchor geometry.
+        //
+        // Equality against a FRESH re-derivation, not "recompute and use
+        // the new value": if the two disagree, the AX frame itself was
+        // measured in an arrangement that can no longer be identified, so
+        // NEITHER conversion is trustworthy and guessing between them would
+        // just move the misplacement around. "unavailable" is the same
+        // fixed code `frameCannotBeMapped` maps to below -- a geometry that
+        // cannot currently be placed, not a lookup failure -- and the
+        // tracker's normal retry cadence (plus the frame change a real
+        // reconfiguration inevitably causes) re-attempts once the layout
+        // settles, reporting a resolution issue in the meantime instead of
+        // a misplaced ring.
+        guard Self.conversionSurvivedWalk(match: match, screensAfterWalk: currentScreens()) else {
+            return .issue("unavailable")
+        }
+
         let newFrame = CGRect(
             x: match.backingFrame.x, y: match.backingFrame.y,
             width: match.backingFrame.width, height: match.backingFrame.height
@@ -112,6 +159,28 @@ public struct AccessibilityAnchorElementResolver: AnchorElementResolving {
             return .issue("unavailable")
         }
         return .resolved(kind: kind, screenId: match.backingFrame.screenId)
+    }
+
+    /// The pure core of `reresolve`'s post-walk display-layout guard: true
+    /// iff `match.backingFrame` re-derives IDENTICALLY from
+    /// `match.accessibilityFrame` under `screensAfterWalk` -- the same
+    /// backing-rect conversion (same default `.requireContainment`
+    /// selection) that produced it against the pre-walk snapshot inside
+    /// `AccessibilityElementResolver.resolve`. False when the fresh
+    /// snapshot cannot map the frame at all (display disconnected) or maps
+    /// it differently (rescaled/rearranged) -- either way the arrangement
+    /// the element was measured in is gone, and the caller must not trust
+    /// the stale conversion. Static and side-effect-free so it can be
+    /// pinned in unit tests with hand-built matches and snapshots; the
+    /// LIVE-walk halves of `reresolve` remain untestable here, per this
+    /// file's existing "no live AX in unit tests" boundary.
+    static func conversionSurvivedWalk(
+        match: AccessibilityElementMatch, screensAfterWalk: [ScreenInfo]
+    ) -> Bool {
+        guard let confirmed = AccessibilityElementResolver.backingRect(
+            forAccessibilityFrame: match.accessibilityFrame, screens: screensAfterWalk
+        ) else { return false }
+        return confirmed == match.backingFrame
     }
 
     /// Maps every `AccessibilityElementResolverError` case onto ONE of
