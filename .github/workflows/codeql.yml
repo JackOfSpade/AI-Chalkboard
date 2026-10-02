@@ -19,15 +19,33 @@ permissions:
 
 jobs:
   analyze:
-    name: Analyze ${{ matrix.language }}
-    runs-on: macos-latest
+    name: Analyze ${{ matrix.language }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
-        language: [swift, c-cpp]
+        # Swift CodeQL needs the macOS build, while the C++ shim is only in
+        # SwiftPM's dependency graph on Windows. Keeping these as distinct
+        # language/platform entries ensures each extractor sees a real build.
+        include:
+          - language: swift
+            os: macos-latest
+          - language: c-cpp
+            os: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # CChalkboardWin is built through SwiftPM on Windows, so install the
+      # same pinned toolchain used by the Windows CI build before CodeQL
+      # starts recording the manual build.
+      - name: Install Swift toolchain (Windows)
+        if: matrix.language == 'c-cpp'
+        uses: compnerd/gha-setup-swift@bbae8ce86bac5a3449f3992b3d88bc4ca25f2057 # v0.5.0
+        with:
+          swift-version: swift-6.3.3-release
+          swift-build: 6.3.3-RELEASE
+
       - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         with:
           languages: ${{ matrix.language }}
