@@ -274,13 +274,13 @@ jobs:
       # multi-platform, but as of this writing its own issue tracker has open
       # reports of specific recent Swift versions being unavailable on
       # Windows -- a live risk for a repo that (like this one) tracks a
-      # specific pinned Swift version. Pinned to v0.4.0 (not @main), the same
+      # specific pinned Swift version. Pinned to v0.5.0 (not @main), the same
       # tag-pinning convention this file already uses for actions/checkout
       # and actions/cache above, so a future release of the action can't
       # silently change how the toolchain gets installed on this blocking
       # gate.
       - name: Install Swift toolchain (Windows)
-        uses: compnerd/gha-setup-swift@eeda069c5bc95ac8a9ac5cea7d4f588ae5420ca5 # v0.4.0
+        uses: compnerd/gha-setup-swift@bbae8ce86bac5a3449f3992b3d88bc4ca25f2057 # v0.5.0
         with:
           swift-version: swift-6.3.3-release
           swift-build: 6.3.3-RELEASE
