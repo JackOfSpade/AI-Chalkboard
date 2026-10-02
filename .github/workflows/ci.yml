@@ -280,7 +280,7 @@ jobs:
       # silently change how the toolchain gets installed on this blocking
       # gate.
       - name: Install Swift toolchain (Windows)
-        uses: compnerd/gha-setup-swift@v0.4.0
+        uses: compnerd/gha-setup-swift@v0.5.0
         with:
           swift-version: swift-6.3.3-release
           swift-build: 6.3.3-RELEASE
