@@ -62,7 +62,7 @@ jobs:
     # macOS to compile and run the AppKit application.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # BLOCKING GATE: actionlint statically checks every workflow file (and runs
       # shellcheck on each embedded `run:` block). A *blocking* linter must be pinned
@@ -70,7 +70,7 @@ jobs:
       # red-light every merge out of nowhere — bump this pin deliberately instead.
       - name: Cache actionlint binary (pinned v1.7.12)
         id: cache-actionlint
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: actionlint
           key: actionlint-v1.7.12-${{ runner.os }}
@@ -227,7 +227,7 @@ jobs:
     # validation stays in the Ubuntu `checks` job above.
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Toolchain version (recorded in the log)
         run: swift --version
@@ -264,7 +264,7 @@ jobs:
     # final runtime layout require platform-specific credentials and tooling.
     # The Swift/C++ build and test suite remain fully covered here.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # compnerd/gha-setup-swift, not swift-actions/setup-swift: compnerd is
       # the Swift project's own Windows-platform maintainer and this action is
@@ -280,7 +280,7 @@ jobs:
       # silently change how the toolchain gets installed on this blocking
       # gate.
       - name: Install Swift toolchain (Windows)
-        uses: compnerd/gha-setup-swift@v0.4.0
+        uses: compnerd/gha-setup-swift@eeda069c5bc95ac8a9ac5cea7d4f588ae5420ca5 # v0.4.0
         with:
           swift-version: swift-6.3.3-release
           swift-build: 6.3.3-RELEASE
