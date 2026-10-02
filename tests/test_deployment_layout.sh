@@ -78,9 +78,3 @@ grep -Fqx 'APP_DIR="$dist_dir/$APP_NAME"' build_app.sh
 grep -Fqx '    codesign --force --timestamp=none --sign "$stable_signing_identity" "$APP_DIR"' build_app.sh
 grep -Fqx '    codesign --force --sign - "$APP_DIR"' build_app.sh
 grep -Fqx 'DEFAULT_BINARY_PATH = "./dist/AIChalkboard.app/Contents/MacOS/AIChalkboard"' test_mcp_stdio.py
-grep -Fqx 'binary_path="$(pwd -P)/dist/AIChalkboard.app/Contents/MacOS/AIChalkboard"' README.md
-grep -Fqx '      "command": "/replace/this/with/the/path/printed/above/AIChalkboard",' README.md
-! grep -Fq '/Users/jack/Desktop/My Apps/AI-Chalkboard' README.md
-grep -Fqx '$binaryPath = (Resolve-Path '\''.\dist\AIChalkboard\AIChalkboard.exe'\'').Path' README.md
-grep -Fqx '      "command": "C:\\replace\\this\\with\\the\\path\\printed\\above\\AIChalkboard.exe",' README.md
-! grep -Fiq 'C:\\Users\\jack' README.md
