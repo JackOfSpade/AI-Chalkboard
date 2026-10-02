@@ -268,21 +268,9 @@ jobs:
           }
           run_check swift build
           run_check swift build -c release
-          # NO app-assembly check here, deliberately. build_app.sh codesigns
-          # with a pinned local identity and FAILS rather than falling back to
-          # ad-hoc signing (an ad-hoc fallback would change the app's designated
-          # requirement every rebuild and destabilise its Screen Recording /
-          # Accessibility grants -- see README, "Build & Run Instructions", and
-          # ci.yml's matching "Assemble .app bundle" step). That certificate
-          # lives only in this developer's login keychain, so on a GitHub-hosted
-          # runner such a check could never be anything but red -- it would
-          # report a permanently broken main on every merge. Nor can it be
-          # rescued by gating it on act: this workflow's `on:` block is
-          # workflow_run + workflow_dispatch with no `push` trigger, so unlike
-          # ci.yml's `build` job it never executes under the local `act push`
-          # pre-push hook either. App assembly is therefore covered ONLY by
-          # ci.yml when that workflow is run locally via act. Do NOT "fix" this
-          # by adding an ad-hoc signing fallback.
+          # Release signing is intentionally not attempted here: it requires a
+          # local signing identity and must not be replaced with an ad-hoc
+          # fallback. The hosted workflow still verifies the build and tests.
           run_check bash tests/test_auto_merge_logic.sh
           if [ "$fail" -eq 0 ]; then
             echo "result=ok" >> "$GITHUB_OUTPUT"

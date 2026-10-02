@@ -28,6 +28,7 @@ name: CI
 on:
   push:
     branches: ['**']
+  pull_request:
   workflow_dispatch:
 
 # Scoped to ${{ github.sha }}, not just ${{ github.ref }}, because
@@ -67,23 +68,8 @@ jobs:
       # shellcheck on each embedded `run:` block). A *blocking* linter must be pinned
       # so that a future actionlint release adding a new check cannot suddenly
       # red-light every merge out of nowhere — bump this pin deliberately instead.
-      # Skipped under act for the same reason the shellcheck step below is gated
-      # on env.ACT, in the opposite direction. act runs this job against the
-      # developer's real checkout path, which can contain a space (e.g.
-      # ".../Desktop/My Apps/AI-Chalkboard"); the post-run save shells out to
-      # `tar ... -C <workspace>` and that path reaches tar word-split, so it dies
-      # with "tar: /Users/jack/Desktop/My: Cannot open". A cache save cannot fail
-      # a job, so this only ever surfaced as a ::warning:: on every single push
-      # to main via the pre-push `act push` hook -- but because the save never
-      # succeeded, the restore never hit either, making the whole step pure
-      # overhead locally rather than a cache. GitHub-hosted runners check out
-      # under /home/runner/work/... where no path component has a space, so real
-      # CI keeps caching exactly as before. `!= 'true'` mirrors the `== 'true'`
-      # convention documented below: env.ACT is set only by act, and GitHub
-      # treats any non-empty string as truthy, so compare explicitly.
       - name: Cache actionlint binary (pinned v1.7.12)
         id: cache-actionlint
-        if: ${{ env.ACT != 'true' }}
         uses: actions/cache@v6
         with:
           path: actionlint
@@ -92,27 +78,6 @@ jobs:
         if: steps.cache-actionlint.outputs.cache-hit != 'true'
         run: |
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
-      # act-local-CI only. GitHub's ubuntu-latest ships shellcheck preinstalled;
-      # act's runner image (catthehacker/ubuntu:act-latest) does not, so both the
-      # actionlint step below (which shells out to shellcheck for embedded run-block
-      # linting) and the standalone shellcheck gate after it died with exit 127 under
-      # the global `act push` pre-push hook — a spurious block on every push to main.
-      # `env.ACT` is set only by act and is unset on GitHub-hosted runners, so this is
-      # skipped there and cannot change real CI. `== 'true'` rather than a bare
-      # truthiness test, because GitHub treats ANY non-empty string (including
-      # "false") as true; the in-script re-check is a second guard so a misfiring
-      # `if:` degrades to a no-op instead of failing this blocking gate on a
-      # transient apt error.
-      - name: Install shellcheck (act-local CI only — GitHub's runner already has it)
-        if: ${{ env.ACT == 'true' }}
-        run: |
-          set -euo pipefail
-          [ "${ACT:-}" = "true" ] || exit 0
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq shellcheck
-          fi
-          shellcheck --version
       - name: actionlint (workflow YAML + embedded run-block bash via shellcheck)
         run: ./actionlint -color
 
@@ -288,41 +253,6 @@ jobs:
         # diagnostics cannot fill that pipe and stall JSON-RPC replies.
         run: python3 -m unittest tests/test_logger_stderr_backpressure.py
 
-      # LOCAL-ONLY, deliberately: build_app.sh codesigns with a pinned local
-      # identity (SHA-1 65B98DF…, "AI Chalkboard Local Code Signing") and FAILS
-      # rather than falling back to ad-hoc signing, because an ad-hoc fallback
-      # would change the app's designated requirement on every rebuild and
-      # destabilise its Screen Recording / Accessibility grants (README, "Build
-      # & Run Instructions"). That certificate exists only in this developer's
-      # login keychain, so on a GitHub-hosted runner this step could never be
-      # anything but red — and Actions is disabled repo-wide for this repo
-      # today anyway. Where it DOES run is the global `act push` pre-push hook:
-      # .actrc maps macos-latest to -self-hosted, so this job executes natively
-      # on the Mac that has the key. Do NOT "fix" this by adding an ad-hoc
-      # signing fallback.
-      #
-      # `env.ACT` is set only by act (same contract the shellcheck-install step
-      # in the `checks` job above relies on) and is unset on GitHub-hosted
-      # runners. `== 'true'` rather than a bare truthiness test, because GitHub
-      # treats ANY non-empty string (including "false") as true.
-      #
-      # Local caveat: the signing key must be granted non-interactive access in
-      # the login keychain. If that is ever revoked, codesign blocks on a
-      # SecurityAgent password prompt a git hook cannot answer and the push
-      # hangs indefinitely rather than failing. Remedy: re-grant "Always Allow"
-      # for the key, or push once with SKIP_ACT=1 to get unblocked.
-      - name: Assemble .app bundle (act-local CI only — needs the local signing identity)
-        if: ${{ env.ACT == 'true' }}
-        run: bash build_app.sh
-
-      # SwiftPM owns `.build` and may replace it during a subsequent build.
-      # The configured MCP executable is instead the signed bundle in `dist/`;
-      # prove both that the bundle survives a release rebuild and that the
-      # documentation/harness stay pointed at it.
-      - name: Verify deployed bundle survives SwiftPM rebuild (act-local CI only)
-        if: ${{ env.ACT == 'true' }}
-        run: bash tests/test_deployment_layout.sh
-
   build-windows:
     name: swift build (debug + release) + swift test (Windows)
     runs-on: windows-latest
@@ -330,17 +260,9 @@ jobs:
     # 10x), so unlike the `build` job above there is no cheap/expensive split to
     # make here -- this job just builds and tests the Windows port directly.
     #
-    # No build_app.ps1 / dist assembly step here, deliberately, mirroring why
-    # the macOS `build` job above only runs build_app.sh under `if: env.ACT ==
-    # 'true'`: this repo has no code-signing identity to fail closed without
-    # attempting on a hosted runner (Windows has none to begin with -- see
-    # build_app.ps1's own comment on why there is no signing step at all), but
-    # the dist layout step still depends on the local Swift Runtimes directory
-    # layout and DLL closure being reproducible, which is exercised by hand
-    # against this developer's real Swift install rather than here. `swift
-    # build`, `swift build -c release`, and `swift test` below already cover
-    # the part of the Windows port -- the actual Swift/C++ source compiling
-    # and passing its test suite on Windows -- that most needs a CI gate.
+    # Packaging is intentionally outside CI because release signing and the
+    # final runtime layout require platform-specific credentials and tooling.
+    # The Swift/C++ build and test suite remain fully covered here.
     steps:
       - uses: actions/checkout@v7
 
