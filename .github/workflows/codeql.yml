@@ -21,6 +21,7 @@ jobs:
   analyze:
     name: Analyze ${{ matrix.language }}
     runs-on: macos-latest
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:

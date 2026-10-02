@@ -13,7 +13,7 @@ name: CI
 # load-bearing property that every branch push produces a CI run the merge gate can
 # read, while excluding tag pushes (which nothing consumes — auto-merge-claude.yml
 # only ever iterates branch heads under refs/remotes/origin/*, so a tag's CI run was
-# previously just a wasted 10x-billed macOS build with no consumer).
+# previously just an unnecessary macOS build with no consumer).
 #
 # Do NOT narrow this further. auto-merge-claude.yml looks up the CI run for a
 # branch's exact tip SHA (repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs
@@ -43,7 +43,7 @@ on:
 # never cancel each other, so this failure mode cannot occur.
 #
 # Accepted cost: two rapid pushes to the same branch now each get their own full CI
-# run — including a 10x-billed macOS build — instead of the older one being
+# run — including a macOS build — instead of the older one being
 # cancelled. A wasted run is a strictly better outcome than a permanently stranded
 # branch.
 concurrency:
@@ -58,9 +58,9 @@ jobs:
     name: shell-lint + actionlint + auto-merge logic tests
     runs-on: ubuntu-latest
     # ubuntu-latest, not macos-latest: this job needs no AppKit/Swift toolchain, and
-    # macOS runners bill at 10x on a private repo. Everything here that does not need
-    # to actually compile/run the app lives in this cheap job; only the `build` job
-    # below pays the macOS multiplier.
+    # Keep platform-neutral checks on Ubuntu; only the `build` job below needs
+    # macOS to compile and run the AppKit application.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -223,9 +223,9 @@ jobs:
   build:
     name: swift build (debug + release) + app bundle
     runs-on: macos-latest
-    # macos-latest runners bill at 10x on a private repo, which is exactly why every
-    # check above that does NOT need AppKit/the Swift toolchain lives in the cheap
-    # ubuntu `checks` job instead. This job only does what genuinely requires macOS.
+    # This job only does what genuinely requires macOS/AppKit; platform-neutral
+    # validation stays in the Ubuntu `checks` job above.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
 
@@ -256,9 +256,9 @@ jobs:
   build-windows:
     name: swift build (debug + release) + swift test (Windows)
     runs-on: windows-latest
-    # windows-latest is billed at the standard multiplier (unlike macos-latest's
-    # 10x), so unlike the `build` job above there is no cheap/expensive split to
-    # make here -- this job just builds and tests the Windows port directly.
+    timeout-minutes: 35
+    # This job builds and tests the Windows port directly; the Ubuntu checks job
+    # already handles platform-neutral validation.
     #
     # Packaging is intentionally outside CI because release signing and the
     # final runtime layout require platform-specific credentials and tooling.

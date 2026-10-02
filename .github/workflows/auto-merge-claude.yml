@@ -23,6 +23,7 @@ concurrency:
 jobs:
   merge:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
       pull-requests: write
@@ -219,8 +220,7 @@ jobs:
   # ran its equivalent check as trailing steps in the same (credential-free, cheap) job as the merge,
   # because those checks were plain Python with no build step. That shortcut does not carry over here:
   # this repo's post-merge check has to actually compile the macOS app (`swift build`, debug and
-  # release), which requires a macos-latest runner — GitHub bills macOS minutes at 10x Linux minutes, and this
-  # repo is private (billed, not free). The `merge` job runs on every CI completion and merges nothing
+  # release), which requires a macos-latest runner. The `merge` job runs on every CI completion and merges nothing
   # on most runs; putting the build check inline would force EVERY one of those runs onto a macOS
   # runner. Splitting it into its own job, gated on `needs.merge.outputs.did_merge == 'true'`, means
   # the macOS runner only spins up on runs that actually landed new content on main.
@@ -244,6 +244,7 @@ jobs:
     needs: merge
     if: needs.merge.outputs.did_merge == 'true'
     runs-on: macos-latest
+    timeout-minutes: 35
     permissions:
       contents: read
       issues: write
