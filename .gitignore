@@ -25,3 +25,6 @@ __pycache__/
 # continuing, and so `git status` stays clean if either tool changes it.
 .pytest_cache/
 .ruff_cache/
+
+# Temporary archives retained by CI.
+/build/

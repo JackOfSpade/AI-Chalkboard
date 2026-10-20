@@ -1,34 +1,11 @@
 name: CI
 
-# The overall run conclusion (success/failure) of THIS workflow IS the merge gate:
-# .github/workflows/auto-merge-claude.yml triggers on this workflow's completion
-# (workflow_run) and merges a branch's exact tip commit into main ONLY if the CI
-# run for that SHA concluded "success". Do NOT add `continue-on-error` to any step
-# in either job below — a step marked continue-on-error can fail silently while the
-# job (and therefore the run) still reports "success", which would let broken code
-# merge to main with zero red signal anywhere.
-#
-# `push:` below is filtered with `branches: ['**']`, which matches EVERY branch
-# (including ones with slashes, like `claude/foo`) and therefore preserves the
-# load-bearing property that every branch push produces a CI run the merge gate can
-# read, while excluding tag pushes (which nothing consumes — auto-merge-claude.yml
-# only ever iterates branch heads under refs/remotes/origin/*, so a tag's CI run was
-# previously just an unnecessary macOS build with no consumer).
-#
-# Do NOT narrow this further. auto-merge-claude.yml looks up the CI run for a
-# branch's exact tip SHA (repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs
-# ?head_sha=$sha) and fails CLOSED — no run found means the branch is skipped, every
-# single drain, forever. A commit that produces no CI run at all (because it didn't
-# match a branch filter, or only touched paths excluded by a paths-ignore filter) can
-# therefore NEVER merge — it would be stranded permanently, recoverable only by a
-# human pushing an unrelated matching change. If you ever need to skip expensive work
-# for e.g. docs-only changes, gate the JOB (or a step) with an `if:` condition instead
-# — the workflow run still exists and still concludes "success", so auto-merge still
-# sees a green gate for that SHA.
+# Validate every branch commit and PR merge tree; required checks also cover bot merges.
 on:
   push:
     branches: ['**']
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 # Scoped to ${{ github.sha }}, not just ${{ github.ref }}, because
@@ -126,45 +103,7 @@ jobs:
           # blocking gate.
           shellcheck -S warning "${existing[@]}"
 
-      - name: workflow_run trigger name stays in sync (auto-merge-claude.yml <-> ci.yml name:)
-        # actionlint does NOT catch this: auto-merge-claude.yml's on.workflow_run.workflows
-        # matches against a workflow's name: field, not its filename. Renaming this
-        # workflow's `name:` without updating that array would silently and permanently
-        # stop CI completions from re-triggering auto-merge, with zero red CI signal.
-        #
-        # The grep below is anchored to the indented `workflows:` YAML key specifically
-        # (leading whitespace, then `workflows:`, then the opening `[`) so that a `#`
-        # comment merely mentioning the word "workflows:" elsewhere in the file can
-        # neither satisfy this check (reading a stale comment instead of the real array
-        # and reporting OK on an actual desync) nor break it (a correct file must still
-        # match the real key line, not an unrelated comment). The trailing `|| true` on
-        # the grep is required, not decorative: under `set -e`, a `var="$(cmd)"`
-        # assignment whose command substitution exits non-zero (grep's exit status when
-        # it finds NO match) aborts the script right there, bare, before the `if [ -z
-        # "$line" ]` guard below ever runs — silently skipping this whole check with no
-        # ::error:: at all. `|| true` lets a no-match assign an empty string instead, so
-        # the guard is what reports the failure, loudly, as intended.
-        run: |
-          set -euo pipefail
-          ci_name="$(grep -m1 '^name:' .github/workflows/ci.yml | sed 's/^name:[[:space:]]*//')"
-          line="$(grep -m1 -E '^[[:space:]]+workflows:[[:space:]]*\[' .github/workflows/auto-merge-claude.yml || true)"
-          if [ -z "$line" ]; then
-            echo "::error::could not find the on.workflow_run.workflows array in .github/workflows/auto-merge-claude.yml -- the merge trigger may have been restructured; this check cannot verify it."
-            exit 1
-          fi
-          mapfile -t triggers < <(printf '%s' "$line" | grep -oP '(?<=\[)[^]]*(?=\])' | tr ',' '\n' | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
-          found=0
-          for t in "${triggers[@]}"; do [ "$t" = "$ci_name" ] && found=1 && break; done
-          if [ "$found" -eq 0 ]; then
-            echo "::error::auto-merge-claude.yml's on.workflow_run.workflows is missing [$ci_name] (this file's name: field) -- CI completions will silently stop re-triggering auto-merge."
-            exit 1
-          fi
-          echo "OK: workflow_run trigger name matches ci.yml's name: field."
-
-      # The most CONSEQUENTIAL automation in this repo is the embedded bash that decides
-      # whether a branch's work reaches main (auto_merge_decision.sh, consumed by
-      # auto-merge-claude.yml). This is therefore a hard BLOCKING gate, not an advisory
-      # check: a failure here fails the CI run, which fails the merge gate above.
+      # Keep coverage of the existing merge decision and branch-deletion safety helpers.
       - name: auto-merge decision logic (CI-gate + delete-safety fixtures)
         run: bash tests/test_auto_merge_logic.sh
 
@@ -253,6 +192,18 @@ jobs:
         # diagnostics cannot fill that pipe and stall JSON-RPC replies.
         run: python3 -m unittest tests/test_logger_stderr_backpressure.py
 
+      - name: Archive the verified test app
+        run: |
+          mkdir -p build/ci-artifacts
+          ditto -c -k --sequesterRsrc --keepParent .test-dist/AIChalkboard.app build/ci-artifacts/AIChalkboard-test.zip
+      - name: Retain test app
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: AIChalkboard-macOS-test-${{ github.sha }}
+          path: build/ci-artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
   build-windows:
     name: swift build (debug + release) + MCP smoke test (Windows)
     runs-on: windows-latest
@@ -308,3 +259,22 @@ jobs:
           }
           $env:AI_CHALKBOARD_LOGGER_TEST_BINARY = $binaryPath
           python -m unittest tests/test_logger_stderr_backpressure.py
+
+  required:
+    name: CI required
+    if: ${{ always() }}
+    needs: [checks, build, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation job to succeed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ["RESULTS"])
+          failed = {name: job["result"] for name, job in results.items() if job["result"] != "success"}
+          if failed:
+              raise SystemExit(f"Required jobs did not succeed: {failed}")
+          PY
