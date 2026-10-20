@@ -136,6 +136,9 @@ jobs:
           python3 -m py_compile tests/mcp_wire_snapshot.py tests/test_mcp_wire_snapshot.py
           python3 -m unittest tests/test_mcp_wire_snapshot.py
 
+      - name: CodeQL legacy configuration preserves the full scan
+        run: python3 -m unittest tests/test_codeql_category_alias.py
+
       - name: Cross-platform protocol conformance (both platforms, no SDK needed)
         # The macOS/Windows split is a set of small protocols with one conformance
         # per platform. Whoever is editing this repo can usually only COMPILE ONE OF
