@@ -45,6 +45,15 @@ class CodeQLCategoryAliasTests(unittest.TestCase):
         source["runs"][0]["results"] = []
         self.assertEqual(legacy_swift_alias(source)["runs"][0]["results"], [])
 
+    def test_raw_cli_output_without_an_identity_gets_only_the_legacy_identity(self):
+        source = self.report()
+        del source["runs"][0]["automationDetails"]
+        original = copy.deepcopy(source)
+        alias = legacy_swift_alias(source)
+        self.assertEqual(source, original)
+        self.assertEqual(alias["runs"][0].pop("automationDetails"), {"id": LEGACY_ID})
+        self.assertEqual(alias, original, "raw CLI findings and rules must also stay intact")
+
     def test_unexpected_run_tool_or_identity_fails_closed(self):
         for edit in (
             lambda report: report.update(runs=[]),

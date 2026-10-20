@@ -21,10 +21,12 @@ def legacy_swift_alias(report):
     run = runs[0]
     if run.get("tool", {}).get("driver", {}).get("name") != "CodeQL":
         raise ValueError("expected a CodeQL scan")
-    if run.get("automationDetails", {}).get("id") != PLATFORM_ID:
+    # The CLI's raw output can omit this field; analyze adds its default matrix
+    # identity to the in-memory upload without rewriting that raw SARIF file.
+    if run.get("automationDetails", {}).get("id") not in (None, PLATFORM_ID):
         raise ValueError("expected the existing language+OS Swift configuration")
     alias = copy.deepcopy(report)
-    alias["runs"][0]["automationDetails"]["id"] = LEGACY_ID
+    alias["runs"][0].setdefault("automationDetails", {})["id"] = LEGACY_ID
     return alias
 
 
