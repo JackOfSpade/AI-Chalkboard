@@ -2,7 +2,6 @@ name: CodeQL
 
 on:
   push:
-    branches: [main]
   pull_request:
     branches: [main]
   schedule:
@@ -52,4 +51,40 @@ jobs:
           build-mode: manual
       - name: Build
         run: swift build
-      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          output: build/codeql-sarif
+
+      # Main still has the successful pre-platform Swift configuration. Publish
+      # the identical scan under that identity too so PR comparisons cover it;
+      # the normal language+OS upload above remains authoritative and unchanged.
+      - name: Copy Swift results for the legacy configuration
+        if: matrix.language == 'swift'
+        run: python3 scripts/codeql_category_alias.py build/codeql-sarif/swift.sarif build/codeql-legacy/swift.sarif
+
+      - name: Upload the same Swift scan under its legacy identity
+        if: matrix.language == 'swift'
+        uses: github/codeql-action/upload-sarif@24c54180a607b1449ed407dd24f251e4e9147c8d # v4
+        with:
+          sarif_file: build/codeql-legacy/swift.sarif
+          category: .github/workflows/codeql.yml:analyze/language:swift
+          matrix: '{"language":"swift"}'
+
+  security-required:
+    name: Security required
+    if: ${{ always() }}
+    needs: ["analyze"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every prerequisite to succeed
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          results = json.loads(os.environ["JOB_RESULTS"])
+          failed = [name for name, job in results.items() if job["result"] != "success"]
+          if failed:
+              sys.exit("Unsuccessful prerequisites: " + ", ".join(failed))
+          PY
